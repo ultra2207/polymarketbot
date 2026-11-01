@@ -177,11 +177,13 @@ def main() -> int:
     wins = [v for v in verdicts if v[4]]
     print(f"\nbuckets where drift beats two crossings and |t| > 3: {len(wins)}/{len(verdicts)}")
     if wins:
-        print("=> CANDIDATE. But note the selection: only 2,117 of 1.75 M tokens printed at "
-              "all four leads, so this is long-lived, heavily traded markets only. It also "
-              "contradicts A1, which found the level dead after costs - so the honest status "
-              "is 'unresolved', and the next test must buy at the ask at 168 h and sell at "
-              "the bid at 6 h rather than use traded prices.")
+        n_all = con.sql("SELECT count(*) FROM mk").fetchall()[0][0]
+        print(f"=> CANDIDATE. Selection caveat: {n:,} of {n_all:,} resolved tokens "
+              f"({100*n/max(n_all,1):.2f} %) printed at all four leads, so this describes "
+              "long-lived, heavily traded markets rather than a random sample. It also "
+              "contradicts A1, which found the level dead after costs, so the status is "
+              "'unresolved': the confirming test must buy at the ask at 168 h and sell at "
+              "the bid at 6 h, not use traded prices.")
     else:
         print("=> dead: no bucket's drift beats the cost of capturing it")
     return 0

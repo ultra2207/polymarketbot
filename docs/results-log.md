@@ -491,3 +491,75 @@ thousands of markets with sub-20-second replacement times. Across the entire dat
 many small pieces. A wallet pushing $50 k through a market may show 1,000 fills of $50. So
 this measures fill size — the right quantity for impact — not order size, which is not the
 right quantity for capital.
+
+---
+
+## ⚠ Data staleness found: `market_labels` predated the API label fetch (2026-11-01)
+
+**What happened.** `market_labels.parquet` was built at 18:41. The Data API label fetch
+finished at 20:49 — two hours later. The merge step was never re-run, so 1,571,580
+resolved conditions fetched from the API were present in `labels_api.parquet` and absent
+from `market_labels.parquet`, which took only **999** rows from it.
+
+**Effect on coverage, by month of `end_date`:**
+
+| 2026 month | resolved before | resolved after |
+|---|---|---|
+| Jan–Mar | 99.9 % | 99.9 % |
+| Apr | 80.3 % | **90.9 %** |
+| May | **0.6 %** | **80.4 %** |
+| Jun | **0.3 %** | **77.8 %** |
+| Jul | 0.0 % | **70.5 %** |
+| Aug | 0.0 % | 49.2 % |
+| Sep | 0.1 % | 37.0 % |
+
+The forward-test window (2026-06-01 → 08-10) went from essentially unlabelled to
+**641,331 resolved of 685,918 markets (93.4 %)**. The rebuild takes 10 seconds.
+
+**How it was caught.** An inner join in `analyse_fill_quality.py` matched only 1,546 of
+3.83 M maker fills and reported "$0.00 B" of volume. The join was not wrong — the labels
+were. The "0.00 B" was the tell, not the join.
+
+**Which results this invalidates.** Any screen that filtered on `resolved` over 2026 data
+was running on 0.3 % coverage for May onwards:
+
+| Screen | Status |
+|---|---|
+| A7 term-structure drift | **re-run below** |
+| C1 crypto reference | needs re-running |
+| A5 lifecycle | needs re-running (also used stale screen rows) |
+| C2 base rates | needs re-running |
+| E1, A2, A3, A4 | unaffected — they do not filter on `resolved` |
+
+**The lesson, which is the third instance today.** A silent, plausible-looking zero is more
+dangerous than an error: no query failed, nothing warned, and every screen returned a
+well-formed table computed on a thin, non-random subsample (Jan–Apr only). The check that
+caught it was a cross-table consistency test — a join that should have matched nearly
+everything matched almost nothing.
+
+---
+
+## A7 re-run on corrected labels — **stronger, and now monotone** (2026-11-01)
+
+| p168 bucket | n | 168→6 drift | ±se | t | vs 2 ¢ cost |
+|---|---|---|---|---|---|
+| 0.00–0.10 | 563 | **+0.0953** | 0.0097 | **+9.8** | beats |
+| 0.10–0.25 | 656 | **+0.0902** | 0.0115 | **+7.8** | beats |
+| 0.25–0.50 | 664 | +0.0219 | 0.0110 | +2.0 | beats (weak) |
+| 0.50–0.75 | 592 | −0.0340 | 0.0121 | −2.8 | beats (weak) |
+| 0.75–0.90 | 449 | **−0.0985** | 0.0143 | **−6.9** | beats |
+| 0.90–1.00 | 372 | **−0.1172** | 0.0131 | **−9.0** | beats |
+
+The effect is now **monotone in price** — positive in the low tail, negative in the high
+tail, near zero in the middle — which is the signature of a genuine tail effect rather than
+a composition artefact. Magnitudes grew from +7.6 / −11.3 ¢ to **+9.5 / −11.7 ¢**.
+
+**But the selection problem is now precisely quantified and it is severe.** Only
+**3,296 of 4,869,752** resolved tokens (0.07 %) printed at all four leads. The reason is
+structural: the median market lives ~24 h, so a 168-hour lead does not exist for it. A7 can
+only ever speak about markets that live longer than a week.
+
+So A7 remains a candidate, not a result, and the constraint is now about *breadth*, not
+method: the effect is real in the population it can see, and that population is 0.07 % of
+markets. Whether it is worth anything depends on whether those markets carry enough volume
+— which is the next question, not a bearing test.
