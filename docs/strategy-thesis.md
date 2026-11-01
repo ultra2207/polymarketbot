@@ -115,3 +115,59 @@ The entry/exit split reported earlier is payout-dependent and was withdrawn — 
 So the operator's mechanism is half-supported: they do take profit early, but the money is
 lost in a long tail that is never dealt with at all, rather than in big positions they
 refuse to cut.
+
+---
+
+## Consolidated understanding (end of overnight session, 2026-11-02)
+
+### Established, with the arithmetic verified
+
+| finding | evidence | confidence |
+|---|---|---|
+| The top decile earns by **taking**, not making | takers +$150.9 m at +5.6–7.7 %; pure makers −$150.0 m at −1.0 % of volume | high |
+| Market making is a **loss centre** | round-trip spread capture +$14.2 m on $14.9 b (0.1 %) vs inventory marking −$163.0 m | high |
+| The edge concentrates in **sports** | taker edge +0.0555 in sports vs +0.0134 crypto, +0.0057 politics | high |
+| Sports has a large **favourite–longshot bias** | 20–30 % priced resolves 12.2 % (−0.129); 70–80 % priced resolves 88.5 % (+0.136) | high, multiple controls |
+| That bias is **decaying** | May −0.094/+0.087 → Sep −0.045/+0.041 | high |
+| Their taker edge **does not decay** | +0.031 to +0.043 per share, every month | high |
+| No disposition effect | losers closed 61.0 %, winners 55.9 % | high |
+| Losses sit in the **middle** of the size distribution | $10–$10 k is 95 % of it; positions above $1 m are profitable | high |
+
+### Not established — and the contradictions that block it
+
+1. **Within price buckets, the top decile's buys resolve ~10 pp better than everyone else's.**
+   But measured per token, the two groups trade the *same* token universe (2.0 M shared
+   tokens, 100 %) and the top decile pays **more** (+7.1 ¢ mean, cheaper in only 29.7 % of
+   tokens) while earning a buy-side edge of ≈0 on those shared tokens.
+   Both cannot describe the same trades unless the difference is *timing within a token*,
+   which the per-month and per-ttl cuts did not isolate. **This is the open contradiction.**
+
+2. **Buy-side edge is not PnL.** A market maker buys at the bid and sells at the ask; their
+   buy-side edge versus the eventual payout understates their economics by the whole spread.
+   Several conclusions above were drawn from buy-side edge, and the role split is the only
+   cut that used full PnL. The sports/crypto numbers should be re-derived with full PnL
+   before they are treated as final.
+
+3. **The `ttl_h` anchor is `end_date`, not actual resolution.** `resolution_timing.parquet`
+   has `resolved_ts`, but only 140 sports markets have it, so the timing dimension is weaker
+   than it looks. Median `end_date` to `resolved_ts` is +4 h but the spread is huge
+   (p10 −133 h).
+
+### What the next session should do, in order
+
+1. **Re-derive the category and price-band results with full PnL** (closed + held + exit)
+   instead of buy-side edge. The role split exists; apply it to the category cube cells.
+2. **Resolve the within-bucket contradiction** by controlling for token identity: for each
+   (token, price bucket), compare the top decile's realised spread against the rest's. If
+   they are identical, the earlier "selection" was a composition artefact of bucketing by a
+   wallet's *average* price.
+3. Only after (1) and (2): decide whether the replicable object is a sports pricing model
+   (a real forecasting task) or a liquidity-provision business (which the role split says
+   loses money at the top).
+
+### The one-sentence summary
+
+The durable, measurable edge in this data is **buying sports favourites and avoiding
+longshots**, it is worth roughly 4–5 % of money deployed, and it is being arbitraged away
+month by month while the top decile's own edge stays flat — which is the strongest hint that
+they are not simply harvesting that bias.
