@@ -58,6 +58,104 @@ without privileged information or speed become strategies.
 
 ---
 
+## 1.5 The actual objective: mechanism transplantation
+
+Copy trading was never the goal, and treating it as the goal produced the wrong analysis.
+The objective is narrower and much more useful:
+
+> Find wallets that trade **algorithmically**, infer the **rule** they run, then deploy that
+> rule in markets where they are **not present**.
+
+That is not copying. Copying replicates their *trades*; this replicates their *rule* and
+then exploits the part of the condition space their coverage does not reach. Three
+differences make it a different research programme:
+
+| | Copy trading | Mechanism transplantation |
+|---|---|---|
+| Unit of analysis | the wallet's signal | the **predicate** they run |
+| Success metric | did our fills match theirs | does the predicate pay **where they are absent** |
+| Failure mode | latency, size, exit-into-copy | the predicate was theirs because of infrastructure we lack |
+
+The economic basis is that a systematic trader's coverage is a **proper subset** of the
+condition space, and the exclusions are structural: minimum size they need to make a fill
+worth it, categories they whitelist, markets they can even scan, capital they will lock,
+and their own risk limits. Those exclusions are the opportunity.
+
+### Step 1 — identify algorithmic wallets from the tape alone
+
+No identity data needed; behaviour is enough.
+
+| Signal | Definition | Why it separates algorithms from humans |
+|---|---|---|
+| Timing entropy | CV of inter-fill gaps; share of fills within 1 s of :00/:30 or a multiple of 60 s | humans are heavy-tailed and diurnal; loops are not |
+| Size quantisation | share of fills in the wallet's own top-3 sizes; roundness of size | algorithms use fixed or derived sizes |
+| Price snapping | share of fills at tick-aligned or round decimal prices | algorithms compute prices; humans click them |
+| Two-sidedness | share of conditions where they are maker on one side and taker on the other within Δt; pairs summing to ≈ 1 | arbitrage and market-making signature |
+| Event locking | share of fills within k seconds of a scheduled boundary | see the slug trick below |
+| Maker share | fraction of fills where the wallet is the maker | separates quoting algos from taker algos |
+| Coverage structure | distinct conditions per day; Gini of volume across markets | a systematic scan, not occasional conviction |
+
+**The slug trick.** SII `slug` values encode the market's window directly:
+`sol-updown-5m-1774560600` is a 5-minute Solana up/down market ending at unix
+`1774560600`. That reconstructs the exact scheduled boundary for crypto up/down markets
+with **no external price series**, so "does this wallet fill within 400 ms of the boundary"
+is computable from the tape we already hold.
+
+### Step 2 — infer the rule as a predicate, not a model
+
+The output must be interpretable enough to be applied elsewhere. Candidate shapes:
+
+- **entry timing**: histogram of time-to-resolution at entry, by market family
+- **entry price**: does it fade extremes or follow them; price bucket distribution
+- **reaction**: direction vs the prior N-second return (momentum or reversion coefficient)
+- **reference deviation**: for crypto, distance from the Chainlink/Binance reference
+- **coverage condition**: minimum lifetime volume, minimum depth, category, tick size,
+  neg-risk flag, market age, hours-to-resolution floor
+
+Fit the first four as behaviour, and the **coverage condition separately** — the coverage
+condition is what defines the gap, so it must be estimated explicitly rather than assumed.
+
+### Step 3 — the discriminator: edge half-life
+
+The whole idea lives or dies on one measurable number. After one of their fills, how long
+until the price has completed most of its eventual adjustment?
+
+- **< 10 s → the edge is latency.** Untransplantable. Their absence elsewhere is irrelevant
+  because we could not compete even where they *are* present.
+- **minutes to hours → the edge is structural or informational.** Transplantable.
+
+Measure as an event study of mid-price response around their fills at 1 s / 10 s / 1 m /
+5 m / 1 h, expressed as the fraction of eventual adjustment completed. Honest prior: most
+crypto and sports up/down algo flow will land in the first bucket. Politics and economics
+are where a multi-minute half-life is plausible.
+
+### Step 4 — the gap set
+
+`predicate ∧ ¬their_coverage ∧ habitable`
+
+`habitable` is not optional: depth at $250 ≥ 3× the order, an exit that exists, and an
+unambiguous resolution. Absence of large traders is ambiguous between neglect (opportunity)
+and uninhabitability (no exit). This is the same guardrail as `plan.md` thesis #2, and
+skipping it is how "whitespace" turns into a graveyard.
+
+### Step 5 — measure with the fill engine
+
+Simulate the predicate on the gap set under all five exit policies. A transplant that needs
+a different exit from the original rule is a different strategy and must be justified.
+
+### Why this can fail — stated up front
+
+1. **Most algo flow is latency-bound.** Then there is nothing to transplant, and the honest
+   answer is that Track A's output is negative.
+2. **The gap may be occupied by other algorithms** we did not identify, because we only
+   survey the top deciles of a survivorship-biased leaderboard.
+3. **The predicate may be overfit** to their fills. Validate on a held-out period of the
+   same wallet before generalising.
+4. **Inverse selection.** They may skip markets for a reason absent from our feature set —
+   an ambiguous resolution rule, a resolution source they do not trust, a venue quirk.
+
+---
+
 ## 2. Ranking traders correctly
 
 Raw lifetime PnL is the wrong metric. It ranks by size and by luck, and prediction-market

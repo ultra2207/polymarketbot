@@ -200,6 +200,92 @@ after fees" conclusion in `docs/results-log.md` used the **gross** taker fee and
 overstates cost. At a $2,000 bankroll the tier will be low, so the correction is small —
 but it is the wrong direction to leave in, because over-stating cost hides real edges.
 
+## New ideas surfaced by the docs, not previously on the backlog
+
+These are not in `plan.md` (ideas #1–28). Each comes from a documented mechanic rather
+than from a market-efficiency story, which makes them structural: they do not require
+being right about anything, only being present in the right state.
+
+### E1. Within-market complete-set arbitrage
+**Mechanism.** A binary market's two tokens always merge back into \$1. If
+`ask(YES) + ask(NO) < 1`, buying both and merging returns \$1 for less than \$1 spent.
+No forecast, no information, no speed requirement beyond noticing.
+**Why it can exist.** The two books are quoted independently, and a 2 ¢ spread normally
+keeps the sum at or above 1. It breaks when one side is mispriced in a thin book.
+**The catch that decides it: fees.** This is a taker trade, so the taker fee applies to
+both legs. Crypto peaks at 1.75 % of notional at the mid — that kills any 1–2 ¢ edge
+outright. Geopolitics is fee-free, so the same 1 ¢ edge survives there. **Category
+selection is the whole strategy.**
+**First test:** from the tape, find timestamps where the last YES trade + last NO trade
+imply a sum below 1 net of the category's taker fee, and measure how long the state
+persists. Execution confirmation needs the book.
+**Kill if:** sub-1 sums only occur where the fee exceeds the gap, or persist for under a
+second.
+
+### E2. Fee-holiday windows
+**Mechanism.** The docs confirm markets are "temporarily made fee-free during a fee
+holiday". Every idea killed by the 2026 fee overlay comes back to life at zero fee.
+**Why it is cheap.** We already snapshot Gamma daily, so `feesEnabled` and `feeType`
+transitions are recordable from now on. This is a monitor, not a model.
+**First test:** measure how often `feesEnabled` flips and how long holidays last; then
+re-run the killed screens restricted to holiday windows.
+**Kill if:** holidays are rare, short, or confined to markets with no depth.
+
+### E3. Venue restriction states: post-only, cancel-only, restart
+**Mechanism.** The API distinguishes *matching-engine restart*, *cancel-only* and
+*post-only* restrictions, and returns `retry_after_seconds`. During **post-only**, takers
+cannot cross, so a resting maker is protected from being picked off. During
+**cancel-only**, the book can only thin, never deepen.
+**Why it can pay.** If a restriction window overlaps a news event, the book cannot reprice
+through takers; whoever is already resting gets the first move. This is a genuine
+structural edge and it needs no forecasting.
+**First test:** log restriction states from the live API alongside the book; measure price
+behaviour across the window. Forward-only.
+**Kill if:** windows are too rare to trade, or makers flatten rather than benefit.
+
+### E4. Taker-delay asymmetry as a maker-protection measure
+**Mechanism.** Crypto markets apply a taker delay — **250 ms → 50 ms (2026-08-17) →
+150 ms (2026-09-04)** — exposed per market as `takerDelayMs`. A longer delay gives a
+resting quote a head start before an aggressor's order completes.
+**Why it can pay.** It ranks markets by how safe passive quoting is there, which is
+exactly the input a reward-farming or quoting strategy needs. Combine with E5.
+**First test:** does realised maker adverse selection fall with `takerDelayMs` across
+markets? Needs the book plus per-market delay.
+**Kill if:** the delay is uniform in practice, or adverse selection is dominated by
+informed takers rather than by latency.
+
+### E5. Liquidity-reward rotation (yield surface)
+**Mechanism.** Extend D1 from "can we earn rewards" to "where is the reward per unit of
+capital highest". `ratePerDay` is per market; your share is proportional to qualifying
+size, so the yield is `ratePerDay / (total qualifying size × capital tied up)`.
+**Why it can pay.** New or neglected markets can have a high rate against thin
+competition. This is a rotation problem, and small capital is an advantage because the
+pro-rata share is not diluted by our own size.
+**First test:** build the yield surface from live Gamma `clobRewards` + book-implied
+qualifying size; rank markets.
+**Kill if:** qualifying size required exceeds our \$250, or the yield is below the
+inventory risk it carries.
+
+### E6. Perps venue: funding carry and liquidation capture
+**Mechanism.** The docs include a full perps product — funding, mark price, index price,
+liquidation mechanics, ADL, 20 ms taker delay, its own liquidity rewards. Two structural
+strategies need no forecast: **funding carry** (hold the leg that is paid, hedge the
+other) and **liquidation-cascade capture** (liquidations are mechanical and create
+predictable impact).
+**Why it is worth a look.** Funding is a contractual cashflow, not a prediction, and small
+size can sit inside a cascade without moving it.
+**First test:** measure funding-rate dispersion versus another venue and the size of
+liquidation bursts.
+**Kill if:** funding is near-zero on average, or cascades are too shallow to trade.
+
+### E7. Mechanism transplantation (Track A, redefined)
+Find algorithmic wallets, infer the predicate they run, and deploy it where their coverage
+does not reach. Full design — including the edge-half-life discriminator that decides
+whether any of it is transplantable — in
+[`strategy-reverse-engineering.md` §1.5](strategy-reverse-engineering.md).
+
+---
+
 ## The global filter
 
 Before any of this is called an edge it must clear, in order:
