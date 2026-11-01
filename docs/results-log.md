@@ -90,3 +90,33 @@ score to put in a backtest.
 **Next:** decompose the directional cohort's PnL by market family and holding time, then
 ask which parts are reachable at our size. Combo wallets are the anomaly worth one look —
 one has rank 1222 with $2.36 M realized against $231 of market PnL.
+
+---
+
+## C2 (free half) Base-rate models — **market price wins, decisively** (2026-11-01)
+
+**Window:** all resolved binary markets; entry VWAP for the T−24 h → T−6 h slot.
+**Sample:** 350 recurring families (≥ 20 resolved instances), 20,652 priced token-observations.
+**Method:** `scripts/screen_base_rates.py`. Family = slug with its date suffix stripped.
+
+| Forecaster | Brier |
+|---|---|
+| **market price** | **0.0875** |
+| family base rate | 0.1843 |
+| 50/50 blend | 0.1127 |
+
+**Verdict: dead.** A constant family base rate is roughly *twice* the Brier loss of the
+market price, and blending it in makes the forecast **worse** than the price alone
+(0.1127 vs 0.0875). The market already knows its own history. Mean |base rate − price| is
+23.8 ¢, an order of magnitude above the ~2 ¢ round trip, but that distance is the base
+rate being wrong, not the market.
+
+**A bug worth recording, because it produced a beautiful fake result.** The first version
+computed the base rate over *both tokens* of each market. Every binary market resolves one
+YES and one NO, so the mean payout over both tokens is exactly 0.500 for every family, and
+the screen printed 0.500 for all 350. It still "ran" and produced a full table. Two tokens
+of one market are not two observations.
+
+**What would change the verdict:** a *conditional* base rate — the family rate given the
+regime (e.g. distance from the strike, previous day's move), i.e. a model rather than a
+prior. That is a different, larger project and no longer "the cheapest idea in the backlog".
