@@ -14,6 +14,7 @@ capital.
 - **Fee model:** [`docs/fees.md`](docs/fees.md)
 - **Data inventory:** [`docs/data-inventory.md`](docs/data-inventory.md)
 - **Results log (including failures):** [`docs/results-log.md`](docs/results-log.md)
+- **Alpha pipeline (test queue + kill conditions):** [`docs/alpha-pipeline.md`](docs/alpha-pipeline.md)
 - **PMXT download + reduce runbook:** [`docs/pmxt-runbook.md`](docs/pmxt-runbook.md) — the 1.1 TB archive is an operator task
 
 ## Status

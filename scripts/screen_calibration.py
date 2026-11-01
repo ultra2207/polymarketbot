@@ -98,8 +98,17 @@ def quarters(since: datetime, until: datetime) -> list[tuple[datetime, datetime]
 
 def build_entries(con: duckdb.DuckDBPyConnection, since: datetime, until: datetime,
                   from_end_h: int, to_end_h: int, min_fills: int,
-                  min_usd: float) -> None:
+                  min_usd: float, side: str = "mid") -> None:
     """VWAP of each token between `from_end_h` and `to_end_h` before resolution.
+
+    `side` decides which fills define the entry:
+
+    * `mid`  — every fill. This is a VWAP, i.e. roughly the mid. It is *not* a
+      price you can pay: an aggressor pays the ask and a resting buyer is filled
+      at the bid.
+    * `ask`  — only fills where the taker bought this token, so the price paid
+      was the ask. This is the honest taker-entry price and needs no book,
+      because the tape records the aggressor's side.
 
     The entry must be a price *before* the outcome is known. An earlier version
     averaged the first 48 h of the market's life, which for the median 24-hour
@@ -110,6 +119,15 @@ def build_entries(con: duckdb.DuckDBPyConnection, since: datetime, until: dateti
     antisymmetric around 0.5 and cancelled to ~0 in the aggregate.
     """
     lo, hi = int(since.timestamp()), int(until.timestamp())
+    if side == "ask":
+        # taker_direction is the aggressor's direction on THIS token, so a
+        # taker BUY executed at the ask. Filtering to it removes the bid side
+        # of the tape and the half-spread illusion a VWAP carries.
+        side_filter = "AND t.taker_direction = 'BUY'"
+    elif side == "bid":
+        side_filter = "AND t.taker_direction = 'SELL'"
+    else:
+        side_filter = ""
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE entries AS
         WITH m AS (
@@ -136,6 +154,7 @@ def build_entries(con: duckdb.DuckDBPyConnection, since: datetime, until: dateti
         JOIN read_parquet('{TRADES.as_posix()}') t
           ON t.condition_id = m.condition_id
         WHERE t.usd_amount > 0 AND t.token_amount > 0
+          {side_filter}
           -- numeric bounds keep Parquet row-group pruning; a function call on
           -- the column would read the whole 1.27 B-row file per quarter.
           AND t.timestamp >= epoch(m.end_date) - {from_end_h} * 3600
@@ -262,6 +281,8 @@ def main() -> int:
                     help="entry window starts this many hours before resolution")
     ap.add_argument("--to-end-hours", type=int, default=6,
                     help="entry window ends this many hours before resolution")
+    ap.add_argument("--side", choices=["mid", "ask", "bid"], default="mid",
+                    help="which fills define the entry price (default: mid/VWAP)")
     ap.add_argument("--min-fills", type=int, default=5)
     ap.add_argument("--min-usd", type=float, default=100.0)
     ap.add_argument("--fresh", action="store_true",
@@ -280,7 +301,8 @@ def main() -> int:
     until = datetime.fromisoformat(args.until).replace(tzinfo=timezone.utc)
 
     global PARTS
-    PARTS = OUT / f"screen_calibration_parts/entry=T-{args.from_end_hours}h..T-{args.to_end_hours}h"
+    PARTS = OUT / (f"screen_calibration_parts/entry=T-{args.from_end_hours}h.."
+                   f"T-{args.to_end_hours}h_side={args.side}")
     qs = quarters(since, until)
     # Resuming is the DEFAULT. Wiping completed work must be asked for: an
     # `if not args.resume` guard here once deleted five finished quarters on a
@@ -300,7 +322,7 @@ def main() -> int:
         t0 = time.time()
         label = f"{a.year}-Q{(a.month - 1) // 3 + 1}"
         build_entries(con, a, b, args.from_end_hours, args.to_end_hours,
-                      args.min_fills, args.min_usd)
+                      args.min_fills, args.min_usd, args.side)
         n = accumulate(con)
         persist_part(con, label)
         log.info("[{}/{}] {}  {} tokens  {:.1f}s", i, len(todo), label, f"{n:,}",
