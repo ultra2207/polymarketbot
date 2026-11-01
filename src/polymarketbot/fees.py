@@ -266,3 +266,100 @@ def schedule_from_market(row: dict) -> FeeSchedule:
     if when is None:
         when = datetime.now(timezone.utc)
     return era_schedule(row.get("category") or "other", when)
+
+
+# ---------------------------------------------------------------------------
+# Taker Rebate Program (docs.polymarket.com/programs/taker-rebates)
+#
+# Live 2026-05-28. Tiers are set by 30-day Weighted Volume, and a rebate only
+# applies to trades made *from the moment a tier is reached*, so the rate is a
+# function of the account's own history - not a property of the market. That is
+# why it lives here as a separate model rather than inside FeeSchedule.
+#
+# The pipeline doc warns that every "dead after fees" verdict used the gross
+# taker fee. This module makes the correction measurable; what it cannot do is
+# make it large, because the entry tier is 3 %.
+# ---------------------------------------------------------------------------
+
+REBATE_LIVE_FROM = "2026-05-28"
+
+# (minimum 30-day weighted volume, tier name, rebate rate). Tier 0 below $2,000.
+REBATE_TIERS: tuple[tuple[float, str, float], ...] = (
+    (2_000.0, "Bronze", 0.03),
+    (20_000.0, "Silver", 0.08),
+    (200_000.0, "Gold", 0.18),
+    (1_000_000.0, "Platinum", 0.32),
+    (4_000_000.0, "Diamond", 0.44),
+    (10_000_000.0, "Obsidian", 0.50),
+)
+
+# Category weights from the published table. Only fee-paying trades earn volume,
+# so a fee-free market (geopolitics) earns nothing regardless of its weight.
+W_VOLUME_WEIGHT: dict[str, float] = {
+    "sports": 1.0,
+    "politics": 1.3,
+    "finance": 1.3,
+    "mentions": 1.3,
+    "tech": 1.3,
+    "economics": 1.7,
+    "culture": 1.7,
+    "weather": 1.7,
+    "other": 1.7,
+    "crypto": 2.3,
+    "geopolitics": 0.0,
+}
+
+
+def weighted_volume(notional: float, entry_price: float, category: str) -> float:
+    """Weighted Volume earned by one taker trade.
+
+        wV = Trade Size x (1 - Entry Price) x Category Weight x Bonuses
+
+    `notional` is dollars paid (shares x price). Bonuses are promotional and are
+    not modelled.
+    """
+    if notional <= 0:
+        return 0.0
+    if not 0.0 <= entry_price <= 1.0:
+        raise ValueError(f"price out of range: {entry_price}")
+    weight = W_VOLUME_WEIGHT.get(category.lower(), 1.7)
+    return notional * (1.0 - entry_price) * weight
+
+
+def taker_tier(weighted_volume_30d: float) -> tuple[str, float]:
+    """Tier name and rebate rate for a 30-day weighted volume."""
+    name, rate = "None", 0.0
+    for threshold, tier_name, tier_rate in REBATE_TIERS:
+        if weighted_volume_30d >= threshold:
+            name, rate = tier_name, tier_rate
+    return name, rate
+
+
+def taker_rebate(taker_fees: float, weighted_volume_30d: float,
+                 when: datetime | str,
+                 price: float = 0.5, category: str = "other") -> float:
+    """Rebate on a batch of taker fees, or 0 before the program opened.
+
+    Deliberately conservative in two ways: the tier is evaluated on the *current*
+    volume with no forward progression, and promotional bonuses are ignored.
+    """
+    if _as_utc(when) < _as_utc(REBATE_LIVE_FROM):
+        return 0.0
+    # A fee-free market earns no weighted volume, so it can never reach a tier
+    # on its own; the guard keeps the semantics honest rather than profitable.
+    if W_VOLUME_WEIGHT.get(category.lower(), 1.7) == 0.0:
+        return 0.0
+    _, rate = taker_tier(weighted_volume_30d)
+    return _round_fee(taker_fees * rate)
+
+
+def turnover_needed_for_tier(threshold: float, capital: float,
+                             price: float, category: str) -> float:
+    """How many times 30-day capital must turn over to reach a tier.
+
+    The number that decides whether a rebate is ever relevant at our size.
+    """
+    per_unit = capital * (1.0 - price) * W_VOLUME_WEIGHT.get(category.lower(), 1.7)
+    if per_unit <= 0:
+        return float("inf")
+    return threshold / per_unit

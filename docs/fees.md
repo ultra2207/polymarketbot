@@ -148,3 +148,55 @@ the fee family agrees with the category for ~96 %. The largest divergence is 211
 label `crypto` that Polymarket charges as `finance_prices_fees` (price/ticker markets). This
 does not misprice anything — the per-market `feeSchedule` wins — but it means category-based
 segmentation and fee-based segmentation are not identical.
+
+## Taker Rebate Program — modelled, and immaterial at our size
+
+`polymarketbot.fees` now models the rebate: `weighted_volume`, `taker_tier`,
+`taker_rebate`, `turnover_needed_for_tier`.
+
+**It went live 2026-05-28**, so it cannot have affected anything before that date, and a
+rebate applies only to trades made *from the moment a tier is reached* — it is a property of
+the account's history, not of the market.
+
+    wV = Trade Size x (1 - Entry Price) x Category Weight x Bonuses
+
+| Tier | 30-day wV | Rebate |
+|---|---|---|
+| None | < $2,000 | 0 % |
+| Bronze | $2,000 | 3 % |
+| Silver | $20,000 | 8 % |
+| Gold | $200,000 | 18 % |
+| Platinum | $1,000,000 | 32 % |
+| Diamond | $4,000,000 | 44 % |
+| Obsidian | $10,000,000 | 50 % |
+
+### The correction is real but small
+
+Crypto charges `0.07 x p(1-p)`, i.e. **1.75 ¢ per share at the 50 ¢ peak**. A rebate is
+levied on that fee, not on notional:
+
+| Tier | Rebate on a 1.75 ¢ fee | Share of a 2 ¢ round trip |
+|---|---|---|
+| Bronze (3 %) | 0.053 ¢ | 2.6 % |
+| Silver (8 %) | 0.140 ¢ | 7.0 % |
+| Gold (18 %) | 0.315 ¢ | 15.8 % |
+| Platinum (32 %) | 0.560 ¢ | 28.0 % |
+
+Turnover needed to reach a tier at **$2,000 capital** in crypto at p = 0.5 (the most
+generous category, weight 2.3):
+
+| Tier | Turns of 30-day capital |
+|---|---|
+| Bronze | 0.9 x |
+| Silver | 8.7 x |
+| Gold | **87 x** |
+
+So a small account reaches Bronze almost immediately and Silver only with heavy turnover;
+Gold and above are unreachable without the capital that makes the rebate unnecessary.
+
+**Consequence for the results log:** the correction does not revive a single measured
+verdict. The largest dead screen (A5 lifecycle) showed a 0.87 ¢ gap against a 1 ¢
+half-spread; a Bronze rebate of 0.05 ¢ closes 6 % of it. A7's drift of 7–11 ¢ was never
+fee-limited. The warning in `alpha-pipeline.md` was directionally right and quantitatively
+negligible — which is worth knowing precisely, because it means no screen needs re-running
+on a rebate-adjusted basis.

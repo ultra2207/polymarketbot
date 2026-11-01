@@ -257,3 +257,59 @@ def test_observed_fee_types_match_era_end_state():
         assert observed.rate == pytest.approx(era.rate), f"{fee_type} rate vs {category} era"
         assert observed.exponent == pytest.approx(era.exponent), fee_type
         assert observed.rebate_rate == pytest.approx(era.rebate_rate), f"{fee_type} rebate"
+
+
+# ---------------------------------------------------------------------------
+# Taker Rebate Program
+# ---------------------------------------------------------------------------
+
+def test_weighted_volume_matches_published_example():
+    """Politics, 1,000 shares at 0.40 => 400 * 0.60 * 1.3 = 312 wV."""
+    from polymarketbot.fees import weighted_volume
+    assert weighted_volume(400.0, 0.40, "politics") == pytest.approx(312.0)
+
+
+def test_weighted_volume_price_matters():
+    """Two $50 crypto trades; the cheap one earns more (0.95 vs 0.50 upside)."""
+    from polymarketbot.fees import weighted_volume
+    cheap = weighted_volume(50.0, 0.05, "crypto")
+    rich = weighted_volume(50.0, 0.50, "crypto")
+    assert cheap == pytest.approx(109.25)
+    assert rich == pytest.approx(57.5)
+    assert cheap > rich
+
+
+def test_geopolitics_earns_no_weighted_volume():
+    from polymarketbot.fees import weighted_volume
+    assert weighted_volume(1_000.0, 0.40, "geopolitics") == 0.0
+
+
+def test_tier_boundaries():
+    from polymarketbot.fees import taker_tier
+    assert taker_tier(0) == ("None", 0.0)
+    assert taker_tier(1_999) == ("None", 0.0)
+    assert taker_tier(2_000) == ("Bronze", 0.03)
+    assert taker_tier(19_999)[0] == "Bronze"
+    assert taker_tier(20_000) == ("Silver", 0.08)
+    assert taker_tier(10_000_000)[0] == "Obsidian"
+
+
+def test_rebate_does_not_exist_before_launch():
+    """The program opened 2026-05-28; a 2026-04 fee cannot have been rebated."""
+    from polymarketbot.fees import taker_rebate
+    assert taker_rebate(10.0, 1_000_000, "2026-04-01", 0.5, "crypto") == 0.0
+    assert taker_rebate(10.0, 1_000_000, "2026-07-01", 0.5, "crypto") > 0.0
+
+
+def test_rebate_is_small_at_entry_tier():
+    """The point of the model: Bronze rebate is a rounding error versus a 2c spread."""
+    from polymarketbot.fees import taker_rebate
+    fee_at_peak = 0.07 * (0.5 * 0.5)      # crypto peak fee per share
+    rebate = taker_rebate(fee_at_peak, 2_500, "2026-07-01", 0.5, "crypto")
+    assert rebate < 0.002, "Bronze rebate should be well under a fifth of a cent"
+
+
+def test_turnover_needed_for_gold_is_out_of_reach_at_small_size():
+    from polymarketbot.fees import turnover_needed_for_tier
+    turns = turnover_needed_for_tier(200_000, 2_000, 0.5, "crypto")
+    assert turns > 80, "reaching Gold at $2k capital would need an implausible turnover"

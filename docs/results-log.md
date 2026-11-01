@@ -300,3 +300,24 @@ and nothing reached even that.
 common hour with ≥ $5, because most ladder legs are short-dated crypto markets whose
 24 h-before window sees little trading. So this establishes coherence for the **actively
 quoted** ladders, not for every ladder. A book-based version could cover the rest.
+
+---
+
+## Cost-model correction — Taker Rebate Program modelled, no verdict changes (2026-11-01)
+
+`alpha-pipeline.md` warned that every "dead after fees" conclusion used the **gross** taker
+fee, because the Taker Rebate Program returns part of it. The rebate is now modelled
+(`polymarketbot.fees`, 6 new tests).
+
+**The program went live 2026-05-28**, is tiered on 30-day weighted volume, and pays 3 %
+at the entry tier. On a crypto fee at its 50 ¢ peak (1.75 ¢/share), that is **0.053 ¢** —
+2.6 % of a 2 ¢ round trip. Reaching Gold (18 %) at $2,000 capital requires **87 turns of
+30-day capital** in crypto, the most generous category.
+
+**No screen changes verdict.** A5's largest gap was 0.87 ¢ against a 1 ¢ half-spread; a
+Bronze rebate closes 6 % of the difference. A7's drift was never fee-limited (7–11 ¢ against
+a 2 ¢ cost). So the correction was worth making explicit and does not need any screen re-run.
+
+The warning was directionally correct and quantitatively negligible — exactly the kind of
+thing that should be measured rather than argued, because "our cost estimates overstate fees"
+sounds like it could rescue an idea, and here it cannot.
