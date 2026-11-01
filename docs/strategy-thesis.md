@@ -428,3 +428,36 @@ event-selection edge can be **predicted from public information** (schedules, te
 venue, rest days) before the event. If it can, it is a forecasting problem — the one the
 project is actually set up to solve. If it cannot, the edge is private information and is out
 of reach, and `plan.md` §6 governs.
+
+### Calibration by market type (last mechanical avenue)
+
+At the first trade price in the 12–6 h window, every sports market type is calibrated within
+±0.005:
+
+| type | tokens | mean price | won | gap |
+|---|---|---|---|---|
+| other | 110,061 | 0.481 | 0.482 | +0.0010 |
+| over/under | 45,486 | 0.477 | 0.472 | −0.0046 |
+| match winner | 30,750 | 0.488 | 0.488 | +0.0003 |
+| spread | 18,246 | 0.485 | 0.488 | +0.0027 |
+| draw | 6,226 | 0.541 | 0.544 | +0.0022 |
+| both-teams-to-score | 4,168 | 0.489 | 0.486 | −0.0029 |
+
+Price-band deviations inside types are ≤ 0.04 and inconsistent in sign, i.e. noise. There is no
+market type, price band, role, size, or turnover bucket in which the market is systematically
+wrong by enough to trade.
+
+### Therefore
+
+Every mechanical explanation is now exhausted:
+
+- aggregate calibration: ±1 pp at a fixed time
+- market types: ±0.5 pp
+- price bands: ±1 pp
+- role, size, turnover: no predictive power (Spearman ≤ 0.06)
+- aggregate PnL: exactly zero
+
+The persistence that remains (+0.231 A→B, +0.270 event-level) can only be **event-specific
+information or modelling**. That is not a microstructure question and cannot be answered from
+trade tape alone. It requires pre-event public data — team strength, schedules, rest, venue,
+lineups — and a forecast compared against the market price.
