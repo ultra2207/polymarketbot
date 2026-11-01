@@ -1,300 +1,245 @@
 # Alpha pipeline — what gets tested, in what order
 
-`plan.md` holds the full backlog (ideas #1–#28). This is the *queue*: what is next,
-what blocks it, and what would kill it. Two things learned on 2026-11-01 reshape the
-order:
+`plan.md` holds the original backlog (ideas #1–28). This is the *queue*: every idea we
+intend to test, what data it needs, and what would kill it.
 
-- **The median quoted spread is 2 ¢.** Round-trip cost is therefore ~2 ¢ per share
-  before fees. Any edge smaller than that is unmeasurable and untradable at our size.
-  This single fact deletes most of the small-mispricing backlog.
-- **Exits are chosen by the system, not assumed.** An idea that only works while
-  holding to resolution is not an edge, it is an assumption. Anything that needs to
-  be exited cannot be graduated until the book replayer exists.
+Three facts learned on 2026-11-01 reshape the order:
 
-Costs degrade the measurement, so every claim below is a *gross* figure until the
-ask-side version is run.
+- **The median quoted spread is 2 ¢.** Round-trip cost is ~2 ¢ per share before fees. An
+  edge smaller than that is unmeasurable and untradable at our size. This deletes most of
+  the small-mispricing backlog before it costs anything to test.
+- **Exits are chosen by the system.** An idea that only works while holding to resolution
+  is an assumption, not an edge. Nothing graduates without the exit comparison.
+- **Half the "blocked" ideas were not blocked.** They were parked on the unavailability of a
+  *raw variable* while an observable proxy, a contractual payout, or a public API covered
+  the same economics. See the unblocking audit at the end.
 
 ---
 
-## Tier 0 — runnable now (tape + labels + `schedule_at` fees)
+## Master list
 
-### A1. Executable-entry re-test of idea #1 (favourite/longshot)
-**Edge story:** the only idea with a measured effect (+3.4 pp at 0.80–0.90, t ≈ 11).
-**First test:** entry = fills where the taker *bought* (so the price paid was the ask),
-T−24 h → T−6 h before resolution; hold. Already implemented as `--side ask`.
+| ID | Idea | Needs | Status |
+|---|---|---|---|
+| A1 | Executable-entry re-test of favourite/longshot | tape + labels + fees | **ready** |
+| A2 | Neg-risk coherence with conversion bounds | tape + labels + fees | **ready** |
+| A3 | Ladder monotonicity | tape + labels | **ready** |
+| A4 | Scalar/range-market anchoring | tape + labels | **ready** |
+| A5 | Lifecycle-stage inefficiency | stored screen rows | **ready** |
+| A6 | Resolution-timing premium | tape + resolution timing | **ready** |
+| A7 | Term-structure drift | tape + labels | **ready** |
+| D2 | Cancel-pressure residual (toxicity proxy) | PMXT book | Tier 1 |
+| E1 | Within-market complete-set arbitrage | tape → then book | **existence ready** |
+| D1 | Liquidity-reward farming | live Gamma `clobRewards` | **ready, forward-only** |
+| E2 | Fee-holiday windows | daily Gamma snapshots | **ready, forward-only** |
+| E5 | Reward rotation (yield surface) | live Gamma + book | forward-only |
+| E3 | Post-only / cancel-only / restart states | live API | forward-only |
+| E4 | Taker-delay asymmetry | per-market `takerDelayMs` + book | needs book |
+| B1 | **Exit-policy comparison** | PMXT book | blocked: download |
+| B2 | Stale-quote pickoff | PMXT book | blocked: download |
+| B3 | Book imbalance → returns | PMXT book | blocked: download |
+| B4 | Depth-aware scheduling | PMXT book | blocked: download |
+| C1 | Crypto up/down vs reference | Binance klines | **unblocked** |
+| C2 | Base-rate models | labels + weather/econ feeds | **unblocked** |
+| C3 | Wallet identity map | on-chain logs | **partly unblocked** |
+| C4 | Cross-venue vs Kalshi | Kalshi public API | **unblocked** |
+| C5 | News latency | GDELT | **unblocked, rate-limited** |
+| E6 | Perps funding carry / liquidations | Binance funding + Polymarket perps | **unblocked** |
+| E7 | Mechanism transplantation | tape (behaviour) | **unblocked at address level** |
+
+---
+
+## Tier 0 — runnable now
+
+### A1. Executable-entry re-test of idea #1
+**Edge story:** the only measured effect (+3.4 pp at 0.80–0.90, t ≈ 11).
+**First test:** entry = fills where the taker *bought*, i.e. the price paid was the ask;
+T−24 h → T−6 h before resolution; hold. Implemented as `--side ask`.
 **Kill if:** the ask-side gap falls below the 2026 fee plus observed spread.
-**Why it matters:** it is the cheapest possible test of whether half-spread, not
-signal, was the whole story. Expected outcome: killed, at ~1 pp.
+**Expected:** killed at ~1 pp. That is a useful result, not a failure.
 
 ### A2. Neg-risk coherence with conversion bounds (#2 + #27)
-**Edge story:** outcomes of a mutually exclusive event must sum to 1. Legs are priced
-independently and drift. Negative-risk conversion (1 NO → 1 YES in every other leg)
-sets hard bounds; ignoring conversion overstates the opportunity.
-**First test:** for each neg-risk event, reconstruct simultaneous leg prices from the
-tape (last trade before each timestamp), compute Σ mid, and count violations that
-exceed fees plus conversion cost, by size available.
-**Kill if:** violations are inside cost, or occur only in events with no depth.
-**Strength:** arithmetic, not information. No speed requirement if violations persist.
+**Edge story:** mutually exclusive outcomes must sum to 1. Legs are priced independently.
+Negative-risk conversion (1 NO → 1 YES in every other leg) sets hard bounds; ignoring it
+overstates the opportunity.
+**First test:** reconstruct simultaneous leg prices per event, Σ mid, count violations
+beyond fees + conversion cost, with size available.
+**Kill if:** violations are inside cost, or only where there is no depth.
+**Strength:** arithmetic, not information.
 
 ### A3. Ladder monotonicity (#3)
-**Edge story:** "BTC above 100k / 110k / 120k" must be monotone in strike. Independent
-pricing breaks it.
-**First test:** detect inversions across strike ladders in the same event; measure
-persistence and the size that could clear at the observed prices.
-**Kill if:** inversions are ≤ 1 tick, transient (< 1 min), or only at 1-share size.
+Probability must be monotone in strike. Detect inversions across ladders in one event;
+measure persistence and the size that could clear.
+**Kill if:** ≤ 1 tick, < 1 min, or 1-share size only.
 
 ### A4. Scalar / range-market anchoring (#25)
-**Edge story:** 64 resolved binary conditions pay a *fraction*; traders may price them
-like binaries.
-**First test:** calibration by price bucket for fractional-payout markets only, versus
-the realised payout fraction.
-**Kill if:** too few markets to size, or calibration beats price by < 2× fees.
+64 resolved binary conditions pay a *fraction*. Test calibration of fractional-payout
+markets against the realised payout fraction.
+**Kill if:** too few markets to size, or < 2× fees.
 
 ### A5. Lifecycle-stage inefficiency (#4)
-**Edge story:** new markets have thin attention; early prices are stale or anchored.
-**First test:** calibration error as a function of time-to-resolution and market age,
-reusing the screen's scored rows (already stored per quarter, no rescan).
-**Kill if:** error is flat across age — then there is no lifecycle window.
+Calibration error versus market age and time-to-resolution, reusing the stored screen rows.
+**Kill if:** flat across age.
 
 ### A6. Resolution-timing premium (#26)
-**Edge story:** sports resolve a median +4.1 h (p90 +5.8 h) after `end_date`; capital is
-locked and dispute risk is unpriceable. Crypto resolves ~0 h, 0 disputes.
-**First test:** price drift between `end_date` and `resolved_at`, by category, with the
-tradability of that window checked (trading may already be closed).
-**Kill if:** the window is not tradable, or no discount is observable.
+Sports resolve a median +4.1 h (p90 +5.8 h) after `end_date`; crypto ~0 h. Measure price
+drift in that window, and whether it is tradable at all.
+**Kill if:** the window is closed or no discount exists.
 
 ### A7. Term-structure drift (#5)
-**Edge story:** favourites may drift upward too slowly as resolution approaches.
-**First test:** drift to terminal by (price bucket × hours-to-resolution).
-**Kill if:** no monotone pattern, or the drift is inside the spread.
+Drift to terminal by (price bucket × hours-to-resolution).
+**Kill if:** no monotone pattern, or inside the spread.
+
+### E1. Within-market complete-set arbitrage
+`ask(YES) + ask(NO) < 1` → buy both, merge for $1. No forecast, no speed requirement.
+**Decided by fees, not signal:** crypto peaks at 1.75 % of notional and kills any 1–2 ¢
+gap; geopolitics is fee-free, so the same gap survives. **Category selection is the
+strategy.**
+**First test:** from the tape, timestamps where last YES + last NO imply a sum under 1 net
+of that category's fee, and how long the state persists. Book confirmation later.
+**Kill if:** sub-1 sums exist only where the fee exceeds the gap, or last under a second.
+
+---
+
+## Tier 0.5 — forward-only monitors (no history needed)
+
+These are strategies about *where to be now*, so missing history is not a blocker. They
+start earning the day they run.
+
+### D1. Liquidity-reward farming
+Daily payouts to makers whose resting orders meet `rewardsMinSize` and sit inside
+`rewardsMaxSpread`. Eligibility is a function of **quoting, not of being filled**, so
+queue position is irrelevant to accrual. **Measured:** 27 % of 400 open markets carry a
+pool, $23,993/day summed, mean $224/day per market.
+**First test:** (our size / total qualifying size) × `rewardsDailyRate`, minus inventory
+risk and adverse selection on fills we do get.
+**Kill if:** yield per unit capital trails a directional idea, or qualifying size exceeds $250.
+
+### E5. Reward rotation as a yield surface
+`ratePerDay / (qualifying size × capital tied up)`. New or neglected markets can have a
+high rate against thin competition. Small capital is an *advantage*: pro-rata share is not
+diluted by our own size.
+**Kill if:** the required qualifying size is out of reach.
+
+### E2. Fee-holiday windows
+Markets are "temporarily made fee-free during a fee holiday". Everything killed by the fee
+overlay revives at zero fee. We snapshot Gamma daily, so `feesEnabled`/`feeType`
+transitions are recordable from now.
+**Kill if:** holidays are rare, short, or confined to depthless markets.
+
+### E3. Venue restriction states
+The API distinguishes *matching-engine restart*, *cancel-only* and *post-only*, with
+`retry_after_seconds`. During post-only, takers cannot cross, so a resting maker is
+protected. If a window overlaps news, the book cannot reprice through takers.
+**Kill if:** windows are too rare, or makers flatten rather than benefit.
 
 ---
 
 ## Tier 1 — needs the PMXT book (2026-04-13 → 2026-08-10)
 
+Blocked on the operator download (`docs/pmxt-runbook.md`), not on analysis.
+
 ### B1. Exit-policy comparison — the structural bet
-**Edge story:** the largest single lever is *when to leave*, not what to enter. Every
-entry gets five counterfactuals on identical fills: hold, taker exit, limit exit, stop,
-and early-exit-on-signal. The last is the only one that can beat holding without being
-faster than the market.
-**First test:** per entry, PnL under all five; report the distribution of the *best*
-policy and how often hold-to-resolution wins. If holding wins most of the time, the
-user's suspicion is wrong and we learn it cheaply.
-**Kill if:** holding dominates, or every alternative exit needs fills we cannot get.
+Every entry gets five counterfactuals on identical fills: hold, taker exit, limit exit,
+stop, early-exit-on-signal. Report the distribution of the best policy and how often
+holding wins.
+**Kill if:** holding dominates, or every alternative needs fills we cannot get.
 
 ### B2. Stale-quote pickoff (#15)
-**Edge story:** ~23 % of resolved markets had no book in their final hour, yet resting
-orders existed. Fills against stale levels are a structural transfer.
-**First test:** detect fills at prices outside the reconstructed touch; net of fees.
-**Kill if:** stale fills are rare or only from other latency bots.
+~23 % of resolved markets had no book in their final hour yet orders rested. Detect fills
+outside the reconstructed touch, net of fees.
 
 ### B3. Book imbalance → short-horizon returns (#13)
-**Edge story:** standard microstructure effect, untested here.
-**First test:** imbalance at t → return over t+1 m / 5 m / 1 h, net of spread.
-**Kill if:** no effect beyond the spread, which is the likely outcome at 2 ¢.
+Imbalance at t → return over t+1 m / 5 m / 1 h, net of spread. Likely dead at 2 ¢.
 
 ### B4. Depth-aware execution scheduling (#16)
-**Edge story:** slicing by depth beats slicing by time for anything above one level.
-**First test:** TWAP-by-time vs TWAP-by-depth on identical signals.
-**Kill if:** depth-aware scheduling does not reduce slippage at our size.
+TWAP-by-time versus TWAP-by-depth on identical signals.
 
-### B5. Capacity curve for every survivor
-Not an idea — a gate. Any Tier-0 survivor must be plotted as PnL vs notional, with the
-point where net edge → 0 stated explicitly.
+### D2 / E4 — need the book and are already listed above
+Cancel-pressure residual (#17) and taker-delay adverse selection both require book state.
 
 ---
 
-## Tier 2 — needs an external series or a long recording
+## Tier 2 — unblocking audit (probed 2026-11-01)
 
-### C1. Crypto up/down vs reference price (#10)
-18.8 % of 2026 volume, resolves on a Chainlink TWAP. Needs free Binance klines first.
-5-minute horizons make this a latency game; at $250 it may be untradable, but the
-mispricing magnitude is worth one measurement.
+Every source below was called live during this audit. Results are what the endpoints
+returned, not what the docs claim.
 
-### C2. Base-rate models for recurring markets (#9)
-Weather ranges, sports totals, econ releases. Public data, stable distributions, clear
-base rates. Small capacity, genuine information edge, not a race.
+### C1. Crypto up/down vs reference price — **UNBLOCKED, no key**
+- `GET api.binance.com/api/v3/klines` → **200**, 1-minute OHLCV with ms timestamps.
+- `data.binance.vision` monthly dumps → reachable, for bulk backfill.
+- **Key simplification:** we do **not** need Chainlink to replicate resolution, because
+  resolution labels already come from on-chain payouts. The reference series is only a
+  *feature*, so Binance klines are sufficient. Chainlink would only be needed to reproduce
+  the TWAP exactly, which we never have to do.
+- **Remaining risk:** 5-minute horizons make this a latency game. Measure the mispricing
+  magnitude first; do not build an execution path before knowing it is worth one.
 
-### C3. Skilled-wallet consensus flow (#7 + #28)
-Aggregate net flow of walk-forward-ranked wallets. Uses `/v2/leaderboard` rather than
-the 60 GB `users.parquet`. Needs the wallet identity map (Gate 1b).
+### C2. Base-rate models — **UNBLOCKED in two halves**
+- **Base rates need no external data at all.** Market families repeat in the slug
+  (`…-on-october-24`, `highest-temperature-in-nyc-on-…`), so the historical base rate is a
+  `GROUP BY` over labels we already hold. Cheapest idea in the backlog.
+- **Forecasts** need feeds, and they are free: Open-Meteo archive → **200** with daily
+  temperature series; `api.weather.gov` → **200**. Econ releases via a free FRED key
+  (optional, not blocking).
 
-### C4. Cross-venue arbitrage vs Kalshi (#19)
-Same event, two venues. Needs Kalshi access and transfer-friction modelling.
+### C3. Wallet identity map — **PARTLY UNBLOCKED**
+- `polygon-rpc.com` → **HTTP 401 "API key disabled, tenant disabled"**. The `HEAD` looked
+  healthy, which is why this needed a real JSON-RPC probe.
+- `polygon-bor-rpc.publicnode.com` → 200 for `eth_blockNumber` and Chainlink reads, but
+  **archive `eth_getLogs` requires a paid plan**.
+- `1rpc.io/matic` → 200, `eth_getLogs` capped at ~5 blocks. Unusable for indexing.
+- **`polygon.drpc.org` → 200, `eth_getLogs` works** (199 logs in a 10-block range) with a
+  **10,000-block cap**.
+- Consequence: historical indexing *is* possible on a free endpoint, chunked. Polygon is
+  ~2.1 s/block, so 10 k blocks ≈ 5.8 h. Covering 2025-05 → 2026-11 (~550 days, ~22.6 M
+  blocks) is **~2,260 chunked requests**. Feasible, rate limits permitting.
+- **Also partly avoidable:** for mechanism transplantation we can start at the *address*
+  level using the tape's `maker`/`taker` fields and detect sybils from co-trading, deferring
+  the on-chain EOA↔proxy map. That removes the dependency from E7's first pass.
+- **One key would materially help here:** a free Alchemy/Infura Polygon key raises the log
+  range and rate limit, turning ~2,260 chunked requests into a handful of large ones. Not
+  blocking, but it is the single highest-leverage key in this project.
 
-### C5. News latency (#18)
-Needs an event feed with timestamps (GDELT/RSS). Measured lag must exceed cost.
+### C4. Cross-venue vs Kalshi — **UNBLOCKED, no key**
+- `GET api.elections.kalshi.com/trade-api/v2/markets` → **200** with market data and
+  cursors, unauthenticated. Trading would need auth; reading does not.
+- This makes the spread measurement possible today. Transfer friction and capital-on-both-
+  venues remain modelling problems, not data problems.
+
+### C5. News latency — **UNBLOCKED, rate-limited**
+- `api.gdeltproject.org/api/v2/doc/doc` → **429** with an explicit "one request every 5
+  seconds" limit. Workable with throttling for event studies; not for real-time.
+
+### E6. Perps funding carry / liquidation capture — **UNBLOCKED, no key**
+- `fapi.binance.com/fapi/v1/fundingRate` → **200** with `fundingRate` and `markPrice`.
+- Funding dispersion against another venue is therefore measurable immediately, and
+  Polymarket exposes its own perps funding and mark price in the expectations.
 
 ---
 
-## Corrected: these were parked for the wrong reason
-
-The first draft of this list parked four ideas on *data unavailability*. That conflated
-"the raw variable is unobtainable" with "the economics are unmeasurable". Three of the
-four have a measurable route.
-
-### D1. Liquidity rewards — promoted from parked to Tier 0 (forward-only)
-
-**What was wrong:** I parked market making because queue position is unobtainable. That
-is true and it blocks **fill-dependent** maker PnL. But Polymarket pays makers on a
-different basis, and that basis is observable.
-
-* **Liquidity Rewards** pay daily at 00:00 UTC to makers whose resting orders meet each
-  market's `rewardsMinSize` and sit inside its `rewardsMaxSpread`. Eligibility is a
-  function of *quoting*, not of being filled. Share of the pool depends on qualifying
-  liquidity, which the aggregate book already reports. So the expected reward is
-  estimable from data we hold; queue position is irrelevant to accrual.
-* **Maker Rebates** pay a share of collected taker fees on liquidity that actually got
-  taken. This one is fill-dependent and therefore inherits the queue-position limit —
-  but it is the smaller, optional second leg.
-
-**Measured 2026-11-01** (400 open markets, Gamma): 27 % carry an active `clobRewards`
-pool, summing **$23,993/day**, mean **$224/day** per incentivized market.
-
-**Data gap:** our Gamma capture never collected `clobRewards`, `rewardsDailyRate`,
-`rewardsMinSize`, `rewardsMaxSpread`, `holdingRewardsEnabled` — all present in the
-schema. Adding them is cheap. Only **forward** history is recoverable, which is fine:
-this is a strategy about where to quote *now*, not a backtest of the past.
-
-**First test:** for the markets we can quote, compute (our size / total qualifying size)
-× `rewardsDailyRate`, minus inventory risk and adverse selection on the fills we do get.
-**Kill if:** per-unit-capital yield after adverse selection is below the same capital
-deployed in a directional idea — or if the qualifying size required exceeds our $250.
-
-### D2. Order-flow toxicity — proxy is live, direct measure is not
-
-Individual order placement/cancellation is unpublished, so order-to-trade ratios and
-spoof attribution are unavailable. But **book delta minus fills gives a net
-adds/cancels residual**, which is already idea #17 and is computable from PMXT. It cannot
-attribute a cancel to a wallet; it can say the book is withdrawing. That is enough to
-test whether extreme cancel pressure predicts anything.
-
-### D3. Single-wallet copy trading — re-scoped, not parked
-
-It fails for latency-sensitive wallets (latency, size dependence, exit into copy flow).
-It does **not** necessarily fail for a slow fundamental wallet holding for weeks: days of
-lag are then tolerable. That case is really "aggregate skill", so it folds into #7/#28
-consensus flow rather than disappearing. A single-wallet variant should be retested on
-the `directional` archetype from the wallet cohort, with the lag explicitly modelled.
-
-### D4. Comment sentiment — the source is dead, the hypothesis is not
-
-Comments are stored off-chain with no bulk export and the read endpoint is current-state
-only, so no as-of record exists. But the hypothesis ("crowd discussion leads price") is
-testable with substitutes: GDELT, RSS, Reddit. That is idea #18 and it needs no
-Polymarket comments at all.
-
-### Genuinely parked
+## Genuinely parked
 
 | Idea | Reason |
 |---|---|
-| Fill-dependent market making (#22) | queue position exists only inside the operator's matching engine; the public book aggregates size by price and discards arrival order. Use D1 instead, which does not depend on fills. |
-
----
-
-## Cost model correction: taker rebates
-
-The **Taker Rebate Program** (live 2026-05-28) returns part of taker fees by tier, with
-weighted volume `wV = Size × (1 − Entry Price) × Category Weight × Bonuses`. Every "dead
-after fees" conclusion in `docs/results-log.md` used the **gross** taker fee and therefore
-overstates cost. At a $2,000 bankroll the tier will be low, so the correction is small —
-but it is the wrong direction to leave in, because over-stating cost hides real edges.
-
-## New ideas surfaced by the docs, not previously on the backlog
-
-These are not in `plan.md` (ideas #1–28). Each comes from a documented mechanic rather
-than from a market-efficiency story, which makes them structural: they do not require
-being right about anything, only being present in the right state.
-
-### E1. Within-market complete-set arbitrage
-**Mechanism.** A binary market's two tokens always merge back into \$1. If
-`ask(YES) + ask(NO) < 1`, buying both and merging returns \$1 for less than \$1 spent.
-No forecast, no information, no speed requirement beyond noticing.
-**Why it can exist.** The two books are quoted independently, and a 2 ¢ spread normally
-keeps the sum at or above 1. It breaks when one side is mispriced in a thin book.
-**The catch that decides it: fees.** This is a taker trade, so the taker fee applies to
-both legs. Crypto peaks at 1.75 % of notional at the mid — that kills any 1–2 ¢ edge
-outright. Geopolitics is fee-free, so the same 1 ¢ edge survives there. **Category
-selection is the whole strategy.**
-**First test:** from the tape, find timestamps where the last YES trade + last NO trade
-imply a sum below 1 net of the category's taker fee, and measure how long the state
-persists. Execution confirmation needs the book.
-**Kill if:** sub-1 sums only occur where the fee exceeds the gap, or persist for under a
-second.
-
-### E2. Fee-holiday windows
-**Mechanism.** The docs confirm markets are "temporarily made fee-free during a fee
-holiday". Every idea killed by the 2026 fee overlay comes back to life at zero fee.
-**Why it is cheap.** We already snapshot Gamma daily, so `feesEnabled` and `feeType`
-transitions are recordable from now on. This is a monitor, not a model.
-**First test:** measure how often `feesEnabled` flips and how long holidays last; then
-re-run the killed screens restricted to holiday windows.
-**Kill if:** holidays are rare, short, or confined to markets with no depth.
-
-### E3. Venue restriction states: post-only, cancel-only, restart
-**Mechanism.** The API distinguishes *matching-engine restart*, *cancel-only* and
-*post-only* restrictions, and returns `retry_after_seconds`. During **post-only**, takers
-cannot cross, so a resting maker is protected from being picked off. During
-**cancel-only**, the book can only thin, never deepen.
-**Why it can pay.** If a restriction window overlaps a news event, the book cannot reprice
-through takers; whoever is already resting gets the first move. This is a genuine
-structural edge and it needs no forecasting.
-**First test:** log restriction states from the live API alongside the book; measure price
-behaviour across the window. Forward-only.
-**Kill if:** windows are too rare to trade, or makers flatten rather than benefit.
-
-### E4. Taker-delay asymmetry as a maker-protection measure
-**Mechanism.** Crypto markets apply a taker delay — **250 ms → 50 ms (2026-08-17) →
-150 ms (2026-09-04)** — exposed per market as `takerDelayMs`. A longer delay gives a
-resting quote a head start before an aggressor's order completes.
-**Why it can pay.** It ranks markets by how safe passive quoting is there, which is
-exactly the input a reward-farming or quoting strategy needs. Combine with E5.
-**First test:** does realised maker adverse selection fall with `takerDelayMs` across
-markets? Needs the book plus per-market delay.
-**Kill if:** the delay is uniform in practice, or adverse selection is dominated by
-informed takers rather than by latency.
-
-### E5. Liquidity-reward rotation (yield surface)
-**Mechanism.** Extend D1 from "can we earn rewards" to "where is the reward per unit of
-capital highest". `ratePerDay` is per market; your share is proportional to qualifying
-size, so the yield is `ratePerDay / (total qualifying size × capital tied up)`.
-**Why it can pay.** New or neglected markets can have a high rate against thin
-competition. This is a rotation problem, and small capital is an advantage because the
-pro-rata share is not diluted by our own size.
-**First test:** build the yield surface from live Gamma `clobRewards` + book-implied
-qualifying size; rank markets.
-**Kill if:** qualifying size required exceeds our \$250, or the yield is below the
-inventory risk it carries.
-
-### E6. Perps venue: funding carry and liquidation capture
-**Mechanism.** The docs include a full perps product — funding, mark price, index price,
-liquidation mechanics, ADL, 20 ms taker delay, its own liquidity rewards. Two structural
-strategies need no forecast: **funding carry** (hold the leg that is paid, hedge the
-other) and **liquidation-cascade capture** (liquidations are mechanical and create
-predictable impact).
-**Why it is worth a look.** Funding is a contractual cashflow, not a prediction, and small
-size can sit inside a cascade without moving it.
-**First test:** measure funding-rate dispersion versus another venue and the size of
-liquidation bursts.
-**Kill if:** funding is near-zero on average, or cascades are too shallow to trade.
-
-### E7. Mechanism transplantation (Track A, redefined)
-Find algorithmic wallets, infer the predicate they run, and deploy it where their coverage
-does not reach. Full design — including the edge-half-life discriminator that decides
-whether any of it is transplantable — in
-[`strategy-reverse-engineering.md` §1.5](strategy-reverse-engineering.md).
+| Fill-dependent market making (#22) | queue position exists only inside the operator's matching engine; the public book aggregates size by price and discards arrival order. **D1 is the substitute** — it pays for quoting, not for fills. |
+| Order-to-trade ratio / spoof *attribution* (#23) | individual order placement and cancellation are never published, so a cancel cannot be tied to a wallet. The **residual** (book delta − fills) is computable and is D2. |
+| Historical comment sentiment (#21) | stored off-chain, no bulk export, read endpoint is current-state only. Substitute feeds make the *hypothesis* testable (C5). |
 
 ---
 
 ## The global filter
 
-Before any of this is called an edge it must clear, in order:
-
 1. **Effect** — gross edge > 2× round-trip cost (≈ 2 ¢ spread + fee).
 2. **Executability** — measured at the ask, not at a VWAP.
-3. **Exit** — survives whichever exit the system picks, including the honest cost of
-   getting out.
-4. **Capacity** — depth at $250 must be ≥ 3× the order; at our size this is usually
-   satisfied, which is the whole argument for starting small.
+3. **Exit** — survives whichever exit the system picks, including the cost of getting out.
+4. **Capacity** — depth at $250 ≥ 3× the order.
 5. **Crowding** — top-10 wallet share < 60 %, or our edge is structurally different.
 6. **Stability** — holds out-of-sample across two periods.
+
+## Cost model correction
+
+The **Taker Rebate Program** returns part of taker fees by tier
+(`wV = Size × (1 − Entry Price) × Category Weight × Bonuses`). Every "dead after fees"
+conclusion in `docs/results-log.md` used the **gross** taker fee and therefore overstates
+cost. At $2,000 the tier is low so the effect is small — but over-stating cost hides real
+edges, which is the wrong error to leave in.
