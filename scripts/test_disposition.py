@@ -143,6 +143,25 @@ def main() -> None:
     print(f"  of those, profitable:         {r[1]:.1f} %")
     print(f"  total PnL on them:            ${r[2]:+,.2f} m")
 
+    print("\n=== never-sold positions: size distribution (dust or conviction?) ===")
+    print("  notional          positions    avg $      total PnL $m")
+    labels = ["<$1", "$1-10", "$10-100", "$100-1k", "$1k-10k",
+              "$10k-100k", "$100k-1M", "$1M-10M", "$10M+"]
+    for r in con.sql("""
+        SELECT b, count(*), avg(n), sum(pnl)/1e6
+        FROM (
+            SELECT pr.bs * (pr.bc / nullif(pr.bs,0)) AS n,
+                   pr.bs * (p.payout - pr.bc / nullif(pr.bs,0)) AS pnl,
+                   CASE WHEN n < 1 THEN 0 WHEN n < 10 THEN 1 WHEN n < 100 THEN 2
+                        WHEN n < 1000 THEN 3 WHEN n < 10000 THEN 4 WHEN n < 100000 THEN 5
+                        WHEN n < 1000000 THEN 6 WHEN n < 10000000 THEN 7 ELSE 8 END AS b
+            FROM pr JOIN top_w ON top_w.wallet = pr.wallet
+            JOIN payout p ON p.asset_id = pr.asset_id
+            WHERE pr.ss = 0 AND pr.bs > 0
+        ) GROUP BY b ORDER BY b
+    """).fetchall():
+        print(f"  {labels[r[0]]:<12} {r[1]:>12,}   {r[2]:>8.2f}   {r[3]:>+12.2f}")
+
 
 if __name__ == "__main__":
     main()

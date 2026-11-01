@@ -807,3 +807,32 @@ The valid decomposition, which never touches payout, is the one used above:
 
 Testing entry skill requires the fair value **at the moment of entry** — the mid then, not
 the payout later. That needs the order book, which is the next data dependency.
+
+### Correction: the unclosed loss is not dust
+
+The previous entry inferred that the 50.5 M never-sold positions were "dust — too small to
+close". The notional distribution refutes that. June 2026, top decile, never-sold positions:
+
+| notional | positions | total PnL | per position |
+|---|---|---|---|
+| <$1 | 425,742 | −$0.01 m | −$0.02 |
+| $1–10 | 2,164,748 | −$0.87 m | −$0.40 |
+| $10–100 | 2,741,062 | **−$6.73 m** | −$2.46 |
+| $100–1k | 1,069,305 | −$0.45 m | −$0.42 |
+| $1k–10k | 161,935 | **−$4.14 m** | −$25.6 |
+| $10k–100k | 19,845 | **−$4.66 m** | −$235 |
+| $100k–1M | 1,178 | **−$5.45 m** | −$4,627 |
+| $1M–10M | 56 | −$1.20 m | −$21,429 |
+| $10M+ | 5 | +$0.24 m | +$48,000 |
+
+**65 % of the loss is in positions above $1 k.** Dust (<$100) is 33 % of it. The largest
+single dollar contributor is the $100 k–$1 M bucket: 1,178 positions, −$5.45 m, about
+−2.2 % of notional each.
+
+Every size class loses a small percentage of notional rather than a subset losing heavily.
+That is the signature of a systematic adverse drift on inventory that is not unloaded, not
+of a handful of bad conviction bets. It also means the loss is not fixable by sweeping dust.
+
+Measured on June only; the full-window distribution has not been run and the labels in
+`test_disposition.py` were fixed after the first pass, so the full-window version should be
+re-run before this table is quoted as anything but indicative.
