@@ -91,6 +91,35 @@ def build_chain_labels(con: duckdb.DuckDBPyConnection) -> None:
 
 def build_market_labels(con: duckdb.DuckDBPyConnection) -> None:
     dest = OUT / "market_labels.parquet"
+    api = OUT / "labels_api.parquet"
+    # The API backfill is a separate, long-running job; the pipeline must still
+    # build from the on-chain set alone. An absent file means "not backfilled
+    # yet", which must surface as 'missing', not as an error.
+    if api.exists():
+        api_join = f"""
+            LEFT JOIN read_parquet('{api.as_posix()}') a
+                   ON a.condition_id = m.condition_id
+        """
+        api_cols = """
+                -- must be per-row: the join is LEFT, so a literal TRUE would
+                -- mark every unjoined market 'api_unresolved' and hide real gaps.
+                (a.condition_id IS NOT NULL) AS api_known,
+                a.resolved     AS api_resolved,
+                a.payout_0     AS api_payout_0,
+                a.payout_1     AS api_payout_1,
+                a.is_void      AS api_is_void,
+                a.n_outcomes   AS api_n_outcomes,
+        """
+    else:
+        api_join = ""
+        api_cols = """
+                FALSE          AS api_known,
+                NULL::BOOLEAN AS api_resolved,
+                NULL::DOUBLE  AS api_payout_0,
+                NULL::DOUBLE  AS api_payout_1,
+                NULL::BOOLEAN AS api_is_void,
+                NULL::INTEGER AS api_n_outcomes,
+        """
     con.execute(f"""
         COPY (
             SELECT
@@ -112,22 +141,32 @@ def build_market_labels(con: duckdb.DuckDBPyConnection) -> None:
                 m.neg_risk,
                 m.volume,
                 m.outcome_prices,
+                {api_cols}
                 -- NOTE: price, not payout. Kept only for reconciliation.
-                l.resolved,
-                l.payout_0,
-                l.payout_1,
-                l.is_void,
-                l.n_outcomes,
+                coalesce(l.resolved, api_resolved)       AS resolved,
+                coalesce(l.payout_0, api_payout_0)       AS payout_0,
+                coalesce(l.payout_1, api_payout_1)       AS payout_1,
+                coalesce(l.is_void, api_is_void)         AS is_void,
+                coalesce(l.n_outcomes, api_n_outcomes)   AS n_outcomes,
                 l.payout_numerators,
                 l.payout_denominator,
+                -- Precedence: on-chain payout numerators are the ground truth
+                -- and stop at 2026-04. Beyond that, /v2/tokens `final_price`
+                -- is the label, validated against on-chain at 371/371 exact
+                -- agreement (scripts/fetch_labels_api.py --cross-check).
+                -- A row that neither source resolved stays 'missing': never
+                -- coerce an unknown into a zero.
                 CASE
-                    WHEN l.condition_id IS NULL           THEN 'missing'
-                    WHEN l.resolved                       THEN 'chain'
-                    ELSE 'chain_unresolved'
+                    WHEN l.condition_id IS NOT NULL AND l.resolved THEN 'chain'
+                    WHEN l.condition_id IS NOT NULL                THEN 'chain_unresolved'
+                    WHEN api_resolved                              THEN 'api'
+                    WHEN api_known                                 THEN 'api_unresolved'
+                    ELSE 'missing'
                 END AS label_source
             FROM read_parquet('{MARKETS.as_posix()}') m
             LEFT JOIN read_parquet('{(OUT / "labels_chain.parquet").as_posix()}') l
                    ON l.condition_id = m.condition_id
+            {api_join}
         ) TO '{dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
     n = con.sql(f"SELECT count(*) FROM read_parquet('{dest.as_posix()}')").fetchall()[0][0]
