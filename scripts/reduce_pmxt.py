@@ -433,12 +433,19 @@ def main() -> int:
         # (168 hours = 62 GB) and defeat the streaming property this script
         # exists to guarantee.
         t = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
+        skipped = 0
         for i in range(args.hours):
             when = t + timedelta(hours=i)
+            part = dest_root / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}" / "books.parquet"
+            if args.skip_existing and part.exists():
+                skipped += 1
+                continue
             stamp = when.strftime("%Y-%m-%dT%H")
             local = SCRATCH / f"polymarket_orderbook_{stamp}.parquet"
             sources.append((when, local))
             pending[local] = stamp
+        if skipped:
+            print(f"  resuming: {skipped:,} hours already reduced", flush=True)
 
     total_rows = 0
     t_start = time.time()
