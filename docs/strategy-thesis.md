@@ -313,3 +313,66 @@ relationships, market-making capital) or replicable (a forecasting model)?
 
 That should be answered from the *persistence-surviving* cohort (A-decile 9–10), not from a
 PnL-ranked decile.
+
+### The mechanism hunt: no observable behaviour predicts out-of-sample returns
+
+For the 10,444 wallets with ≥ $10 k bought in both halves, Spearman of period-A features against
+period-B return:
+
+| feature (measured in A) | Spearman with B return |
+|---|---|
+| A return | **+0.231** |
+| turnover (sold / bought) | −0.059 |
+| average ticket size | +0.042 |
+| average entry price | +0.039 |
+| number of tokens | +0.022 |
+| maker share | +0.008 |
+
+Only past return predicts future return. Every behavioural descriptor is within noise of zero.
+Quintile cuts show the same:
+
+| quintile | maker share | B return | note |
+|---|---|---|---|
+| Q1 | 0.13 | **−2.26 %** | pure takers lose |
+| Q2 | 0.63 | +2.83 % | |
+| Q5 | 0.99 | +0.38 % | |
+
+| quintile (A entry price) | price | B return |
+|---|---|---|
+| Q1 (longshots) | 0.285 | **−2.70 %** |
+| Q3 | 0.525 | +1.81 % |
+| Q5 (near-certainties) | 0.964 | −0.11 % |
+
+### Trade-level check
+
+Splitting each wallet's own positions **at random** into two halves (36,476 wallets ≥ $5 k per
+half) gives Spearman(half 0, half 1) = **+0.148**. So the edge repeats trade-to-trade, not only
+period-to-period. Caveat: correlated tokens inside the same event can inflate this, because the
+split is by token and not by event; an event-level split is the next control.
+
+### Concentration
+
+- 437,381 of 947,499 wallets (46.2 %) net positive. Positive PnL totals $409.0 m; the top 100
+  wallets carry 33.8 % of it.
+- Skill is therefore **broad-based, not a handful of insiders**.
+
+## 7. Where this leaves the project
+
+Every observable, mechanical feature has been tested and rejected as an explanation. What is
+left is the possibility that the persistence lives in **which events each wallet chooses** —
+i.e. information about the underlying sports/events — which trade data alone cannot reveal.
+That is also the least replicable kind of edge.
+
+Before spending more compute, the next session should run these three controls, in order:
+
+1. **Event-level within-wallet split.** Re-run the +0.148 with the split by `condition_id`
+   instead of `asset_id`. If it collapses, the "trade-level skill" was correlated-token noise.
+2. **A1/A2 vs A/B.** Split A into two random halves and correlate A1 with A2. If that
+   correlation is also ≈ 0.23, the persistence is a stable trait (skill or persistent variance);
+   if it is much higher, the A→B number is being diluted by something time-varying.
+3. **PnL decomposition by event.** For the wallets that persist, check whether their profit
+   comes from a small number of events (information) or is spread evenly (superior modelling).
+
+If (1) collapses to zero and (3) shows concentration in a few events, the conclusion is:
+**the only persistent edge is private event information, and it is not replicable by us.**
+That is a legitimate, plan-relevant answer, and `plan.md` §6 already says what to do with it.
