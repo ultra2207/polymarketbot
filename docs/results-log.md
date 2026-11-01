@@ -274,3 +274,29 @@ toward the realised payout. A favourite quoted 0.95 with a 0.83 payout rate drif
 **Next test (needs the book):** buy at `best_ask` at 168 h, sell at `best_bid` at 6 h, and
 require the drift to survive both crossings plus fees, on every market rather than the
 self-selected four-lead subset.
+
+---
+
+## A3 Ladder monotonicity — **dead: markets agree with themselves** (2026-11-01)
+
+**Sample:** 33,398 ladder legs across 3,447 events. Prices taken from the last taker-BUY
+print inside a **single common hour** (24–23 h before `end_date`), so every leg in a
+comparison is quoted at the same time by construction.
+
+| size floor | legs priced | events comparable | adjacent pairs | inversions > 1 tick | worst |
+|---|---|---|---|---|---|
+| ≥ $25 | 241 | 53 | 73 | **0** | 0.005 |
+| ≥ $5 | 558 | 151 | 282 | **0** | 0.005 |
+
+**Verdict: dead.** Across 282 adjacent strike pairs in 151 events, the largest inversion is
+**half a tick** (0.005). Ladders are internally consistent — the market does not price a
+higher strike above a lower one by a tradable amount.
+
+This is a *good* negative result: ladder coherence is a structural property that either
+holds or leaks money to anyone watching, and it holds. The kill criterion was "≤ 1 tick",
+and nothing reached even that.
+
+**Limitation to keep in mind:** only 558 of 33,398 legs (1.7 %) had a print inside the
+common hour with ≥ $5, because most ladder legs are short-dated crypto markets whose
+24 h-before window sees little trading. So this establishes coherence for the **actively
+quoted** ladders, not for every ladder. A book-based version could cover the rest.

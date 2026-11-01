@@ -20,15 +20,15 @@ Three facts learned on 2026-11-01 reshape the order:
 
 | ID | Idea | Needs | Status |
 |---|---|---|---|
-| A1 | Executable-entry re-test of favourite/longshot | tape + labels + fees | **ready** |
-| A2 | Neg-risk coherence with conversion bounds | tape + labels + fees | **ready** |
-| A3 | Ladder monotonicity | tape + labels | **ready** |
-| A4 | Scalar/range-market anchoring | tape + labels | **ready** |
-| A5 | Lifecycle-stage inefficiency | stored screen rows | **ready** |
+| A1 | Executable-entry re-test of favourite/longshot | tape + labels + fees | **run (VWAP): dead after costs; ask version needs book** |
+| A2 | Neg-risk coherence with conversion bounds | tape + labels + fees | **run: no persistent violation** |
+| A3 | Ladder monotonicity | tape + labels | **run: coherent, no inversion > 1 tick** |
+| A4 | Scalar/range-market anchoring | only 61 scalar markets exist | **run: no population** |
+| A5 | Lifecycle-stage inefficiency | stored screen rows | **run: non-monotone, inside spread** |
 | A6 | Resolution-timing premium | tape + resolution timing | **ready** |
-| A7 | Term-structure drift | tape + labels | **ready** |
+| A7 | Term-structure drift | tape + labels | **run: CANDIDATE - tails too extreme** |
 | D2 | Cancel-pressure residual (toxicity proxy) | PMXT book | Tier 1 |
-| E1 | Within-market complete-set arbitrage | tape → then book | **existence ready** |
+| E1 | Within-market complete-set arbitrage | tape → then book | **run: no persistence, needs book** |
 | D1 | Liquidity-reward farming | live Gamma `clobRewards` | **ready, forward-only** |
 | E2 | Fee-holiday windows | daily Gamma snapshots | **ready, forward-only** |
 | E5 | Reward rotation (yield surface) | live Gamma + book | forward-only |
@@ -39,7 +39,7 @@ Three facts learned on 2026-11-01 reshape the order:
 | B3 | Book imbalance → returns | PMXT book | blocked: download |
 | B4 | Depth-aware scheduling | PMXT book | blocked: download |
 | C1 | Crypto up/down vs reference | Binance klines | **unblocked** |
-| C2 | Base-rate models | labels + weather/econ feeds | **unblocked** |
+| C2 | Base-rate models | labels (done) + weather feeds | **free half run: market wins** |
 | C3 | Wallet identity map | on-chain logs | **partly unblocked** |
 | C4 | Cross-venue vs Kalshi | Kalshi public API | **unblocked** |
 | C5 | News latency | GDELT | **unblocked, rate-limited** |
