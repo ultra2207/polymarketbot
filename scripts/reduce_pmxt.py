@@ -72,7 +72,7 @@ SCRATCH = Path(".tmp/pmxt_raw")
 
 def connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    con.execute("SET threads = 8")
+    con.execute("SET threads = 12")
     con.execute("SET memory_limit = '8GB'")
     con.execute("SET TimeZone = 'UTC'")
     return con
@@ -200,29 +200,36 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
         GROUP BY asset_id, bucket_end
     """)
 
+    # Depth bands must be aggregated WITHOUT the list columns in the GROUP BY:
+    # `GROUP BY ALL` over bid_prices/ask_prices was slower than the four
+    # correlated subqueries it replaced (167 s vs 101 s per hour).
+    con.execute("""
+        CREATE OR REPLACE TEMP TABLE band AS
+        SELECT
+            s.asset_id, s.bucket_end,
+            sum(CASE WHEN s.side = 'bid' AND s.price >= b.best_bid - 0.01
+                     THEN s.price * s.size ELSE 0 END) AS bid_notional_1c,
+            sum(CASE WHEN s.side = 'ask' AND s.price <= b.best_ask + 0.01
+                     THEN s.price * s.size ELSE 0 END) AS ask_notional_1c,
+            sum(CASE WHEN s.side = 'bid' AND s.price >= b.best_bid - 0.02
+                     THEN s.price * s.size ELSE 0 END) AS bid_notional_2c,
+            sum(CASE WHEN s.side = 'ask' AND s.price <= b.best_ask + 0.02
+                     THEN s.price * s.size ELSE 0 END) AS ask_notional_2c
+        FROM state s
+        JOIN book b ON b.token_id = s.asset_id AND b.ts = s.bucket_end
+        GROUP BY 1, 2
+    """)
+
     con.execute("""
         CREATE OR REPLACE TEMP TABLE depth AS
-        SELECT b.token_id, b.ts, b.best_bid, b.best_ask,
-               b.bid_notional_top, b.ask_notional_top,
-               b.bid_shares_top, b.ask_shares_top,
-               b.bid_prices, b.bid_sizes, b.ask_prices, b.ask_sizes,
-               -- notional inside 1c / 2c of the touch: the number that governs
-               -- slippage at a $250 order, unlike whole-book totals.
-               coalesce((SELECT sum(s.price * s.size) FROM state s
-                         WHERE s.asset_id = b.token_id AND s.bucket_end = b.ts
-                           AND s.side = 'bid' AND s.price >= b.best_bid - 0.01), 0) AS bid_notional_1c,
-               coalesce((SELECT sum(s.price * s.size) FROM state s
-                         WHERE s.asset_id = b.token_id AND s.bucket_end = b.ts
-                           AND s.side = 'ask' AND s.price <= b.best_ask + 0.01), 0) AS ask_notional_1c,
-               coalesce((SELECT sum(s.price * s.size) FROM state s
-                         WHERE s.asset_id = b.token_id AND s.bucket_end = b.ts
-                           AND s.side = 'bid' AND s.price >= b.best_bid - 0.02), 0) AS bid_notional_2c,
-               coalesce((SELECT sum(s.price * s.size) FROM state s
-                         WHERE s.asset_id = b.token_id AND s.bucket_end = b.ts
-                           AND s.side = 'ask' AND s.price <= b.best_ask + 0.02), 0) AS ask_notional_2c
+        SELECT b.*, d.bid_notional_1c, d.ask_notional_1c,
+               d.bid_notional_2c, d.ask_notional_2c
         FROM book b
+        JOIN band d ON d.asset_id = b.token_id AND d.bucket_end = b.ts
         WHERE b.best_bid IS NOT NULL AND b.best_ask IS NOT NULL
     """)
+
+
 
     rows = con.sql("SELECT count(*) FROM depth").fetchall()[0][0]
     assets = con.sql("SELECT count(DISTINCT token_id) FROM depth").fetchall()[0][0]
@@ -300,7 +307,7 @@ def main() -> int:
         t0 = time.time()
         rows, assets = reduce_hour(con, src, args.bucket_seconds, args.top_levels)
         part = dest_root / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}"
-        part.parent.mkdir(parents=True, exist_ok=True)
+        part.mkdir(parents=True, exist_ok=True)
         con.execute(f"""
             COPY (SELECT * FROM depth) TO '{(part / 'books.parquet').as_posix()}'
             (FORMAT PARQUET, COMPRESSION ZSTD)

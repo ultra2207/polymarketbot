@@ -347,6 +347,10 @@ def main() -> int:
                 written += 1
                 if written % args.flush_every == 0:
                     jf.flush()
+                    # Rewrite the parquet too: the journal is the source of
+                    # truth, but a stale destination file made a 24-minute run
+                    # look like it had produced 1,000 rows.
+                    flush(con)
                     elapsed = time.time() - t0
                     rate = written / elapsed if elapsed else 0
                     eta = (len(batches) - written) / rate / 60 if rate else 0
