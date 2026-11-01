@@ -72,7 +72,7 @@ def main() -> int:
     con.execute(f"""
         COPY (
             WITH x AS (
-                SELECT dec,
+                SELECT dec, coalesce(cat, 0) AS cat,
                        CASE WHEN bs > 0 THEN least(19, greatest(0, floor(20 * bc / bs)))::INT
                             ELSE -1 END AS pbucket,
                        CASE WHEN payout IS NULL THEN -1 WHEN payout > 0.5 THEN 1 ELSE 0 END AS outcome,
@@ -115,7 +115,7 @@ def main() -> int:
                             ELSE 0 END AS exit_pnl
                 FROM read_parquet('{args.positions}')
             )
-            SELECT coalesce(dec, 0) AS dec, pbucket, outcome, cbucket, sbucket, mbucket, tbucket,
+            SELECT coalesce(dec, 0) AS dec, cat, pbucket, outcome, cbucket, sbucket, mbucket, tbucket,
                    count(*) AS n,
                    count(*) FILTER (WHERE ss > 0)  AS n_closed,
                    count(*) FILTER (WHERE ss = 0 AND bs > 0) AS n_buy_only,
@@ -126,7 +126,7 @@ def main() -> int:
                    sum(held_pnl)   AS held_pnl,
                    sum(exit_pnl)   AS exit_pnl
             FROM x
-            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
         ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
     if out.exists():

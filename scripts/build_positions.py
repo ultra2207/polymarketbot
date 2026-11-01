@@ -121,14 +121,24 @@ def main() -> int:
                 WHERE resolved AND NOT coalesce(is_void,false) AND token2 IS NOT NULL
             ),
             tok_end AS (
-                SELECT token1 AS asset_id, epoch(TRY_CAST(end_date AS TIMESTAMP)) AS end_ts
+                SELECT token1 AS asset_id, epoch(TRY_CAST(end_date AS TIMESTAMP)) AS end_ts,
+                       CASE coalesce(category,'other')
+                            WHEN 'crypto' THEN 1 WHEN 'sports' THEN 2 WHEN 'weather' THEN 3
+                            WHEN 'politics' THEN 4 WHEN 'geopolitics' THEN 5 WHEN 'tech' THEN 6
+                            WHEN 'economics' THEN 7 WHEN 'culture' THEN 8 WHEN 'finance' THEN 9
+                            WHEN 'health' THEN 10 ELSE 0 END AS cat
                 FROM read_parquet('{MARKETS}') WHERE token1 IS NOT NULL
                 UNION ALL
-                SELECT token2, epoch(TRY_CAST(end_date AS TIMESTAMP))
+                SELECT token2, epoch(TRY_CAST(end_date AS TIMESTAMP)),
+                       CASE coalesce(category,'other')
+                            WHEN 'crypto' THEN 1 WHEN 'sports' THEN 2 WHEN 'weather' THEN 3
+                            WHEN 'politics' THEN 4 WHEN 'geopolitics' THEN 5 WHEN 'tech' THEN 6
+                            WHEN 'economics' THEN 7 WHEN 'culture' THEN 8 WHEN 'finance' THEN 9
+                            WHEN 'health' THEN 10 ELSE 0 END
                 FROM read_parquet('{MARKETS}') WHERE token2 IS NOT NULL
             )
             SELECT a.wallet, d.dec, a.asset_id, a.bs, a.bc, a.ss, a.sc,
-                   a.maker_share, p.payout,
+                   a.maker_share, p.payout, coalesce(e.cat, 0) AS cat,
                    CASE WHEN e.end_ts IS NOT NULL AND a.first_ts IS NOT NULL
                         THEN (e.end_ts - a.first_ts) / 3600.0 END AS ttl_h
             FROM agg a

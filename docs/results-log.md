@@ -951,3 +951,91 @@ explanation yet of why their maker book loses.
 3. `held` is measured against the realised payout. A maker who is flat at resolution shows
    zero however much the spread earned — which is why the round-trip column must be read
    alongside it.
+
+---
+
+## Overnight session: where the edge actually is (2026-11-02)
+
+Four questions were run to completion. Each is a distinct, verified result.
+
+### 1. The edge is in taking, not making (already recorded above)
+
+Top decile: taking +$150.9 m at +5.6–7.7 % of volume; pure market making −$150.0 m at −1.0 %.
+Round-trip spread capture as a maker is +$14.2 m on $14.9 b (0.1 %), while the inventory it
+creates loses $163.0 m. Spread income is an order of magnitude smaller than the marking loss.
+
+### 2. The taker edge is concentrated in sports
+
+| category | taker edge | bought | maker edge | bought |
+|---|---|---|---|---|
+| **sports** | **+0.0555** | $1,358 m | −0.0079 | $8,754 m |
+| crypto | +0.0134 | $407 m | −0.0002 | $3,097 m |
+| geopolitics | +0.0124 | $223 m | +0.0048 | $825 m |
+| politics | +0.0057 | $184 m | +0.0009 | $157 m |
+
+By price band, the taker edge is positive from 30 % to 95 %, peaking at 45–70 % (+0.10 to
++0.11) and negative only below 30 %. Maker losses concentrate in crypto and sports longshots
+(crypto 25–30 %: −0.144).
+
+### 3. The market has a large, decaying favourite–longshot bias in sports
+
+Price measured as the volume-weighted trade price **12–6 h before the market's end date**,
+then compared with the realised payout. Unweighted, tokens with ≥ 20 fills:
+
+| price band | tokens | won | priced | gap |
+|---|---|---|---|---|
+| 20–30 % | 1,712 | 0.122 | 0.251 | **−0.129** |
+| 30–40 % | 1,844 | 0.209 | 0.350 | **−0.141** |
+| 60–70 % | 1,732 | 0.764 | 0.650 | **+0.114** |
+| 70–80 % | 1,850 | 0.885 | 0.749 | **+0.136** |
+
+The bias survives every control applied: `neg_risk = false` (−0.197 / +0.207), markets whose
+own two-sided book sums to 1.00 (−0.246 / +0.207), liquidity filters of ≥ 50 fills and ≥
+$1,000 traded, and unweighted rather than share-weighted aggregation (which halves but does
+not remove it). Token→payout mapping was verified directly on sampled binary markets:
+t1/t2 are YES/NO, prices sum to ~1, payouts consistent.
+
+**It is decaying:**
+
+| month | 20–40 % gap | 60–80 % gap |
+|---|---|---|
+| 2026-05 | −0.094 | +0.087 |
+| 2026-06 | −0.065 | +0.079 |
+| 2026-07 | −0.071 | +0.081 |
+| 2026-08 | −0.055 | +0.050 |
+| 2026-09 | −0.045 | +0.041 |
+
+Roughly halved in five months. That is what arbitrage looks like.
+
+### 4. The top decile's taker edge does NOT decay
+
+Buy-side edge per share for taker-heavy top-decile positions:
+
+| month | bought | edge | per share |
+|---|---|---|---|
+| 2026-04 | $398 m | +$30.56 m | +0.0357 |
+| 2026-05 | $353 m | +$28.13 m | +0.0398 |
+| 2026-06 | $455 m | +$28.82 m | +0.0312 |
+| 2026-07 | $525 m | +$35.02 m | +0.0344 |
+| 2026-08 | $327 m | +$27.28 m | +0.0434 |
+| 2026-09 | $256 m | +$18.77 m | +0.0365 |
+
+Stable at ~3.5 ¢ per share while the market's calibration gap halved. So they are **not**
+simply harvesting the published bias — if they were, their edge would have fallen with it.
+They buy ~3.5 ¢ below the realised payout rate consistently, in a market whose mispricing is
+shrinking. That is the residual question: whether their +3.5 ¢ is skill at selection, or
+whether they are the *cause* of the shrinking bias by arbitraging it themselves.
+
+### 5. Concentration
+
+26,390 top-decile wallets trade sports 45–70 %; the edge is +$178.9 m across them, of which
+the ten largest carry +$85.6 m (48 %). It is not a single actor, but it is top-heavy.
+
+### Method notes that changed the code
+
+- `build_positions.py` is now partitioned by wallet-hash bucket and resumable; four buckets
+  take 4.6 minutes total. The single 14 GB COPY died at the 600-second cap and lost 15 minutes.
+- The cube gained role (`maker_share`), time-to-resolution (`ttl_h`) and category dimensions:
+  2,084,137 cells, 81 MB, 15 s to build. All cross-sections run in under a second.
+- AGENTS.md gained a time-budget rule (nothing over 60 s until proven at 60 s; 600 s cap) and
+  an incremental-save rule (every unit of work persists; a kill must leave inspectable progress).
