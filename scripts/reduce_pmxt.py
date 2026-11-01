@@ -65,6 +65,7 @@ sys.path.insert(0, "src")
 
 import duckdb
 import requests
+from tqdm import tqdm
 
 PMXT = "https://r2v2.pmxt.dev/polymarket_orderbook_{stamp}.parquet"
 OUT = Path("data/processed/pmxt_reduced")
@@ -449,12 +450,15 @@ def main() -> int:
 
     total_rows = 0
     t_start = time.time()
-    for i, (when, src) in enumerate(sources, 1):
+    bar = tqdm(sources, desc="pmxt", unit="hr", dynamic_ncols=True,
+               disable=not sources)
+    for i, (when, src) in enumerate(bar, 1):
         t0 = time.time()
         if src in pending:
+            bar.set_postfix_str(f"{when:%m-%dT%H} downloading")
             got = fetch_hour(pending[src], src, args.connections)
             if got is None:
-                print(f"  {when:%Y-%m-%dT%H}: absent (404)", flush=True)
+                bar.write(f"  {when:%Y-%m-%dT%H}: absent (404)")
                 continue
         rows, assets = reduce_hour(con, src, args.bucket_seconds, args.top_levels)
         part = dest_root / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}"
@@ -465,13 +469,16 @@ def main() -> int:
         """)
         size = (part / "books.parquet").stat().st_size
         total_rows += rows
-        print(f"  [{i}/{len(sources)}] {when:%Y-%m-%dT%H}  "
-              f"{rows:>8,} rows  {assets:>7,} assets  "
-              f"{size/1e6:>7.1f} MB  {time.time()-t0:>6.1f}s", flush=True)
+        bar.set_postfix_str(
+            f"{when:%m-%dT%H} {rows:,}r {size/1e6:.1f}MB {time.time()-t0:.0f}s")
+        bar.write(f"  [{i}/{len(sources)}] {when:%Y-%m-%dT%H}  "
+                  f"{rows:>8,} rows  {assets:>7,} assets  "
+                  f"{size/1e6:>7.1f} MB  {time.time()-t0:>6.1f}s")
         # Never delete a file the operator downloaded; only our own scratch copy.
         if not args.keep_raw and not args.file and not args.dir:
             src.unlink(missing_ok=True)
 
+    bar.close()
     if sources:
         elapsed = time.time() - t_start
         print(f"\n{len(sources)} hour(s) in {elapsed/60:.1f} min — "
