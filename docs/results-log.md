@@ -886,3 +886,68 @@ The June-only table that suggested "65 % of the loss is above $1 k" does not sur
 full window. The loss is concentrated in **$10–$10 k (95 % of it)**, and the largest
 positions — above $1 m — are *profitable*. So it is neither dust nor a handful of huge bad
 bets: it is a broad middle-sized tail that is never closed.
+
+---
+
+## The edge is in taking, not making (2026-04 → 10)
+
+**Method.** Every position carries `maker_share` = maker cash / total cash in that token
+(1.0 = every fill posted as a maker, 0.0 = every fill crossed the spread). Positions are
+bucketed by that ratio and the full PnL decomposition applied: round trip, held to
+resolution, short-side exit.
+
+### Top decile
+
+| maker share | volume $m | round trip $m | held $m | exit $m | net $m | net per $ |
+|---|---|---|---|---|---|---|
+| 0 (pure taker) | 13,791 | +63.96 | −19.97 | +22.08 | **+66.07** | +0.48 % |
+| 1 | 683 | +33.02 | +2.41 | +3.03 | +38.46 | +5.63 % |
+| 2 | 691 | +51.28 | +3.51 | −1.81 | +52.98 | +7.67 % |
+| 3 | 813 | +56.63 | +4.00 | −1.17 | +59.46 | +7.31 % |
+| 4 | 923 | +25.47 | +7.05 | −2.20 | +30.32 | +3.29 % |
+| 5 | 939 | +4.22 | +4.87 | −6.03 | +3.06 | +0.33 % |
+| 6 | 885 | −2.51 | +6.40 | −1.23 | +2.65 | +0.30 % |
+| 7 | 1,046 | −7.18 | +9.00 | −1.66 | +0.16 | +0.01 % |
+| 8 | 1,430 | −9.99 | −1.64 | −3.51 | −15.14 | −1.06 % |
+| **9 (pure maker)** | **14,908** | +14.21 | **−163.05** | −1.20 | **−150.04** | **−1.01 %** |
+
+**The top decile's profit is entirely on the taking side.** Positions where they cross the
+spread earn **+$150.9 m across maker-share buckets 1–4** (+5.6 % to +7.7 % of volume), plus
++$66.1 m on the pure-taker bucket. Positions where they are pure makers lose **−$150.0 m**,
+at −1.01 % of volume.
+
+**The mechanism is visible inside the maker bucket:** round-trip spread capture is only
++$14.21 m on $14.9 b of maker volume — 0.1 %, far thinner than the two-cent spread implies —
+and the inventory they carry to resolution loses **−$163.05 m**. Spread income is an order of
+magnitude smaller than the marking loss on the inventory it creates.
+
+**Buy-side cross-check.** Measuring only the buy side, and ignoring sells:
+
+| role | edge per share bought |
+|---|---|
+| taker-heavy (maker share 0–40 %) | **+$141.72 m** on $1,936 m |
+| mixed (40–70 %) | +$47.36 m on $1,218 m |
+| maker-heavy (70–100 %) | **−$140.43 m** on $12,435 m |
+
+Same conclusion from a measure that never touches their sell side: the tokens they *choose*
+to buy resolve better than the price; the tokens they are *handed* as a maker resolve worse.
+That is textbook adverse selection against a liquidity provider, and it is the clearest
+explanation yet of why their maker book loses.
+
+### What this means for the research program
+
+- Market making is **not** the edge; it is a cost centre at −1 % of volume.
+- The edge is a **decision to take**, worth +5 to +8 % of the money deployed.
+- So the thing to reverse-engineer is a **pricing/timing signal at the moment of crossing**,
+  not a quoting policy. That is a materially easier problem: it is a supervised learning
+  question (at entry time, which tokens out-perform their price?), not an imitation problem.
+
+### Caveats that must travel with this
+
+1. `maker_share` is per (wallet, token) across six months, so a single wallet appears in
+   several buckets. This is a decomposition of *positions*, not of wallets.
+2. Positions with no resolved payout are excluded from the PnL columns, so the denominators
+   are the resolved subset ($36.1 b of the ~$42 b traded).
+3. `held` is measured against the realised payout. A maker who is flat at resolution shows
+   zero however much the spread earned — which is why the round-trip column must be read
+   alongside it.

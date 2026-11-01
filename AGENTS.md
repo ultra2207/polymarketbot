@@ -56,6 +56,16 @@ runs have already wasted hours here.
   against that estimate when it returns. A run that took 10× longer than
   predicted is a bug report, not a success.
 
+- **Every operation that can run long saves incrementally at a reasonable cadence**, not
+  just "long jobs". The unit of persistable work should be small enough that a timeout
+  costs one unit, and the next run resumes by skipping units already written. A 10-minute
+  build that writes one 14 GB file at the end loses everything to a 600-second cap — which
+  has already happened here. Partition the work (by month, by hash bucket, by wallet range)
+  and write one file per partition.
+- **Check the write cadence against the timeout**: if a run is expected to take N seconds
+  and the cap is 600, there must be at least N/300 completed, durable outputs along the
+  way, so a kill is always inspectable progress rather than a total loss.
+
 ## SQL discipline
 
 Every query is written against a 45 GB tape and a 250 M-row cache. A query that

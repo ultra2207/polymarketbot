@@ -43,7 +43,7 @@ import duckdb
 
 from polymarketbot.logs import get_logger
 
-POSITIONS = "data/processed/positions.parquet"
+POSITIONS = "data/processed/positions/*.parquet"
 OUT = Path("data/processed/cube.parquet")
 
 
@@ -76,6 +76,18 @@ def main() -> int:
                        CASE WHEN bs > 0 THEN least(19, greatest(0, floor(20 * bc / bs)))::INT
                             ELSE -1 END AS pbucket,
                        CASE WHEN payout IS NULL THEN -1 WHEN payout > 0.5 THEN 1 ELSE 0 END AS outcome,
+                       -- role: 1.0 = pure maker (supplies liquidity), 0.0 = pure taker
+                       CASE WHEN maker_share IS NULL THEN -1
+                            ELSE least(9, greatest(0, floor(10 * maker_share)))::INT END AS mbucket,
+                       -- hours from first fill to end date
+                       CASE WHEN ttl_h IS NULL THEN 7
+                            WHEN ttl_h < 1   THEN 0
+                            WHEN ttl_h < 6   THEN 1
+                            WHEN ttl_h < 24  THEN 2
+                            WHEN ttl_h < 72  THEN 3
+                            WHEN ttl_h < 168 THEN 4
+                            WHEN ttl_h < 720 THEN 5
+                            ELSE 6 END AS tbucket,
                        CASE WHEN bs + ss = 0 THEN 0
                             ELSE least(9, greatest(0,
                                  floor(10 * 2 * least(bs, ss) / (bs + ss))))::INT
@@ -103,7 +115,7 @@ def main() -> int:
                             ELSE 0 END AS exit_pnl
                 FROM read_parquet('{args.positions}')
             )
-            SELECT coalesce(dec, 0) AS dec, pbucket, outcome, cbucket, sbucket,
+            SELECT coalesce(dec, 0) AS dec, pbucket, outcome, cbucket, sbucket, mbucket, tbucket,
                    count(*) AS n,
                    count(*) FILTER (WHERE ss > 0)  AS n_closed,
                    count(*) FILTER (WHERE ss = 0 AND bs > 0) AS n_buy_only,
@@ -114,7 +126,7 @@ def main() -> int:
                    sum(held_pnl)   AS held_pnl,
                    sum(exit_pnl)   AS exit_pnl
             FROM x
-            GROUP BY 1, 2, 3, 4, 5
+            GROUP BY 1, 2, 3, 4, 5, 6, 7
         ) TO '{tmp}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
     if out.exists():
