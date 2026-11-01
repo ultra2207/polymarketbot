@@ -120,3 +120,36 @@ of one market are not two observations.
 **What would change the verdict:** a *conditional* base rate — the family rate given the
 regime (e.g. distance from the strike, previous day's move), i.e. a model rather than a
 prior. That is a different, larger project and no longer "the cheapest idea in the backlog".
+
+---
+
+## E1 Complete-set arbitrage — **candidates exist, but none persist** (2026-11-01)
+
+**Window:** 2026-04-01 → 2026-07-01 on the trade tape.
+**Sample:** 42,806 quotable minute-cells (both legs printed ≥ $25 and priced inside
+0.02–0.98); 2,022 with a positive net edge after fees.
+
+| Category | cells | net > 0 | net > 0.5 c | best net | median $/cell |
+|---|---|---|---|---|---|
+| sports | 27,766 | 2,022 | 1,769 | 0.550 | 198 |
+| geopolitics | 7,328 | 379 | 283 | 0.200 | 187 |
+| politics | 3,781 | 67 | 55 | 0.272 | 187 |
+| crypto | 2,033 | 128 | 90 | 0.103 | 146 |
+| other+ | 1,898 | 65 | 42 | 0.098 | 120 |
+
+**Verdict: unconfirmed, and the persistence says no.** Of 1,769 cells exceeding the
+threshold, only **16 lasted 2 consecutive minutes** and **none lasted longer**. A 55 %
+round-trip edge that cannot survive 60 seconds is not an edge; it is a stale last-trade
+price on one leg.
+
+The first naive pass claimed 12.8 % of all minute-buckets were arbitrage with a minimum
+sum of 0.011 — dust prints of $0.31–$5.79 at prices like (0.001, 0.010). Both filters now
+applied (≥ $25 per leg, both legs inside 0.02–0.98) removed that entire class.
+
+**What this establishes:** the tape alone cannot settle E1. Last-traded price is only a
+lower bound on the ask, and it goes stale exactly where arbitrage would live. The question
+is decided by the book, so E1 moves to B-series once the reduced book exists — this screen
+now supplies the candidate list to check against it.
+
+**Category selection still matters** (the plan's point): crypto carries the 1.75 % peak fee,
+geopolitics is fee-free, and the fee overlay is what kills a 1–2 ¢ gap.
