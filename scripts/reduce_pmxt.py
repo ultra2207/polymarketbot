@@ -186,28 +186,33 @@ def fetch_hour(stamp: str, dest: Path, connections: int = 64) -> Path | None:
 
 
 def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
-                top_n: int) -> tuple[int, int]:
+                top_n: int, hour_start: datetime | None = None,
+                seed_path: Path | None = None,
+                carry_out: Path | None = None) -> tuple[int, int]:
     """Reconstruct bucket-end book state for one hour. Returns (rows, assets).
 
-    Two changes over the first version, both measured rather than assumed:
+    The hour-boundary problem
+    -------------------------
+    An hourly file only contains *that hour's* events. An order resting since yesterday
+    produces no event inside the hour, so reconstructing from one file alone leaves its
+    price level missing entirely, and the reconstructed top of book drifts away from the
+    true touch.
 
-    1. **State is hash-agg + forward fill, not ASOF JOIN.** The ASOF version
-       took 46.3 s per hour and spilled 8.5 GB; this takes 3.2 s and spills
-       2.2 GB. The ASOF had to sort 81 M events against a join of every level
-       with every bucket. `arg_max(size, ts)` collapses each (level, bucket)
-       cell first, leaving a 10.8 M-row grid to forward-fill with a window
-       function.
-    2. **Tokens are int32, sides are booleans.** `asset_id` is a 77-character
-       decimal string; carrying it through 81 M rows of shuffle is pure waste.
-       `dense_rank` over the 73 k distinct tokens gives a stable key for the
-       hour.
+    That is not hypothetical: without a seed the reduced book showed a **median spread of
+    14 c** and 46 % of snapshots above 20 c, against a real median of about 2 c. The bug is
+    invisible in any single market and obvious across 3.9 M snapshots.
 
-    Bucket convention: a row labelled `bucket_end` describes the ladder over
-    `[bucket_end - bucket_s, bucket_end)`. An event exactly on a boundary
-    belongs to the following bucket, so the snapshot never sees an event it
-    could not have seen at that instant.
+    The fix is a carry: the end-of-hour state is written next to the output, and the next
+    hour is seeded with it as if those levels had last changed at the hour boundary. Orders
+    outside the window simply inherit.
+
+    Two other measured changes remain from earlier work: state is hash-agg plus forward
+    fill (the ASOF join spilled 8.5 GB and took 4x as long), and tokens are int32 while
+    sides are booleans.
     """
     p = src.as_posix()
+    start_ts = (hour_start or datetime(1970, 1, 1, tzinfo=timezone.utc))
+    start_epoch = int(start_ts.timestamp())
 
     # ---- 1. level-change timeline (typed, compact) -----------------------
     con.execute(f"""
@@ -217,7 +222,7 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
             -- CAST to a typed double list: `from_json(..., '[["VARCHAR","VARCHAR"]]')`
             -- rejects the file ("too many values in array of JSON structure").
             SELECT asset_id, timestamp AS ts, TRUE AS is_bid,
-                   l[1] AS price, l[2] AS size
+                   l[1] AS price, l[2] AS size, TRUE AS is_anchor
             FROM (
                 SELECT asset_id, timestamp,
                        unnest(CAST(bids AS DOUBLE[][])) AS l
@@ -226,7 +231,7 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
             )
             UNION ALL
             SELECT asset_id, timestamp AS ts, FALSE AS is_bid,
-                   l[1] AS price, l[2] AS size
+                   l[1] AS price, l[2] AS size, TRUE AS is_anchor
             FROM (
                 SELECT asset_id, timestamp,
                        unnest(CAST(asks AS DOUBLE[][])) AS l
@@ -238,7 +243,7 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
             -- `side` is the LADDER side: BUY rows are bids, SELL rows are asks.
             SELECT asset_id, timestamp AS ts, side = 'BUY' AS is_bid,
                    CAST(price AS DOUBLE) AS price,
-                   CAST(size AS DOUBLE)  AS size
+                   CAST(size AS DOUBLE)  AS size, FALSE AS is_anchor
             FROM read_parquet('{p}')
             WHERE event_type = 'price_change' AND price IS NOT NULL
               AND side IN ('BUY', 'SELL')
@@ -246,31 +251,53 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
         SELECT * FROM anchors UNION ALL SELECT * FROM deltas
     """)
 
-    # ---- 2. token -> int32, then drop the string table -------------------
+    # ---- 2. seed with the previous hour's closing book -------------------
+    has_seed = seed_path is not None and seed_path.exists()
+    if has_seed:
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE seed AS
+            SELECT token_id AS asset_id, to_timestamp({start_epoch}) AS ts,
+                   is_bid, price, size, FALSE AS is_anchor
+            FROM read_parquet('{seed_path.as_posix()}')
+            WHERE size > 0
+        """)
+        con.execute("INSERT INTO upd SELECT * FROM seed")
+        con.execute("DROP TABLE seed")
+
+    # ---- 3. token -> int32, then drop the string table -------------------
     con.execute("""
         CREATE OR REPLACE TEMP TABLE dim AS
         SELECT token_id, dense_rank() OVER (ORDER BY token_id)::INTEGER AS aid
         FROM (SELECT DISTINCT asset_id AS token_id FROM upd)
     """)
+    # A `book` event is a FULL LADDER, not an incremental update. Treating it as a
+    # delta leaves every level that vanished from the snapshot alive forever, which is
+    # how the reconstruction came out crossed (mean spread -0.48 against a true +0.024).
+    # Each asset therefore carries a generation counter that increments on every anchor,
+    # and a level is only valid while its last update belongs to the current generation.
     con.execute("""
         CREATE OR REPLACE TEMP TABLE ev AS
-        SELECT d.aid, u.ts, u.is_bid, u.price, u.size
+        SELECT d.aid, u.ts, u.is_bid, u.price, u.size,
+               sum(CASE WHEN u.is_anchor THEN 1 ELSE 0 END) OVER (
+                   PARTITION BY u.asset_id ORDER BY u.ts, u.is_bid, u.price
+               ) AS gen
         FROM upd u JOIN dim d ON d.token_id = u.asset_id
     """)
     con.execute("DROP TABLE upd")
 
-    # ---- 3. last size inside each bucket ---------------------------------
+    # ---- 4. last size inside each bucket ---------------------------------
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE cell AS
         SELECT aid, is_bid, price,
                time_bucket(INTERVAL {bucket_s} SECOND, ts)
                    + INTERVAL {bucket_s} SECOND AS bucket_end,
-               arg_max(size, ts) AS size
+               arg_max(size, ts) AS size,
+               max(gen) AS gen
         FROM ev
         GROUP BY ALL
     """)
 
-    # ---- 4. every (level, bucket) cell that could be non-empty -----------
+    # ---- 5. every (level, bucket) cell that could be non-empty -----------
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE grid AS
         SELECT lv.aid, lv.is_bid, lv.price, k.bucket_end
@@ -284,7 +311,7 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
     """)
     con.execute("DROP TABLE ev")
 
-    # ---- 5. carry each level forward; a level untouched keeps its size ----
+    # ---- 6. carry each level forward; a level untouched keeps its size ----
     con.execute("""
         CREATE OR REPLACE TEMP TABLE state AS
         SELECT * FROM (
@@ -292,17 +319,37 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
                    last_value(c.size IGNORE NULLS) OVER (
                        PARTITION BY g.aid, g.is_bid, g.price
                        ORDER BY g.bucket_end
-                   ) AS size
+                   ) AS size,
+                   last_value(c.gen IGNORE NULLS) OVER (
+                       PARTITION BY g.aid, g.is_bid, g.price
+                       ORDER BY g.bucket_end
+                   ) AS lgen,
+                   max(c.gen) OVER (
+                       PARTITION BY g.aid ORDER BY g.bucket_end
+                   ) AS cgen
             FROM grid g
             LEFT JOIN cell c
               ON c.aid = g.aid AND c.is_bid = g.is_bid
              AND c.price = g.price AND c.bucket_end = g.bucket_end
-        ) WHERE size IS NOT NULL AND size > 0
+        ) WHERE size IS NOT NULL AND size > 0 AND lgen = cgen
     """)
     con.execute("DROP TABLE cell")
     con.execute("DROP TABLE grid")
 
-    # ---- 6. top N levels per side ---------------------------------------
+    # ---- 7. export the closing book as the next hour's seed --------------
+    if carry_out is not None:
+        carry_out.parent.mkdir(parents=True, exist_ok=True)
+        con.execute(f"""
+            COPY (
+                SELECT d.token_id, s.is_bid, s.price, s.size
+                FROM state s
+                JOIN dim d ON d.aid = s.aid
+                WHERE s.bucket_end = (SELECT max(bucket_end) FROM state)
+                  AND s.size > 0
+            ) TO '{carry_out.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+
+    # ---- 8. top N levels per side ---------------------------------------
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE ranked AS
         SELECT * FROM (
@@ -315,7 +362,7 @@ def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
         ) WHERE rn <= {top_n}
     """)
 
-    # ---- 7. top-of-book summary -----------------------------------------
+    # ---- 9. top-of-book summary -----------------------------------------
     con.execute("""
         CREATE OR REPLACE TEMP TABLE book AS
         SELECT
@@ -460,7 +507,13 @@ def main() -> int:
             if got is None:
                 bar.write(f"  {when:%Y-%m-%dT%H}: absent (404)")
                 continue
-        rows, assets = reduce_hour(con, src, args.bucket_seconds, args.top_levels)
+        carry_dir = dest_root / "_carry"
+        prev = when - timedelta(hours=1)
+        seed_path = carry_dir / f"dt={prev:%Y-%m-%d}" / f"hour={prev:%H}.parquet"
+        carry_out = carry_dir / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}.parquet"
+        rows, assets = reduce_hour(
+            con, src, args.bucket_seconds, args.top_levels,
+            hour_start=when, seed_path=seed_path, carry_out=carry_out)
         part = dest_root / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}"
         part.mkdir(parents=True, exist_ok=True)
         con.execute(f"""

@@ -194,6 +194,36 @@ is cuDF/RAPIDS, which has no native Windows build (Linux/WSL2 only) — a day of
 infrastructure. After the memory fix the full window is 16.6 h of compute, so the
 payoff does not justify the new failure surface. Revisit only if the window grows.
 
+### Correctness: `book` events are full ladders, not deltas (fixed 2026-11-01)
+
+The first reducer treated every row as an incremental level change. A `book` event is
+**the complete ladder at that instant**, so any level absent from it has size 0. Treated as
+a delta, every level that ever existed stayed alive forever, and the reconstructed book
+slowly filled with stale orders on both sides of the true touch.
+
+Measured against the 145,308 authoritative `book` snapshots inside a single hour:
+
+| | mean spread | |bid error| | |ask error| |
+|---|---|---|---|---|
+| true snapshots | **+0.0238** | — | — |
+| reconstruction, anchors as deltas | **−0.4766** | 0.2526 | 0.2526 |
+| reconstruction, anchors reset the book | **+0.0524** | 0.0303 | 0.0523 |
+
+A *negative* mean spread means the book was crossed — bid above ask — which no real book
+ever is. The bug is invisible per market (individual assets matched exactly) and obvious
+across the population, which is why the check has to be aggregate.
+
+The fix is a generation counter: each asset increments a generation at every anchor, and a
+level is only valid while its last update belongs to the current generation.
+
+**How it was found:** not by reading code, but by comparing a reconstruction against the
+snapshots that produced it. Every correctness check in this file that mattered came from
+that comparison rather than from inspection.
+
+**Consequence:** any partition reduced before this fix is invalid and must be re-run. The
+carry file (`_carry/`) exists so hour state survives a boundary; it does not repair a
+wrong rule.
+
 ### Correctness: the rewrite also removed a lookahead bug
 
 The ASOF version used `ts <= bucket_end`, so an event timestamped exactly at the
