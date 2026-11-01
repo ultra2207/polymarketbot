@@ -26,6 +26,11 @@ What we hold, what we derive, and how to rebuild it. Sizes and row counts are fr
 | `market_tick.parquet` | 163,908 | `build_tick_sizes.py` | tick from Dome (2025-10→2026-03) |
 | `market_metadata_gamma.parquet` | ~2.4 M (filling) | `enrich_market_metadata.py` | version, token/position ids, feeSchedule, tick, min order |
 | `markets_pit.parquet` | 4,049,855 | `build_universe.py` | **the point-in-time market table** |
+| `labels_api.parquet` | ~1.5 M (filling) | `fetch_labels_api.py` | 2026-04+ settlements from `/v2/tokens`; `final_price` validated 371/371 against on-chain payouts |
+| `screen_calibration_rows.parquet` | 152,895 | `screen_calibration.py` | scored token-entries behind the idea-#1 result |
+| `screen_calibration_parts/entry=…/quarter=…` | per quarter | `screen_calibration.py` | resumable screen output, one file per quarter |
+| `pmxt_reduced/dt=…/hour=…` | per hour | `reduce_pmxt.py` | reconstructed book per (token, bucket); exists only once the raw archive is downloaded |
+| `trades/year=…/month=…` | per month | `build_trades.py` | canonical fills: no dust, no self-trades, no audit hashes |
 | `wallet_cohort.parquet` | sample | `fetch_wallet_cohort.py` | ranked wallets + PnL decomposition |
 | `resolution_timing.parquet` | sample | `fetch_resolution_timing.py` | `resolved_at`, disputes, lag |
 | `indexer_crosscheck.*` | 200 | `cross_check_indexers.py` | SII vs moose-code agreement |
@@ -53,6 +58,10 @@ What we hold, what we derive, and how to rebuild it. Sizes and row counts are fr
 | `snapshot_gamma.py` | daily open-market snapshot | `--max-pages` |
 | `download_docs.py` | mirror the docs site | `--max-seconds` |
 | `profile_job.py` | cProfile / EXPLAIN ANALYZE | — |
+| `fetch_labels_api.py` | 2026-04+ labels from `/v2/tokens` | `--max-seconds`, journal-resumable |
+| `build_trades.py` | canonical monthly trades | one month per invocation |
+| `screen_calibration.py` | idea #1 screen | one parquet per quarter, resumable |
+| `reduce_pmxt.py` | PMXT hour → book buckets | `--dir` over a local archive |
 
 ## Rebuild order
 

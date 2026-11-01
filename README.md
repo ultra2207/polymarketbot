@@ -13,6 +13,7 @@ capital.
 - **Polymarket mechanics (verified):** [`docs/polymarket-mechanics.md`](docs/polymarket-mechanics.md)
 - **Fee model:** [`docs/fees.md`](docs/fees.md)
 - **Data inventory:** [`docs/data-inventory.md`](docs/data-inventory.md)
+- **Results log (including failures):** [`docs/results-log.md`](docs/results-log.md)
 - **PMXT download + reduce runbook:** [`docs/pmxt-runbook.md`](docs/pmxt-runbook.md) — the 1.1 TB archive is an operator task
 
 ## Status
@@ -23,8 +24,9 @@ capital.
 | 1 — Data acquisition and integrity | counts, payouts, cross-indexer | **passed 2026-11-01** |
 | 1b — Missing sources | fees, wallets, reference prices | **partial** — fees and categories done (per-market schedules for 1.94 M markets; 2.7 % `other`); wallet identity, crypto reference prices, UMA/sports metadata pending |
 | 2 — Point-in-time universe | no lookahead, explicit rules | **passed 2026-11-01** |
-| 3 — Trade normalisation and PnL | labels, unified fills, positions | **blocked on labels** — 1.94 M traded markets / ~$25 B of volume after 2026-04 carry no label; the forward-test window is 100 % unlabelled |
-| 4+ | — | not started |
+| 3 — Trade normalisation and PnL | labels, unified fills, positions | **in progress** — label backfill running (682 k of ~1.9 M done); `build_trades.py` written, not yet validated |
+| 4 — Book replayer | PMXT reduce + replay invariants | reducer works (verified against an independent replay); waits on the 1.06 TB archive download |
+| 5+ | — | not started |
 
 ## Data we hold
 
