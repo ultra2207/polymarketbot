@@ -153,3 +153,33 @@ now supplies the candidate list to check against it.
 
 **Category selection still matters** (the plan's point): crypto carries the 1.75 % peak fee,
 geopolitics is fee-free, and the fee overlay is what kills a 1–2 ¢ gap.
+
+---
+
+## A2 Neg-risk coherence — **no persistent violation found** (2026-11-01)
+
+**Window:** 2026-04-01 → 2026-07-01. **Sample:** 522,059 legs across 82,949 neg-risk events;
+only **487 complete snapshots** where every leg of an event printed inside the same 5-minute
+window with ≥ $25.
+
+| Side | snapshots | gross > 0 | net > 0.5 c | best gross |
+|---|---|---|---|---|
+| buy-all-NO | 387 | 84 | 24 | 0.140 |
+| buy-all-YES | 100 | 18 | 6 | 0.060 |
+
+**Verdict: no persistent violation.** Every candidate is an isolated 5-minute cell; **zero**
+runs lasted 2 or more windows. Largest net was +0.12 on a 3-leg event, with nothing above
++0.06 after that.
+
+**The honest weakness of this test.** Requiring every leg to quote in the same window is
+necessary — a leg you cannot buy is not arbitrage — but it restricts the sample to the
+*liquid* subset of neg-risk events, and 487 snapshots over three months is thin. Violations,
+if they exist, are most likely in the illiquid events this filter excludes. So the correct
+reading is narrow: **no violation among liquid, fully-quoted neg-risk events**, not "no
+violation exists". Settling the wider question needs the book, where resting depth is
+visible without a trade printing.
+
+**Two methodology notes.** A 1-minute window was tried first and produced only 742
+snapshots for the same reason; 5 minutes is a compromise between freshness and coverage.
+And the buy-all-NO bound (`sum < k-1`, not `sum < 1`) is the one that actually binds —
+the YES side showed just 6 net-positive cells against 24 for NO.
