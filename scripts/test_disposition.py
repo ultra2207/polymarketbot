@@ -143,6 +143,32 @@ def main() -> None:
     print(f"  of those, profitable:         {r[1]:.1f} %")
     print(f"  total PnL on them:            ${r[2]:+,.2f} m")
 
+    print("\n=== conditional on the outcome: do winners get closed and losers held? ===")
+    print("  outcome if held   positions    closed%   mean frac closed   pnl if held $m")
+    for r in con.sql("""
+        SELECT CASE WHEN payout > vbuy THEN 'would win' ELSE 'would lose' END AS outcome,
+               count(*),
+               100.0 * count(*) FILTER (WHERE ss > 0) / count(*) AS closed_pct,
+               avg(least(ss / nullif(bs,0), 1)) AS mean_closed_frac,
+               sum(bs * (payout - vbuy)) / 1e6 AS pnl_held
+        FROM (
+            SELECT pr.bs, pr.ss, pr.bc / nullif(pr.bs,0) AS vbuy, p.payout
+            FROM pr JOIN top_w ON top_w.wallet = pr.wallet
+            JOIN payout p ON p.asset_id = pr.asset_id
+            WHERE pr.bs > 0
+        ) GROUP BY outcome ORDER BY outcome
+    """).fetchall():
+        print(f"  {r[0]:<16} {r[1]:>11,}   {r[2]:>6.1f}   {r[3]:>16.3f}   {r[4]:>+13.2f}")
+
+    print("\n=== of the exits they do take, how many are at a loss? ===")
+    r = con.sql("""
+        SELECT 100.0 * count(*) FILTER (WHERE vsell < vbuy) / count(*)
+        FROM (SELECT pr.ss, pr.sc / nullif(pr.ss,0) AS vsell, pr.bc / nullif(pr.bs,0) AS vbuy
+              FROM pr JOIN top_w ON top_w.wallet = pr.wallet
+              WHERE pr.ss > 0 AND pr.bs > 0)
+    """).fetchall()[0]
+    print(f"  exits taken at a loss: {r[0]:.1f} %")
+
     print("\n=== never-sold positions: size distribution (dust or conviction?) ===")
     print("  notional          positions    avg $      total PnL $m")
     labels = ["<$1", "$1-10", "$10-100", "$100-1k", "$1k-10k",

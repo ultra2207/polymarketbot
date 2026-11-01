@@ -836,3 +836,53 @@ of a handful of bad conviction bets. It also means the loss is not fixable by sw
 Measured on June only; the full-window distribution has not been run and the labels in
 `test_disposition.py` were fixed after the first pass, so the full-window version should be
 re-run before this table is quoted as anything but indicative.
+
+---
+
+## Speed: 7 minutes -> 10 seconds for a full-window confirmation
+
+Every test rebuilt the same 250 M-position table from a 15-column, 15 GB cache, joined the
+payout table, and recomputed wallet deciles: ~2-4 minutes of identical work per test.
+
+Four layers now, built once each:
+
+| layer | rows | size | build time |
+|---|---|---|---|
+| `data/raw/sii/trades.parquet` | 600 M fills | 45.85 GB | — (raw) |
+| `data/processed/wallet_token/` | 261 M pairs | 14.90 GB | 17 min |
+| `data/processed/positions.parquet` | 259 M positions | 13.56 GB | 392 s |
+| **`data/processed/cube.parquet`** | **30,667 cells** | **1.6 MB** | **9 s** |
+
+`scripts/report.py` prints all four cross-sections in **0.25 s** from the cube.
+
+The cube aggregates at the finest resolution any test needs — wallet decile x price bucket
+x realised outcome x closed-fraction bucket x notional-size bucket — and stores only
+additive measures (counts, sums, closed/held/exit PnL). Any roll-up is then exact.
+
+**Two bugs this forced out**, both of which had produced confident wrong numbers:
+
+1. Unresolved positions were valued at `payout = 0`, turning every open position into a
+   total loss. The cube reported −$2,324 m of held PnL before this was fixed.
+2. The per-position column divided total held PnL by the never-sold count only, inflating
+   it by the partially-closed positions.
+
+### Correction: the unclosed loss is mid-size, not large, not dust
+
+Full window, top decile, positions with a known payout and a net long position:
+
+| notional | never sold | held PnL | per held position |
+|---|---|---|---|
+| <$1 | 5,838,293 | −$0.12 m | −$0.02 |
+| $1–10 | 19,936,388 | −$7.23 m | −$0.33 |
+| $10–100 | 18,872,075 | **−$48.30 m** | −$2.05 |
+| $100–1k | 6,350,423 | **−$41.79 m** | −$4.84 |
+| $1k–10k | 1,006,851 | **−$51.16 m** | −$33.54 |
+| $10k–100k | 125,398 | −$13.99 m | −$71.04 |
+| $100k–1M | 7,805 | −$0.73 m | −$59.36 |
+| $1M–10M | 279 | **+$15.39 m** | +$37,170 |
+| $10M+ | 9 | +$0.50 m | +$31,179 |
+
+The June-only table that suggested "65 % of the loss is above $1 k" does not survive the
+full window. The loss is concentrated in **$10–$10 k (95 % of it)**, and the largest
+positions — above $1 m — are *profitable*. So it is neither dust nor a handful of huge bad
+bets: it is a broad middle-sized tail that is never closed.
