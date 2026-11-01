@@ -214,3 +214,23 @@ large as the effect. The intuition that brand-new markets are the softest is not
 **What would change the verdict:** quoted spreads *by age*, because a young market may be
 both more mispriced and wider. That needs the book, so this moves behind PMXT rather than
 being closed outright.
+
+---
+
+## A4 Scalar / range-market anchoring — **dead: the population does not exist** (2026-11-01)
+
+Of 886,390 resolved binary conditions, 13,130 carry a non-{0,1} payout:
+
+| payout_0 | count | what it is |
+|---|---|---|
+| 0.500 | 13,069 | **voided markets refunding half** |
+| other fractions | 61 | genuine scalar markets |
+
+**Verdict: dead by sample size, exactly as the pipeline's kill criterion anticipated
+("too few markets to size").** A4 was written as "64 resolved binary conditions pay a
+fraction"; 64 is the number of real scalar markets in the entire dataset, and the 13 k
+apparent cases were refunds. There is no population to model calibration against.
+
+Worth recording because the shape of the error is common: the first query — count of
+non-{0,1} payouts — returned 13,130 and looked like a real population. Only splitting by
+*value* separated refunds from scalars. A count is not a sample.
