@@ -112,9 +112,9 @@ earns it.**
 
 | Phase | Window | Hours | Download | Compute @ 15-min | Stored | Gate |
 |---|---|---|---|---|---|---|
-| **1** | 2026-04-20 → 04-27 | 168 | 63 GB | ~7 h | ~2.5 GB | build replayer + exit comparison |
-| 2 | extend to 05-31 | 1,158 | 430 GB | ~48 h | ~17 GB | only if phase 1 produces a signal |
-| 3 | 2026-06-01 → 08-10 | 1,703 | 630 GB | ~71 h | ~26 GB | **only after Gate 7**, forward test stays untouched |
+| **1** | 2026-04-20 → 04-27 | 168 | 63 GB | **59 min** | ~2.5 GB | build replayer + exit comparison |
+| 2 | extend to +21 days | 504 | 187 GB | **2.9 h** | ~8 GB | only if phase 1 produces a signal |
+| 3 | 2026-06-01 → 08-10 | 1,703 | 630 GB | **9.9 h** | ~26 GB | **only after Gate 7**, forward test stays untouched |
 
 Three reasons this is the right shape:
 
@@ -128,6 +128,59 @@ Three reasons this is the right shape:
 3. **Each phase is independently useful and independently abandonable.** Phase 1 answers
    "does the replayer work and does any exit beat holding". If the answer is no, we stop
    after 63 GB instead of 1.06 TB.
+
+### Reducer performance (measured 2026-11-01, one hour = 68,840,573 rows)
+
+The first reducer took 43.6 s/hour at 1-hour buckets and ~150 s/hour at 15-minute
+buckets. Profiling each statement found one dominant cost and one dominant cause.
+
+| Statement | Time | Share |
+|---|---|---|
+| parse to 80.9 M events | 3.2 s | 8 % |
+| DISTINCT keys + levels | 5.3 s | 14 % |
+| **ASOF JOIN state** | **29.8 s** | **76 %** |
+| top-N ranking | 0.7 s | 2 % |
+
+Running the same statement twice in one session made it **5x slower** (29.8 s ->
+161 s): accumulated temp tables crossed the 8 GB limit and DuckDB spilled. With
+15.6 GB of RAM the limit, not the algorithm, was setting the pace.
+
+Four changes, in order of what they bought:
+
+1. `preserve_insertion_order = false` plus an explicit `temp_directory`.
+2. **State via hash aggregate + forward fill instead of ASOF.** `arg_max(size, ts)`
+   collapses each (level, bucket) cell, leaving a 10.8 M-row grid to forward-fill
+   with `last_value(... IGNORE NULLS)`. Spill fell from 8.5 GB to 2.2 GB.
+3. **Tokens as `int32`, sides as booleans.** `asset_id` is a 77-character decimal
+   string; hashing and sorting 81 M of them was pure waste.
+4. Explicit `DROP TABLE` after each step so peak memory is one table, not six.
+
+| Cadence | Before | After | Speedup | 2,861 h extrapolation |
+|---|---|---|---|---|
+| 3600 s | 55.6 s | **18.2 s** | 3.1x | 14.5 h |
+| 900 s | ~161 s | **20.9 s** | **7.7x** | **16.6 h** |
+
+Threads were left at 12: 24 threads made the parse step *slower* (8.4 s vs 3.2 s)
+by overrunning the memory limit.
+
+**GPU: not used, and now not needed.** DuckDB has no GPU backend. The only route
+is cuDF/RAPIDS, which has no native Windows build (Linux/WSL2 only) — a day of
+infrastructure. After the memory fix the full window is 16.6 h of compute, so the
+payoff does not justify the new failure surface. Revisit only if the window grows.
+
+### Correctness: the rewrite also removed a lookahead bug
+
+The ASOF version used `ts <= bucket_end`, so an event timestamped exactly at the
+snapshot instant contributed to that snapshot. Comparing both outputs against a
+direct reconstruction from the raw file, on the 4 rows where they disagreed:
+
+| | Matches ground truth |
+|---|---|
+| original ASOF | **0 of 4** |
+| hash + forward-fill | **4 of 4** |
+
+The bucket is now `[bucket_end - bucket_s, bucket_end)`: an event on the boundary
+belongs to the following bucket and cannot appear in a snapshot taken before it.
 
 ### Disk safety
 
