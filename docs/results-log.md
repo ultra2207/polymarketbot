@@ -563,3 +563,44 @@ So A7 remains a candidate, not a result, and the constraint is now about *breadt
 method: the effect is real in the population it can see, and that population is 0.07 % of
 markets. Whether it is worth anything depends on whether those markets carry enough volume
 — which is the next question, not a bearing test.
+
+---
+
+## Fill quality — do the automated makers earn, or are they paid? (2026-04 → 10)
+
+**Method.** For every maker fill, mark the token at its realised payout and compute
+`edge = (payout − price)` for a maker buy, `(price − payout)` for a maker sell. Aggregate
+per wallet, then by volume decile.
+
+**Sample.** 67,239 makers with ≥ 200 priced fills · 598,381,359 fills · **$15.85 B** of
+maker volume. Marked against `market_labels` (rebuilt).
+
+| Volume decile | makers | volume $m | edge $m | edge per $ |
+|---|---|---|---|---|
+| **1 (largest)** | 6,724 | **14,634** | **+8.6** | **+0.00059** |
+| 2 | 6,724 | 680 | −6.7 | −0.00978 |
+| 3 | 6,724 | 253 | −1.8 | −0.00712 |
+| 4–9 | 40,344 | 275 | −4.1 | −0.011 … −0.025 |
+| 10 (smallest) | 6,723 | 3 | −0.1 | −0.02086 |
+| **all** | 67,239 | 15,850 | **−4.0** | **−0.00026** |
+
+The largest decile carries **92 % of all maker volume** and is the only one with a positive
+terminal edge (+0.06 ¢ per $1). Every smaller decile loses on the trade, and loses more the
+smaller it is. Aggregate terminal edge is **−$4 M on $15.85 B — indistinguishable from
+zero.**
+
+**What this does and does not say.** It says the top of the maker population holds inventory
+to resolution that is, on average, *correctly* sided — they are not systematically left
+holding the losing token. It does **not** measure spread capture: a maker who buys and sells
+the same token flattens to zero terminal exposure whatever they earned on the round trip, so
+this metric sees only the inventory carried to resolution. The honest reading is therefore
+"the biggest makers do not systematically eat adverse selection at resolution", not "the
+biggest makers are profitable".
+
+Proving *paid not skilled* needs round-trip PnL (fill-to-fill, matched by token and time),
+not a resolution mark. That is the next build.
+
+**What it does establish.** The concentration is extreme: 6,724 wallets do 92 % of maker
+volume. Combined with E7 (median fill $13, 3–19 s between fills), the maker side is a small
+number of automated participants with near-total coverage — which is why the *whitespace*
+question (idea 3) matters more than the *copying* question.
