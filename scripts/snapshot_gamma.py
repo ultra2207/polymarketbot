@@ -45,6 +45,9 @@ KEEP = [
     "archived", "endDate", "startDate", "negRisk", "clobTokenIds",
     "outcomePrices", "volume", "liquidity", "feesEnabled", "feeType",
     "umaResolutionStatuses", "tags",
+    # Liquidity-reward eligibility. Without these the D1/E5 questions cannot be
+    # answered for any day that was not captured, and Gamma overwrites them.
+    "rewardsMinSize", "rewardsMaxSpread", "competitive",
 ]
 
 
@@ -93,6 +96,22 @@ def main() -> int:
             tags = m.get("tags") or []
             rec["tag_labels"] = [t.get("label") for t in tags]
             rec["event_ids"] = [e.get("id") for e in (m.get("events") or [])]
+
+            # `clobRewards` is a list of reward campaigns, each with its own daily
+            # rate and validity window. Flatten the money fields so a daily snapshot
+            # is queryable without unnesting JSON.
+            rewards = m.get("clobRewards") or []
+            rec["reward_campaigns"] = len(rewards)
+            rec["rewards_daily_rate"] = sum(
+                float(r.get("rewardsDailyRate") or 0) for r in rewards)
+            rec["rewards_amount"] = sum(
+                float(r.get("rewardsAmount") or 0) for r in rewards)
+            rec["rewards_start"] = min(
+                (r.get("startDate") for r in rewards if r.get("startDate")),
+                default=None)
+            rec["rewards_end"] = max(
+                (r.get("endDate") for r in rewards if r.get("endDate")),
+                default=None)
             rows.append(rec)
         cursor = payload.get("next_cursor")
         if page % 10 == 0:

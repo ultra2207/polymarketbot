@@ -404,3 +404,40 @@ across windows* (stable near zero) rather than by any one row.
 **The general lesson, now demonstrated twice today:** an effect whose magnitude changes when
 you move the measurement clock is measuring your clock. Both the ASOF row-matching bug and
 this one produced full, plausible-looking tables.
+
+---
+
+## D1 Liquidity-reward pools — **reward side measured; yield needs the book** (2026-11-01)
+
+**Source:** Gamma snapshot 2026-11-01, 40,000 open markets, now capturing `clobRewards`.
+
+| | |
+|---|---|
+| markets with a reward pool | **8,000 (20.0 %)** |
+| total paid across pools | **$92,634 / day** |
+| daily rate | median $3.0, p90 $19.0, max $3,000 |
+| median minimum qualifying size | 20 shares |
+| median `rewardsMaxSpread` | 4.5 ¢ |
+
+**The yield cannot be computed from the snapshot, and my first attempt at it was
+worthless.** I reported a "ceiling" as `daily_rate / (min_size x price)`, assuming we were
+the only qualifier. That produced a 5,475 % median annual return and a 730,000 % maximum.
+The arithmetic is right and the metric is meaningless: a pro-rata pool splits across
+everyone who qualifies, so "one minimum-size quote captures the whole pool" measures the
+size floor, not the opportunity. **A metric that ranks pools by their minimum size
+requirement is worse than no metric**, because it looks like an answer.
+
+Removed. The screen now reports the reward side descriptively and stops.
+
+**What the book adds:** total qualifying size resting inside `rewardsMaxSpread` of the mid.
+Yield is then `our size / that total x daily rate`, which needs reconstructed depth — so D1
+joins the other book-dependent ideas rather than being closed.
+
+**One untested lead:** Gamma exposes a `competitive` field (0.83–1.00 on the richest pools)
+which may already encode the competition measure. Its definition is undocumented, so it
+cannot be trusted as a substitute, but it is one probe away from being checkable against
+depth once the book lands.
+
+**Note on scale:** the earlier estimate in `alpha-pipeline.md` was $23,993/day over 400
+markets (27 %). The true figure across 40,000 open markets is **$92,634/day over 8,000** —
+larger in absolute terms, and a lower share of markets (20 %).
