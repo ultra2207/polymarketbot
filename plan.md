@@ -125,17 +125,46 @@ Everything else is a candidate, not a commitment.
 ## 3. Sequencing
 
 ```
-Phase 3 (positions/PnL)  ──►  Phase 6b (landscape)  ──►  screen Tier 1 ideas
-                                        │                        │
-                                        ▼                        ▼
-                              wallet_skill, archetypes    2–3 survive screening
-                              crowding, whitespace                │
-                                                                  ▼
-                                                    Phase 7 strategy loops (full harness)
-                                                                  │
-                                                                  ▼
-                                                          Phase 8 forward test
+                    ┌──────────────── critical path (decided 2026-11-01) ────────────────┐
+Phase 3 (labels, unified fills, PnL) ──► Phase 4 (book replayer) ──► Phase 5 (fill engine,
+                                                                     all five exit policies)
+                    │                                                        │
+                    ▼                                                        ▼
+        gross-effect screen (tape only)                        exit-policy comparison on
+        may DELETE an idea, never graduate it                  2026-04-13 → 2026-08-10
+                    │                                                        │
+                    └──────────────► Phase 6b (landscape) ──► Phase 7 loops ◄─┘
+                                                                     │
+                                                                     ▼
+                                                             Phase 8 forward test
 ```
+
+**Two decisions recorded 2026-11-01 change this sequence.**
+
+1. **Exits are chosen by the system, not fixed.** "Hold to resolution" is a candidate action,
+   not the plan's assumption. Evaluating any exit honestly needs book state across the whole
+   holding period, and full L2 exists only for **2026-04-13 → 2026-08-10**. That makes the
+   book replayer (Phase 4) and fill engine (Phase 5) the critical path rather than a later
+   refinement, and it makes the recorder the only way to lengthen the observable window.
+2. **Capital should be as small as possible** so research and live testing start early
+   (working assumption: `$2,000` bankroll, `$250` max order — `configs/windows.yaml`). This
+   is an advantage, not a compromise: at `$250` against a p10 ask depth of ~`$1,500` an order
+   is a fraction of one price level, so fills are tractable and an edge that survives at
+   small size is a real edge rather than a backtest artefact.
+
+**Consequence for screening.** Screening splits into two stages, because they have different
+evidence requirements:
+
+| Stage | Needs | Can do | Cannot do |
+|---|---|---|---|
+| **Gross effect** | tape + labels + `schedule_at` fees | **delete** an idea whose effect is absent or inside 2× costs | claim an edge is tradable |
+| **Graduation** | all five exit policies on reconstructed books | rank strategies, score capacity | — |
+
+A gross-effect screen is still worth running early: it is the cheapest possible way to
+delete most of the backlog, and deletion is the point. But nothing "survives screening" in a
+tradable sense until it has been through the exit comparison. An idea that only works if you
+hold to resolution is not an edge — it is an assumption about the exit.
+
 
 Screening is deliberately cheap: for each idea, answer three questions before writing a
 model —

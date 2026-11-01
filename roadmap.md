@@ -371,12 +371,33 @@ Every simulated order carries: `token_id, side, price, size, t_place, tif, cance
 2. `LIMIT_PASSIVE(price, size)` — queue ahead `Q` = resting size at that level at `t_place` (conservative: all of it). Fill when cumulative traded volume at or through `price` after `t_place` exceeds `Q × queue_share`. Fill size = `min(size, remaining_crossing_volume)`. `queue_share ∈ {0.0, 0.5, 1.0}` as a sensitivity knob.
 3. `LIMIT_AGGRESSIVE(price, size)` — treat as taker with a price cap; unfilled remainder rests as passive.
 
-**Exit modes** (simulate all four, report each)
+**Exit modes — a decision variable, not a reporting axis** (confirmed 2026-11-01)
 
-1. `HOLD_TO_RESOLUTION` — payoff = `final_price × size`. No slippage. Always available. Baseline.
+The system chooses exits; "hold to resolution" is one candidate action, not the default.
+For every entry the harness must produce the counterfactual PnL of *each* exit policy
+applied to the *same* entry, so a strategy can be expressed as `enter(token, t) ×
+exit_policy` and the policy can be selected or learned.
+
+1. `HOLD_TO_RESOLUTION` — payoff = `final_price × size`. No slippage. Always available. The
+   benchmark every other policy must beat, not a constraint.
 2. `TAKER_EXIT` — walk the book at exit time.
 3. `LIMIT_EXIT(price, timeout)` — passive fill rules; on timeout fall back to (1) or (2).
 4. `STOP(threshold)` — market exit when mid crosses; models gap risk and thin books.
+5. `EARLY_EXIT_ON_SIGNAL(p)` — exit when a point-in-time model's probability crosses the
+   quoted price by a margin. The only policy that can beat holding without needing to be
+   faster than the market, and the one most likely to work at small size.
+
+**Consequence that reshapes the roadmap.** Evaluating an exit policy honestly requires book
+state for the whole *holding period*, not just at entry. Full L2 exists only for
+2026-04-13 → 2026-08-10, so that is the only window in which exit choice can be measured
+rather than assumed. Before 2026-04 the tape supports *entry* analysis only, and every
+pre-2026 "strategy PnL" is really "entry quality holding to resolution".
+
+This promotes Phase 4 (book replayer) and Phase 5 (fill engine) from "the hard part" to the
+critical path, and makes the recorder (§8) the only way to extend the window in which the
+answer is observable. It also makes the size question cheaper: at $250 notional against a
+p10 ask depth of ~$1,500, an order is a small fraction of one price level, so the impact
+model carries far less weight than it would at $5,000.
 
 **Constraints that must be enforced**
 
@@ -723,7 +744,9 @@ Nothing in Phases 5–8 is meaningful until this is closed.
 - [ ] Validate on 2026-04 → 2026-05 holdout
 - [ ] Hand-check 100 simulated fills against the book by eye; document every disagreement
 - [ ] Produce the **fill error report**: predicted vs observed slippage by size decile and category
-- **Gate 5:** median abs error ≤ 15 bps, p90 ≤ 50 bps on the holdout; 100/100 hand-checks explained; engine deterministic under fixed seed
+- [ ] Produce the **exit-policy comparison**: for every entry in the holdout, PnL under all five exit modes on identical entries, with the reason for the best policy recorded
+- [ ] Prove exits are not free: report `LIMIT_EXIT` fill rates and timeout rates separately from `TAKER_EXIT`
+- **Gate 5:** median abs error ≤ 15 bps, p90 ≤ 50 bps on the holdout; 100/100 hand-checks explained; engine deterministic under fixed seed; **no exit policy may be reported without its counterfactual set**
 
 ### Phase 6 — Baselines and evaluation harness (4–6 days)
 
@@ -829,11 +852,11 @@ Every month of recording adds a month of honest out-of-sample window. This is th
 
 ## 10. Open questions
 
-1. **Confirm the sweep grid and total capital.** Size no longer needs to be chosen up front — it is swept (§3.1). Total capital still matters: it caps how much of the capacity curve is usable, independently of per-order size.
+1. ~~Confirm the sweep grid and total capital.~~ **Answered 2026-11-01: capital should be as small as possible so research and live testing start early.** Working assumption: **$2,000 bankroll, $250 max order** (8 concurrent position slots), recorded in `configs/windows.yaml` and cheap to change. Small capital is not a compromise here — it is an advantage: at $250 against a p10 ask depth of ~$1,500 the order is a fraction of one price level, so fills are tractable, exits are cheap, and the edge that matters is one that survives at small size rather than one that only exists in a backtest.
 2. **Holding horizon — confirm or override the default.** Determines whether fills are load-bearing (see §3.1). Long horizon keeps the free stack comfortable; minutes-long horizons shrink the defensible test window to 2026-04 → 2026-08.
 3. **Category focus?** Politics / sports / crypto up-down have radically different liquidity and fee structures.
 4. **Is 4 months (2026-06 → 2026-08) enough forward test?** It is ~120 days and thousands of markets, but one regime. If you want more, the recorder is the only free answer, and it takes calendar time.
-5. **Are you willing to accept "hold to resolution" as the primary exit?** If yes, the free-data plan is comfortable. If no, the only route is a much longer recording period — there is no free depth history to fall back on, and no paid option on the table.
+5. ~~Are you willing to accept "hold to resolution" as the primary exit?~~ **Answered 2026-11-01: no.** The system decides exits itself, so the fill engine is mandatory and Phase 4/5 are the critical path. Consequence: the only window where exit choice is *observable* is 2026-04-13 → 2026-08-10, so the recorder is no longer optional infrastructure — it is the only way to lengthen the answer.
 
 ---
 

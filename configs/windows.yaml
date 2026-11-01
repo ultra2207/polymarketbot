@@ -3,9 +3,24 @@
 # Nothing here is a "decision" yet — these are the axes the backtester must be
 # able to vary. Early phases run the default cell only.
 
+# Capital decision (2026-11-01): start small, start early. The bankroll caps how
+# much of any capacity curve is usable, and it is deliberately the smallest
+# viable number rather than the largest defensible one. At $250 against a p10
+# ask depth of ~$1,500 an order is a fraction of one price level, so fills and
+# exits are tractable without a heroic impact model.
+capital:
+  bankroll_usd: 2000
+  max_order_usd: 250
+  max_concurrent_positions: 8
+  max_position_usd: 250
+  # Hard stop, not a suggestion. Live code must read this, not a constant.
+  daily_loss_limit_usd: 200
+
 default_cell:
   notional_usd: 250
-  horizon: hold_to_resolution
+  # Exits are a decision, not a default: the harness reports every policy for
+  # the same entry and the strategy layer chooses. See roadmap §4.1.
+  exit_policy: compare_all
   queue: back
 
 notional_usd: [50, 100, 250, 500, 1000, 2500, 5000]
@@ -14,6 +29,15 @@ horizons:
   - hold_to_resolution
   - plus_1d
   - plus_7d
+
+# Every entry is evaluated under all of these on identical fills. None is a
+# default: `hold_to_resolution` is the benchmark the others must beat.
+exit_policies:
+  - hold_to_resolution
+  - taker_exit
+  - limit_exit
+  - stop
+  - early_exit_on_signal
 
 queue_fill_assumptions: [back, pro_rata, front]
 
@@ -28,6 +52,12 @@ splits:
   fill_calibration:
     start: 2025-10-14
     end: 2026-03-31
+
+  # The ONLY window where exit choice is observable rather than assumed:
+  # book state must exist for the whole holding period, not just at entry.
+  exit_policy_evaluation:
+    start: 2026-04-13
+    end: 2026-08-10
 
   # Full L2 depth available (PMXT v2).
   fill_validation:

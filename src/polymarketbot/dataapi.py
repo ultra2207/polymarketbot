@@ -222,6 +222,19 @@ class DataAPIClient:
         key, value = ("condition", condition) if condition else ("token_id", token_id)
         return self.get("/v2/tokens", {key: value}).get("data") or []
 
+    def token_references(self, token_ids: Iterable[str]) -> list[dict]:
+        """Batched `/v2/tokens`: up to 50 token ids per call, not paginated.
+
+        Unknown ids are omitted from the response, so a short result is normal
+        and must not be read as "unresolved". Returns rows carrying
+        `token_id`, `condition_id`, `outcome_index`, `resolved` and
+        `final_price` (the settled payout per share, or None).
+        """
+        ids = [str(t) for t in token_ids]
+        if not 1 <= len(ids) <= 50:
+            raise ValueError(f"token_id batch must be 1-50 ids, got {len(ids)}")
+        return self.get("/v2/tokens", {"token_id": ",".join(ids)}).get("data") or []
+
     def leaderboard(self, *, limit: int = 100, max_pages: int | None = None,
                     **extra: Any) -> list[dict]:
         params = list(extra.items())
