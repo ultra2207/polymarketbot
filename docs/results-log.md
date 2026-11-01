@@ -57,3 +57,36 @@ antisymmetric around 0.5 and cancelled to ~0 in the aggregate (crypto: −0.187 
 
 **Rule that follows:** an entry price must be a point-in-time price with resolution still
 ahead of it. Never average across a window that contains the terminal price.
+
+---
+
+## Track A framing — wallet cohort built, and what it already says (2026-11-01)
+
+**Source:** `/v2/leaderboard` (30 pages) + `/v2/biggest-winners` (5 pages) + one
+`/v2/user-stats` per wallet. **3000 wallets**, no null PnL, no duplicates.
+
+| Archetype | n | realized PnL | rebates | rebate share | median trades |
+|---|---|---|---|---|---|
+| directional | 2,331 | $62.8 M | $6.0 M | **9.5 %** | 338 |
+| maker | 564 | $26.4 M | $17.9 M | **67.7 %** | 1,772 |
+| combo | 82 | $4.2 M | $0.0 M | 0.2 % | 420 |
+| unknown | 23 | — | — | — | 2 |
+
+**What this changes.** The maker archetype is not primarily a trading strategy: **two
+thirds of its realised PnL is maker rebate**, not price movement. That is a fee-structure
+artefact available only to whoever the rebate schedule pays, and it is not replicable by a
+directional strategy at any size we could reach. Any "market making looks profitable, let's
+do that" inference from leaderboard data is therefore measuring the rebate schedule, not
+skill.
+
+Directional PnL — the only kind we could in principle replicate — is $62.8 M spread across
+2,331 wallets, i.e. a mean of ~$27 k each, while the top few carry most of it. The
+distribution matters more than the mean; it is the input to Track A.
+
+**Caveat that makes this unusable as a feature:** the boards rank by *today's* PnL, so the
+cohort is survivorship-biased and not point-in-time. It is a list of whom to study, never a
+score to put in a backtest.
+
+**Next:** decompose the directional cohort's PnL by market family and holding time, then
+ask which parts are reachable at our size. Combo wallets are the anomaly worth one look —
+one has rank 1222 with $2.36 M realized against $231 of market PnL.

@@ -53,6 +53,10 @@ PNL_FIELDS = [
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-wallets", type=int, default=200)
+    ap.add_argument("--leaderboard-pages", type=int, default=10,
+                    help="100 wallets per page; the board paginates to 3,000+")
+    ap.add_argument("--winners-pages", type=int, default=5,
+                    help="biggest_winners stops yielding after ~500 rows")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--max-seconds", type=float, default=600.0)
     args = ap.parse_args()
@@ -63,7 +67,7 @@ def main() -> int:
     print("fetching boards ...", flush=True)
     board: dict[str, dict] = {}
 
-    for row in client.leaderboard(limit=100, max_pages=3):
+    for row in client.leaderboard(limit=100, max_pages=args.leaderboard_pages):
         w = row.get("user_id")
         if not w:
             continue
@@ -76,7 +80,7 @@ def main() -> int:
         })
         board[w]["sources"].add("leaderboard")
 
-    for row in client.biggest_winners(limit=100, max_pages=2):
+    for row in client.biggest_winners(limit=100, max_pages=args.winners_pages):
         w = row.get("user_id")
         if not w:
             continue
