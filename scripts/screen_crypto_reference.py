@@ -53,10 +53,15 @@ def connect() -> duckdb.DuckDBPyConnection:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--entry-offset-hours", type=float, default=12.0,
+                    help="hours before end_date at which the reference price is read. "
+                         "The stored entry VWAP spans T-24..T-6 h, so the result must be "
+                         "stable across offsets or it is a timestamp artefact.")
     ap.add_argument("--dest", default=str(OUT))
     args = ap.parse_args()
 
     con = connect()
+    off = args.entry_offset_hours
     if not Path("data/raw/binance/klines").exists():
         print("no klines on disk - run scripts/fetch_binance_klines.py first")
         return 1
@@ -94,10 +99,10 @@ def main() -> int:
           AND m.slug LIKE '%-above-%' AND m.token1 IS NOT NULL AND m.payout_0 IS NOT NULL
     """)
 
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE TEMP TABLE base AS
         SELECT mk.*, r.vwap AS price,
-               epoch(mk.end_ts) - 43200 AS entry_s     -- 12 h before end
+               epoch(mk.end_ts) - CAST({off} * 3600 AS BIGINT) AS entry_s
         FROM mk
         JOIN read_parquet('data/processed/screen_calibration_rows.parquet') r
           ON r.token_id = mk.token_id

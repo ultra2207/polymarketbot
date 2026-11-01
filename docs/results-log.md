@@ -321,3 +321,50 @@ a 2 ¢ cost). So the correction was worth making explicit and does not need any 
 The warning was directionally correct and quantitatively negligible — exactly the kind of
 thing that should be measured rather than argued, because "our cost estimates overstate fees"
 sounds like it could rescue an idea, and here it cannot.
+
+---
+
+## C1 Crypto vs reference price — **directionally consistent, magnitude not stable** (2026-11-01)
+
+**Sample:** 4,850 crypto `above-` markets with a parsed strike, a stored entry VWAP and a
+Binance reference bar matched by ASOF join. 5.52 M kline-minutes on disk (BTC/ETH/SOL to
+2026-09).
+
+**The robustness test that decides this.** The stored entry price is a VWAP over
+T−24 h → T−6 h, while the reference price is read at one instant. Those are misaligned, so
+the reference was sampled at four offsets. A real effect should survive the choice; an
+artefact should not.
+
+| distance bucket | 6 h | 12 h | 18 h | 24 h |
+|---|---|---|---|---|
+| < −10 % | −0.0069 | −0.0064 | −0.0017 | −0.0053 |
+| −10…−2 % | −0.0464 | −0.0194 | −0.0146 | −0.0171 |
+| −2…0 % | **−0.0951** | **−0.0916** | −0.0536 | −0.0298 |
+| 0…2 % | −0.0123 | −0.0596 | −0.0586 | −0.0504 |
+| 2…10 % | +0.0343 | +0.0263 | +0.0077 | **−0.0012** |
+| > 10 % | +0.0058 | +0.0049 | +0.0055 | +0.0045 |
+
+**Verdict: partial.** Two things are true and one is not.
+
+- **The sign is stable.** Markets priced below the strike are overpriced, above the strike
+  underpriced, at every offset. That is the same tail effect A7 found, seen from a
+  different angle.
+- **The only magnitude that holds is tiny.** `> 10 %` shows +0.45 to +0.58 ¢ at every
+  offset (t = 3.0–13.6) — consistent, but only a quarter of a 2 ¢ round trip.
+- **The large numbers are not stable.** The −2…0 % bucket moves from −9.5 ¢ to −3.0 ¢ as the
+  offset changes, and `2…10 %` **changes sign**. An effect whose size halves when you move
+  the measurement clock is measuring your clock.
+
+**Why the misalignment matters, not just as noise:** the market price and the reference must
+be read at the *same instant* before either can be compared. The stored VWAP spans 18 hours;
+a 12-hour reference instant cannot be aligned to it. The next version must take the market
+price from the tape at exactly the reference instant rather than reuse the calibration VWAP.
+
+**This also explains part of A7.** A7's 168 h → 6 h drift is measured between two traded
+prices, so it is internally aligned and unaffected by this problem. C1's instability does not
+invalidate A7; it means C1 cannot yet confirm it.
+
+**One process note:** the first run matched only 1,869 markets and returned a `< −10 %` bucket
+priced at 0.507 — nonsense that still looked like a table. The cause was an ASOF join whose
+right side was unsorted, so every market matched the same bar (67,540). An ASOF join needs an
+explicitly ordered right side; DuckDB does not sort it for you.
