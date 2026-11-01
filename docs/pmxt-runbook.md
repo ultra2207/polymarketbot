@@ -68,6 +68,73 @@ Output: `data/processed/pmxt_reduced/dt=YYYY-MM-DD/hour=HH/books.parquet`, one r
 `--bucket-seconds 300` gives 3× the rows and 3× the compute. 900 s matches a decision cadence
 that makes sense at $250/order; raise it if disk is tight.
 
+## Decision: a contiguous block, not the full archive and not a sparse sample
+
+Two candidate plans were on the table. Both were solving the wrong constraint, so both
+are rejected — for different reasons.
+
+### Measurement first (2026-11-01)
+
+| Quantity | Measured |
+|---|---|
+| Free disk | **297 GB** |
+| Raw archive, full window | 1.06 TB (2,861 hours x 371 MB) |
+| Reduced output, 15-min cadence | **43 GB** |
+| Reduced output, 1-hour cadence | **13 GB** |
+| Reducer cost, 1-hour buckets | **43.6 s/hour** |
+| Reducer cost, 15-min buckets | **~150 s/hour** |
+| Download throughput | 15 MB/s |
+
+**Storage was never the blocker.** The full reduced archive fits with room to spare. The
+real costs are bandwidth (20 h for 1.06 TB) and compute (35 h at 1-hour cadence, ~110 h at
+15-minute cadence).
+
+### Why "download only what is needed" does not work
+
+A PMXT hour is 68,840,573 rows in **66 row groups of ~1.04 M rows** (5.65 bytes/row
+compressed). The file is ordered by time, so each row group spans roughly 52 seconds of
+the hour and contains **every asset active in that slice**. There is therefore no
+row-group pruning that isolates a market: any query for a specific token still reads
+essentially every row group. Filtering can only happen after the bytes arrive, so it saves
+storage — which we do not need — and saves no bandwidth at all.
+
+### Why sparse sampling does not work
+
+A sparse sample (2 hours per day) saves bandwidth but destroys **continuity**, and
+continuity is the one thing the exit-policy comparison requires: the book must exist for
+the whole holding period, not at isolated points. A gap in the middle of a position makes
+the exit unfalsifiable.
+
+### The decision
+
+**Reduce a contiguous block inside the calibration window, then extend only if the method
+earns it.**
+
+| Phase | Window | Hours | Download | Compute @ 15-min | Stored | Gate |
+|---|---|---|---|---|---|---|
+| **1** | 2026-04-20 → 04-27 | 168 | 63 GB | ~7 h | ~2.5 GB | build replayer + exit comparison |
+| 2 | extend to 05-31 | 1,158 | 430 GB | ~48 h | ~17 GB | only if phase 1 produces a signal |
+| 3 | 2026-06-01 → 08-10 | 1,703 | 630 GB | ~71 h | ~26 GB | **only after Gate 7**, forward test stays untouched |
+
+Three reasons this is the right shape:
+
+1. **A 7-day block contains complete market lives.** The median market lifetime is 24 h
+   (crypto 24.1 h, sports 24.8 h, weather 49 h), so a week holds the entire life of the
+   large majority of markets. That is what makes exit evaluation possible without the full
+   archive.
+2. **It stays inside the calibration window.** Developing on 2026-04-13 → 05-31 is exactly
+   what that window is for. Using the forward test for development would make the eventual
+   forward test meaningless.
+3. **Each phase is independently useful and independently abandonable.** Phase 1 answers
+   "does the replayer work and does any exit beat holding". If the answer is no, we stop
+   after 63 GB instead of 1.06 TB.
+
+### Disk safety
+
+The pipeline streams: download one hour → reduce → delete the raw file. Peak raw usage is
+therefore one hour (~400 MB), not 63 GB. That is why the block size can be large while
+disk stays comfortable.
+
 ## Why the reducer exists at all
 
 Three properties of the raw data, each verified against a real hour (`2026-06-01T00`), that
