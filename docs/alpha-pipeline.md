@@ -243,3 +243,65 @@ The **Taker Rebate Program** returns part of taker fees by tier
 conclusion in `docs/results-log.md` used the **gross** taker fee and therefore overstates
 cost. At $2,000 the tier is low so the effect is small — but over-stating cost hides real
 edges, which is the wrong error to leave in.
+
+---
+
+## What is NOT blocked on the PMXT book (2026-11-01)
+
+The book gates only the ideas that need reconstructed order-book state. Everything below
+runs on data already held, or on a free endpoint already probed. Grouped by the resource
+each needs, because that is what decides whether two of them can run at once.
+
+### A. Tape + labels only - no download, no key
+
+| ID | Idea | Status |
+|---|---|---|
+| A1 | Executable-entry (VWAP version) | **run: dead after costs** |
+| A1b | Executable-entry at the **ask** | blocked - needs book |
+| A2 | Neg-risk coherence with conversion bounds | runnable |
+| A3 | Ladder monotonicity | runnable |
+| A4 | Scalar / range-market anchoring | runnable |
+| A5 | Lifecycle-stage inefficiency | runnable (screen rows on disk) |
+| A7 | Term-structure drift | runnable |
+| E1 | Complete-set arbitrage | **run: candidates, no persistence** |
+| C2 | Base-rate models (free half) | **run: market price wins** |
+| E7 | Mechanism transplantation at address level | runnable (tape `maker`/`taker`) |
+
+### B. One free fetch - no PMXT, no key
+
+| ID | Idea | Source | Probed |
+|---|---|---|---|
+| C1 | Crypto up/down vs reference | `api.binance.com/api/v3/klines` | 200 |
+| C2f | Weather forecasts | Open-Meteo, api.weather.gov | 200 |
+| C4 | Cross-venue vs Kalshi | `api.elections.kalshi.com` | 200 |
+| C5 | News latency | GDELT | 429, 1 req / 5 s |
+| E6 | Perps funding carry | `fapi.binance.com/fapi/v1/fundingRate` | 200 |
+| C3 | Wallet identity map | `polygon.drpc.org` logs (10 k-block chunks) | 200 |
+
+### C. Forward-only monitors - start now or the history never exists
+
+These are about *where to be now*, so missing history is not a blocker, but every day not
+snapshotted is a day that can never be recovered. Highest time-priority of anything here.
+
+| ID | Idea | What to capture |
+|---|---|---|
+| E2 | Fee-holiday windows | daily Gamma `feesEnabled` / `feeType` per market |
+| D1 | Liquidity-reward farming | daily Gamma `clobRewards` (`rewardsMinSize`, `rewardsMaxSpread`, `rewardsDailyRate`) |
+| E5 | Reward rotation | same snapshot, plus qualifying size |
+| E3 | Venue restriction states | live matching-engine / cancel-only / post-only polling |
+
+### D. Actually blocked on the book
+
+`A1b`, `B1` exit comparison, `B2` stale-quote pickoff, `B3` imbalance, `B4` depth-aware
+scheduling, `D2` cancel-pressure residual, `E4` taker-delay asymmetry, and confirmation of
+`E1`. All of these need reconstructed ladder state, which is what the PMXT block provides.
+
+### Order taken
+
+1. `C2` base rates - cheapest, done, dead.
+2. `E1` complete-set - arithmetic, done, no persistence.
+3. `A2` neg-risk coherence - arithmetic, next.
+4. `E2` + `D1` daily snapshots - start immediately, time-sensitive.
+5. `A5` / `A7` / `A3` / `A4` - the remaining tape screens.
+6. `C1` / `C4` / `E6` - one fetch each.
+7. `C3` / `E7` - the expensive Track A path.
