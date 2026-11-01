@@ -100,3 +100,18 @@ entry?"** — because they are not winning more bets, they are buying the same b
 
 Not yet explained: 23 % of top-decile flow is `sell_only` (minting and selling one leg).
 That is market making rather than EV trading, and both behaviours live in the same wallets.
+
+## Correction and refinement (2026-11-02, after the disposition test)
+
+The entry/exit split reported earlier is payout-dependent and was withdrawn — see
+`docs/results-log.md`. The load-bearing facts are now:
+
+- Top decile: +$192 m captured on round trips, −$141 m on positions never closed.
+- Exits are taken in profit 56.2 % of the time vs 47.8 % if held (+8.4 pp) — a real but
+  modest tilt toward closing winners, not a clean disposition effect.
+- The loss sits in **50.5 M never-sold positions averaging −$2.94 at a 50.0 % win rate**,
+  not in a few large losing holds.
+
+So the operator's mechanism is half-supported: they do take profit early, but the money is
+lost in a long tail that is never dealt with at all, rather than in big positions they
+refuse to cut.

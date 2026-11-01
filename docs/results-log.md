@@ -746,3 +746,64 @@ in the same wallets.
 **Caveat on the measure.** The closed fraction is bimodal, not uniform: 18 % of mixed
 shares sit in positions that are 0–10 % closed and 33 % in positions that are 90–100 %
 closed. A single mean hides two different behaviours inside the top decile.
+
+---
+
+## Disposition effect? Within-position test (2026-04 → 10)
+
+**Question.** The top decile earns +$192 m closing positions and loses −$141 m on what it
+carries. Is that "take profits early, wait on losers" (disposition), or fair-value timing?
+
+**Within-position test.** For the 9,322,452 partially-exited net-long positions of the top
+decile, split the booked PnL of the sold shares from the PnL of the shares left open:
+
+| sold / held | positions | closed PnL | held PnL |
+|---|---|---|---|
+| sold win, held loss | 2,628,559 | +$71.24 m | −$413.64 m |
+| sold win, held win | 2,606,525 | +$112.64 m | +$497.77 m |
+| sold loss, held loss | 2,233,678 | −$71.79 m | −$405.46 m |
+| sold loss, held win | 1,853,690 | −$61.39 m | +$322.63 m |
+
+**Result: a modest tilt, not a disposition effect.** Exits are taken in profit 56.2 % of the
+time against 47.8 % if the same positions had been held — **+8.4 pp**. But 43.8 % of exits
+are taken at a loss, and 20 % of positions are "sold at a loss while holding a winner",
+which a pure disposition account cannot produce. Held parts net to +$1.3 m across these
+positions while sold parts earn +$50.7 m.
+
+**Where the loss actually is.** Separate from partially-exited positions, the top decile has
+**50,522,914 positions it never sells at all**, holding them to resolution:
+
+| | positions | profitable | total PnL |
+|---|---|---|---|
+| never sold | 50,522,914 | **50.0 %** | **−$148.72 m** |
+
+The −$141 m settlement loss is therefore not concentrated in a handful of conviction bets
+gone wrong. It is spread over 50.5 M positions averaging **−$2.94 each at a coin-flip win
+rate**. That is consistent with dust — positions too small to close — but the notional
+distribution of the never-sold set has not yet been measured, so "dust" remains an
+inference, not a finding.
+
+---
+
+## Correction: the entry/exit edge split was not meaningful
+
+An earlier result reported that 87 % of the top decile's edge was "entry edge". That
+decomposition is arithmetically exact but economically empty:
+
+```
+entry_edge = buys  * (payout - buy_vwap)
+exit_edge  = sells * (sell_vwap - payout)
+entry + exit = spread          (for a fully round-tripped position)
+```
+
+The *sum* is payout-independent, but the *split* moves with the payout. A token resolving
+YES makes any bought-and-sold position look like entry edge and negative exit edge. The
+87 % figure therefore measured where the outcomes landed, not where the skill was.
+
+The valid decomposition, which never touches payout, is the one used above:
+
+    realised  = matched * (sell_vwap - buy_vwap)     spread actually captured
+    settled   = residual * (payout - buy_vwap)       what the unclosed part earned
+
+Testing entry skill requires the fair value **at the moment of entry** — the mid then, not
+the payout later. That needs the order book, which is the next data dependency.
