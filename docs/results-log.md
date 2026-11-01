@@ -234,3 +234,43 @@ apparent cases were refunds. There is no population to model calibration against
 Worth recording because the shape of the error is common: the first query — count of
 non-{0,1} payouts — returned 13,130 and looked like a real population. Only splitting by
 *value* separated refunds from scalars. A count is not a sample.
+
+---
+
+## A7 Term-structure drift — **CANDIDATE: far-side prices are too extreme** (2026-11-01)
+
+**Window:** 2026-01-01 → 2026-10-01. **Sample:** 2,117 resolved tokens that printed at all
+four leads (168, 72, 24, 6 h before `end_date`).
+
+| p168 bucket | n | 168→72 | 72→24 | 24→6 | **168→6** | ±se | t | payout |
+|---|---|---|---|---|---|---|---|---|
+| 0.00–0.10 | 414 | +0.0423 | +0.0217 | +0.0115 | **+0.0756** | 0.0101 | **+7.5** | 0.126 |
+| 0.10–0.25 | 407 | +0.0304 | +0.0305 | +0.0071 | **+0.0680** | 0.0137 | **+5.0** | 0.214 |
+| 0.25–0.50 | 413 | −0.0030 | −0.0061 | +0.0123 | +0.0032 | 0.0124 | +0.3 | 0.349 |
+| 0.50–0.75 | 357 | −0.0144 | −0.0010 | +0.0017 | −0.0137 | 0.0136 | −1.0 | 0.622 |
+| 0.75–0.90 | 259 | −0.0377 | −0.0263 | −0.0021 | **−0.0660** | 0.0171 | **−3.9** | 0.745 |
+| 0.90–1.00 | 267 | −0.0535 | −0.0419 | −0.0175 | **−0.1129** | 0.0146 | **−7.7** | 0.831 |
+
+**Reading:** at 168 h the prices are systematically too extreme in both tails and converge
+toward the realised payout. A favourite quoted 0.95 with a 0.83 payout rate drifts down
+11 ¢; a longshot quoted 0.05 with a 0.13 rate drifts up 7.6 ¢. The middle of the book
+(0.25–0.75) shows no drift at all, which is what a genuine tail effect should look like.
+
+**Against the 2 ¢ cost** (two crossings, in and out), four of six buckets clear with
+|t| > 3. That is the first thing in this project to survive a cost test.
+
+**Why this is not yet a conclusion — three specific reasons:**
+
+1. **Selection.** Only **2,117 of 1.75 M** resolved tokens printed at all four leads. Those
+   are long-lived, heavily traded markets, not a random sample. The tails are exactly where
+   thin markets live, and they are under-represented.
+2. **It contradicts A1**, which found the level dead after costs. Both cannot be right in
+   the same market. The difference is horizon and the entry/exit method, and that difference
+   is the thing to test.
+3. **Traded prices, not quotes.** This measures the drift in last-traded prices. Capturing it
+   means buying at the *ask* at 168 h and selling at the *bid* at 6 h, which is wider than
+   the drift measured here.
+
+**Next test (needs the book):** buy at `best_ask` at 168 h, sell at `best_bid` at 6 h, and
+require the drift to survive both crossings plus fees, on every market rather than the
+self-selected four-lead subset.
