@@ -368,3 +368,39 @@ invalidate A7; it means C1 cannot yet confirm it.
 priced at 0.507 — nonsense that still looked like a table. The cause was an ASOF join whose
 right side was unsorted, so every market matched the same bar (67,540). An ASOF join needs an
 explicitly ordered right side; DuckDB does not sort it for you.
+
+---
+
+## C1 aligned — **the mispricing was a clock artefact** (2026-11-01)
+
+**Fix under test:** read the market price and the reference price at the *same instant* —
+the last taker print at or before the lead, and the kline at that exact trade's timestamp.
+The earlier version compared an 18-hour VWAP against a single-instant reference.
+
+| window | n | −2…0 % gap | 2…10 % gap | > 10 % gap |
+|---|---|---|---|---|
+| 30 min | 240 | −0.0207 (t = −0.3) | −0.0131 (t = −0.6) | +0.0100 (t = 4.4) |
+| 120 min | 362 | −0.0431 (t = −0.7) | +0.0025 (t = 0.2) | +0.0090 (t = 6.7) |
+| 480 min | 511 | −0.0984 (t = −1.9) | −0.0054 (t = −0.4) | +0.0075 (t = 16.0) |
+
+**Verdict: no tradable mispricing once the clocks agree.** Every middle bucket is
+statistically indistinguishable from zero. The earlier version reported **−9.2 ¢ (t = −5.2)**
+in the −2…0 % bucket and +2.6 ¢ in 2…10 %; both vanish under alignment.
+
+The only survivor is the `> 10 %` bucket at **+0.75 to +0.90 ¢** (t = 6.7–16.0) — highly
+significant and far too small: a quarter of the ~2 ¢ round trip, on markets where the asset
+is already past the strike.
+
+**What this means for A7.** A7's tail drift stays the only candidate, and this does *not*
+corroborate it. That is the useful part: the two measurements disagreed, and the aligned one
+won because its method was right. A7's defence is different — its drifts are measured between
+two traded prices, so it is internally aligned and immune to this specific error. It still
+needs the book test.
+
+**Sample caveat:** 240–511 markets, because thin daily crypto markets rarely print near a
+fixed lead. That is why the window was widened, and why the vote is decided by the *pattern
+across windows* (stable near zero) rather than by any one row.
+
+**The general lesson, now demonstrated twice today:** an effect whose magnitude changes when
+you move the measurement clock is measuring your clock. Both the ASOF row-matching bug and
+this one produced full, plausible-looking tables.
