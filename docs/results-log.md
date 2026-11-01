@@ -441,3 +441,53 @@ depth once the book lands.
 **Note on scale:** the earlier estimate in `alpha-pipeline.md` was $23,993/day over 400
 markets (27 %). The true figure across 40,000 open markets is **$92,634/day over 8,000** —
 larger in absolute terms, and a lower share of markets (20 %).
+
+---
+
+## E7 Wallet behaviour from the tape — the top of the volume distribution is automated
+
+**Window:** 2026-04-01 → 2026-10-01. **Sample:** 238,240 wallets with ≥ 200 fills,
+covering **$37.2 B** of taker-plus-maker volume.
+
+| Role mix | wallets | volume | median fill | median markets (busiest month) |
+|---|---|---|---|---|
+| **maker** | 26,486 | $15.4 B | **$13** | 620 |
+| **taker** | 166,074 | $13.3 B | **$19** | 308 |
+| mixed | 45,680 | $8.5 B | $17 | 312 |
+
+Top 12 wallets by volume: **2,468 to 60,616 markets per month**, median fill **$5–40**,
+median time between fills **3–19 seconds**.
+
+**What this says.** The highest-volume participants are broad, automated, small-clip
+makers. They are not large directional traders; they are quoting robots spread across
+thousands of markets with sub-20-second replacement times. Across the entire dataset only
+**18 wallets** have a median fill ≥ $1,000, and they account for $360 M — 1 % of volume.
+
+**Three consequences for the plan:**
+
+1. **Size dependence is less binding than assumed.** A $250 clip is *larger* than the
+   median fill of the top-volume wallets. Section 3.1 of the roadmap treats our size as
+   the constraint; at $250 we are not the small participant, we are the large one in most
+   of these books. That changes which mechanisms are open to us — and means impact, not
+   anonymity, is the thing to measure.
+2. **Directional large-clip participation is rare.** The replicable population is mostly
+   not doing what the plan's Track A hoped to copy. Copying is even less promising than
+   the thesis said, for a second and independent reason.
+3. **Maker share is 41 % of all volume** ($15.4 B), consistent with the cohort finding that
+   maker wallets draw 67.7 % of PnL from rebates. Two independent datasets now point at the
+   same structural fact.
+
+**Two columns were wrong and are fixed, recorded because both looked plausible:**
+
+- `markets` was originally `approx_count_distinct` of the per-month market *counts*. A
+  wallet with monthly counts 3,4,5,4,3 came out as "3 distinct values", which is why every
+  wallet read ~5 markets. It is now `max()`, a lower bound: distinct markets in its busiest
+  month.
+- `rhythm` classified **all 238,240 wallets** as "bursty". The classifier is not wrong, it
+  is useless: median gap 22 s with variance above threshold. A constant column is worse
+  than no column and should be dropped rather than shipped.
+
+**Caveat that limits conclusion 1:** `usd_amount` is per **fill**, and makers are filled in
+many small pieces. A wallet pushing $50 k through a market may show 1,000 fills of $50. So
+this measures fill size — the right quantity for impact — not order size, which is not the
+right quantity for capital.
