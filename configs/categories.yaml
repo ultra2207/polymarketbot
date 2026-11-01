@@ -1,0 +1,89 @@
+# Category derivation rules.
+#
+# Why rules and not the API: SII `markets.parquet` has no tag column, Gamma's
+# `category` field is null for most markets, and keyset pagination caps at 100
+# rows/page (a 4 M-market crawl is ~40 k requests). Gamma tags are therefore
+# treated as an *enrichment* for a defined universe, not the primary source.
+#
+# Rules are evaluated in order against `event_slug`, falling back to `slug`.
+# First match wins, so specific families must precede generic ones.
+#
+# Keep this file the single source of truth: the Phase 2 universe and every
+# downstream segment analysis read `category` from here.
+
+version: 1
+
+# Applied to the combined "event_slug slug" string, lowercased.
+rules:
+  - category: sports
+    why: >
+      League matchups are encoded as <league>-<home>-<away>-<date>. This also
+      catches the long tail of three-letter league codes (sea, arg, col, lal).
+    patterns:
+      - '^[a-z0-9]{2,8}-[a-z0-9]{2,5}-[a-z0-9]{2,5}-20\d{2}-\d{2}-\d{2}'
+      - '-(spread|handicap|moneyline|exact-score|halftime|player-props|run-line|puck-line|over-under|first-set|game\d|total-corners|total-cards|both-teams-to-score)\b'
+      - '\b(nba|wnba|nfl|nhl|mlb|ncaa|cbb|cfb|atp|wta|itf|ufc|f1|nascar|pga|epl|ucl|uel|fifwc|mls|cs2|lol|dota2|valorant|val-|cpl|kbo|npb|jleague|bundesliga|serie-a|la-liga|ligue-1)\b'
+      - '\b(world-cup|fifa|wimbledon|french-open|us-open|australian-open|super-bowl|world-series|stanley-cup|ronaldo|messi)\b'
+      - '\b(crict20|ipl|cricket|ewc|esports|chess|grand-chess|valorant|overwatch|rocket-league|halftime|la-liga|laliga|serie-a|seriea|bundesliga|ligue-1|ligue1|eredivisie|primeira-liga)\b'
+      - '\b(sports?|tennis|football|soccer|basketball|baseball|hockey|golf|boxing|motorsport)\b'
+
+  - category: crypto
+    why: Up/down and price-target markets encode the asset in the slug.
+    patterns:
+      - '\b(btc|eth|sol|xrp|bnb|doge|ada|avax|link|ltc|shib|pepe|hype|bitcoin|ethereum|solana|dogecoin|cardano|polkadot)\b'
+      - '\b(updown|crypto|altcoin|stablecoin|market-cap|all-time-high|ath|halving|airdrop)\b'
+      - 'price-of|what-price-will|hit-\$|reach-\$|dip-to|rise-to'
+  - category: weather
+    patterns:
+      - '\b(temperature|weather|rain|snow|hurricane|tornado|heat-record|cold-record|hottest|coldest|climate)\b'
+
+  - category: geopolitics
+    patterns:
+      - '\b(israel|israeli|gaza|hamas|hezbollah|iran|iranian|ukraine|ukrainian|russia|russian|putin|zelensk\w*|taiwan|nato|venezuela|syria|north-korea|saudi|pakistan|lebanon|yemen|red-sea)\b'
+      - '\b(china|chinese|xi-jinping)\b'
+      - '\b(geopolitics|world-affairs|foreign-policy)\b'
+
+  - category: finance
+    why: >
+      Finance and Economics carry different fee rates (0.04 vs 0.05), so tickers,
+      indices and commodity levels must be separated from macro releases.
+    patterns:
+      - '\b(amzn|msft|googl|aapl|nvda|tsla|spy|qqq|mstr|ndx|spx|nikkei|hang-seng|ftse|dax|s-p-500|sp500|nasdaq|dow-jones)\b'
+      - '\b(close-price|official-close|stock-market|earnings|ipo|bond-yield|treasury-yield)\b'
+      - '\b(oil|gold|silver|copper)\s+(price|above|below|hit)'
+
+  - category: economics
+    patterns:
+      - '\b(fed|fomc|rate-cut|rate-hike|interest-rate|cpi|inflation|gdp|recession|unemployment|jobs-report|nonfarm|payrolls|treasury|yield|opec|tariff|tariffs)\b'
+      - '\b(economy|economics|business)\b'
+
+  - category: tech
+    patterns:
+      - '\b(openai|chatgpt|gpt-?\d|apple|alphabet|google|tesla|spacex|starship|nvidia|microsoft|meta-|iphone|android|quantum|humanoid|robotaxi|artificial-intelligence|llm)\b'
+      - '\b(elon-musk|gta|gemini|grok|xai|starlink)\b'
+      - '\b(tech|technology|science-and-tech|semiconductors?)\b'
+      - '\b(ai)\s+(model|company|regulation|bill|safety)'
+
+  - category: politics
+    patterns:
+      - '\b(trump|biden|harris|vance|newsom|desantis|obama|clinton|pelosi|aoc|omar|senate|congress|president|presidential|election|primary|democrat|republican|governor|mayor|supreme-court|impeach|cabinet|electoral|approval-rating|shutdown|filibuster|gerrymander)\b'
+      - '\b(presidency|party-wins|coalition|parliament|referendum|popular-vote)\b'
+      - '\b(prime-minister|next-leader|next-president|next-ceo|chancellor|pope|impeachment|no-confidence)\b'
+      - '\b(politics|political|elections?|government)\b'
+
+  - category: culture
+    patterns:
+      - '\b(oscar|grammy|emmy|tony-award|box-office|movie|film|album|billboard|netflix|spotify|eurovision|nobel|person-of-the-year|celebrity|taylor-swift|drake|kardashian|episode-of|season-\d|bachelor|survivor|broadway)\b'
+      - '\b(culture|entertainment|pop-culture|music|movies|celebrities)\b'
+
+  - category: health
+    patterns:
+      - '\b(covid|vaccine|fda|who-|pandemic|bird-flu|measles|drug-approval|clinical-trial|obesity-drug|ozempic)\b'
+      - '\b(health|medicine|science|biotech)\b'
+
+  - category: other
+    patterns:
+      - '.*'
+
+# Values above are deliberately coarse. `other` is a measured quantity, not a
+# dumping ground: build_categories.py reports its share by count and volume.

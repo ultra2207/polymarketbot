@@ -1,0 +1,82 @@
+# Sweep grid and evaluation splits.
+#
+# Nothing here is a "decision" yet — these are the axes the backtester must be
+# able to vary. Early phases run the default cell only.
+
+default_cell:
+  notional_usd: 250
+  horizon: hold_to_resolution
+  queue: back
+
+notional_usd: [50, 100, 250, 500, 1000, 2500, 5000]
+
+horizons:
+  - hold_to_resolution
+  - plus_1d
+  - plus_7d
+
+queue_fill_assumptions: [back, pro_rata, front]
+
+# Windows are inclusive-start, exclusive-end (UTC).
+splits:
+  # 2023 is 0.1% of lifetime volume: a data artefact, not a period.
+  model_dev:
+    start: 2024-01-01
+    end: 2026-03-31
+
+  # Top-10 snapshot depth available (Dome / genesis-liquidity).
+  fill_calibration:
+    start: 2025-10-14
+    end: 2026-03-31
+
+  # Full L2 depth available (PMXT v2).
+  fill_validation:
+    start: 2026-04-13
+    end: 2026-05-31
+
+  # Untouched until the go/no-go. Do not peek.
+  forward_test:
+    start: 2026-06-01
+    end: 2026-08-10
+
+  # Tape only, no depth: robustness, not a headline result.
+  robustness:
+    start: 2026-08-11
+    end: 2026-10-04
+
+data_windows:
+  tape:
+    start: 2022-11-21
+    end: 2026-10-04
+  dome_depth:
+    start: 2025-10-14
+    end: 2026-03-31
+  pmxt_v2_depth:
+    start: 2026-04-13T19
+    end: 2026-08-10T23
+  # PMXT v1 is quarantined: ~50% market coverage gaps.
+  pmxt_v1_quarantined:
+    start: 2026-02-23
+    end: 2026-04-16
+
+# Protocol cutover. V2 is 41% of all fills, so this cannot be a footnote.
+protocol:
+  v1:
+    ctf_exchange: "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
+    neg_risk_exchange: "0xc5d563a36ae78145c45a50134d48a1215220f80a"
+    collateral: "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+    collateral_symbol: USDC
+  v2:
+    ctf_exchange: "0xe111180000d2663c0091e4f400237545b87b996b"
+    neg_risk_exchange: "0xe2222d279d744050d28e00520010520000310f59"
+    collateral: pUSD
+    activation: 2026-04-28
+
+# Universe rules. Documented here so Phase 2 has exactly one definition.
+universe:
+  exclude_zero_volume: true
+  min_lifetime_seconds: 3600
+  # Void resolution: pay out at the on-chain payout (0.5 per share for a
+  # standard void), never as a win or a loss.
+  void_settlement: payout
+  min_volume_usd: 0

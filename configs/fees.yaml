@@ -1,0 +1,152 @@
+# Fee schedule.
+#
+# Formula (docs.polymarket.com/trading/fees, verified 2026-11-01):
+#
+#     fee = C x rate x (p x (1 - p)) ^ exponent
+#
+# C = shares, p = price. Makers pay nothing. Fees round to 5 decimal places;
+# anything smaller rounds to zero.
+#
+# IMPORTANT: the authoritative per-market source is Gamma's `feeSchedule`
+# object (rate, exponent, takerOnly, rebateRate), alongside `feeType`
+# (`sports_fees_v2` vs `sports_fees_v3`, `crypto_fees_v2`, ...). The era table
+# below is a fallback for markets whose schedule has not been fetched.
+#
+# History, from docs.polymarket.com/changelog:
+#   2026-01-05  taker fees enabled on 15-minute crypto markets, peak 1.56% at p=0.5
+#   2026-02-12  5-minute crypto markets launched with the same curve
+#   2026-02-18  sports fees on NCAAB and Serie A only (per-league, not modelled here)
+#   2026-03-06  crypto fees extend to all crypto markets (new markets only)
+#   2026-03-30  Fee Structure V2: per-category rates; geopolitics stays fee-free
+#   2026-03-31  fees must be read from the market's `feeSchedule`
+#   2026-04-28  V2 cutover: fees set at match time, `feeRateBps` removed from orders
+#   2026-07-10  sports rate 0.03 -> 0.05; sports maker rebate 0.25 -> 0.15
+
+formula:
+  rounding_dp: 5
+  min_fee: 0.00001
+  maker_fee: 0.0
+
+# Ordered; the last era whose `effective_from` is <= the trade time wins.
+eras:
+  - name: fee_free
+    effective_from: 2020-01-01
+    rates: {}          # every category 0.0
+    rebates: {}
+
+  - name: crypto_pilot
+    effective_from: 2026-01-05
+    note: >
+      Crypto only, 15m then 5m markets. Gamma shows rate 0.25 with exponent 2
+      for `crypto_fees` / `crypto_15_min`, which gives 0.25 * (p(1-p))^2, i.e.
+      0.015625 per share at p=0.5 = the documented "peak 1.56%". The exponent is
+      part of the schedule; rate alone is not enough to reproduce the curve.
+    rates:
+      crypto: 0.25
+    exponents:
+      crypto: 2.0
+    rebates:
+      crypto: 0.20
+
+  - name: fee_structure_v2
+    effective_from: 2026-03-30
+    rates:
+      crypto: 0.07
+      sports: 0.03
+      finance: 0.04
+      politics: 0.04
+      economics: 0.05
+      culture: 0.05
+      weather: 0.05
+      tech: 0.04
+      mentions: 0.04
+      geopolitics: 0.0
+      combos: 0.05
+      other: 0.05
+    rebates:
+      crypto: 0.20
+      sports: 0.25
+      finance: 0.25
+      politics: 0.25
+      economics: 0.25
+      culture: 0.25
+      weather: 0.25
+      tech: 0.25
+      mentions: 0.25
+      geopolitics: 0.0
+      combos: 0.0
+      other: 0.25
+
+  - name: post_2026_07_10
+    effective_from: 2026-07-10
+    rates:
+      crypto: 0.07
+      sports: 0.05
+      finance: 0.04
+      politics: 0.04
+      economics: 0.05
+      culture: 0.05
+      weather: 0.05
+      tech: 0.04
+      mentions: 0.04
+      geopolitics: 0.0
+      combos: 0.05
+      other: 0.05
+    rebates:
+      crypto: 0.20
+      sports: 0.15
+      finance: 0.25
+      politics: 0.25
+      economics: 0.25
+      culture: 0.25
+      weather: 0.25
+      tech: 0.25
+      mentions: 0.25
+      geopolitics: 0.0
+      combos: 0.0
+      other: 0.25
+
+# Maps our coarse market category to a fee category.
+category_map:
+  sports: sports
+  crypto: crypto
+  finance: finance
+  politics: politics
+  economics: economics
+  culture: culture
+  weather: weather
+  tech: tech
+  geopolitics: geopolitics
+  mentions: mentions
+  health: other      # no health row in the fee table -> Other/General
+  other: other
+
+# Observed per-market schedules, keyed by Gamma `feeType`.
+#
+# Measured 2026-11-01 across 1,937,137 markets: these 16 types cover the entire
+# scheduled universe, and each type has exactly one (rate, exponent, rebate)
+# triple. Reproduce with `uv run scripts/validate_fee_model.py`.
+#
+# `rate` is the type's *current* value. Gamma reports only the present
+# schedule, so a market created in 2025-06 carries today's rate — that is why
+# this table is a contract for the era table, not a substitute for it. Point-in-
+# time fees come from `eras`; this block is what `eras` must agree with at the
+# end of history, and it is the only way to know a market is fee-free by design
+# (`zero_fees`).
+fee_types:
+  zero_fees:                  {rate: 0.0,    exponent: 1.0, rebate: 0.0,   effective_from: 2025-09-17}
+  crypto_15_min:              {rate: 0.25,   exponent: 2.0, rebate: 0.20,  effective_from: 2026-01-05}
+  crypto_fees:                {rate: 0.25,   exponent: 2.0, rebate: 0.20,  effective_from: 2026-01-05}
+  crypto_fees_v2:             {rate: 0.07,   exponent: 1.0, rebate: 0.20,  effective_from: 2026-01-05}
+  sports_fees:                {rate: 0.0175, exponent: 1.0, rebate: 0.25,  effective_from: 2026-02-18}
+  sports_fees_v2:             {rate: 0.03,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-02-18}
+  sports_fees_v3:             {rate: 0.05,   exponent: 1.0, rebate: 0.15,  effective_from: 2026-07-10}
+  sports_fees_nfl_cfb_oct26:  {rate: 0.03,   exponent: 1.0, rebate: 0.15,  effective_from: 2026-08-21}
+  weather_fees:               {rate: 0.05,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  politics_fees:              {rate: 0.04,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  culture_fees:               {rate: 0.05,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  finance_prices_fees:        {rate: 0.04,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  tech_fees:                  {rate: 0.04,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  economics_fees:             {rate: 0.05,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  mentions_fees:              {rate: 0.04,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+  general_fees:               {rate: 0.05,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
