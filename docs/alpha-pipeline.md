@@ -127,16 +127,78 @@ Needs an event feed with timestamps (GDELT/RSS). Measured lag must exceed cost.
 
 ---
 
-## Parked, and why
+## Corrected: these were parked for the wrong reason
+
+The first draft of this list parked four ideas on *data unavailability*. That conflated
+"the raw variable is unobtainable" with "the economics are unmeasurable". Three of the
+four have a measurable route.
+
+### D1. Liquidity rewards — promoted from parked to Tier 0 (forward-only)
+
+**What was wrong:** I parked market making because queue position is unobtainable. That
+is true and it blocks **fill-dependent** maker PnL. But Polymarket pays makers on a
+different basis, and that basis is observable.
+
+* **Liquidity Rewards** pay daily at 00:00 UTC to makers whose resting orders meet each
+  market's `rewardsMinSize` and sit inside its `rewardsMaxSpread`. Eligibility is a
+  function of *quoting*, not of being filled. Share of the pool depends on qualifying
+  liquidity, which the aggregate book already reports. So the expected reward is
+  estimable from data we hold; queue position is irrelevant to accrual.
+* **Maker Rebates** pay a share of collected taker fees on liquidity that actually got
+  taken. This one is fill-dependent and therefore inherits the queue-position limit —
+  but it is the smaller, optional second leg.
+
+**Measured 2026-11-01** (400 open markets, Gamma): 27 % carry an active `clobRewards`
+pool, summing **$23,993/day**, mean **$224/day** per incentivized market.
+
+**Data gap:** our Gamma capture never collected `clobRewards`, `rewardsDailyRate`,
+`rewardsMinSize`, `rewardsMaxSpread`, `holdingRewardsEnabled` — all present in the
+schema. Adding them is cheap. Only **forward** history is recoverable, which is fine:
+this is a strategy about where to quote *now*, not a backtest of the past.
+
+**First test:** for the markets we can quote, compute (our size / total qualifying size)
+× `rewardsDailyRate`, minus inventory risk and adverse selection on the fills we do get.
+**Kill if:** per-unit-capital yield after adverse selection is below the same capital
+deployed in a directional idea — or if the qualifying size required exceeds our $250.
+
+### D2. Order-flow toxicity — proxy is live, direct measure is not
+
+Individual order placement/cancellation is unpublished, so order-to-trade ratios and
+spoof attribution are unavailable. But **book delta minus fills gives a net
+adds/cancels residual**, which is already idea #17 and is computable from PMXT. It cannot
+attribute a cancel to a wallet; it can say the book is withdrawing. That is enough to
+test whether extreme cancel pressure predicts anything.
+
+### D3. Single-wallet copy trading — re-scoped, not parked
+
+It fails for latency-sensitive wallets (latency, size dependence, exit into copy flow).
+It does **not** necessarily fail for a slow fundamental wallet holding for weeks: days of
+lag are then tolerable. That case is really "aggregate skill", so it folds into #7/#28
+consensus flow rather than disappearing. A single-wallet variant should be retested on
+the `directional` archetype from the wallet cohort, with the lag explicitly modelled.
+
+### D4. Comment sentiment — the source is dead, the hypothesis is not
+
+Comments are stored off-chain with no bulk export and the read endpoint is current-state
+only, so no as-of record exists. But the hypothesis ("crowd discussion leads price") is
+testable with substitutes: GDELT, RSS, Reddit. That is idea #18 and it needs no
+Polymarket comments at all.
+
+### Genuinely parked
 
 | Idea | Reason |
 |---|---|
-| #22 market making | queue position is unobtainable — structural, not a data gap |
-| #23 order-flow toxicity | needs individual order events, which the operator never publishes |
-| #24 single-wallet copy trading | fails by construction: latency + impact + exit into copy flow |
-| #21 comment sentiment | no historical record exists; forward-only, needs ≥ 3 months of recording |
+| Fill-dependent market making (#22) | queue position exists only inside the operator's matching engine; the public book aggregates size by price and discards arrival order. Use D1 instead, which does not depend on fills. |
 
 ---
+
+## Cost model correction: taker rebates
+
+The **Taker Rebate Program** (live 2026-05-28) returns part of taker fees by tier, with
+weighted volume `wV = Size × (1 − Entry Price) × Category Weight × Bonuses`. Every "dead
+after fees" conclusion in `docs/results-log.md` used the **gross** taker fee and therefore
+overstates cost. At a $2,000 bankroll the tier will be low, so the correction is small —
+but it is the wrong direction to leave in, because over-stating cost hides real edges.
 
 ## The global filter
 
