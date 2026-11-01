@@ -183,3 +183,34 @@ visible without a trade printing.
 snapshots for the same reason; 5 minutes is a compromise between freshness and coverage.
 And the buy-all-NO bound (`sum < k-1`, not `sum < 1`) is the one that actually binds —
 the YES side showed just 6 net-positive cells against 24 for NO.
+
+---
+
+## A5 Lifecycle-stage inefficiency — **dead: not monotone, and inside the spread** (2026-11-01)
+
+**Sample:** 157,240 token-observations with a resolvable age at entry, across 101,585
+markets, entry in the stored T−24 h → T−6 h slot.
+
+| Age at entry | markets | mean px | payout | calib gap | ±se | net edge |
+|---|---|---|---|---|---|---|
+| < 1 d | 11,193 | 0.522 | 0.524 | +0.0024 | 0.0027 | +0.0008 |
+| 1–3 d | 21,868 | 0.604 | 0.613 | +0.0087 | 0.0016 | +0.0072 |
+| 3–7 d | 34,133 | 0.648 | 0.654 | +0.0068 | 0.0010 | +0.0063 |
+| 7–30 d | 30,172 | 0.569 | 0.575 | +0.0053 | 0.0015 | +0.0049 |
+| > 30 d | 4,219 | 0.737 | 0.745 | +0.0079 | 0.0023 | +0.0079 |
+
+**Verdict: dead, on two independent grounds.**
+
+1. **Not monotone.** Deltas between bins are `+0.0063, −0.0019, −0.0015, +0.0026`. The gap
+   rises then falls then rises, so "new markets are inefficient" is false; whatever moves
+   is a composition effect — which markets happen to live in each bucket — not a lifecycle
+   signal.
+2. **Inside the cost.** The largest gap is +0.87 ¢ against a ~1 ¢ taker half-spread (median
+   quoted spread 2 ¢). Nothing here is tradable even if the pattern were real.
+
+Note the first bin: markets under a day old show a gap of +0.24 ¢ with a standard error as
+large as the effect. The intuition that brand-new markets are the softest is not supported.
+
+**What would change the verdict:** quoted spreads *by age*, because a young market may be
+both more mispriced and wider. That needs the book, so this moves behind PMXT rather than
+being closed outright.
