@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -97,29 +98,90 @@ def connect() -> duckdb.DuckDBPyConnection:
     return con
 
 
-def fetch_hour(stamp: str, dest: Path) -> Path | None:
-    """Download one hourly file. Returns None when the hour does not exist."""
+def fetch_hour(stamp: str, dest: Path, connections: int = 64) -> Path | None:
+    """Download one hourly file using parallel ranged requests.
+
+    Why parallel
+    ------------
+    Measured on 2026-11-01 from this machine, one connection to
+    `r2v2.pmxt.dev` sustains only 0.33 MB/s. The limit is per connection, not
+    total bandwidth — the same host served:
+
+        1 connection    0.33 MB/s
+        6 connections   1.12 MB/s
+        12 connections  2.10 MB/s
+        24 connections  3.15 MB/s
+        32 connections  3.74 MB/s
+        64 connections  7.6-9.0 MB/s   <- default
+        128 connections 2.12 MB/s      <- throttled, worse
+
+    The knee is at ~64: past it the host throttles and throughput collapses.
+    At one connection an hour file (371 MB) takes 18.7 minutes, which would
+    make a 7-day block a two-day job; at 64 it takes about 45 seconds.
+
+    R2 advertises `Accept-Ranges: bytes`, so the file is split into
+    `connections` contiguous ranges fetched concurrently and written at their
+    own offsets in a preallocated scratch file.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         return dest
     url = PMXT.format(stamp=stamp)
     tmp = dest.with_suffix(".part")
+
     try:
-        with requests.get(url, stream=True, timeout=120) as r:
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            with tmp.open("wb") as fh:
-                for chunk in r.iter_content(chunk_size=1 << 22):
-                    fh.write(chunk)
-        tmp.replace(dest)
-        return dest
-    except requests.HTTPError:
+        head = requests.head(url, timeout=120, allow_redirects=True)
+        if head.status_code == 404:
+            return None
+        head.raise_for_status()
+        total = int(head.headers["Content-Length"])
+    except Exception:  # noqa: BLE001 - absent hour or transient network
+        return None
+
+    part_size = max(4 << 20, total // connections)
+    ranges = []
+    off = 0
+    while off < total:
+        end = min(off + part_size - 1, total - 1)
+        ranges.append((off, end))
+        off = end + 1
+
+    with tmp.open("wb") as fh:
+        fh.truncate(total)  # preallocate so workers can seek independently
+
+    def _get(rng: tuple[int, int]) -> int:
+        start, end = rng
+        for attempt in range(3):
+            try:
+                r = requests.get(url, headers={"Range": f"bytes={start}-{end}"},
+                                 stream=True, timeout=180)
+                if r.status_code not in (200, 206):
+                    raise requests.HTTPError(f"status {r.status_code}")
+                buf = b"".join(r.iter_content(chunk_size=1 << 20))
+                if len(buf) != end - start + 1:
+                    raise requests.HTTPError(
+                        f"short read {len(buf)} != {end - start + 1}")
+                with tmp.open("r+b") as out:
+                    out.seek(start)
+                    out.write(buf)
+                return len(buf)
+            except Exception:  # noqa: BLE001 - retry transient stalls
+                if attempt == 2:
+                    raise
+        return 0
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(connections, len(ranges))) as pool:
+            written = sum(pool.map(_get, ranges))
+    except Exception:  # noqa: BLE001 - any part failing invalidates the hour
         tmp.unlink(missing_ok=True)
         return None
-    except Exception:  # noqa: BLE001 - network flakiness
+
+    if written != total:
         tmp.unlink(missing_ok=True)
         return None
+    tmp.replace(dest)
+    return dest
 
 
 def reduce_hour(con: duckdb.DuckDBPyConnection, src: Path, bucket_s: int,
@@ -320,6 +382,8 @@ def main() -> int:
     ap.add_argument("--bucket-seconds", type=int, default=900,
                     help="book snapshot cadence (default 900 = 15 min)")
     ap.add_argument("--top-levels", type=int, default=5)
+    ap.add_argument("--connections", type=int, default=24,
+                    help="parallel ranged requests per hour file (default 24)")
     ap.add_argument("--keep-raw", action="store_true")
     ap.add_argument("--dest", default=str(OUT))
     args = ap.parse_args()
@@ -368,7 +432,7 @@ def main() -> int:
             when = t + timedelta(hours=i)
             stamp = when.strftime("%Y-%m-%dT%H")
             local = SCRATCH / f"polymarket_orderbook_{stamp}.parquet"
-            got = fetch_hour(stamp, local)
+            got = fetch_hour(stamp, local, args.connections)
             if got is None:
                 print(f"  {stamp}: absent (404)")
                 continue

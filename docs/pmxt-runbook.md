@@ -83,7 +83,8 @@ are rejected — for different reasons.
 | Reduced output, 1-hour cadence | **13 GB** |
 | Reducer cost, 1-hour buckets | **43.6 s/hour** |
 | Reducer cost, 15-min buckets | **~150 s/hour** |
-| Download throughput | 15 MB/s |
+| Download throughput, 1 connection | **0.33 MB/s** |
+| Download throughput, 64 range requests | **7.6-9.0 MB/s** |
 
 **Storage was never the blocker.** The full reduced archive fits with room to spare. The
 real costs are bandwidth (20 h for 1.06 TB) and compute (35 h at 1-hour cadence, ~110 h at
@@ -112,9 +113,9 @@ earns it.**
 
 | Phase | Window | Hours | Download | Compute @ 15-min | Stored | Gate |
 |---|---|---|---|---|---|---|
-| **1** | 2026-04-20 → 04-27 | 168 | 63 GB | **59 min** | ~2.5 GB | build replayer + exit comparison |
-| 2 | extend to +21 days | 504 | 187 GB | **2.9 h** | ~8 GB | only if phase 1 produces a signal |
-| 3 | 2026-06-01 → 08-10 | 1,703 | 630 GB | **9.9 h** | ~26 GB | **only after Gate 7**, forward test stays untouched |
+| **1** | 2026-04-20 → 04-27 | 168 | 63 GB | **3.1 h wall** | ~2.5 GB | build replayer + exit comparison |
+| 2 | extend to +21 days | 504 | 187 GB | **9.4 h wall** | ~8 GB | only if phase 1 produces a signal |
+| 3 | 2026-06-01 → 08-10 | 1,703 | 630 GB | **31.7 h wall** | ~26 GB | **only after Gate 7**, forward test stays untouched |
 
 Three reasons this is the right shape:
 
@@ -128,6 +129,31 @@ Three reasons this is the right shape:
 3. **Each phase is independently useful and independently abandonable.** Phase 1 answers
    "does the replayer work and does any exit beat holding". If the answer is no, we stop
    after 63 GB instead of 1.06 TB.
+
+### Download bandwidth (measured 2026-11-01)
+
+The assumption that download was fast was wrong. Measured with curl against
+`r2v2.pmxt.dev`:
+
+| Concurrent range requests | Aggregate throughput |
+|---|---|
+| 1 | 0.33 MB/s |
+| 6 | 1.12 MB/s |
+| 12 | 2.10 MB/s |
+| 24 | 3.15 MB/s |
+| 32 | 3.74 MB/s |
+| **64** | **7.6-9.0 MB/s** |
+| 128 | 2.12 MB/s (throttled) |
+
+The limit is **per connection**, roughly 0.13 MB/s each, and it scales close to
+linearly until the host starts throttling somewhere between 64 and 128. At one
+connection an hour file takes 18.7 minutes — a 7-day block would have taken two
+days. At 64 it takes about 45 seconds. The initial attempt also stalled at
+exactly 60 MiB, which is why `fetch_hour` now verifies that every range returned
+its exact byte count and retries, rather than trusting a single stream.
+
+`requests` alone cannot exploit this; `fetch_hour` splits each file into
+contiguous ranges and fetches them concurrently.
 
 ### Reducer performance (measured 2026-11-01, one hour = 68,840,573 rows)
 
