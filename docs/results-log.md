@@ -697,3 +697,52 @@ Identical deciles to the last digit, which cross-validates both paths.
 The cache is only 3× smaller than the tape because 600 M fills collapse into 261 M
 (wallet, token) pairs — most pairs contain ~2 fills. The remaining cost is the 261 M-row
 group-by, which is memory-bandwidth bound, not arithmetic bound.
+
+---
+
+## Do the big wallets hold to resolution, or exit? (2026-04 → 10)
+
+**Method.** For every (wallet, token) position over the window:
+
+    closed = 2 * min(buys, sells) / (buys + sells)     1.0 = fully round-tripped
+
+and the PnL is split into the round trip (`realised`) and the settlement of what is left
+(`settled`). `buy_only` (sold nothing) is the honest holding measure; `sell_only` (bought
+nothing) is a market maker who minted a complete set and sold one leg, which looks open in
+the tape but is not.
+
+**Positions by type, share of traded shares:**
+
+| decile | buy-only (held) | sell-only (minted) | mixed | closed fraction of mixed |
+|---|---|---|---|---|
+| **1 (largest)** | 26.6 % | 23.1 % | 50.4 % | **0.583** |
+| 2 | 21.0 % | 35.5 % | 43.5 % | 0.766 |
+| 5 | 19.5 % | 33.1 % | 47.3 % | 0.845 |
+| 10 (smallest) | 20.4 % | 26.9 % | 52.7 % | **0.917** |
+
+The largest wallets close **58 %** of what they enter; the smallest close **92 %**. Holding
+falls monotonically with size — the opposite of what a naive "big players hold positions"
+story predicts.
+
+**Where the PnL comes from:**
+
+| decile | realised $m | settled $m | net $m |
+|---|---|---|---|
+| **1** | **+191.98** | **−141.13** | **+50.85** |
+| 2 | +9.80 | −25.44 | −15.64 |
+| 3 | +3.07 | −11.07 | −8.00 |
+| 4–10 | +4.43 | −24.48 | −20.05 |
+
+**The top decile earns its money on the round trip and loses $141 m on what it carries to
+resolution.** Closing everything before resolution would give it +$192 m instead of
++$50.9 m; holding costs it 74 % of its profit.
+
+**Reading.** This is consistent with the recorded thesis (`docs/strategy-thesis.md`): the
+edge is taken by exiting when the calculation reverses, and the residue left open is
+adverse. It is *not* a pure EV-trader story, because 23 % of top-decile flow is
+`sell_only` — minting a complete set and selling one leg is market making, and it coexists
+in the same wallets.
+
+**Caveat on the measure.** The closed fraction is bimodal, not uniform: 18 % of mixed
+shares sit in positions that are 0–10 % closed and 33 % in positions that are 90–100 %
+closed. A single mean hides two different behaviours inside the top decile.
