@@ -376,3 +376,55 @@ Before spending more compute, the next session should run these three controls, 
 If (1) collapses to zero and (3) shows concentration in a few events, the conclusion is:
 **the only persistent edge is private event information, and it is not replicable by us.**
 That is a legitimate, plan-relevant answer, and `plan.md` §6 already says what to do with it.
+
+### Control 1 (event-level split): the skill is in event selection
+
+Splitting each wallet's positions by **event** (`condition_id`) rather than by token:
+
+| split | wallets | Spearman(half0, half1) |
+|---|---|---|
+| token-level | 36,476 | +0.148 |
+| **event-level** | 36,209 | **+0.270** |
+
+The event-level correlation is **higher**, not lower. So the persistence is not an artifact of
+correlated tokens inside one event — it is concentrated in *which events a wallet chooses*.
+Wallets that do well on one disjoint set of events do well on another.
+
+### Control 3 (event concentration): profit is spread, not one lucky hit
+
+| cohort | wallets | median events traded | median share of profit from best single event |
+|---|---|---|---|
+| best (A-dec 9–10) | 1,575 | 330 | **0.342** |
+| middle | 3,090 | 869 | 0.227 |
+| worst (A-dec 1–2) | 484 | 320 | **0.544** |
+
+The persistent cohort's profit is spread across ~330 events with a third coming from its best
+single event. The losing cohort is far more concentrated (54 % from one event), which is what
+a few large mistakes look like. So the skilled wallets are not riding one lucky market; they
+are making many slightly-better decisions.
+
+## 8. Session conclusion
+
+What has been established, with the evidence that established it:
+
+| claim | evidence |
+|---|---|
+| The market is zero-sum | aggregate PnL $0.0 m over 1.2 M wallets |
+| The market is calibrated at each point in time | edge at first/last/p95 trade price within ±1 pp |
+| No favourite–longshot bias | the VWAP "bias" reverses at a fixed time |
+| Wallet skill persists out of sample | Spearman +0.231 (A→B), monotone deciles |
+| Skill is at the event-selection level | event-level split +0.270 > token-level +0.148 |
+| Skill is not explained by role, price, size, or turnover | all Spearman ≤ 0.06 |
+| Skill is spread across many events | 34 % from the best of ~330 events |
+| Skill is broad-based, not a small cabal | 46 % of wallets net positive; top 100 = 34 % of positive PnL |
+
+**The honest single sentence:** the market is efficient in aggregate, but a broad set of
+wallets persistently chooses *which events* better than the rest, and that edge is neither
+explained nor replicated by any mechanical feature — which points at underlying-event
+information or modelling rather than at microstructure.
+
+The next session's job is therefore not more data engineering. It is to test whether the
+event-selection edge can be **predicted from public information** (schedules, team strength,
+venue, rest days) before the event. If it can, it is a forecasting problem — the one the
+project is actually set up to solve. If it cannot, the edge is private information and is out
+of reach, and `plan.md` §6 governs.
