@@ -726,7 +726,8 @@ Nothing in Phases 5–8 is meaningful until this is closed.
 ### Phase 4 — Book replayer (4–6 days)
 
 - [ ] **Build a streaming reducer before a replayer.** `scripts/reduce_pmxt.py` reads one hour (~250–600 MB), emits derived artefacts, deletes the raw file. The full archive is ~1.1 TB and must never be materialised.
-- [ ] Parse PMXT v2 → typed events (`market` arrives as BLOB(66) → decode to hex; `bids`/`asks` are JSON strings)
+- [x] **Measure a real hour before designing.** 2026-06-01T00: 68,840,573 rows, 73,367 assets, and the three traps that decide the design — `price_change.best_bid/best_ask` are stale, `side` names the ladder side, only 11 % of assets carry a `book` anchor. See Appendix C.
+- [ ] Parse PMXT v2 → typed events. `market` is **ASCII inside a BLOB**: `CAST(market AS VARCHAR)` gives the 66-char condition id, matching `markets_pit.condition_id` exactly (0 unmatched of 73,367). `bids`/`asks` parse with `CAST(x AS DOUBLE[][])`, not `from_json`.
 - [ ] Replay: `book` snapshot anchors, `price_change` deltas applied in order, `size = 0` removes level
 - [ ] Invariants: no negative sizes, no crossed book (except the known 0.019 % settled-market cases), best bid < best ask
 - [ ] Emit `book_state(token, ts)` queryable via DuckDB
@@ -905,6 +906,12 @@ Collateral: USDC.e before 2026-04-28, **pUSD** after. Both 6 decimals. Token amo
 - ~31 k `OrderFilled` events have no Gamma market match (≈ 18 k trades) — stay in raw only
 - PMXT v1: ~50 % market coverage gaps; do not compute volume from it
 - PMXT `book` snapshots are sparse; `price_change` is dominant — anchor then replay
+- **PMXT `price_change.best_bid` / `best_ask` are stale and unusable.** Measured on 2026-06-01T00: for the busiest asset they held `0.50`/`0.51` across 15 consecutive events while the ladder moved from `0.01`→`0.11` and `0.96`→`0.99`. Any top-of-book series built from these columns is a frozen book. Reconstruct from levels.
+- **PMXT `side` names the ladder side, not the aggressor.** `BUY` rows are bids, `SELL` rows are asks. Verified by content: `BUY` prices are `<= best_ask` 100 % of the time and observed at 0.01–0.47, `SELL` prices are `>= best_bid` 100 % and observed at 0.53–0.99. Reading `side` as taker direction inverts the book.
+- **PMXT anchors are rarer than the docs imply.** Only **8,238 of 73,367** assets have a `book` snapshot in a given hour, and the busiest asset had **8 anchors against 200,075 events**. Full L2 state requires reconstruction, and reconstruction must carry across hour boundaries because an asset's first anchor may be in a previous file.
+- **PMXT `market` is the condition id as ASCII text inside a BLOB**, not hex-encoded bytes. `encode(market,'hex')` produces the hex of the characters; join with `CAST(market AS VARCHAR)` and compare directly to `markets_pit.condition_id` (both 66 chars). All 73,367 probe assets matched.
+- **PMXT `bids` / `asks` cannot be parsed with `from_json(x, '[["VARCHAR","VARCHAR"]]')`** — DuckDB errors with "too many values in array of JSON structure". Use `CAST(bids AS DOUBLE[][])`, which succeeds and is typed.
+- **PMXT event mix (one hour, 68.8 M rows):** `price_change` 68.6 M (99.7 %), `book` 150,736, `last_trade_price` 72,269, `tick_size_change` 376. The archive is overwhelmingly deltas; snapshot cadence in the reducer, not event volume, is what governs cost.
 - Data API v1 retired 2026-10-24; v2 uses cursors, rejects `offset`/`market`
 - Market-scoped trade tape has a ~3-year floor; `start` can narrow but not extend
 - v2 `prices-history` is a sampled series, not a tape

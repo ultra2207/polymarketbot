@@ -13,6 +13,7 @@ capital.
 - **Polymarket mechanics (verified):** [`docs/polymarket-mechanics.md`](docs/polymarket-mechanics.md)
 - **Fee model:** [`docs/fees.md`](docs/fees.md)
 - **Data inventory:** [`docs/data-inventory.md`](docs/data-inventory.md)
+- **PMXT download + reduce runbook:** [`docs/pmxt-runbook.md`](docs/pmxt-runbook.md) — the 1.1 TB archive is an operator task
 
 ## Status
 
