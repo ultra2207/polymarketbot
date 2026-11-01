@@ -604,3 +604,96 @@ not a resolution mark. That is the next build.
 volume. Combined with E7 (median fill $13, 3–19 s between fills), the maker side is a small
 number of automated participants with near-total coverage — which is why the *whitespace*
 question (idea 3) matters more than the *copying* question.
+
+---
+
+## Round-trip maker PnL — corrected, conservation-verified (2026-04 → 10)
+
+**First, a bug that produced a clean wrong answer.** The first version reported makers
+earning **+0.75 ¢ per $1** in every decile. That uniformity was the tell: aggregate trader
+PnL is zero by conservation — every trade has a buyer and a seller at the same price, and a
+complete set costs $1 and pays $1.
+
+The cause was a NULL comparison. For a wallet with only one side (buy_sh IS NULL or
+sell_sh IS NULL), `buy_sh > sell_sh` evaluates to NULL, so the CASE fell through to ELSE
+and produced NULL — **silently dropping every one-sided wallet's settlement term while
+still counting two-sided wallets' realised PnL.** Dropping a negative term inflates the
+total.
+
+Two fixes:
+1. `coalesce` before the comparison, so one-sided wallets settle correctly.
+2. Use `price * token_amount` for cash instead of `usd_amount`, which is **rounded to the
+   cent** — wrong by up to 50 % on sub-dollar fills, and 55 % of June rows differ from
+   `price * token_amount`.
+
+**Verification (the test that matters).** With no volume filter at all, June aggregate PnL:
+
+| version | PnL |
+|---|---|
+| before fix | **+$44.38 M** on $6.21 B |
+| after fix | **−$0.00 M** on $6.21 B |
+
+Conservation now holds exactly. A per-token check agrees: one token with 77,845 trades and
+104.8 M shares balanced on both sides previously summed to +$2.27 M and now sums to zero.
+
+**Result — PnL is concentrated in the top decile, and the rest subsidise it:**
+
+| decile | makers | volume $m | PnL $m | per $ | positive |
+|---|---|---|---|---|---|
+| **1 (largest)** | 35,404 | **29,413 (91 %)** | **+56.60** | **+0.192 ¢** | 40.7 % |
+| 2 | 35,404 | 1,288 | −16.05 | −1.246 ¢ | 32.6 % |
+| 3 | 35,404 | 577 | −9.45 | −1.636 ¢ | 37.9 % |
+| 4 | 35,404 | 337 | −6.74 | −2.002 ¢ | 32.0 % |
+| 5 | 35,404 | 209 | −4.84 | −2.316 ¢ | 30.8 % |
+| 6–9 | 141,616 | 359 | −12.0 | −2.6…−3.1 ¢ | ~31 % |
+| 10 (smallest) | 35,404 | 40 | −1.22 | −3.068 ¢ | 30.8 % |
+| **all** | 354,040 | **32,224** | **+8.32** | **+0.026 ¢** | 32.9 % |
+
+The relationship is monotone: **the larger the wallet, the better its PnL per dollar**,
+from +0.19 ¢ for the top decile down to −3.07 ¢ for the smallest. Only 32.9 % of wallets are
+profitable at all.
+
+The aggregate is +$8.32 M rather than 0 because the payout join keeps only the 4.87 M tokens
+that are resolved in our labels, out of ~8.1 M traded; the missing tokens are the recent,
+unresolved tail. The 0.026 ¢ residual is that selection, not a leak in the metric.
+
+**The largest wallets, individually:**
+
+| PnL $m | volume $m | per $ | tokens |
+|---|---|---|---|
+| +15.69 | 480 | +3.27 ¢ | 203,254 |
+| +8.19 | 482 | +1.70 ¢ | 11,053 |
+| +6.67 | 439 | +1.52 ¢ | 158,995 |
+| +3.05 | 564 | +0.54 ¢ | 111,704 |
+| −6.84 | 293 | −2.34 ¢ | 435,345 |
+| −5.11 | 153 | −3.34 ¢ | 39,993 |
+
+Note the **inverse relation with token count**: the most profitable large wallet trades
+203 k tokens at +3.27 ¢, while the worst trades 435 k tokens at −2.34 ¢. Breadth is not a
+proxy for skill — covering more markets diluted the spread.
+
+**What this establishes.** Trading PnL is not evenly distributed and not zero-mean-within-
+makers: a small top slice earns the spread and everyone below pays it. The top decile's
++0.192 ¢ is *trading* PnL, before rebates, so the biggest makers do earn on the round trip
+— they are not merely paid. The 32 % win rate means the median participant loses.
+
+---
+
+## Performance: materialised cache, 3.7× faster and identical
+
+`data/raw/sii/trades.parquet` is 45.85 GB / 212 partitions. Every analysis rescanned it.
+
+`scripts/build_wallet_token.py` materialises per-(wallet, token, month) sums once, into
+`data/processed/wallet_token/` — 6 months, 261 M pairs, 14.6 GB, built in 13 minutes,
+resumable per month.
+
+| path | full-window round trip |
+|---|---|
+| direct tape scan + union + payout join | **9 m 22 s** |
+| cache read + payout join | **2 m 33 s** |
+
+Identical deciles to the last digit, which cross-validates both paths.
+
+The cache is only 3× smaller than the tape because 600 M fills collapse into 261 M
+(wallet, token) pairs — most pairs contain ~2 fills. The remaining cost is the 261 M-row
+group-by, which is memory-bandwidth bound, not arithmetic bound.
