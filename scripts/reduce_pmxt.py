@@ -392,6 +392,7 @@ def main() -> int:
     con = connect()
 
     sources: list[tuple[datetime, Path]] = []
+    pending: dict[Path, str] = {}   # local path -> archive stamp still to fetch
     if args.dir:
         # Handoff mode: the raw archive lives on an external drive and must
         # never be deleted by this script.
@@ -427,21 +428,27 @@ def main() -> int:
         if not args.start:
             print("pass --file or --start")
             return 1
+        # Download INSIDE the processing loop, one hour at a time. Fetching the
+        # whole batch up front would hold every raw file on disk simultaneously
+        # (168 hours = 62 GB) and defeat the streaming property this script
+        # exists to guarantee.
         t = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
         for i in range(args.hours):
             when = t + timedelta(hours=i)
             stamp = when.strftime("%Y-%m-%dT%H")
             local = SCRATCH / f"polymarket_orderbook_{stamp}.parquet"
-            got = fetch_hour(stamp, local, args.connections)
-            if got is None:
-                print(f"  {stamp}: absent (404)")
-                continue
-            sources.append((when, got))
+            sources.append((when, local))
+            pending[local] = stamp
 
     total_rows = 0
     t_start = time.time()
     for i, (when, src) in enumerate(sources, 1):
         t0 = time.time()
+        if src in pending:
+            got = fetch_hour(pending[src], src, args.connections)
+            if got is None:
+                print(f"  {when:%Y-%m-%dT%H}: absent (404)", flush=True)
+                continue
         rows, assets = reduce_hour(con, src, args.bucket_seconds, args.top_levels)
         part = dest_root / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}"
         part.mkdir(parents=True, exist_ok=True)
@@ -453,7 +460,7 @@ def main() -> int:
         total_rows += rows
         print(f"  [{i}/{len(sources)}] {when:%Y-%m-%dT%H}  "
               f"{rows:>8,} rows  {assets:>7,} assets  "
-              f"{size/1e6:>7.1f} MB  {time.time()-t0:>6.1f}s")
+              f"{size/1e6:>7.1f} MB  {time.time()-t0:>6.1f}s", flush=True)
         # Never delete a file the operator downloaded; only our own scratch copy.
         if not args.keep_raw and not args.file and not args.dir:
             src.unlink(missing_ok=True)
