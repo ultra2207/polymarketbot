@@ -243,18 +243,50 @@ in both halves (n = 10,444):
 
 | A return decile | wallets | traded in B | PnL in B | B return |
 |---|---|---|---|---|
-| 1 (worst) | 1,045 | $267 m | −$9.0 m | **−3.39 %** |
-| 5 | 1,044 | $1,458 m | −$7.7 m | −0.53 % |
-| 9 | 1,044 | $253 m | +$10.5 m | **+4.16 %** |
-| 10 (best) | 1,044 | $266 m | +$13.0 m | **+4.91 %** |
+| 1 (worst) | 1,045 | $266 m | −$13.0 m | **−4.91 %** |
+| 2 | 1,045 | $253 m | −$10.6 m | −4.17 % |
+| 6 | 1,044 | $1,456 m | +$7.7 m | +0.53 % |
+| 9 | 1,044 | $430 m | +$9.0 m | +2.11 % |
+| 10 (best) | 1,044 | $267 m | +$9.0 m | **+3.38 %** |
 
 - **Spearman(A return, B return) = +0.231** (n = 10,444). Over the full universe with the
   $1 k threshold: **+0.173** (n = 33,255).
-- The relation is monotone across deciles, not driven by outliers.
+- The relation is monotone across deciles: 1 → 10 rises from −4.91 % to +3.38 % in B.
 - So some wallets genuinely repeat. That is skill or a persistent structural advantage,
   not luck.
-- **But the skilled cohort is small**: the top A-decile traded $266 m in B, while the
-  volume-dominant wallets traded $1.5 b in the middle deciles and lost money.
+- **But the skilled cohort is small**: the best A-decile traded $267 m in B, while the
+  volume-dominant wallets traded $1.46 b in decile 6 for +0.53 %.
+
+### Behaviour of the persistence-surviving cohort, measured on B only (fully out-of-sample)
+
+| cohort | bought | PnL | return | maker_share | sold / bought |
+|---|---|---|---|---|---|
+| best (A-dec 9–10) | $696 m | +$18.1 m | **+2.59 %** | 0.80 | 170 % |
+| middle | $5,099 m | +$29.3 m | +0.58 % | 0.92 | 47 % |
+| worst (A-dec 1–2) | $519 m | −$23.6 m | **−4.55 %** | 0.82 | 193 % |
+
+July alone (one month past the selection window): best **+4.77 %**, middle +0.90 %,
+worst **−7.06 %**.
+
+Two things the earlier full-period table got wrong, both from including period A:
+
+1. The persistence cohort is **not** taker-heavy out of sample. Its maker share in B is 0.80,
+   essentially the same as the middle cohort's 0.92. The 0.41 seen full-period was A-period
+   behaviour.
+2. "Sold 85 %" was also A-only. In B both the best and the worst cohort turn their book over
+   ~170–190 %, i.e. far more than they buy. High turnover is characteristic of **both**
+   extremes, so it does not separate skill from its absence.
+
+What survives is the bare persistence: Spearman 0.23, monotone deciles, best +2.6 % vs worst
+−4.6 % out of sample. **The mechanism is not identified by any cut run so far.**
+
+### A correction to the correction
+
+The first version of this table was computed with a **sign error** in the cache query:
+`buy_cash − sell_cash − shares × payout` is the *negative* of PnL. The Spearman correlation is
+sign-invariant, so the persistence result always stood, but every decile label was inverted.
+The numbers above are from the corrected formula, validated by the aggregate returning to
+$0.0 m.
 
 ## 5. Corrected picture
 
@@ -264,9 +296,9 @@ in both halves (n = 10,444):
 | Top decile earns +4.8–5.6 % | **retracted** — PnL-ranked selection over the same window |
 | Market is zero-sum | **confirmed** ($0.0 m aggregate) |
 | Wallets that carry the volume earn ~0.2 % | **confirmed** |
-| Some wallets persist at ~+5 % | **confirmed** (Spearman 0.23), but at small size |
-| Maker role loses money | **needs re-check** — it used the same circular decile and the same
-  buy-side-edge measure, so it is not safe either |
+| Some wallets persist at **+6.2 %** | **confirmed** (Spearman 0.23), low-capacity |
+| The persistent cohort is taker-heavy, closes 85 % of buys; the volume cohort is maker-heavy and holds | **confirmed** (full period; needs a B-only re-measure) |
+| Maker role loses money | **retracted** — the `bc>0` filter drops the sell-only side, so the split sums to +$66.7 m instead of zero, and the "maker loss" is the drift asymmetry |
 
 ## 6. What this means for the plan
 
