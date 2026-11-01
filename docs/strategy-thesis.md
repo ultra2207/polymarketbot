@@ -171,3 +171,113 @@ The durable, measurable edge in this data is **buying sports favourites and avoi
 longshots**, it is worth roughly 4–5 % of money deployed, and it is being arbitraged away
 month by month while the top decile's own edge stays flat — which is the strongest hint that
 they are not simply harvesting that bias.
+
+---
+
+# CORRECTION (2026-11-02, later the same session)
+
+The two findings recorded above — a large favourite–longshot bias in sports, and a +4.8–5.6 %
+edge concentrated in a top decile — **do not survive their own controls.** Both were
+measurement artifacts. This section replaces them.
+
+## 1. There is no favourite–longshot bias. The market is calibrated.
+
+The earlier calibration used the **volume-weighted average price over the window**
+(12–6 h before `end_date`). Re-measured using the price at a **single point in time**, the gap
+collapses to ±1 pp:
+
+| price band | edge @ VWAP | edge @ first trade | edge @ last trade |
+|---|---|---|---|
+| 20–30 % | −0.027 | **+0.004** | −0.005 |
+| 30–40 % | −0.028 | **+0.005** | −0.005 |
+| 60–70 % | −0.007 | **−0.004** | +0.000 |
+| 70–80 % | +0.002 | **−0.006** | +0.001 |
+| 80–90 % | +0.007 | **−0.007** | +0.000 |
+
+The VWAP is biased because **volume correlates with the outcome inside the window**: tokens
+that go on to win trade more at high prices, so their VWAP sits below the final price. Averaged
+across tokens, that looks like "favourites are underpriced". It is an average over a path, not
+a price anyone can pay.
+
+Confirmed independently: the edge at the 95th-percentile price and at the maximum price in the
+window is also ≈ 0 in every bucket. And the same test one window earlier (17–12 h) gives the
+same ±1 pp.
+
+**There is no exploitable favourite–longshot bias in this data.**
+
+## 2. The market is exactly zero-sum.
+
+Summed over 1.2 M wallets and $16.18 b of buys with known payouts:
+
+```
+total PnL = $0.0 m
+aggregate buy-side edge = −0.0023 per dollar
+```
+
+Payouts are funded entirely by the losing side. Every dollar one wallet earns, another loses.
+
+## 3. The "top decile" was a selection artifact.
+
+`wallet_deciles` was built by ranking wallets **on realised PnL over the whole period**, then
+the "edge" of the top decile was measured **over that same period**. That is circular: by
+construction the top decile of a zero-sum distribution is profitable.
+
+Ranking by **volume** instead (independent of outcome):
+
+| volume decile | wallets | bought | PnL | return |
+|---|---|---|---|---|
+| 10 (largest) | 120,327 | $16,054 m | +$33.9 m | **+0.21 %** |
+| 1–9 | 1,082,943 | $130 m | −$33.9 m | — |
+
+The wallets that carry 99 % of the volume earn **+0.21 %**, not +5 %.
+
+A second test confirms the artifact: within price buckets, matched on entry price to within
+2 ¢, the "top decile" and everyone else have **the same edge** (60–70 %: +0.257 vs +0.282 — the
+rest is slightly better). The earlier +10 pp within-bucket gap came from bucketing by a
+wallet's *average* price, which mixes tokens.
+
+## 4. What does survive: skill persists out-of-sample, but it is small and low-capacity
+
+Split Apr–Jun (A) vs Jul–Sep (B). Rank wallets on A, measure on B. Wallets with ≥ $10 k bought
+in both halves (n = 10,444):
+
+| A return decile | wallets | traded in B | PnL in B | B return |
+|---|---|---|---|---|
+| 1 (worst) | 1,045 | $267 m | −$9.0 m | **−3.39 %** |
+| 5 | 1,044 | $1,458 m | −$7.7 m | −0.53 % |
+| 9 | 1,044 | $253 m | +$10.5 m | **+4.16 %** |
+| 10 (best) | 1,044 | $266 m | +$13.0 m | **+4.91 %** |
+
+- **Spearman(A return, B return) = +0.231** (n = 10,444). Over the full universe with the
+  $1 k threshold: **+0.173** (n = 33,255).
+- The relation is monotone across deciles, not driven by outliers.
+- So some wallets genuinely repeat. That is skill or a persistent structural advantage,
+  not luck.
+- **But the skilled cohort is small**: the top A-decile traded $266 m in B, while the
+  volume-dominant wallets traded $1.5 b in the middle deciles and lost money.
+
+## 5. Corrected picture
+
+| claim | status |
+|---|---|
+| Favourite–longshot bias in sports | **retracted** — VWAP artifact |
+| Top decile earns +4.8–5.6 % | **retracted** — PnL-ranked selection over the same window |
+| Market is zero-sum | **confirmed** ($0.0 m aggregate) |
+| Wallets that carry the volume earn ~0.2 % | **confirmed** |
+| Some wallets persist at ~+5 % | **confirmed** (Spearman 0.23), but at small size |
+| Maker role loses money | **needs re-check** — it used the same circular decile and the same
+  buy-side-edge measure, so it is not safe either |
+
+## 6. What this means for the plan
+
+The search for "a segment where someone has a big edge we can copy" has produced a **negative**
+result so far: the market is efficient in aggregate, the apparent biases are artifacts, and the
+only persistent skill is small and low-capacity. Per `plan.md` §6, that is exactly the case in
+which lowering the bar is the wrong move.
+
+The live question is no longer "where is the mispricing". It is: **what do the persistent
+skilled wallets do differently** — and is their advantage structural (speed, information,
+relationships, market-making capital) or replicable (a forecasting model)?
+
+That should be answered from the *persistence-surviving* cohort (A-decile 9–10), not from a
+PnL-ranked decile.
