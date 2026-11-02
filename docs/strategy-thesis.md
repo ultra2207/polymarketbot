@@ -650,3 +650,38 @@ What the persistent wallets have — and this model does not — is information 
 historical outcome sequence at all: team news, lineups, travel, weather, motivation, or simply
 a better probability model than a single Elo number. **That is the actual barrier, and it is a
 data-acquisition problem before it is a modelling problem.**
+
+## 13. Sizing the prize
+
+The 6–12 h match-winner window, Apr–Jul 2026:
+
+| metric | value |
+|---|---|
+| fills | 601,256 |
+| shares | 246.4 m |
+| notional | **$123.4 m** |
+| perfect-foresight profit (buy the correct side at the traded price) | **$56.3 m** |
+| captured by the persistent cohort | $10.6 m (**18.8 %** of the maximum) |
+
+$56.3 m is an upper bound that assumes every share traded is taken by an informed trader at
+the traded price — no slippage, no competition, no adverse selection. It is not a forecast. It
+does establish the order of magnitude: **the window where the information lives is roughly
+$120 m of notional per four months, and the best wallets take about a fifth of the theoretical
+maximum.**
+
+## 14. Where the project stands
+
+Three things are now established with enough evidence to act on:
+
+1. **There is no microstructure or calibration edge.** The market is zero-sum, calibrated at
+   every point in time, across every market type, price band, role and size tested.
+2. **The real edge is event information with a timing**: 6–12 h before the match, worth about
+   4 % of notional to the wallets who have it, and gone by kick-off.
+3. **It is not reachable by copying or by a model built from outcomes.** Followers pay the
+   information away within an hour; an Elo model built from the same public outcomes the market
+   already prices loses 2–4 %.
+
+The next investment that can change the answer is **pre-match data the market does not have
+cheaply**: team news, confirmed lineups, travel and rest, weather, referee, and a probability
+model that is genuinely better than a single Elo number. That is a data-acquisition project
+first and a modelling project second, and it is the only direction the evidence supports.
