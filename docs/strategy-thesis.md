@@ -544,3 +544,49 @@ approaches only if the information is public (lineups) — or persist if private
 before it breaks). The next session can test the timing of their match-winner buys relative to
 kick-off, using `question` text to identify the fixture and the trade timestamp to locate the
 buy in the pre-match window. That requires no external data and is the cheapest remaining test.
+
+## 11. The edge is a 6–12 hour pre-event window
+
+Match-winner buys, Apr–Jul 2026, edge per share by hours before `end_date`:
+
+| window | cohort edge/share | everyone else |
+|---|---|---|
+| 0–6 h | +0.0093 | +0.0077 |
+| **6–12 h** | **+0.1327** | +0.0308 |
+| 12–18 h | +0.0584 | −0.0500 |
+| 18–24 h | +0.1022 | −0.0287 |
+| 24–30 h | −0.0301 | +0.0230 |
+| 30–36 h | −0.0460 | −0.0197 |
+| 36–42 h | +0.0723 | +0.0412 |
+
+Contribution to the cohort's total match-winner edge:
+
+| window | shares bought | edge | % of cohort edge |
+|---|---|---|---|
+| **6–12 h** | 79.7 m | +$10.6 m | **80.7 %** |
+| 0–6 h | 88.2 m | +$0.8 m | 6.3 % |
+| 36 h+ | 9.6 m | +$0.7 m | 5.3 % |
+| 18–24 h | 6.7 m | +$0.7 m | 5.3 % |
+| 12–18 h | 10.2 m | +$0.6 m | 4.5 % |
+| 24–36 h | 7.4 m | −$0.3 m | −2.0 % |
+
+**Four fifths of the edge sits in one six-hour band, 6–12 h before the event. In the final six
+hours their edge is indistinguishable from everyone else's (0.0093 vs 0.0077).**
+
+That is the shape of an information advantage with a **timing**: whatever they know becomes
+knowable hours before the match, they act, and the market closes the gap by kick-off. It is not
+speed (the last hours show no edge), and it is not microstructure (the volume-weighted and
+fixed-price measurements agree here).
+
+### What this implies for building an edge
+
+A strategy does not need to beat the crowd in the final hour — it cannot. It needs to be **right
+in the 6–12 h window**, which means it needs pre-match information that the market has not yet
+absorbed: team news, lineups (usually ~1 h, so probably not), travel and rest, weather, venue,
+motivation, or a better rating model than the market's.
+
+The cheapest concrete test, and the one the data supports directly: build a team-strength model
+from the resolved match-winner markets themselves (the tape gives both the pre-match price and
+the outcome for tens of thousands of fixtures), and ask whether it disagrees with the 6–12 h
+price in a way that predicts the result. That requires no external data and is the natural next
+session.
