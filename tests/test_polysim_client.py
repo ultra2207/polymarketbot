@@ -189,3 +189,65 @@ def test_polysim_rate_limit_retry():
         assert resp.status_code == 200
         assert mock_session.request.call_count == 2
 
+
+def test_polysim_manage_positions_take_profit():
+    client = MagicMock()
+    client.get_positions.return_value = [
+        {
+            "market_id": "cond_test_1",
+            "quantity": "10.0",
+            "avg_entry_price": "0.30",
+            "current_price": "0.32",
+            "outcome": "Yes",
+        }
+    ]
+    client.place_order.return_value = PolySimOrderResult(
+        success=True, order_id="ord_exit_1", status="matched", price=0.32, size=10.0, side="SELL"
+    )
+
+    trader = PolySimulatorTrader(client=client)
+    trader.target_market = {"condition_id": "cond_test_1", "question": "Test Market"}
+    trader.yes_token_id = "tok_yes"
+    trader.yes_tick = 0.01
+
+    events = trader.manage_positions()
+    assert len(events) == 1
+    assert "TAKE PROFIT MATCHED" in events[0]
+    client.place_order.assert_called_once_with(
+        token_id="tok_yes",
+        side="SELL",
+        size=10.0,
+        price=0.32,
+        order_type="GTC",
+        tick_size=0.01,
+    )
+
+
+def test_polysim_execute_active_starter_trade():
+    client = MagicMock()
+    client.get_positions.return_value = []
+    client.get_book.return_value = {
+        "bids": [{"price": "0.30", "size": "100"}],
+        "asks": [{"price": "0.32", "size": "100"}],
+    }
+    client.place_order.return_value = PolySimOrderResult(
+        success=True, order_id="ord_entry_1", status="matched", price=0.32, size=10.0, side="BUY"
+    )
+
+    trader = PolySimulatorTrader(client=client)
+    trader.target_market = {"condition_id": "cond_test_1", "question": "Test Market"}
+    trader.yes_token_id = "tok_yes"
+    trader.yes_tick = 0.01
+
+    events = trader.execute_active_starter_trade(size=10.0)
+    assert len(events) == 1
+    assert "TACTICAL ENTRY" in events[0]
+    client.place_order.assert_called_once_with(
+        token_id="tok_yes",
+        side="BUY",
+        size=10.0,
+        price=0.32,
+        order_type="GTC",
+        tick_size=0.01,
+    )
+

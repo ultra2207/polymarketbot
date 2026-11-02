@@ -167,6 +167,8 @@ class PolySimulatorClient:
         data = resp.json()
         return data if isinstance(data, list) else data.get("history", [])
 
+    get_trade_history = get_history
+
     # ------------------------------------------------------------------
     # Markets & Order Book Data
     # ------------------------------------------------------------------

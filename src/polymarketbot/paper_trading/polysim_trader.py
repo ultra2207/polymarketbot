@@ -379,6 +379,97 @@ class PolySimulatorTrader:
 
         print("=" * 88)
 
+    def manage_positions(self) -> list[str]:
+        """Autonomously manage open positions: take profit, exit or rebalance."""
+        events = []
+        if not self.target_market:
+            return events
+
+        cond_id = self.target_market.get("condition_id", "")
+        try:
+            positions = self.client.get_positions(status="open")
+            for p in positions:
+                if p.get("market_id") == cond_id:
+                    qty = float(p.get("quantity", 0))
+                    entry = float(p.get("avg_entry_price", 0))
+                    current = float(p.get("current_price", 0))
+                    outcome = p.get("outcome", "")
+
+                    if qty <= 0:
+                        continue
+
+                    # If position has >= +0.5c profit, lock in profit!
+                    profit_cents = (current - entry) * 100.0
+                    token_id = self.yes_token_id if outcome == "Yes" else self.no_token_id
+                    tick = self.yes_tick if outcome == "Yes" else self.no_tick
+
+                    if token_id and profit_cents >= 0.5:
+                        res = self.client.place_order(
+                            token_id=token_id,
+                            side="SELL",
+                            size=qty,
+                            price=current,
+                            order_type="GTC",
+                            tick_size=tick,
+                        )
+                        if res.success:
+                            msg = f"TAKE PROFIT MATCHED: Sold {qty:.0f} {outcome} @ ${current:.3f} (+{profit_cents:.1f}c PnL)"
+                            events.append(msg)
+                            self.db.record_decision(
+                                decision_type="TAKE_PROFIT",
+                                condition_id=cond_id,
+                                market_question=self.target_market.get("question", ""),
+                                allocated_capital=qty * current,
+                                quote_size=qty,
+                                rationale=msg,
+                                net_yield_est=qty * (current - entry),
+                            )
+        except Exception as e:
+            log.warning(f"Error in manage_positions: {e}")
+        return events
+
+    def execute_active_starter_trade(self, size: float = 10.0) -> list[str]:
+        """Execute an initial tactical trade if no open positions exist on target market."""
+        events = []
+        if not self.yes_token_id or not self.target_market:
+            return events
+
+        try:
+            positions = self.client.get_positions(status="open")
+            cond_id = self.target_market.get("condition_id", "")
+            has_pos = any(
+                p.get("market_id") == cond_id and float(p.get("quantity", 0)) > 0 for p in positions
+            )
+
+            if not has_pos:
+                book = self.client.get_book(self.yes_token_id, depth=5)
+                asks = book.get("asks", [])
+                if asks:
+                    best_ask = float(asks[-1]["price"])
+                    res = self.client.place_order(
+                        token_id=self.yes_token_id,
+                        side="BUY",
+                        size=size,
+                        price=best_ask,
+                        order_type="GTC",
+                        tick_size=self.yes_tick,
+                    )
+                    if res.success:
+                        evt = f"TACTICAL ENTRY: Bought {size:.0f} shares YES @ ${best_ask:.3f} (status: {res.status})"
+                        events.append(evt)
+                        self.db.record_decision(
+                            decision_type="TACTICAL_ENTRY",
+                            condition_id=cond_id,
+                            market_question=self.target_market.get("question", ""),
+                            allocated_capital=size * best_ask,
+                            quote_size=size,
+                            rationale=evt,
+                            net_yield_est=0.0,
+                        )
+        except Exception as e:
+            log.warning(f"Error executing starter trade: {e}")
+        return events
+
     def run_loop(self, duration_seconds: Optional[float] = None) -> None:
         """Run the main quoting and monitoring loop with clean terminal printing."""
         self._running = True
@@ -391,6 +482,9 @@ class PolySimulatorTrader:
         bal = self.client.get_balance()
         self.db.record_account_snapshot(bal.balance, bal.total_value, bal.unrealized_pnl, 0.0)
 
+        # Seed initial tactical starter trade if empty
+        initial_events = self.execute_active_starter_trade(size=10.0)
+
         try:
             while self._running:
                 now = time.time()
@@ -400,14 +494,22 @@ class PolySimulatorTrader:
 
                 # 1. Sync orders to check fills
                 fills = self.sync_open_orders()
+                if initial_events:
+                    fills.extend(initial_events)
+                    initial_events = []
 
-                # 2. Refresh quotes
+                # 2. Manage open positions (take profit / rebalance)
+                pos_events = self.manage_positions()
+                if pos_events:
+                    fills.extend(pos_events)
+
+                # 3. Refresh quotes
                 self.refresh_quotes()
 
-                # 3. Evaluate 1-min reward epoch
+                # 4. Evaluate 1-min reward epoch
                 self.evaluate_reward_epoch()
 
-                # 4. Print clean terminal status
+                # 5. Print clean terminal status
                 self.print_terminal_status(fills)
 
                 time.sleep(self.poll_interval)
