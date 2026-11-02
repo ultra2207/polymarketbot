@@ -506,3 +506,41 @@ The market is efficient; a broad set of wallets still has real event information
 information is gone from the price within an hour; and there is no mechanical feature of the
 book that predicts it. Generating alpha therefore requires being *early with information*, not
 being fast with order flow or clever with microstructure.
+
+## 10. Where the persistent edge sits
+
+Period B, persistent cohort (A-dec 9–10), by category:
+
+| category | bought | PnL | return |
+|---|---|---|---|
+| sports | $568 m | +$12.0 m | **+2.12 %** |
+| crypto | $67 m | +$4.7 m | **+6.95 %** |
+| geopolitics | $27 m | −$0.2 m | −0.83 % |
+| economics / politics / weather / tech | $29 m total | +$1.3 m | +4 to +8 % (tiny) |
+
+And the whole market in B, for contrast, returns **exactly 0.00 % in every category** — the
+zero-sum property holds category by category, not only in aggregate.
+
+Inside sports:
+
+| market type | bought | return |
+|---|---|---|
+| other sports | $265 m | +2.68 % |
+| **match winner** | $148 m | **+4.11 %** |
+| over/under | $69 m | +0.78 % |
+| **advance** | $39 m | **−7.35 %** |
+| spread | $24 m | +3.67 % |
+| draw | $18 m | −1.12 % |
+| both-teams-to-score | $6 m | +8.59 % |
+
+The edge is concentrated in **match-winner markets** and **crypto**, and the cohort *loses* on
+"team to advance" markets. That is a specific, falsifiable lead: the information is about
+**who wins a match**, not about aggregate scoring or tournament progression.
+
+### What would falsify the "information" reading
+
+If the cohort's match-winner edge came from information, it should decay as the match
+approaches only if the information is public (lineups) — or persist if private (injury news
+before it breaks). The next session can test the timing of their match-winner buys relative to
+kick-off, using `question` text to identify the fixture and the trade timestamp to locate the
+buy in the pre-match window. That requires no external data and is the cheapest remaining test.
