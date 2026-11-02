@@ -68,10 +68,16 @@ def resolve_ipv4(host: str, depth: int = 0) -> str:
     if depth > 5:
         raise RuntimeError(f"CNAME loop resolving {host}")
 
+    # Blocked by regional ISP injunction (causes WinError 10054 on TLS handshake)
+    BLOCKED_IPS = {"104.18.34.205", "172.64.153.51"}
+    RESILIENT_CF_FALLBACK = "104.18.35.205"
+
     answers = _doh_query(host, "A")
     for a in answers:
         if a.get("type") == 1:
             ip = a["data"]
+            if ip in BLOCKED_IPS:
+                ip = RESILIENT_CF_FALLBACK
             _CACHE[host] = (time.time() + 300, ip)
             return ip
 
@@ -79,6 +85,8 @@ def resolve_ipv4(host: str, depth: int = 0) -> str:
         if a.get("type") == 5:
             target = a["data"].rstrip(".")
             ip = resolve_ipv4(target, depth + 1)
+            if ip in BLOCKED_IPS:
+                ip = RESILIENT_CF_FALLBACK
             _CACHE[host] = (time.time() + 300, ip)
             return ip
 

@@ -517,16 +517,29 @@ class LivePolymarketFeed:
             if not isinstance(item, dict):
                 continue
 
-            ev_type = item.get("event_type")
-            asset_id = item.get("asset_id")
+            # Support both flat and wrapped payload schemas
+            p = item.get("payload", {}) if isinstance(item.get("payload"), dict) else item
+            ev_type = item.get("event_type") or item.get("type") or p.get("event_type") or p.get("type")
+            asset_id = item.get("asset_id") or item.get("assetId") or p.get("asset_id") or p.get("assetId")
+
+            # Infer event type if not explicitly set
+            if not ev_type:
+                if "bids" in item or "bids" in p:
+                    ev_type = "book"
+                elif "price_changes" in item or "price_changes" in p:
+                    ev_type = "price_change"
+                elif ("best_bid" in item or "best_bid" in p) and ("best_ask" in item or "best_ask" in p):
+                    ev_type = "best_bid_ask"
+                elif ("price" in item or "price" in p) and ("side" in item or "fee_rate_bps" in p or "transaction_hash" in p):
+                    ev_type = "last_trade_price"
 
             # 1. Full order book snapshot
             if ev_type == "book" and asset_id:
-                bids = item.get("bids", [])
-                asks = item.get("asks", [])
-                tick = _parse_float(item.get("tick_size"), 0.01)
-                book_hash = item.get("hash")
-                ts_raw = item.get("timestamp")
+                bids = p.get("bids") if "bids" in p else item.get("bids", [])
+                asks = p.get("asks") if "asks" in p else item.get("asks", [])
+                tick = _parse_float(p.get("tick_size") or p.get("tickSize") or item.get("tick_size"), 0.01)
+                book_hash = p.get("hash") or item.get("hash")
+                ts_raw = p.get("timestamp") or item.get("timestamp")
                 ts = (_parse_float(ts_raw) / 1000.0) if ts_raw else time.time()
 
                 snapshot = build_book_snapshot(
@@ -542,8 +555,8 @@ class LivePolymarketFeed:
 
             # 2. Best bid/ask top of book update
             elif ev_type == "best_bid_ask" and asset_id:
-                bb = _parse_float(item.get("best_bid"), 0.0)
-                ba = _parse_float(item.get("best_ask"), 1.0)
+                bb = _parse_float(p.get("best_bid") or p.get("bestBid") or item.get("best_bid"), 0.0)
+                ba = _parse_float(p.get("best_ask") or p.get("bestAsk") or item.get("best_ask"), 1.0)
                 raw_bids = [{"price": bb, "size": 100.0}] if bb > 0 else []
                 raw_asks = [{"price": ba, "size": 100.0}] if ba < 1.0 else []
                 snapshot = build_book_snapshot(
@@ -556,12 +569,12 @@ class LivePolymarketFeed:
 
             # 3. Price change / batch delta
             elif ev_type == "price_change":
-                changes = item.get("price_changes", [])
+                changes = p.get("price_changes") or item.get("price_changes") or p.get("priceChanges") or item.get("priceChanges") or []
                 for ch in changes:
-                    c_aid = ch.get("asset_id")
+                    c_aid = ch.get("asset_id") or ch.get("assetId")
                     if c_aid:
-                        bb = _parse_float(ch.get("best_bid"), 0.0)
-                        ba = _parse_float(ch.get("best_ask"), 1.0)
+                        bb = _parse_float(ch.get("best_bid") or ch.get("bestBid"), 0.0)
+                        ba = _parse_float(ch.get("best_ask") or ch.get("bestAsk"), 1.0)
                         raw_bids = [{"price": bb, "size": 100.0}] if bb > 0 else []
                         raw_asks = [{"price": ba, "size": 100.0}] if ba < 1.0 else []
                         snapshot = build_book_snapshot(
@@ -574,12 +587,12 @@ class LivePolymarketFeed:
 
             # 4. Public trade stream
             elif ev_type in ("last_trade_price", "trade") and asset_id:
-                price = _parse_float(item.get("price"))
-                size = _parse_float(item.get("size"))
-                side = str(item.get("side", "BUY")).upper()
-                ts_raw = item.get("timestamp")
+                price = _parse_float(p.get("price") or item.get("price"))
+                size = _parse_float(p.get("size") or item.get("size"))
+                side = str(p.get("side") or item.get("side", "BUY")).upper()
+                ts_raw = p.get("timestamp") or item.get("timestamp")
                 ts = (_parse_float(ts_raw) / 1000.0) if ts_raw else time.time()
-                trade_id = str(item.get("transaction_hash") or item.get("id") or uuid.uuid4().hex[:12])
+                trade_id = str(p.get("transaction_hash") or p.get("transactionHash") or item.get("transaction_hash") or item.get("id") or uuid.uuid4().hex[:12])
 
                 if price > 0.0 and size > 0.0:
                     trade = MarketTrade(
@@ -619,16 +632,30 @@ class LivePolymarketFeed:
                     if self._subscribed_tokens:
                         await self._send_subscription(list(self._subscribed_tokens))
 
-                    while self._running:
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=25.0)
-                            await self._process_ws_payload(msg)
-                        except asyncio.TimeoutError:
-                            # Send explicit ping on quiet connection
+                    # Start application-level heartbeat task (Polymarket requires text frame "PING" every 10s)
+                    async def _heartbeat_worker() -> None:
+                        while self._running and self._ws_connected and self._active_ws is ws:
+                            await asyncio.sleep(8.0)
                             try:
-                                await ws.ping()
+                                await ws.send("PING")
                             except Exception:
                                 break
+
+                    hb_task = asyncio.create_task(_heartbeat_worker(), name="CLOB-WS-Heartbeat")
+
+                    try:
+                        while self._running:
+                            try:
+                                msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                                await self._process_ws_payload(msg)
+                            except asyncio.TimeoutError:
+                                # Re-verify connection with explicit ping
+                                try:
+                                    await ws.send("PING")
+                                except Exception:
+                                    break
+                    finally:
+                        hb_task.cancel()
 
             except asyncio.CancelledError:
                 break

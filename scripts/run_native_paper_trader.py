@@ -154,6 +154,14 @@ def resolve_market_details(
     markets = feed.get_rewards_markets_sync()
     target_market: Optional[dict[str, Any]] = None
 
+    def _get_rate(m: dict[str, Any]) -> float:
+        cfg = m.get("rewards_config", [])
+        if cfg and isinstance(cfg, list) and len(cfg) > 0:
+            val = float(cfg[0].get("rate_per_day", 0.0) or 0.0)
+            return (val / 100.0) if val >= 500.0 else val
+        val = float(m.get("rewards_daily_rate", 0.0) or 0.0)
+        return (val / 100.0) if val >= 500.0 else val
+
     if requested_cid:
         for m in markets:
             if m.get("condition_id", "").lower() == requested_cid.lower():
@@ -161,12 +169,12 @@ def resolve_market_details(
                 break
     elif markets:
         # Pick market with highest daily reward rate
-        markets_sorted = sorted(markets, key=lambda x: float(x.get("rewards_daily_rate", 0) or 0), reverse=True)
+        markets_sorted = sorted(markets, key=_get_rate, reverse=True)
         target_market = markets_sorted[0] if markets_sorted else None
 
     cid = requested_cid or (target_market.get("condition_id") if target_market else None) or "0x221319cd...demo"
     question = (target_market.get("question") if target_market else None) or f"Market Condition {cid[:14]}..."
-    daily_reward = float(target_market.get("rewards_daily_rate", 25.0)) if target_market else 25.0
+    daily_reward = _get_rate(target_market) if target_market else 25.0
     max_spread = float(target_market.get("rewards_max_spread", 1.0)) if target_market else 1.0
     min_size = float(target_market.get("rewards_min_size", 20.0)) if target_market else 20.0
 
@@ -320,9 +328,9 @@ def render_dashboard(
     sys.stdout.flush()
 
 
-def run_paper_trading(args: argparse.Namespace) -> int:
-    """Main execution loop for native Polymarket paper trader."""
-    feed = LivePolymarketFeed()
+async def run_paper_trading_async(args: argparse.Namespace) -> int:
+    """Async main execution loop for native Polymarket paper trader with live WebSocket and REST streaming."""
+    feed = LivePolymarketFeed(fallback_poll_interval=2.0)
     market = resolve_market_details(
         feed=feed,
         requested_cid=args.condition_id,
@@ -349,7 +357,57 @@ def run_paper_trading(args: argparse.Namespace) -> int:
         ledger_path=args.ledger_path,
     )
 
-    log.info("Starting live CLOB feed subscription...")
+    # 1. Register live book listener
+    def on_book_update(snapshot: Any) -> None:
+        tok_side = "YES" if snapshot.asset_id == market["token_yes"] else "NO"
+        engine.update_orderbook_snapshot(
+            token_side=tok_side,
+            bids=snapshot.bids,
+            asks=snapshot.asks,
+        )
+        engine.evaluate_quotes()
+
+    feed.add_book_listener(on_book_update)
+
+    # 2. Register live trade listener (drains queue_ahead and executes fills!)
+    def on_trade_update(trade: Any) -> None:
+        tok_side = "YES" if trade.asset_id == market["token_yes"] else "NO"
+        fills = engine.process_public_trade(
+            token_side=tok_side,
+            price=trade.price,
+            size=trade.size,
+            side=trade.side,
+            timestamp=trade.timestamp,
+        )
+        if fills:
+            for f in fills:
+                log.info(
+                    f"[SIMULATED FILL] {f.token_side} {f.side} {f.fill_size:.1f}sh @ "
+                    f"${f.fill_price:.4f} (Queue Depleted: {f.queue_depleted:.1f}, Drift: {f.post_fill_drift:+.4f})"
+                )
+            engine.evaluate_quotes()
+
+    feed.add_trade_listener(on_trade_update)
+
+    # 3. Subscribe tokens to feed
+    feed.subscribe(market["token_yes"])
+    feed.subscribe(market["token_no"])
+
+    # 4. Initial book snapshot via REST
+    try:
+        book_yes = feed.get_book_sync(market["token_yes"])
+        if book_yes and (book_yes.bids or book_yes.asks):
+            engine.update_orderbook_snapshot("YES", book_yes.bids, book_yes.asks)
+        book_no = feed.get_book_sync(market["token_no"])
+        if book_no and (book_no.bids or book_no.asks):
+            engine.update_orderbook_snapshot("NO", book_no.bids, book_no.asks)
+    except Exception as e:
+        log.warning(f"Initial REST orderbook fetch warning: {e}")
+
+    # 5. Start live feed (WebSocket + REST fallback)
+    await feed.start()
+    log.info("Live Polymarket Feed started (WebSocket streaming + trade listener active).")
+
     start_time = time.time()
     last_epoch_check = time.time()
     running = True
@@ -361,66 +419,53 @@ def run_paper_trading(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    # Initial order book fetch
-    try:
-        book_data = feed.get_book_sync(market["token_yes"])
-        if book_data and (book_data.bids or book_data.asks):
-            engine.update_orderbook_snapshot(
-                token_side="YES",
-                bids=book_data.bids,
-                asks=book_data.asks,
-            )
-    except Exception as e:
-        log.warning(f"Initial order book fetch warning: {e}")
-
-    # Main Simulation Loop
     log.info("Paper trading execution loop engaged.")
-    while running:
-        loop_now = time.time()
+    try:
+        while running:
+            loop_now = time.time()
+            if args.duration and (loop_now - start_time) >= args.duration:
+                log.info(f"Requested duration ({args.duration}s) reached. Stopping.")
+                break
 
-        # Check duration cap
-        if args.duration and (loop_now - start_time) >= args.duration:
-            log.info(f"Requested duration ({args.duration}s) reached. Stopping.")
-            break
+            try:
+                # Periodic 60-second reward epoch
+                if (loop_now - last_epoch_check) >= 60.0:
+                    engine.process_reward_epoch(timestamp=loop_now)
+                    last_epoch_check = loop_now
 
-        try:
-            # 1. Fetch live book update via REST/WS
-            book_snapshot = feed.get_book_sync(market["token_yes"])
-            if book_snapshot and (book_snapshot.bids or book_snapshot.asks):
-                engine.update_orderbook_snapshot(
-                    token_side="YES",
-                    bids=book_snapshot.bids,
-                    asks=book_snapshot.asks,
+                # Auto complete-set merge check
+                pos = engine.portfolio.get_position(market["condition_id"])
+                if pos.complete_sets >= args.auto_merge_threshold:
+                    m_res = engine.portfolio.merge(market["condition_id"], pos.complete_sets)
+                    log.info(
+                        f"[CTF MERGE] Merged {m_res.shares_merged:.1f} complete sets -> "
+                        f"Unlocked ${m_res.cash_unlocked:.2f} USDC (Gas fee: ${m_res.gas_fee:.3f})"
+                    )
+
+                # Quoting & de-skew evaluation
+                engine.evaluate_quotes(timestamp=loop_now)
+
+                # Render dashboard
+                render_dashboard(
+                    engine=engine,
+                    market_info=market,
+                    start_time=start_time,
+                    clear_screen=not args.no_clear,
                 )
 
-            # 2. Check 60-second reward epoch
-            if (loop_now - last_epoch_check) >= 60.0:
-                engine.process_reward_epoch(timestamp=loop_now)
-                last_epoch_check = loop_now
+                # Flush persistence
+                engine.flush_ledger()
 
-            # 3. Quoting & de-skew evaluation
-            engine.evaluate_quotes(timestamp=loop_now)
+            except Exception as e:
+                log.error(f"Error in paper trading iteration: {e}")
 
-            # 4. Render high-density dashboard
-            render_dashboard(
-                engine=engine,
-                market_info=market,
-                start_time=start_time,
-                clear_screen=not args.no_clear,
-            )
+            await asyncio.sleep(args.poll_interval)
+    finally:
+        log.info("Stopping live feed and flushing final ledger...")
+        await feed.stop()
+        engine.flush_ledger()
+        log.info(f"Native paper trading completed. State saved to {args.db_path} and {args.ledger_path}.")
 
-            # 5. Flush persistence
-            engine.flush_ledger()
-
-        except Exception as e:
-            log.error(f"Error in paper trading iteration: {e}")
-
-        time.sleep(args.poll_interval)
-
-    # Final shutdown
-    log.info("Flushing final ledger state to disk and database...")
-    engine.flush_ledger()
-    log.info(f"Native paper trading completed. State saved to {args.db_path} and {args.ledger_path}.")
     return 0
 
 
@@ -428,7 +473,7 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args()
-    return run_paper_trading(args)
+    return asyncio.run(run_paper_trading_async(args))
 
 
 if __name__ == "__main__":
