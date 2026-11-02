@@ -179,6 +179,20 @@ class PolySimulatorTrader:
         if not needs_requote:
             return
 
+        yes_bid, no_bid = self.calculate_binary_quotes(mid)
+        self.last_mid = mid
+
+        # Check if daily order placement cap has been reached
+        gov = getattr(self.client, "governor", None)
+        if gov and not gov.get_status().can_place_order:
+            if not getattr(self, "_daily_cap_logged", False):
+                log.info(
+                    "[RateGovernor] Daily order limit (100 orders/day) reached for UTC day. "
+                    "Running in Passive Monitoring & Rewards Accrual mode until 00:00 UTC reset."
+                )
+                self._daily_cap_logged = True
+            return
+
         # Dynamically size quote based on actual available cash
         bal = self.client.get_balance()
         available_cash = max(0.0, bal.balance)
@@ -192,13 +206,10 @@ class PolySimulatorTrader:
                 f"Available cash (${available_cash:.2f}) insufficient for two-sided quoting "
                 f"(needs ${unit_cost * 10:.2f} for 10 shares). Holding existing inventory."
             )
-            self._quote_cooldown_until = time.time() + 30.0
+            self._quote_cooldown_until = time.time() + 60.0
             return
 
         self.cancel_all_quotes()
-
-        yes_bid, no_bid = self.calculate_binary_quotes(mid)
-        self.last_mid = mid
 
         cond_id = self.target_market.get("condition_id", "") if self.target_market else ""
 
@@ -231,8 +242,15 @@ class PolySimulatorTrader:
                 outcome="Yes",
             )
         elif not r_yes.success:
+            if "daily" in (r_yes.error_msg or "").lower() or "limit" in (r_yes.error_msg or "").lower():
+                if gov:
+                    gov._daily_order_count = gov.config.max_orders_per_day
+                log.info(
+                    "[RateGovernor] Daily order limit detected from server. "
+                    "Switching to Passive Monitoring & Rewards Accrual mode."
+                )
             log.warning(f"BUY YES rejected: {r_yes.error_msg}. Cooling down quotes.")
-            self._quote_cooldown_until = time.time() + 30.0
+            self._quote_cooldown_until = time.time() + 60.0
             return
 
         time.sleep(0.6)  # rate limit courtesy
@@ -472,6 +490,10 @@ class PolySimulatorTrader:
         """Execute an initial tactical trade if no open positions exist on target market."""
         events = []
         if not self.yes_token_id or not self.target_market:
+            return events
+
+        gov = getattr(self.client, "governor", None)
+        if gov and not gov.get_status().can_place_order:
             return events
 
         try:
