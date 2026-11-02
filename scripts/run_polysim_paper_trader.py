@@ -31,7 +31,13 @@ log = get_logger("polysim_runner")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="PolySimulator Cloud-Hosted Polymarket Paper Trader"
+        description="PolySimulator Cloud-Hosted Polymarket Autonomous Paper Trader"
+    )
+    parser.add_argument(
+        "--capital",
+        type=float,
+        default=100.0,
+        help="Fraction of balance unlocked for trading in USD (default: $100.00).",
     )
     parser.add_argument(
         "--duration",
@@ -42,8 +48,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quote-size",
         type=float,
-        default=50.0,
-        help="Maker order size in shares per quote (default: 50.0).",
+        default=None,
+        help="Optional manual override for order size in shares (default: autonomous based on capital).",
     )
     parser.add_argument(
         "--spread-offset",
@@ -55,13 +61,13 @@ def parse_args() -> argparse.Namespace:
         "--filter",
         type=str,
         default=None,
-        help="Filter keyword to select target market (e.g. 'Netanyahu', 'Fed').",
+        help="Optional filter keyword to select target market (e.g. 'Netanyahu', 'Fed').",
     )
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=3.0,
-        help="Poll interval in seconds (default: 3.0s).",
+        default=3.5,
+        help="Poll interval in seconds (default: 3.5s).",
     )
     parser.add_argument(
         "--dry-run",
@@ -102,10 +108,11 @@ def main() -> int:
         return 1
 
     trader = PolySimulatorTrader(
+        unlocked_capital_usd=args.capital,
         client=client,
-        quote_size=args.quote_size,
         spread_offset_cents=args.spread_offset,
         poll_interval_seconds=args.poll_interval,
+        quote_size=args.quote_size,
     )
 
     if not trader.select_market(filter_keyword=args.filter):
@@ -114,12 +121,15 @@ def main() -> int:
 
     if args.dry_run:
         log.info("Dry-run mode enabled: verified account and market. Exiting without placing orders.")
-        mid = client.get_midpoint(trader.target_token_id)
-        bid, ask = trader.calculate_quotes(mid or 0.50)
-        log.info(f"Calculated Quotes: BID ${bid:.3f} / ASK ${ask:.3f} (Mid: ${mid})")
+        mid = client.get_midpoint(trader.yes_token_id)
+        yes_bid, no_bid = trader.calculate_binary_quotes(mid or 0.50)
+        log.info(f"Calculated Binary Quotes: BUY YES @ ${yes_bid:.3f} | BUY NO @ ${no_bid:.3f} (Mid: ${mid})")
         return 0
 
-    log.info(f"Starting paper trading (duration={args.duration}s, quote_size={args.quote_size})...")
+    log.info(
+        f"Starting autonomous paper trading (Unlocked Capital=${args.capital:.2f}, "
+        f"Auto Quote Size={trader.quote_size:.0f} shares, Duration={args.duration}s)..."
+    )
     trader.run_loop(duration_seconds=args.duration)
     return 0
 

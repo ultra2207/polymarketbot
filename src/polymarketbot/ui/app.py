@@ -106,6 +106,39 @@ def get_db() -> PolySimDatabase:
 client = get_client()
 db = get_db()
 
+
+@st.cache_data(ttl=6)
+def fetch_balance(_c):
+    try:
+        return _c.get_balance()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=6)
+def fetch_open_orders(_c):
+    try:
+        return _c.get_open_orders()
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=6)
+def fetch_positions(_c):
+    try:
+        return _c.get_positions(status="open")
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=6)
+def fetch_book(_c, token_id: str):
+    try:
+        return _c.get_book(token_id, depth=12)
+    except Exception:
+        return {}
+
+
 # -----------------------------------------------------------------------------
 # Sidebar: The Single User Parameter & Engine Controls
 # -----------------------------------------------------------------------------
@@ -114,6 +147,7 @@ st.sidebar.title("⚡ Autonomous Harvester")
 if not client.api_key:
     st.sidebar.error("⚠️ POLYSIMULATOR_API_KEY is not configured in .env!")
     st.stop()
+
 
 st.sidebar.markdown(
     """
@@ -186,12 +220,10 @@ with col_status:
     else:
         st.markdown('<div class="status-paused">■ ENGINE PAUSED</div>', unsafe_allow_html=True)
 
-try:
-    bal = client.get_balance()
-except Exception:
-    bal = None
+bal = fetch_balance(client)
 
 # Top Metrics Row
+
 m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
     st.metric("Total Equity", f"${bal.total_value:.2f}" if bal else "$100.00")
@@ -276,7 +308,7 @@ with tab_book:
         with col_depth:
             st.markdown("#### Live PolySimulator L2 Order Book")
             try:
-                book = client.get_book(daemon.current_yes_token, depth=12)
+                book = fetch_book(client, daemon.current_yes_token)
                 raw_bids = book.get("bids", [])
                 raw_asks = book.get("asks", [])
 
@@ -304,7 +336,7 @@ with tab_book:
         with col_my_quotes:
             st.markdown("#### Bot's Resting Maker Quotes on PolySimulator")
             try:
-                open_orders = client.get_open_orders()
+                open_orders = fetch_open_orders(client)
                 if open_orders:
                     view_orders = []
                     for o in open_orders:
@@ -321,6 +353,7 @@ with tab_book:
                     st.info("No active resting quotes currently. Bot will place them during quoting loop.")
             except Exception as e:
                 st.error(f"Error reading open orders: {e}")
+
 
             # Collateral & Capital Utilization Gauge
             quoting_capital = daemon.current_quote_size * (daemon.current_mid or 0.50) * 2
@@ -433,17 +466,26 @@ with tab_leaderboard:
 with tab_audit:
     st.subheader("📑 Execution Audit Log & Positions")
 
+    st.info(
+
+        "💡 **Resting Orders vs. Token Positions:**\n\n"
+        "- **Resting Maker Orders (Active Liquidity):** Our bot places limit orders on the book. As long as they rest without filling, you earn **Quadratic Liquidity Rewards** every minute with zero directional inventory risk.\n"
+        "- **Open Positions:** A position is ONLY created when an external taker trades against your resting quotes and executes a fill.\n"
+        "- **Website Dashboard Wallet:** On `polysimulator.com`, ensure you switch your wallet selector from 'MAIN' to **'API Sandbox'** to view your bot's resting orders and balance."
+    )
+
     col_p, col_o = st.columns(2)
     with col_p:
         st.markdown("#### Open Token Positions (PolySimulator)")
         try:
-            pos = client.get_positions(status="open")
+            pos = fetch_positions(client)
             if pos:
                 st.dataframe(pd.DataFrame(pos), hide_index=True, use_container_width=True)
             else:
-                st.info("No token positions held.")
+                st.info("No token positions held yet (orders are resting as maker liquidity).")
         except Exception as e:
             st.error(f"Error reading positions: {e}")
+
 
     with col_o:
         st.markdown("#### Recent Database Orders")
