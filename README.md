@@ -25,9 +25,26 @@ capital.
 | 1 — Data acquisition and integrity | counts, payouts, cross-indexer | **passed 2026-11-01** |
 | 1b — Missing sources | fees, wallets, reference prices | **partial** — fees and categories done (per-market schedules for 1.94 M markets; 2.7 % `other`); wallet identity, crypto reference prices, UMA/sports metadata pending |
 | 2 — Point-in-time universe | no lookahead, explicit rules | **passed 2026-11-01** |
-| 3 — Trade normalisation and PnL | labels, unified fills, positions | **in progress** — label backfill running (682 k of ~1.9 M done); `build_trades.py` written, not yet validated |
+| 3 — Trade normalisation and PnL | labels, unified fills, positions | **passed 2026-11-02** — 15.1 GB positions, 2.08 M-cell cube, sub-second cross-sections |
 | 4 — Book replayer | PMXT reduce + replay invariants | reducer works (verified against an independent replay); waits on the 1.06 TB archive download |
 | 5+ | — | not started |
+
+### What the wallet study established (2026-11-02)
+
+Full detail in `docs/strategy-thesis.md` §1–11. Summary:
+
+- The market is **zero-sum** (aggregate PnL $0.0 m over 1.2 M wallets) and **calibrated at every
+  point in time** (±1 pp at the first, last and 95th-percentile trade price).
+- There is **no favourite–longshot bias**; the earlier finding was a VWAP averaging artifact.
+- The "top decile" edge was **selection on realised PnL**; ranked by volume, the wallets that
+  carry 99 % of it earn +0.21 %.
+- Wallet skill **does persist out of sample** (Spearman 0.231 A→B; event-level split 0.270).
+- It is **not copyable**: followers pay +3.3 ¢ after an hour against a 2.2 ¢ edge.
+- **80.7 % of the match-winner edge sits in the 6–12 h window** before the event; the final six
+  hours show no edge.
+
+The open problem is therefore a forecasting one: build a team-strength model and test whether it
+disagrees with the 6–12 h price in a way that predicts results.
 
 ## Data we hold
 
