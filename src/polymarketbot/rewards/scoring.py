@@ -32,9 +32,10 @@ def order_spread_cents(order_price: float, mid_price: float, side: str) -> float
     For a bid (BUY), order sits below mid: spread = (mid - price) * 100.
     For an ask (SELL), order sits above mid: spread = (price - mid) * 100.
     """
-    if side.upper() == "BUY":
+    s = side.upper() if not (side == "BUY" or side == "SELL") else side
+    if s == "BUY":
         return max(0.0, (mid_price - order_price) * 100.0)
-    elif side.upper() == "SELL":
+    elif s == "SELL":
         return max(0.0, (order_price - mid_price) * 100.0)
     else:
         raise ValueError(f"Unknown order side: {side}")
@@ -104,11 +105,11 @@ def compute_book_side_scores(
         if q.size < min_size or q.duration_seconds < 3.5:
             continue
 
-        outcome_norm = q.outcome.upper()
-        side_norm = q.side.upper()
+        outcome = q.outcome.upper() if not (q.outcome == "YES" or q.outcome == "NO") else q.outcome
+        side = q.side.upper() if not (q.side == "BUY" or q.side == "SELL") else q.side
 
-        if outcome_norm == "YES":
-            spr = order_spread_cents(q.price, mid_price_yes, side_norm)
+        if outcome == "YES":
+            spr = order_spread_cents(q.price, mid_price_yes, side)
             score = quadratic_order_score(
                 max_spread_cents=max_spread_cents,
                 spread_cents=spr,
@@ -117,12 +118,12 @@ def compute_book_side_scores(
                 min_size=min_size,
                 duration_seconds=q.duration_seconds,
             )
-            if side_norm == "BUY":
+            if side == "BUY":
                 q_one += score
-            elif side_norm == "SELL":
+            elif side == "SELL":
                 q_two += score
-        elif outcome_norm == "NO":
-            spr = order_spread_cents(q.price, mid_price_no, side_norm)
+        elif outcome == "NO":
+            spr = order_spread_cents(q.price, mid_price_no, side)
             score = quadratic_order_score(
                 max_spread_cents=max_spread_cents,
                 spread_cents=spr,
@@ -132,10 +133,10 @@ def compute_book_side_scores(
                 duration_seconds=q.duration_seconds,
             )
             # NO ask complements YES bid -> contributes to Q_one
-            if side_norm == "SELL":
+            if side == "SELL":
                 q_one += score
             # NO bid complements YES ask -> contributes to Q_two
-            elif side_norm == "BUY":
+            elif side == "BUY":
                 q_two += score
 
     return q_one, q_two
