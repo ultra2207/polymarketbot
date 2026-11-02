@@ -461,3 +461,48 @@ The persistence that remains (+0.231 A→B, +0.270 event-level) can only be **ev
 information or modelling**. That is not a microstructure question and cannot be answered from
 trade tape alone. It requires pre-event public data — team strength, schedules, rest, venue,
 lineups — and a forecast compared against the market price.
+
+## 9. Is the event-selection skill copyable? No.
+
+The persistence survives, so the natural next question is whether observing the persistent
+wallets and following their buys captures anything. Two measurements answer it.
+
+### What they earn
+
+Tokens the persistent cohort (A-dec 9–10) bought in period B: their entry VWAP is **0.4432**,
+the realised payout is **0.4654**, so their edge is **+0.0222 per share**.
+
+### What a follower pays: the price impact of their buying
+
+For 5.75 M skilled buy trades in July 2026 (2,088 wallets, 891 M shares), the price of the same
+token at the next trade after *h*:
+
+| horizon | observations | mean ΔP | median ΔP |
+|---|---|---|---|
+| 1 minute | 5,082,557 | **+0.0140** | 0.0000 |
+| 10 minutes | 2,987,494 | +0.0095 | 0.0000 |
+| 1 hour | 2,417,763 | **+0.0332** | 0.0000 |
+| 6 hours | 1,389,251 | +0.0189 | 0.0000 |
+
+The mean rises because a minority of tokens move; the median is flat.
+
+### The subtraction
+
+| follower latency | price paid above theirs | edge left per share |
+|---|---|---|
+| 1 minute | +1.40 ¢ | **+0.8 ¢** |
+| 1 hour | +3.32 ¢ | **−1.1 ¢** |
+
+So the information is real, it is theirs, and it is impounded within about an hour. Copying
+after that hour is negative; copying inside a minute leaves less than a cent and is a pure
+latency race against 2,088 wallets who are already faster.
+
+**Conclusion: the persistent edge is private event information, it is expressed through taking,
+and it is not copyable at our latency.**
+
+### What this means, in one line
+
+The market is efficient; a broad set of wallets still has real event information; that
+information is gone from the price within an hour; and there is no mechanical feature of the
+book that predicts it. Generating alpha therefore requires being *early with information*, not
+being fast with order flow or clever with microstructure.
