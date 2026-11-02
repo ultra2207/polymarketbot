@@ -28,6 +28,7 @@ from polymarketbot.logs import get_logger
 from polymarketbot.rewards.deskew import DynamicDeSkewOptimizer
 from polymarketbot.simulator.engine import NativePaperTradingEngine
 from polymarketbot.simulator.feed import LivePolymarketFeed
+from polymarketbot.simulator.optimizer import derive_quote_size, optimize_spread_offset
 
 log = get_logger("native_paper_trader")
 
@@ -77,14 +78,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quote-size",
         type=float,
-        default=20.0,
-        help="Virtual maker quote size in shares (default: 20.0).",
+        default=None,
+        help="Virtual maker quote size in shares (default: dynamically derived from initial cash).",
     )
     parser.add_argument(
         "--spread-offset",
         type=float,
-        default=0.50,
-        help="Half-spread offset from mid in cents (default: 0.50c).",
+        default=None,
+        help="Half-spread offset from mid in cents (default: dynamically optimized for target market).",
     )
     parser.add_argument(
         "--daily-reward",
@@ -182,19 +183,38 @@ def resolve_market_details(
     tok_yes = requested_yes
     tok_no = requested_no
 
+    mid_price = 0.50
     if target_market and target_market.get("tokens"):
         tokens = target_market["tokens"]
         for t in tokens:
             outcome = str(t.get("outcome", "")).upper()
             tid = str(t.get("token_id", ""))
-            if outcome == "YES" and not tok_yes:
-                tok_yes = tid
+            price = float(t.get("price", 0.50) or 0.50)
+            if outcome == "YES":
+                mid_price = price
+                if not tok_yes:
+                    tok_yes = tid
             elif outcome == "NO" and not tok_no:
                 tok_no = tid
 
     # Fallback asset IDs if not returned
     tok_yes = tok_yes or f"{cid}_YES"
     tok_no = tok_no or f"{cid}_NO"
+
+    # Spread and tick size
+    market_spread_cents = float(target_market.get("spread", 0.01) or 0.01) * 100.0 if target_market else 1.0
+    tick_size_cents = float(target_market.get("tick_size", 0.01) or 0.01) * 100.0 if target_market else 1.0
+
+    # Market category inference
+    q_lower = question.lower()
+    if any(k in q_lower for k in ["senate", "house", "president", "election", "democrat", "republican", "tax", "vote"]):
+        category = "politics"
+    elif any(k in q_lower for k in ["btc", "eth", "crypto", "solana"]):
+        category = "crypto"
+    elif any(k in q_lower for k in ["nba", "nfl", "champion", "match", "cup"]):
+        category = "sports"
+    else:
+        category = "default"
 
     return {
         "condition_id": cid,
@@ -204,6 +224,10 @@ def resolve_market_details(
         "daily_reward": daily_reward,
         "max_spread": max_spread,
         "min_size": min_size,
+        "mid_price": mid_price,
+        "market_spread_cents": market_spread_cents,
+        "tick_size_cents": tick_size_cents,
+        "category": category,
     }
 
 
@@ -243,7 +267,13 @@ def render_dashboard(
     lines.append(f"{C_BOLD}{C_WHITE}[MM] POLYMARKET NATIVE PAPER TRADING ENGINE | 24/7 CLOB & CTF SIMULATION{C_RESET}")
     lines.append(f"{C_BOLD}{C_CYAN}========================================================================================{C_RESET}")
     lines.append(f"{C_BOLD}Market:{C_RESET} {market_info['question'][:76]}")
-    lines.append(f"{C_DIM}Condition:{C_RESET} {t['condition_id']} | {C_DIM}Time:{C_RESET} {now_str} | {C_DIM}Runtime:{C_RESET} {elapsed:.1f}s")
+    lines.append(
+        f"{C_DIM}Condition:{C_RESET} {t['condition_id'][:18]}... | "
+        f"{C_DIM}Time:{C_RESET} {now_str} | "
+        f"{C_DIM}Runtime:{C_RESET} {elapsed:.1f}s | "
+        f"{C_BOLD}Dynamic Size:{C_RESET} {engine.quote_size:.1f}sh | "
+        f"{C_BOLD}Offset:{C_RESET} {engine.spread_offset_cents:.2f}c"
+    )
     lines.append(f"{C_DIM}Tokens:{C_RESET} YES: {market_info['token_yes'][:18]}... | NO: {market_info['token_no'][:18]}...")
     lines.append(f"{C_CYAN}----------------------------------------------------------------------------------------{C_RESET}")
 
@@ -342,13 +372,48 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
     max_spr = args.max_spread or market["max_spread"]
     min_sz = args.min_size or market["min_size"]
 
+    # 1. Dynamically derive quote size from initial cash if not explicitly passed
+    if args.quote_size is not None:
+        quote_sz = args.quote_size
+        log.info(f"Using manual quote size override: {quote_sz:.1f} shares")
+    else:
+        quote_sz = derive_quote_size(
+            initial_cash=args.initial_cash,
+            mid_price=market["mid_price"],
+            min_size=min_sz,
+            reserve_pct=0.25,
+        )
+        log.info(
+            f"[DYNAMIC SIZING] Derived quote size from ${args.initial_cash:.2f} initial cash: "
+            f"{quote_sz:.1f} shares (mid=${market['mid_price']:.3f}, min_size={min_sz:.1f})"
+        )
+
+    # 2. Dynamically optimize spread offset for this specific market if not explicitly passed
+    if args.spread_offset is not None:
+        spread_off = args.spread_offset
+        log.info(f"Using manual spread offset override: {spread_off:.2f}c")
+    else:
+        spread_off, opt_meta = optimize_spread_offset(
+            max_spread_cents=max_spr,
+            market_spread_cents=market["market_spread_cents"],
+            tick_size_cents=market.get("tick_size_cents", 1.0),
+            daily_reward_pool=daily_rew,
+            quote_size=quote_sz,
+            category=market.get("category", "default"),
+        )
+        log.info(
+            f"[DYNAMIC SPREAD OPTIMIZER] Optimized spread offset for market: "
+            f"s*={spread_off:.2f}c (Max Spread={max_spr:.1f}c, Mkt Spread={market['market_spread_cents']:.1f}c) -> "
+            f"Net Utility=${opt_meta.get('net_utility', 0.0):.2f}/d, Proj Rewards=${opt_meta.get('payout_daily', 0.0):.2f}/d"
+        )
+
     engine = NativePaperTradingEngine(
         condition_id=market["condition_id"],
         asset_id_yes=market["token_yes"],
         asset_id_no=market["token_no"],
         initial_cash=args.initial_cash,
-        quote_size=args.quote_size,
-        spread_offset_cents=args.spread_offset,
+        quote_size=quote_sz,
+        spread_offset_cents=spread_off,
         daily_reward_rate=daily_rew,
         rewards_max_spread_cents=max_spr,
         rewards_min_size=min_sz,

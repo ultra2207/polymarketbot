@@ -37,6 +37,10 @@ from polymarketbot.simulator.engine import (
     NativePaperTradingEngine,
     OrderMatcherBridge,
 )
+from polymarketbot.simulator.optimizer import (
+    derive_quote_size,
+    optimize_spread_offset,
+)
 
 # Optional exports from feed & matcher modules
 try:
@@ -86,4 +90,6 @@ __all__ = [
     "OrderBookSnapshot",
     "FillEvent",
     "SimulationOrderMatcher",
+    "derive_quote_size",
+    "optimize_spread_offset",
 ]
