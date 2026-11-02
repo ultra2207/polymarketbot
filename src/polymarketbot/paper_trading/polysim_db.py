@@ -88,9 +88,23 @@ class PolySimDatabase:
                 cumulative_rewards REAL
             );
 
+            CREATE TABLE IF NOT EXISTS autonomous_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                decision_type TEXT,
+                condition_id TEXT,
+                market_question TEXT,
+                allocated_capital REAL,
+                quote_size REAL,
+                rationale TEXT,
+                net_yield_est REAL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_reward_epochs_ts ON reward_epochs(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_decisions_ts ON autonomous_decisions(timestamp);
             """)
+
 
     # ------------------------------------------------------------------
     # Order Tracking
@@ -263,3 +277,58 @@ class PolySimDatabase:
             cursor = conn.execute("SELECT COALESCE(SUM(payout_usd), 0.0) FROM daily_rewards")
             val = cursor.fetchone()[0]
             return float(val)
+
+    # ------------------------------------------------------------------
+    # Autonomous Decisions Tracking
+    # ------------------------------------------------------------------
+
+    def record_decision(
+        self,
+        decision_type: str,
+        condition_id: str,
+        market_question: str,
+        allocated_capital: float,
+        quote_size: float,
+        rationale: str,
+        net_yield_est: float,
+    ) -> None:
+        """Record an autonomous algorithmic decision with full reasoning."""
+        now = time.time()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO autonomous_decisions (
+                    timestamp, decision_type, condition_id, market_question,
+                    allocated_capital, quote_size, rationale, net_yield_est
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    decision_type,
+                    condition_id,
+                    market_question,
+                    allocated_capital,
+                    quote_size,
+                    rationale,
+                    net_yield_est,
+                ),
+            )
+
+    def get_recent_decisions(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Fetch recent autonomous algorithmic decisions."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM autonomous_decisions ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_latest_decision(self) -> Optional[dict[str, Any]]:
+        """Fetch the most recent autonomous decision."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM autonomous_decisions ORDER BY timestamp DESC LIMIT 1"
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+

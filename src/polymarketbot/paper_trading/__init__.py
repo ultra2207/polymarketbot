@@ -22,6 +22,7 @@ from polymarketbot.paper_trading.polysim_client import (
 )
 from polymarketbot.paper_trading.polysim_db import PolySimDatabase
 from polymarketbot.paper_trading.polysim_trader import PolySimulatorTrader
+from polymarketbot.paper_trading.autonomous_daemon import AutonomousHarvesterDaemon
 
 __all__ = [
     "VirtualQuote",
@@ -40,6 +41,8 @@ __all__ = [
     "PolySimOrderResult",
     "PolySimulatorTrader",
     "PolySimDatabase",
+    "AutonomousHarvesterDaemon",
 ]
+
 
 
