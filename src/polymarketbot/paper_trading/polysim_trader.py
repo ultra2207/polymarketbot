@@ -47,8 +47,8 @@ class PolySimulatorTrader:
         spread_offset_cents: float = 0.75,
         max_spread_cents: float = 3.0,
         daily_reward_pool_usd: float = 2000.0,
-        requote_threshold_cents: float = 1.0,
-        poll_interval_seconds: float = 3.5,
+        requote_threshold_cents: float = 2.0,
+        poll_interval_seconds: float = 25.0,
         quote_size: Optional[float] = None,
     ) -> None:
         self.unlocked_capital_usd = unlocked_capital_usd
@@ -396,6 +396,20 @@ class PolySimulatorTrader:
         user_sc = compute_quadratic_score(self.max_spread_cents, self.spread_offset_cents, self.quote_size * 2)
         floor_label = f"CLEARED (${payout:.2f})" if floor_cleared else f"Accruing (${accrued:.3f}/$1.00)"
         print(f"   • Quote Score S(v, s): {user_sc:.1f} pts | Daily Accrued: ${accrued:.3f} | $1.00 Floor: {floor_label} | Epochs: {total_epochs}/1440")
+
+        gov = getattr(self.client, "governor", None)
+        if gov:
+            st = gov.get_status()
+            print("\n RATE LIMIT & 100K MONTHLY BUDGET GOVERNOR:")
+            print(
+                f"   • Minute: {st.requests_last_minute}/40 RPM | "
+                f"Hour: {st.requests_last_hour}/138 RPH (Remaining: {st.hourly_budget_remaining}) | "
+                f"Day: {st.requests_today}/3,333 RPD"
+            )
+            print(
+                f"   • Daily Orders Placed: {st.orders_placed_today}/90 | "
+                f"Order Placement Permitted: {'YES' if st.can_place_order else 'NO (Daily Cap)'}"
+            )
 
         if fills:
             print("\n " + "!" * 86)

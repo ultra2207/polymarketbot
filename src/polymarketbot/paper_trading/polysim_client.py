@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from polymarketbot.logs import get_logger
+from polymarketbot.paper_trading.governor import RateLimitGovernor
 
 log = get_logger("polysim_client")
 
@@ -78,6 +79,7 @@ class PolySimulatorClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 10.0,
         session: Optional[requests.Session] = None,
+        governor: Optional[RateLimitGovernor] = None,
     ) -> None:
         self.api_key = api_key or _read_env_key("POLYSIMULATOR_API_KEY")
         if not self.api_key:
@@ -85,6 +87,7 @@ class PolySimulatorClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
+        self.governor = governor or RateLimitGovernor()
         self.session.headers.update({
             "X-API-Key": self.api_key,
             "Content-Type": "application/json",
@@ -99,7 +102,25 @@ class PolySimulatorClient:
         json_data: Optional[Any] = None,
         max_retries: int = 3,
     ) -> requests.Response:
-        """Execute HTTP request with retry logic for 429 rate limits and 5xx errors."""
+        """Execute HTTP request with proactive rate governance and retry logic."""
+        # Enforce rate governor before hitting the network
+        is_order_write = method.upper() == "POST" and any(
+            p in endpoint for p in ("/clob/order", "/orders", "/order")
+        )
+        if is_order_write:
+            allowed, reason = self.governor.acquire_order_write_slot()
+            if not allowed:
+                mock_resp = requests.Response()
+                mock_resp.status_code = 429
+                mock_resp._content = (
+                    f'{{"error": "LOCAL_GOVERNOR_DAILY_ORDER_LIMIT", "message": "{reason}"}}'.encode("utf-8")
+                )
+                mock_resp.headers["Retry-After"] = "60"
+                mock_resp.headers["X-Polysim-Code"] = "LOCAL_GOVERNOR_DAILY_ORDER_LIMIT"
+                return mock_resp
+        else:
+            self.governor.acquire_read_slot()
+
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         for attempt in range(max_retries):
             try:

@@ -72,8 +72,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=5.0,
-        help="Poll interval in seconds (default: 5.0s).",
+        default=25.0,
+        help="Poll interval in seconds (default: 25.0s, matches 100k monthly budget).",
     )
     parser.add_argument(
         "--dry-run",
