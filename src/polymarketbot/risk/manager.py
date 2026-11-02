@@ -647,6 +647,16 @@ class RiskManager:
 
         return False, f"basis {combined_basis:.4f} exceeds max {max_acceptable_basis:.4f}", 0.0
 
+    def get_hedging_cash_reserve(self) -> float:
+        """Return the reserved liquid cash amount for synthetic hedging under micro-capital model."""
+        if self.config.total_bankroll_usd <= 500.0 and self.config.concentrated_micro_capital:
+            return round(self.config.total_bankroll_usd * self.config.micro_capital_cash_reserve_pct, 2)
+        return 0.0
+
+    def get_effective_capital_allocation(self) -> float:
+        """Return maximum allocated capital on the top quoting market under micro-capital model."""
+        return self.config.max_position_cost_per_market
+
     def resume(self, reset_peak: bool = False, reset_day_start: bool = False) -> None:
         """Safely resume after operator inspection."""
         self.portfolio_state.kill_switch_active = False

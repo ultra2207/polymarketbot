@@ -20,6 +20,12 @@ from polymarketbot.rewards.queue import (
     OrderBookQueueSimulator,
     RestingOrder,
 )
+from polymarketbot.rewards.microstructure import (
+    MicrostructureEngine,
+    MicrostructureState,
+    MultiAssetMicrostructureSentinel,
+    QuoteAction,
+)
 from polymarketbot.rewards.scoring import (
     DEFAULT_COMPETITOR_LADDER,
     OrderQuote,
@@ -30,6 +36,20 @@ from polymarketbot.rewards.scoring import (
     normalize_sample_score,
     order_spread_cents,
     quadratic_order_score,
+)
+from polymarketbot.rewards.scanner import (
+    MarketOpportunity,
+    OpportunityScanner,
+    calculate_expected_yield,
+    infer_market_category,
+)
+from polymarketbot.rewards.switching import (
+    OpportunisticSwitchingEngine,
+    SwitchEngineState,
+    SwitchEvent,
+    SwitchingConfig,
+    calculate_switching_cost,
+    evaluate_switching_hurdle,
 )
 
 __all__ = [
@@ -54,4 +74,19 @@ __all__ = [
     "normalize_sample_score",
     "order_spread_cents",
     "quadratic_order_score",
+    "MicrostructureEngine",
+    "MicrostructureState",
+    "MultiAssetMicrostructureSentinel",
+    "QuoteAction",
+    "MarketOpportunity",
+    "OpportunityScanner",
+    "calculate_expected_yield",
+    "infer_market_category",
+    "OpportunisticSwitchingEngine",
+    "SwitchEngineState",
+    "SwitchEvent",
+    "SwitchingConfig",
+    "calculate_switching_cost",
+    "evaluate_switching_hurdle",
 ]
+

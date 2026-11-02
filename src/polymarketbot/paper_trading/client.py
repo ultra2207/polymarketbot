@@ -47,6 +47,9 @@ class PolymarketLiveClient:
         self.epoch_interval = epoch_interval_seconds
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "polymarketbot/paper-trading-rewards"})
+        from polymarketbot.rewards.scanner import OpportunityScanner
+
+        self.scanner = OpportunityScanner(rest_url=self.rest_url, session=self.session)
         self.subscribed_token_ids: list[str] = []
         self._running = False
         install_doh_fallback()
@@ -55,79 +58,58 @@ class PolymarketLiveClient:
         self,
         limit: int = 5,
         filter_keyword: Optional[str] = None,
+        bankroll_usd: float = 300.0,
+        concentration_pct: float = 0.75,
     ) -> list[MarketConfig]:
-        """Fetch top reward head pools dynamically from Polymarket CLOB REST API.
+        """Fetch and rank top reward head pools dynamically using Net Expected Marginal Yield.
 
         Args:
             limit: Maximum number of markets to return.
-            filter_keyword: Optional keyword to prioritize (e.g. "Wealth Tax").
+            filter_keyword: Optional keyword to filter/prioritize (default None = all active pools).
+            bankroll_usd: Total bankroll used for marginal yield scoring.
+            concentration_pct: Capital concentration allocation percentage.
 
         Returns:
             List of configured MarketConfig instances.
         """
-        url = f"{self.rest_url}/rewards/markets/multi"
-        params = {
-            "order_by": "rate_per_day",
-            "position": "DESC",
-            "page_size": max(limit * 3, 20),
-        }
-        logger.info(f"Querying CLOB REST for reward pools: {url}")
-        resp = self.session.get(url, params=params, timeout=15.0)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
+        raw_data = self.scanner.fetch_raw_reward_pools(limit=max(limit * 3, 20))
 
-        matched: list[dict[str, Any]] = []
-        unmatched: list[dict[str, Any]] = []
+        if filter_keyword:
+            matched = [m for m in raw_data if filter_keyword.lower() in m.get("question", "").lower()]
+            candidate_raw = matched if matched else raw_data
+        else:
+            candidate_raw = raw_data
 
-        for m in data:
-            q = m.get("question", "")
-            if filter_keyword and filter_keyword.lower() in q.lower():
-                matched.append(m)
-            else:
-                unmatched.append(m)
+        ranked_opportunities = self.scanner.scan_and_rank_markets(
+            bankroll_usd=bankroll_usd,
+            concentration_pct=concentration_pct,
+            raw_markets=candidate_raw,
+        )
 
-        selected_raw = (matched + unmatched)[:limit]
         configs: list[MarketConfig] = []
-
-        for m in selected_raw:
-            cid = m.get("condition_id", "")
-            q = m.get("question", "Unknown")
-            rewards_cfg = m.get("rewards_config", [])
-            rate = float(rewards_cfg[0].get("rate_per_day", 0.0)) if rewards_cfg else 0.0
-            min_size = float(m.get("rewards_min_size", 50.0))
-            max_spread = float(m.get("rewards_max_spread", 3.0))
-
-            tokens: list[TokenConfig] = []
-            for tok in m.get("tokens", []):
-                t_id = tok.get("token_id")
-                outcome = tok.get("outcome", "unknown")
-                p = float(tok.get("price", 0.50))
-                if t_id:
-                    tokens.append(TokenConfig(token_id=t_id, outcome=outcome, price=p))
-
-            cfg = MarketConfig(
-                condition_id=cid,
-                question=q,
-                rate_per_day=rate,
-                rewards_min_size=min_size,
-                rewards_max_spread=max_spread,
-                tokens=tokens,
-            )
+        for opp in ranked_opportunities[:limit]:
+            cfg = opp.to_market_config()
             configs.append(cfg)
             self.engine.register_market(cfg)
-            for t in tokens:
+            for t in cfg.tokens:
                 if t.token_id not in self.subscribed_token_ids:
                     self.subscribed_token_ids.append(t.token_id)
 
         logger.info(
-            f"Dynamically selected {len(configs)} head reward pools ({len(self.subscribed_token_ids)} tokens)."
+            f"Dynamically selected and ranked {len(configs)} head reward pools ({len(self.subscribed_token_ids)} tokens)."
         )
         return configs
 
-    def fetch_initial_order_books(self) -> None:
-        """Fetch REST snapshot of order books for all subscribed tokens."""
-        logger.info(f"Fetching initial order books for {len(self.subscribed_token_ids)} tokens...")
-        for tok_id in self.subscribed_token_ids:
+    def switch_active_tokens(self, new_tokens: list[TokenConfig]) -> None:
+        """Replace or update subscribed tokens when migrating to a new market."""
+        self.subscribed_token_ids = [t.token_id for t in new_tokens if t.token_id]
+        logger.info(f"Subscribed tokens updated to {len(self.subscribed_token_ids)} tokens for active market.")
+
+    def fetch_initial_order_books(self, token_ids: Optional[list[str]] = None) -> None:
+        """Fetch REST snapshot of order books for specified or all subscribed tokens."""
+        target_ids = token_ids if token_ids is not None else self.subscribed_token_ids
+        logger.info(f"Fetching initial order books for {len(target_ids)} tokens...")
+        for tok_id in target_ids:
             try:
                 resp = self.session.get(
                     f"{self.rest_url}/book", params={"token_id": tok_id}, timeout=8.0

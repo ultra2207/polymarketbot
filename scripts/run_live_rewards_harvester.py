@@ -38,6 +38,11 @@ from polymarketbot.logs import get_logger
 from polymarketbot.paper_trading.client import PolymarketLiveClient
 from polymarketbot.paper_trading.engine import PaperTradingEngine
 from polymarketbot.paper_trading.models import MarketConfig, TokenConfig
+from polymarketbot.rewards.scanner import MarketOpportunity, OpportunityScanner
+from polymarketbot.rewards.switching import (
+    OpportunisticSwitchingEngine,
+    SwitchingConfig,
+)
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.models import CircuitBreakerReason, RiskConfig, RiskStatus
 
@@ -46,7 +51,7 @@ log = get_logger("live_harvester")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Polymarket Liquidity Rewards Production Harvester"
+        description="Polymarket Liquidity Rewards Dynamic Production Harvester"
     )
     parser.add_argument(
         "--live",
@@ -68,8 +73,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--market-filter",
         type=str,
-        default="Wealth Tax",
-        help="Keyword filter for target head reward pool (default: 'Wealth Tax').",
+        default=None,
+        help="Optional keyword filter for head reward pools (default: None for fully dynamic scanning).",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=300.0,
+        help="Periodic re-scan interval in seconds (default: 300.0 / 5 minutes).",
+    )
+    parser.add_argument(
+        "--switch-hurdle",
+        type=float,
+        default=0.20,
+        help="Minimum net yield premium percentage to trigger market switch (default: 0.20 / 20%%).",
+    )
+    parser.add_argument(
+        "--amortization-horizon",
+        type=float,
+        default=4.0,
+        help="Switching cost amortization horizon in hours (default: 4.0 hours).",
+    )
+    parser.add_argument(
+        "--concentration-pct",
+        type=float,
+        default=0.75,
+        help="Capital concentration percentage on top market (default: 0.75 / 75%%).",
+    )
+    parser.add_argument(
+        "--cash-reserve-pct",
+        type=float,
+        default=0.25,
+        help="Liquid cash reserve percentage for synthetic hedging (default: 0.25 / 25%%).",
     )
     parser.add_argument(
         "--quote-size",
@@ -80,8 +115,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-position",
         type=float,
-        default=150.0,
-        help="Hard maximum position cap in shares per token (default: 150.0).",
+        default=250.0,
+        help="Hard maximum position cap in shares per token (default: 250.0).",
     )
     parser.add_argument(
         "--urgency-threshold",
@@ -111,10 +146,13 @@ class LiveRewardsHarvester:
         self.args = args
         self.is_live = args.live and not args.dry_run
 
-        # Initialize Risk Management Engine
+        # Initialize Concentrated Micro-Capital Risk Management Engine ($300 bankroll)
         self.risk_config = RiskConfig(
             total_bankroll_usd=args.bankroll,
-            max_position_cost_per_market=args.bankroll * 0.20,  # $60 max per market
+            concentrated_micro_capital=True,
+            micro_capital_concentration_pct=args.concentration_pct,
+            micro_capital_cash_reserve_pct=args.cash_reserve_pct,
+            max_position_cost_per_market=None,  # Dynamically derived (e.g. $225 on $300)
             max_position_shares_per_token=args.max_position,
             max_quote_size_shares=args.quote_size,
             daily_loss_limit_usd=args.daily_stop_loss,
@@ -154,6 +192,23 @@ class LiveRewardsHarvester:
             epoch_interval_seconds=60.0,
         )
 
+        # Initialize Dynamic Scanner and Opportunistic Switching Engine
+        self.scanner = OpportunityScanner(
+            rest_url=self.client.rest_url,
+            session=self.client.session,
+        )
+        self.switching_config = SwitchingConfig(
+            scan_interval_seconds=args.scan_interval,
+            switch_hurdle_pct=args.switch_hurdle,
+            amortization_horizon_hours=args.amortization_horizon,
+        )
+        self.switching_engine = OpportunisticSwitchingEngine(
+            scanner=self.scanner,
+            config=self.switching_config,
+            bankroll_usd=args.bankroll,
+            concentration_pct=args.concentration_pct,
+        )
+
     def verify_environment(self) -> bool:
         """Verify operating credentials, RPC connectivity, and capital parameters."""
         log.info("====================================================================")
@@ -186,34 +241,85 @@ class LiveRewardsHarvester:
 
         return True
 
+    async def _switching_loop(self, duration_seconds: float) -> None:
+        """Periodic background task evaluating candidate head pools for opportunistic market switching."""
+        start_ts = time.time()
+        interval = self.switching_config.scan_interval_seconds
+        log.info(f"Starting opportunistic market switching loop (Interval: {interval:.1f}s)...")
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                if duration_seconds > 0 and (time.time() - start_ts) >= duration_seconds:
+                    break
+
+                log.info("Re-scanning market universe for opportunistic switching candidates...")
+                raw_pools = self.scanner.fetch_raw_reward_pools(limit=30)
+                if self.args.market_filter:
+                    raw_pools = [
+                        m for m in raw_pools
+                        if self.args.market_filter.lower() in m.get("question", "").lower()
+                    ] or raw_pools
+
+                ranked = self.scanner.scan_and_rank_markets(
+                    bankroll_usd=self.args.bankroll,
+                    concentration_pct=self.args.concentration_pct,
+                    raw_markets=raw_pools,
+                )
+
+                should_switch, target_mkt, reason = self.switching_engine.check_opportunity_switch(ranked)
+                if should_switch and target_mkt:
+                    log.info(f"⚡ OPPORTUNISTIC SWITCH TRIGGERED: {reason}")
+                    self.switching_engine.execute_market_switch(
+                        new_market=target_mkt,
+                        engine=self.engine,
+                        client=self.client,
+                        reason=reason,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Error in opportunistic switching loop: {e}")
+
     async def run(self) -> None:
         """Execute market selection, order book streaming, and risk-managed quoting."""
         if not self.verify_environment():
             sys.exit(1)
 
-        # 1. Fetch target head reward pool dynamically
-        log.info(f"Scanning for target head reward pools matching '{self.args.market_filter}'...")
-        markets = self.client.fetch_dynamic_reward_pools(
-            limit=1,
-            filter_keyword=self.args.market_filter,
+        # 1. Fetch target head reward pool dynamically via Yield Scanner
+        log.info(
+            f"Scanning all head reward pools dynamically (Bankroll: ${self.args.bankroll:.2f}, "
+            f"Concentration: {self.args.concentration_pct * 100:.0f}%)..."
+        )
+        raw_pools = self.scanner.fetch_raw_reward_pools(limit=50)
+        if self.args.market_filter:
+            log.info(f"Filtering candidate pools with keyword: '{self.args.market_filter}'")
+            raw_pools = [
+                m for m in raw_pools
+                if self.args.market_filter.lower() in m.get("question", "").lower()
+            ] or raw_pools
+
+        ranked_opportunities = self.scanner.scan_and_rank_markets(
+            bankroll_usd=self.args.bankroll,
+            concentration_pct=self.args.concentration_pct,
+            raw_markets=raw_pools,
         )
 
-        if not markets:
-            log.warning(
-                f"No reward markets found matching '{self.args.market_filter}'. "
-                "Falling back to top reward pool..."
-            )
-            markets = self.client.fetch_dynamic_reward_pools(limit=1)
-
-        if not markets:
+        if not ranked_opportunities:
             log.critical("Failed to retrieve any active reward pools from Polymarket API.")
             sys.exit(1)
 
-        target = markets[0]
+        target_opp = ranked_opportunities[0]
+        self.switching_engine.set_active_market(target_opp)
+
+        target = target_opp.to_market_config()
+        self.engine.register_market(target)
+        self.client.switch_active_tokens(target.tokens)
+
         log.info(
             f"🎯 Target Market Selected: {target.question} "
-            f"(${target.rate_per_day:,.0f}/day pool | min_size={target.rewards_min_size} | "
-            f"max_spread={target.rewards_max_spread}c)"
+            f"(${target.rate_per_day:,.0f}/day pool | Net Yield: ${target_opp.net_expected_yield:.2f}/d | "
+            f"min_size={target.rewards_min_size} | max_spread={target.rewards_max_spread}c)"
         )
 
         # 2. Fetch initial order books
@@ -223,10 +329,19 @@ class LiveRewardsHarvester:
         log.info("Establishing baseline reward score and quote state...")
         self.engine.run_epoch_sample()
 
-        # 4. Start execution loop
+        # 4. Start execution loop with concurrent switching evaluator
         duration = self.args.duration if self.args.duration > 0 else 86400  # Default 24h
         log.info(f"Starting harvester execution loop (Duration: {duration}s)...")
-        await self.client.run(duration_seconds=duration)
+
+        switching_task = asyncio.create_task(self._switching_loop(duration_seconds=duration))
+        try:
+            await self.client.run(duration_seconds=duration)
+        finally:
+            switching_task.cancel()
+            try:
+                await switching_task
+            except asyncio.CancelledError:
+                pass
 
 
 def main() -> None:

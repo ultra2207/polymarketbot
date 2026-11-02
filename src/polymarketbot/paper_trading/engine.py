@@ -156,6 +156,16 @@ class PaperTradingEngine:
                 self.virtual_quotes[aid] = {"bid": None, "ask": None}
         logger.info(f"Quotes cancelled for {'all assets' if not asset_id else asset_id}")
 
+    def cancel_quotes_for_condition(self, condition_id: str) -> None:
+        """Cancel all resting virtual quotes for tokens belonging to a specific condition."""
+        mkt = self.markets.get(condition_id)
+        if not mkt:
+            return
+        for tok in mkt.tokens:
+            if tok.token_id in self.virtual_quotes:
+                self.virtual_quotes[tok.token_id] = {"bid": None, "ask": None}
+        logger.info(f"Cancelled all resting quotes for market condition {condition_id[:12]}")
+
     def update_orderbook(
         self,
         asset_id: str,
@@ -561,6 +571,10 @@ class PaperTradingEngine:
             if self.risk_manager.portfolio_state.is_halted:
                 self.cancel_quotes()
 
+        # Regime B active synthetic cross-hedger to maintain delta neutrality
+        if not trigger_reason.startswith("synthetic_cross_hedge"):
+            self.check_and_execute_synthetic_hedge(cid, fill_px, ts)
+
         # Check automated CTF complete-set merge
         self.check_and_execute_merge(cid, timestamp=ts)
 
@@ -651,6 +665,10 @@ class PaperTradingEngine:
             if self.risk_manager.portfolio_state.is_halted:
                 self.cancel_quotes()
 
+        # Regime B active synthetic cross-hedger to maintain delta neutrality
+        if not trigger_reason.startswith("synthetic_cross_hedge"):
+            self.check_and_execute_synthetic_hedge(cid, fill_px, ts)
+
         # Check automated CTF complete-set merge
         self.check_and_execute_merge(cid, timestamp=ts)
 
@@ -683,6 +701,60 @@ class PaperTradingEngine:
             p1 = self.positions.get(mkt.tokens[1].token_id)
             return p0, p1
         return yes_pos, no_pos
+
+    def check_and_execute_synthetic_hedge(
+        self,
+        condition_id: str,
+        fill_price: float,
+        timestamp: Optional[float] = None,
+    ) -> Optional[SimulatedFill]:
+        """Evaluate and execute Regime B active synthetic cross-hedge to maintain delta neutrality."""
+        if not self.risk_manager or not self.risk_manager.config.enable_synthetic_hedging:
+            return None
+
+        yes_pos, no_pos = self._get_yes_no_positions(condition_id)
+        if not yes_pos or not no_pos:
+            return None
+
+        # Net directional inventory q = YES - NO
+        net_q = yes_pos.shares - no_pos.shares
+        if abs(net_q) < self.risk_manager.config.q_urgency_threshold_shares:
+            return None
+
+        # If net_q > 0 (long YES surplus): complementary asset to buy is NO
+        # If net_q < 0 (long NO surplus): complementary asset to buy is YES
+        comp_pos = no_pos if net_q > 0 else yes_pos
+        comp_aid = comp_pos.asset_id
+        comp_book = self.orderbooks.get(comp_aid)
+        if not comp_book:
+            return None
+
+        comp_ask = comp_book.get("best_ask", 1.0)
+        should_cross, reason, target_size = self.risk_manager.evaluate_synthetic_hedge(
+            current_inventory_q=net_q,
+            fill_price=fill_price,
+            complementary_best_ask=comp_ask,
+        )
+
+        if not should_cross or target_size <= 0.0:
+            return None
+
+        hedge_val = target_size * comp_ask
+        if self.cash_usd < hedge_val:
+            target_size = max(0.0, self.cash_usd / max(1e-4, comp_ask))
+            if target_size < 1.0:
+                return None
+
+        logger.info(
+            f"[SYNTHETIC HEDGE TRIGGERED] {reason} | Buying {target_size:.1f} {comp_pos.outcome} @ {comp_ask:.3f}"
+        )
+        return self._execute_buy_fill(
+            asset_id=comp_aid,
+            fill_px=comp_ask,
+            fill_sz=target_size,
+            trigger_reason=f"synthetic_cross_hedge:{reason}",
+            ts=timestamp if timestamp is not None else time.time(),
+        )
 
     def check_and_execute_merge(
         self,

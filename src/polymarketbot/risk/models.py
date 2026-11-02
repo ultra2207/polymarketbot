@@ -65,12 +65,42 @@ class RiskConfig:
 
     # 1. Hard Capital & Position Limits
     total_bankroll_usd: float = 300.0  # Max allocated bankroll ($300)
-    max_position_cost_per_market: float = 60.0  # Max $60 notional per market (20% of bankroll)
-    max_position_shares_per_token: float = 150.0  # Max 150 shares per token/market
-    max_portfolio_inventory_usd: float = 200.0  # Max total absolute inventory across all markets ($200)
+    max_position_cost_per_market: Optional[float] = None  # None = dynamically derived from concentration pct
+    max_position_shares_per_token: Optional[float] = None  # None = dynamically derived
+    max_portfolio_inventory_usd: Optional[float] = None  # None = dynamically derived
     max_portfolio_inventory_shares: float = 400.0  # Max total inventory shares
     max_quote_size_shares: float = 50.0  # Max single quote size in shares
     max_active_markets: int = 5  # Multi-market scaling cap
+
+    # Micro-capital concentration model (for total_bankroll_usd <= $500)
+    concentrated_micro_capital: bool = True
+    micro_capital_concentration_pct: float = 0.75  # 70%–85% capital concentration ($225 on $300)
+    micro_capital_cash_reserve_pct: float = 0.25   # 15%–30% liquid cash reserve for synthetic hedging ($75 on $300)
+
+    def __post_init__(self) -> None:
+        if self.max_position_cost_per_market is None:
+            if self.total_bankroll_usd <= 500.0 and self.concentrated_micro_capital:
+                self.max_position_cost_per_market = round(
+                    self.total_bankroll_usd * self.micro_capital_concentration_pct, 2
+                )
+            else:
+                self.max_position_cost_per_market = round(self.total_bankroll_usd * 0.20, 2)
+
+        if self.max_position_shares_per_token is None:
+            if self.total_bankroll_usd <= 500.0 and self.concentrated_micro_capital:
+                self.max_position_shares_per_token = round(
+                    self.max_position_cost_per_market / 0.50, 1
+                )
+            else:
+                self.max_position_shares_per_token = 150.0
+
+        if self.max_portfolio_inventory_usd is None:
+            if self.total_bankroll_usd <= 500.0 and self.concentrated_micro_capital:
+                self.max_portfolio_inventory_usd = round(
+                    self.total_bankroll_usd * self.micro_capital_concentration_pct, 2
+                )
+            else:
+                self.max_portfolio_inventory_usd = 200.0
 
     # 2. Max Drawdown Circuit Breakers
     daily_loss_limit_usd: float = 15.0  # Stop quoting if daily loss > $15 (5% of $300)
