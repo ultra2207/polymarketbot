@@ -18,6 +18,11 @@ import streamlit as st
 from polymarketbot.paper_trading.autonomous_daemon import AutonomousHarvesterDaemon
 from polymarketbot.paper_trading.polysim_client import PolySimulatorClient
 from polymarketbot.paper_trading.polysim_db import PolySimDatabase
+from polymarketbot.paper_trading.rewards import (
+    compute_competing_depth_score,
+    compute_quadratic_score,
+)
+
 
 # -----------------------------------------------------------------------------
 # Streamlit App Configuration
