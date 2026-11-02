@@ -406,37 +406,82 @@ class SimulatedPortfolio:
             net_cash_delta = -cash_needed
 
         elif side_norm == "SELL":
-            # Check inventory sufficiency
             current_shares = pos.shares_yes if outcome_norm == "YES" else pos.shares_no
             current_cost = pos.avg_cost_yes if outcome_norm == "YES" else pos.avg_cost_no
 
-            if current_shares < size:
-                # If short selling in prediction markets, standard CTF doesn't allow uncollateralized shorts.
-                # However, if selling exceeds inventory, we clip or record warning
-                log.warning(f"SELL size ({size:.2f}) exceeds held {outcome_norm} shares ({current_shares:.2f}). Clipping.")
-                size = current_shares
-                notional = price * size
-                fee = notional * (0.0 if is_maker else self.taker_fee_rate)
+            # Real Polymarket CTF Short-Selling Mechanics:
+            # 1. If holding outcome shares >= size: sell held shares directly for cash.
+            # 2. If holding outcome shares < size:
+            #    Sell held shares first, then for the deficit (size - held), mint complete sets
+            #    using (1 - price) USDC collateral, leaving the maker holding the COMPLEMENT token
+            #    (e.g., selling YES leaves you long NO at basis 1 - price; selling NO leaves you long YES).
+            held_to_sell = min(current_shares, size)
+            deficit_to_mint = max(0.0, size - held_to_sell)
 
-            cash_proceeds = notional - fee
-            self.cash += cash_proceeds
+            cash_delta = 0.0
+            realized_gain = 0.0
 
-            realized_gain = round((price - current_cost) * size - fee, 6)
-            self.total_realized_pnl += realized_gain
-            pos.realized_pnl += realized_gain
+            # Step A: Sell held shares (if any)
+            if held_to_sell > 0:
+                notional_held = price * held_to_sell
+                fee_held = notional_held * (0.0 if is_maker else self.taker_fee_rate)
+                proceeds_held = notional_held - fee_held
+                gain_held = round((price - current_cost) * held_to_sell - fee_held, 6)
+                
+                cash_delta += proceeds_held
+                realized_gain += gain_held
+                self.total_realized_pnl += gain_held
+                pos.realized_pnl += gain_held
 
-            if outcome_norm == "YES":
-                pos.shares_yes -= size
-                if pos.shares_yes <= 1e-6:
-                    pos.shares_yes = 0.0
-                    pos.avg_cost_yes = 0.0
-            else:
-                pos.shares_no -= size
-                if pos.shares_no <= 1e-6:
-                    pos.shares_no = 0.0
-                    pos.avg_cost_no = 0.0
+                if outcome_norm == "YES":
+                    pos.shares_yes -= held_to_sell
+                    if pos.shares_yes <= 1e-6:
+                        pos.shares_yes = 0.0
+                        pos.avg_cost_yes = 0.0
+                else:
+                    pos.shares_no -= held_to_sell
+                    if pos.shares_no <= 1e-6:
+                        pos.shares_no = 0.0
+                        pos.avg_cost_no = 0.0
 
-            net_cash_delta = cash_proceeds
+            # Step B: Deficit short-sold via CTF collateralized mint
+            if deficit_to_mint > 0:
+                collateral_per_share = round(1.0 - price, 6)
+                collateral_needed = collateral_per_share * deficit_to_mint
+                fee_mint = (price * deficit_to_mint) * (0.0 if is_maker else self.taker_fee_rate)
+                total_cash_outflow = collateral_needed + fee_mint
+
+                if self.cash + cash_delta < total_cash_outflow:
+                    log.warning(
+                        f"Insufficient cash collateral for CTF short sell: needed ${total_cash_outflow:.2f}, "
+                        f"available ${self.cash + cash_delta:.2f}. Adjusting deficit."
+                    )
+                    deficit_to_mint = max(0.0, (self.cash + cash_delta) / (collateral_per_share + price * (0.0 if is_maker else self.taker_fee_rate)))
+                    collateral_needed = collateral_per_share * deficit_to_mint
+                    fee_mint = (price * deficit_to_mint) * (0.0 if is_maker else self.taker_fee_rate)
+                    total_cash_outflow = collateral_needed + fee_mint
+
+                cash_delta -= total_cash_outflow
+
+                # Short selling YES leaves maker holding complement NO tokens
+                complement_side = "NO" if outcome_norm == "YES" else "YES"
+                if complement_side == "NO":
+                    curr_no = pos.shares_no
+                    curr_cost_no = pos.avg_cost_no
+                    new_no = curr_no + deficit_to_mint
+                    pos.avg_cost_no = ((curr_no * curr_cost_no) + collateral_needed) / new_no if new_no > 0 else 0.0
+                    pos.shares_no = new_no
+                else:
+                    curr_yes = pos.shares_yes
+                    curr_cost_yes = pos.avg_cost_yes
+                    new_yes = curr_yes + deficit_to_mint
+                    pos.avg_cost_yes = ((curr_yes * curr_cost_yes) + collateral_needed) / new_yes if new_yes > 0 else 0.0
+                    pos.shares_yes = new_yes
+
+            actual_size = held_to_sell + deficit_to_mint
+            notional = price * actual_size
+            self.cash += cash_delta
+            net_cash_delta = cash_delta
         else:
             raise ValueError(f"Unsupported side: {side_norm}")
 
