@@ -146,6 +146,8 @@ class NativePaperTradingEngine:
         rewards_min_size: float = 20.0,
         auto_merge_threshold: float = 10.0,
         gas_fee_merge: float = 0.015,
+        institutional_mode: bool = True,
+        gamma: float = 0.02,
         db_path: Union[str, Path] = "data/native_paper_trading.db",
         ledger_path: Union[str, Path] = "data/native_paper_trading_ledger.json",
         deskew_optimizer: Optional[DynamicDeSkewOptimizer] = None,
@@ -160,6 +162,8 @@ class NativePaperTradingEngine:
         self.rewards_min_size = float(rewards_min_size)
         self.auto_merge_threshold = float(auto_merge_threshold)
         self.gas_fee_merge = float(gas_fee_merge)
+        self.institutional_mode = bool(institutional_mode)
+        self.gamma = float(gamma)
 
         # Paths
         self.db_path = Path(db_path)
@@ -509,14 +513,36 @@ class NativePaperTradingEngine:
         # Record deskew event
         self._record_deskew_event(decision, ts)
 
-        # Long YES (net_q > 0): fade YES ask to top-of-book, pull YES bid
+        if self.institutional_mode:
+            pos = self.portfolio.get_position(self.condition_id)
+            net_q = pos.shares_yes - pos.shares_no
+            p = max(0.01, min(0.99, mid_yes))
+            variance = (p * (1.0 - p)) / 7.0
+            r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
+            offset = self.spread_offset_cents / 100.0
+
+            if net_q > 0:
+                # Long YES -> tighten NO bid to complete sets; fade/widen YES bid
+                target_bid_no = round(min(0.98, max(0.01, 1.00 - max(best_bid_yes + 0.001, decision.target_price))), 3)
+                faded_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, r_yes - offset - 0.01)), 3)
+                self._set_virtual_quote("NO", "BUY", target_bid_no, self.quote_size, ts)
+                self._set_virtual_quote("YES", "BUY", faded_bid_yes, self.quote_size, ts)
+            else:
+                # Long NO -> tighten YES bid to complete sets; fade/widen NO bid
+                target_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, decision.target_price)), 3)
+                faded_bid_no = round(max(0.01, min(0.98, 1.00 - (r_yes + offset + 0.01))), 3)
+                self._set_virtual_quote("YES", "BUY", target_bid_yes, self.quote_size, ts)
+                self._set_virtual_quote("NO", "BUY", faded_bid_no, self.quote_size, ts)
+
+            self._cancel_virtual_quote("SELL_YES")
+            self._cancel_virtual_quote("SELL_NO")
+            return
+
+        # Legacy Single-Token Mode
         if decision.target_token == "YES" and decision.action_side == "SELL":
             faded_ask = min(best_ask_yes, max(best_bid_yes + 0.001, decision.target_price))
-            # Place aggressive sell quote on YES, and conservative/pulled buy quote
             self._set_virtual_quote("YES", "SELL", faded_ask, self.quote_size, ts)
             self._cancel_virtual_quote("BID_YES")
-
-        # Long NO (net_q < 0): pull NO bid, tighten YES bid to complete pairs
         elif decision.target_token == "YES" and decision.action_side == "BUY":
             faded_bid = max(best_bid_yes, min(best_ask_yes - 0.001, decision.target_price))
             self._set_virtual_quote("YES", "BUY", faded_bid, self.quote_size, ts)
@@ -577,10 +603,40 @@ class NativePaperTradingEngine:
         """Standard two-sided virtual maker quotes inside the qualifying spread."""
         offset = self.spread_offset_cents / 100.0
 
+        if self.institutional_mode:
+            # Jane Street Institutional Dual-Cash Quoting (BUY YES + BUY NO)
+            pos = self.portfolio.get_position(self.condition_id)
+            net_q = pos.shares_yes - pos.shares_no
+            p = max(0.01, min(0.99, mid_yes))
+            variance = (p * (1.0 - p)) / 7.0
+            r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
+
+            skew_adj = net_q * 0.0005
+            target_bid_yes = r_yes - offset - max(0.0, skew_adj)
+            target_ask_yes = r_yes + offset - min(0.0, skew_adj)
+
+            target_bid_yes = min(best_ask_yes - 0.001, target_bid_yes)
+            target_ask_yes = max(best_bid_yes + 0.001, target_ask_yes)
+
+            target_bid_yes = round(max(0.01, min(0.98, target_bid_yes)), 3)
+            target_ask_yes = round(max(target_bid_yes + 0.002, min(0.99, target_ask_yes)), 3)
+            target_bid_no = round(1.00 - target_ask_yes, 3)
+
+            # Enforce cash sizing bounds
+            req_cash = (target_bid_yes + target_bid_no) * self.quote_size
+            eff_size = self.quote_size if self.portfolio.cash >= req_cash else max(5.0, math.floor(self.portfolio.cash / (target_bid_yes + target_bid_no)))
+
+            # Place pure dual-cash bids
+            self._set_virtual_quote("YES", "BUY", target_bid_yes, eff_size, ts)
+            self._set_virtual_quote("NO", "BUY", target_bid_no, eff_size, ts)
+            self._cancel_virtual_quote("SELL_YES")
+            self._cancel_virtual_quote("SELL_NO")
+            return
+
+        # Legacy Single-Token Mode
         target_bid = round(max(0.01, mid_yes - offset), 3)
         target_ask = round(min(0.99, mid_yes + offset), 3)
 
-        # Enforce post-only constraints: bid < best_ask, ask > best_bid
         if target_bid >= best_ask_yes:
             target_bid = round(best_ask_yes - 0.001, 3)
         if target_ask <= best_bid_yes:

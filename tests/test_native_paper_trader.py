@@ -144,7 +144,7 @@ class TestNativePaperTradingEngine:
                 rewards_max_spread_cents=1.0,
                 rewards_min_size=20.0,
                 auto_merge_threshold=10.0,
-                gas_fee_merge=0.015,
+                institutional_mode=False,
                 db_path=db_path,
                 ledger_path=ledger_path,
             )
@@ -257,3 +257,30 @@ class TestNativePaperTradingEngine:
             data = json.load(f)
             assert "portfolio" in data
             assert data["condition_id"] == engine.condition_id
+
+    def test_institutional_dual_cash_mode(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            eng = NativePaperTradingEngine(
+                condition_id="0xINSTITUTIONAL",
+                initial_cash=150.0,
+                quote_size=30.0,
+                spread_offset_cents=0.50,
+                institutional_mode=True,
+                db_path=Path(tmp_dir) / "trading.db",
+                ledger_path=Path(tmp_dir) / "ledger.json",
+            )
+            try:
+                bids = [{"price": 0.74, "size": 100.0}]
+                asks = [{"price": 0.75, "size": 100.0}]
+                eng.update_orderbook_snapshot("YES", bids=bids, asks=asks)
+
+                # In Jane Street mode: quotes are pure dual-cash bids (BUY YES + BUY NO)
+                assert "BUY_YES" in eng.active_quotes
+                assert "BUY_NO" in eng.active_quotes
+                assert "SELL_YES" not in eng.active_quotes
+
+                assert eng.active_quotes["BUY_YES"]["price"] <= 0.749
+                # BUY NO price is 1.00 - target_ask_yes
+                assert eng.active_quotes["BUY_NO"]["price"] <= 0.26
+            finally:
+                eng.close()

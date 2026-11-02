@@ -112,6 +112,11 @@ def parse_args() -> argparse.Namespace:
         help="Threshold of complete sets before triggering CTF Merge (default: 10.0).",
     )
     parser.add_argument(
+        "--legacy-mode",
+        action="store_true",
+        help="Run legacy single-token quoting (BUY YES + SELL YES) instead of Jane Street pure dual-cash bidding (BUY YES + BUY NO).",
+    )
+    parser.add_argument(
         "--duration",
         type=float,
         default=None,
@@ -420,6 +425,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         auto_merge_threshold=args.auto_merge_threshold,
         db_path=args.db_path,
         ledger_path=args.ledger_path,
+        institutional_mode=not args.legacy_mode,
     )
 
     # 1. Register live book listener
