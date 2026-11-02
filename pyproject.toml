@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
     "rich>=15.0.0",
+    "streamlit>=1.66.1",
     "tqdm>=4.70.1",
     "websockets>=17.4",
 ]

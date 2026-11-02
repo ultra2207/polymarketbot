@@ -131,12 +131,19 @@ uv run python scripts/run_polysim_paper_trader.py --duration 1800 --filter "Neta
 uv run python scripts/run_polysim_paper_trader.py --cancel-all
 ```
 
-### Rate Limiting & Safety Guardrails
-- **Free-Tier Limits:** 2 req/sec burst / 120 req/min sustained. Built-in 0.6s inter-order delay and exponential backoff on HTTP 429.
-- **Heartbeat & Dead-Man's-Switch:** Every exit signal (Ctrl+C, timeout, unhandled error) calls `cancel_all_quotes()` and `POST /v1/cancel-all?confirm=true` to guarantee zero dangling orders.
-
-### Inspecting Results
-Query live database progress using DuckDB or SQLite:
+### Streamlit UI Dashboard
+Launch the interactive web terminal:
 ```powershell
-uv run python -c "import sqlite3; conn = sqlite3.connect('data/polysim_paper_trading.db'); conn.row_factory = sqlite3.Row; print('Orders:'); [print(dict(r)) for r in conn.execute('SELECT * FROM orders').fetchall()]; print('Daily:'); [print(dict(r)) for r in conn.execute('SELECT * FROM daily_rewards').fetchall()]"
+uv run streamlit run src/polymarketbot/ui/app.py
+# Or using the launcher:
+uv run python scripts/run_ui.py
 ```
+Access at: `http://localhost:8501`
+
+**Dashboard Features:**
+- **Live Account Overview:** Real-time API cash balance ($100 API wallet), total equity, starting balance, and unrealized PnL from `api.polysimulator.com`.
+- **Live Polymarket L2 Order Book:** Real-time bids/asks book ladder, midpoint, and spread for the selected candidate market.
+- **Binary Quoting Controls:** Interactive sliders for quote size (shares) and spread offset (cents). One-click **"Quote Both Sides"** (`BUY YES` + `BUY NO`) and **"Cancel All"** emergency kill-switch.
+- **Quadratic Liquidity Rewards Tracker:** Progress bar towards Polymarket's **$1.00 daily payout floor**, 1-minute epoch historical charts, and user score vs competing depth breakdown from SQLite (`data/polysim_paper_trading.db`).
+- **Positions & Audit Log:** Live open token positions from PolySimulator alongside recent order state transitions.
+
