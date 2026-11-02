@@ -590,3 +590,63 @@ from the resolved match-winner markets themselves (the tape gives both the pre-m
 the outcome for tens of thousands of fixtures), and ask whether it disagrees with the 6–12 h
 price in a way that predicts the result. That requires no external data and is the natural next
 session.
+
+## 12. A first forecasting attempt: Elo does not beat the market
+
+The test the previous section calls for: build a team-strength model from the resolved
+match-winner markets themselves and see whether it disagrees with the 6–12 h price in a way
+that predicts results.
+
+### Data
+
+From `event_slug` (which encodes `league-teamA-teamB-YYYY-MM-DD`) and the two "Will <team>
+win on <date>?" markets per fixture:
+
+- **21,719 fixtures**, 3,721 teams, 2024-10-19 → 2026-10-18.
+- 13,429 fixtures have a usable 6–12 h price (≥ 5 fills), giving 22,870 team-rows.
+- Raw calibration of that price is good: gap within ±0.009 in every band up to 70 %, and
+  +0.02–0.025 above it.
+
+### Model
+
+Elo (K = 24, home advantage 55 points) updated chronologically, then a three-way softmax
+`z_home = a·d + b`, `z_draw = c`, `z_away = −a·d + b`, fitted by maximum likelihood on the
+2,448 fixtures before 2026 and tested on the 6,993 in 2026. Fitted values: a = 0.00305,
+b = −0.323, c = −0.801.
+
+### Result
+
+| market-price quintile | model | market | actual |
+|---|---|---|---|
+| Q1 | 0.391 | 0.126 | 0.112 |
+| Q2 | 0.429 | 0.253 | 0.251 |
+| Q3 | 0.444 | 0.363 | 0.363 |
+| Q4 | 0.464 | 0.482 | 0.477 |
+| Q5 | 0.499 | 0.678 | 0.681 |
+
+The market is calibrated to within 5 pp in every quintile. The model is badly
+**underconfident** — it never leaves 0.39–0.50 while the market spans 0.13–0.68.
+
+Betting the disagreement loses money at every threshold:
+
+| threshold | bets | staked | net | ROI |
+|---|---|---|---|---|
+| 0.02 | 6,443 | 1,477 | −56.2 | **−3.80 %** |
+| 0.05 | 5,655 | 1,216 | −32.4 | −2.66 % |
+| 0.10 | 4,437 | 847 | −17.7 | −2.10 % |
+
+### What this does and does not show
+
+It shows that a **naive** team-strength model, built only from outcomes the market already
+sees, adds nothing. That is the expected result if the market is efficient and is consistent
+with everything in §1–11.
+
+It does **not** show that no model can win. The model here has no league-specific parameters,
+no team-specific home advantage, no opponent-quality correction beyond a single Elo number,
+and only two years of history. The gap between 0.39–0.50 and 0.13–0.68 is a confidence problem,
+not an information problem, and better calibration alone is not an edge.
+
+What the persistent wallets have — and this model does not — is information that is not in the
+historical outcome sequence at all: team news, lineups, travel, weather, motivation, or simply
+a better probability model than a single Elo number. **That is the actual barrier, and it is a
+data-acquisition problem before it is a modelling problem.**
