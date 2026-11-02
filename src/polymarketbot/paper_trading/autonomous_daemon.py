@@ -27,7 +27,6 @@ from polymarketbot.paper_trading.rewards import (
     compute_competing_depth_score,
     compute_quadratic_score,
 )
-from polymarketbot.rewards.scanner import MarketOpportunity, OpportunityScanner
 
 log = get_logger("autonomous_daemon")
 

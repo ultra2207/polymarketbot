@@ -21,6 +21,11 @@ from polymarketbot.paper_trading.rewards import (
     compute_competing_depth_score,
     compute_quadratic_score,
 )
+from polymarketbot.rewards.deskew import (
+    DeSkewDecision,
+    DeSkewPathway,
+    DynamicDeSkewOptimizer,
+)
 
 log = get_logger("polysim_trader")
 
@@ -75,6 +80,12 @@ class PolySimulatorTrader:
         self.last_mid: Optional[float] = None
         self.last_epoch_time: float = 0.0
         self._running: bool = False
+        self.deskew_optimizer = DynamicDeSkewOptimizer(
+            q_soft_threshold=15.0,
+            q_hard_threshold=150.0,
+            max_holding_seconds=300.0,
+            drift_toxicity_cents=1.5,
+        )
 
     @property
     def target_tick_size(self) -> float:
@@ -140,11 +151,30 @@ class PolySimulatorTrader:
 
         return True
 
-    def calculate_binary_quotes(self, mid_price: float) -> Tuple[float, float]:
-        """Compute quantized BUY prices for YES and NO using binary complementation."""
+    def calculate_binary_quotes(
+        self, mid_price: float, net_q: float = 0.0
+    ) -> Tuple[float, float]:
+        """Compute quantized BUY prices for YES and NO with Tier 1 inventory skewing."""
         half_spread = self.spread_offset_cents / 100.0
         raw_yes_bid = max(0.01, mid_price - half_spread)
         raw_no_bid = max(0.01, (1.0 - mid_price) - half_spread)
+        yes_active = True
+        no_active = True
+
+        # Tier 1 Passive Inventory Skewing (q_soft = 15.0):
+        if net_q > 15.0:
+            # Long YES (excess YES): pull/disable YES bid, tighten NO bid to complete pairs organically
+            yes_active = False
+            tighten_offset = min(half_spread * 0.8, (net_q / 150.0) * half_spread)
+            raw_no_bid = min(1.0 - mid_price - 0.001, raw_no_bid + tighten_offset)
+        elif net_q < -15.0:
+            # Long NO (excess NO): pull/disable NO bid, tighten YES bid to complete pairs organically
+            no_active = False
+            tighten_offset = min(half_spread * 0.8, (abs(net_q) / 150.0) * half_spread)
+            raw_yes_bid = min(mid_price - 0.001, raw_yes_bid + tighten_offset)
+
+        self.yes_quote_active = yes_active
+        self.no_quote_active = no_active
 
         yes_bid = round(round(raw_yes_bid / self.yes_tick) * self.yes_tick, 4)
         no_bid = round(round(raw_no_bid / self.no_tick) * self.no_tick, 4)
@@ -170,7 +200,7 @@ class PolySimulatorTrader:
             needs_requote = True
         elif abs(mid - self.last_mid) * 100.0 >= self.requote_threshold_cents:
             needs_requote = True
-        elif len(self.active_quotes) < 2:
+        elif len(self.active_quotes) < 1:
             needs_requote = True
 
         if time.time() < getattr(self, "_quote_cooldown_until", 0.0):
@@ -179,7 +209,18 @@ class PolySimulatorTrader:
         if not needs_requote:
             return
 
-        yes_bid, no_bid = self.calculate_binary_quotes(mid)
+        cond_id = self.target_market.get("condition_id", "") if self.target_market else ""
+        positions = self.client.get_positions(status="open")
+        pos_dict = {
+            p.get("outcome", "").upper(): float(p.get("quantity", 0))
+            for p in positions
+            if p.get("market_id") == cond_id
+        }
+        net_q = pos_dict.get("YES", 0.0) - pos_dict.get("NO", 0.0)
+
+        yes_bid, no_bid = self.calculate_binary_quotes(mid, net_q)
+        yes_active = getattr(self, "yes_quote_active", True)
+        no_active = getattr(self, "no_quote_active", True)
         self.last_mid = mid
 
         # Check if daily order placement cap has been reached
@@ -193,17 +234,21 @@ class PolySimulatorTrader:
                 self._daily_cap_logged = True
             return
 
-        # Dynamically size quote based on actual available cash
+        # Dynamically size quote based on active sides
         bal = self.client.get_balance()
         available_cash = max(0.0, bal.balance)
-        unit_cost = yes_bid + no_bid
+        unit_cost = 0.0
+        if yes_active:
+            unit_cost += yes_bid
+        if no_active:
+            unit_cost += no_bid
 
         max_affordable_shares = int((available_cash * 0.90) / unit_cost) if unit_cost > 0 else 0
         actual_size = min(self.quote_size, float(max_affordable_shares))
 
         if actual_size < 10.0:
             log.warning(
-                f"Available cash (${available_cash:.2f}) insufficient for two-sided quoting "
+                f"Available cash (${available_cash:.2f}) insufficient for quoting "
                 f"(needs ${unit_cost * 10:.2f} for 10 shares). Holding existing inventory."
             )
             self._quote_cooldown_until = time.time() + 60.0
@@ -211,81 +256,81 @@ class PolySimulatorTrader:
 
         self.cancel_all_quotes()
 
-        cond_id = self.target_market.get("condition_id", "") if self.target_market else ""
-
-        # Post BUY YES
-        r_yes = self.client.place_order(
-            token_id=self.yes_token_id,
-            side="BUY",
-            size=actual_size,
-            price=yes_bid,
-            order_type="GTC",
-            tick_size=self.yes_tick,
-        )
-        if r_yes.success and r_yes.order_id:
-            self.active_quotes[r_yes.order_id] = ActiveQuote(
-                order_id=r_yes.order_id,
-                token_id=self.yes_token_id,
-                outcome="Yes",
-                side="BUY",
-                price=yes_bid,
-                size=actual_size,
-            )
-            self.db.record_order(
-                order_id=r_yes.order_id,
+        # Post BUY YES if active
+        if yes_active:
+            r_yes = self.client.place_order(
                 token_id=self.yes_token_id,
                 side="BUY",
-                price=yes_bid,
                 size=actual_size,
-                status="live",
-                market_id=cond_id,
-                outcome="Yes",
+                price=yes_bid,
+                order_type="GTC",
+                tick_size=self.yes_tick,
             )
-        elif not r_yes.success:
-            if "daily" in (r_yes.error_msg or "").lower() or "limit" in (r_yes.error_msg or "").lower():
-                if gov:
-                    gov._daily_order_count = gov.config.max_orders_per_day
-                log.info(
-                    "[RateGovernor] Daily order limit detected from server. "
-                    "Switching to Passive Monitoring & Rewards Accrual mode."
+            if r_yes.success and r_yes.order_id:
+                self.active_quotes[r_yes.order_id] = ActiveQuote(
+                    order_id=r_yes.order_id,
+                    token_id=self.yes_token_id,
+                    outcome="Yes",
+                    side="BUY",
+                    price=yes_bid,
+                    size=actual_size,
                 )
-            log.warning(f"BUY YES rejected: {r_yes.error_msg}. Cooling down quotes.")
-            self._quote_cooldown_until = time.time() + 60.0
-            return
+                self.db.record_order(
+                    order_id=r_yes.order_id,
+                    token_id=self.yes_token_id,
+                    side="BUY",
+                    price=yes_bid,
+                    size=actual_size,
+                    status="live",
+                    market_id=cond_id,
+                    outcome="Yes",
+                )
+            elif not r_yes.success:
+                if "daily" in (r_yes.error_msg or "").lower() or "limit" in (r_yes.error_msg or "").lower():
+                    if gov:
+                        gov._daily_order_count = gov.config.max_orders_per_day
+                    log.info(
+                        "[RateGovernor] Daily order limit detected from server. "
+                        "Switching to Passive Monitoring & Rewards Accrual mode."
+                    )
+                log.warning(f"BUY YES rejected: {r_yes.error_msg}. Cooling down quotes.")
+                self._quote_cooldown_until = time.time() + 60.0
+                return
 
         time.sleep(0.6)  # rate limit courtesy
 
-        # Post BUY NO
-        r_no = self.client.place_order(
-            token_id=self.no_token_id,
-            side="BUY",
-            size=actual_size,
-            price=no_bid,
-            order_type="GTC",
-            tick_size=self.no_tick,
-        )
-        if r_no.success and r_no.order_id:
-            self.active_quotes[r_no.order_id] = ActiveQuote(
-                order_id=r_no.order_id,
-                token_id=self.no_token_id,
-                outcome="No",
-                side="BUY",
-                price=no_bid,
-                size=actual_size,
-            )
-            self.db.record_order(
-                order_id=r_no.order_id,
+        # Post BUY NO if active
+        if no_active:
+            r_no = self.client.place_order(
                 token_id=self.no_token_id,
                 side="BUY",
-                price=no_bid,
                 size=actual_size,
-                status="live",
-                market_id=cond_id,
-                outcome="No",
+                price=no_bid,
+                order_type="GTC",
+                tick_size=self.no_tick,
             )
-        elif not r_no.success:
-            log.warning(f"BUY NO rejected: {r_no.error_msg}. Cooling down quotes.")
-            self._quote_cooldown_until = time.time() + 30.0
+            if r_no.success and r_no.order_id:
+                self.active_quotes[r_no.order_id] = ActiveQuote(
+                    order_id=r_no.order_id,
+                    token_id=self.no_token_id,
+                    outcome="No",
+                    side="BUY",
+                    price=no_bid,
+                    size=actual_size,
+                )
+                self.db.record_order(
+                    order_id=r_no.order_id,
+                    token_id=self.no_token_id,
+                    side="BUY",
+                    price=no_bid,
+                    size=actual_size,
+                    status="live",
+                    market_id=cond_id,
+                    outcome="No",
+                )
+            elif not r_no.success:
+                log.warning(f"BUY NO rejected: {r_no.error_msg}. Cooling down quotes.")
+                self._quote_cooldown_until = time.time() + 30.0
 
     def cancel_all_quotes(self) -> None:
         """Cancel resting quotes and update SQLite."""
@@ -438,7 +483,7 @@ class PolySimulatorTrader:
         print("=" * 88)
 
     def manage_positions(self) -> list[str]:
-        """Autonomously manage open positions: take profit, exit or rebalance."""
+        """Autonomously manage open positions with CTF Merging and Tier 2 Active De-Skewing."""
         events = []
         if not self.target_market:
             return events
@@ -446,6 +491,8 @@ class PolySimulatorTrader:
         cond_id = self.target_market.get("condition_id", "")
         try:
             positions = self.client.get_positions(status="open")
+
+            # 0. Take-Profit Execution on profitable individual legs
             for p in positions:
                 if p.get("market_id") == cond_id:
                     qty = float(p.get("quantity", 0))
@@ -456,7 +503,6 @@ class PolySimulatorTrader:
                     if qty <= 0:
                         continue
 
-                    # If position has >= +0.5c profit, lock in profit!
                     profit_cents = (current - entry) * 100.0
                     token_id = self.yes_token_id if outcome == "Yes" else self.no_token_id
                     tick = self.yes_tick if outcome == "Yes" else self.no_tick
@@ -482,8 +528,138 @@ class PolySimulatorTrader:
                                 rationale=msg,
                                 net_yield_est=qty * (current - entry),
                             )
+
+            pos_dict = {
+                p.get("outcome", "").upper(): p
+                for p in positions
+                if p.get("market_id") == cond_id
+            }
+
+            qty_yes = float(pos_dict.get("YES", {}).get("quantity", 0))
+            qty_no = float(pos_dict.get("NO", {}).get("quantity", 0))
+            net_q = qty_yes - qty_no
+
+            # 1. CTF Complete-Set Merge Check (YES + NO = 1.00 USDC Cash)
+            complete_pairs = min(qty_yes, qty_no)
+            if complete_pairs >= 10.0:
+                merge_msg = (
+                    f"CTF COMPLETE-SET MERGE: Merged {complete_pairs:.0f} YES + {complete_pairs:.0f} NO "
+                    f"-> ${complete_pairs:.2f} USDC Cash unlocked! (Net exposure resets to {abs(net_q):.0f} shares)"
+                )
+                events.append(merge_msg)
+                log.info(merge_msg)
+                self.db.record_decision(
+                    decision_type="CTF_MERGE",
+                    condition_id=cond_id,
+                    market_question=self.target_market.get("question", ""),
+                    allocated_capital=complete_pairs,
+                    quote_size=complete_pairs,
+                    rationale=merge_msg,
+                    net_yield_est=0.0,
+                )
+
+            # 2. Tier 2 Emergency Circuit Breaker (Optimizer-Driven De-Skewing)
+            if self.yes_token_id and self.no_token_id:
+                mid = self.last_mid or 0.50
+                book_yes = self.client.get_book(self.yes_token_id, depth=5)
+                time.sleep(0.4)
+                book_no = self.client.get_book(self.no_token_id, depth=5)
+
+                b_yes = float(book_yes["bids"][-1]["price"]) if book_yes.get("bids") else mid - 0.01
+                a_yes = float(book_yes["asks"][-1]["price"]) if book_yes.get("asks") else mid + 0.01
+                b_no = float(book_no["bids"][-1]["price"]) if book_no.get("bids") else (1.0 - mid) - 0.01
+                a_no = float(book_no["asks"][-1]["price"]) if book_no.get("asks") else (1.0 - mid) + 0.01
+
+                decision = self.deskew_optimizer.evaluate_skew(
+                    shares_yes=qty_yes,
+                    shares_no=qty_no,
+                    best_bid_yes=b_yes,
+                    best_ask_yes=a_yes,
+                    best_bid_no=b_no,
+                    best_ask_no=a_no,
+                )
+
+                if decision.pathway in (DeSkewPathway.SYNTHETIC_MERGE, DeSkewPathway.DIRECT_CROSS):
+                    gov = getattr(self.client, "governor", None)
+                    if gov and gov.get_status().can_place_order:
+                        tok_id = self.yes_token_id if decision.target_token == "YES" else self.no_token_id
+                        tick = self.yes_tick if decision.target_token == "YES" else self.no_tick
+                        res = self.client.place_order(
+                            token_id=tok_id,
+                            side=decision.action_side,
+                            size=decision.target_size,
+                            price=decision.target_price,
+                            order_type="GTC",
+                            tick_size=tick,
+                        )
+                        if res.success:
+                            evt_msg = (
+                                f"TIER 2 ACTIVE DE-SKEW ({decision.pathway.value}): "
+                                f"{decision.action_side} {decision.target_size:.0f} {decision.target_token} "
+                                f"@ ${decision.target_price:.3f} | {decision.reason}"
+                            )
+                            events.append(evt_msg)
+                            log.info(evt_msg)
+                            self.db.record_decision(
+                                decision_type=decision.pathway.value,
+                                condition_id=cond_id,
+                                market_question=self.target_market.get("question", ""),
+                                allocated_capital=decision.target_size * decision.target_price,
+                                quote_size=decision.target_size,
+                                rationale=decision.reason,
+                                net_yield_est=0.0,
+                            )
         except Exception as e:
             log.warning(f"Error in manage_positions: {e}")
+        return events
+
+    def exit_session(self) -> list[str]:
+        """End-of-Session Flattener: cancels resting quotes and liquidates residual positions to cash."""
+        events = []
+        log.info("Executing End-of-Session Flattener: returning 100% of capital to USDC cash...")
+        self.cancel_all_quotes()
+        self.client.cancel_all()
+
+        try:
+            positions = self.client.get_positions(status="open")
+            if not positions:
+                log.info("No open positions to liquidate. Clean cash state.")
+                return events
+
+            gov = getattr(self.client, "governor", None)
+            for p in positions:
+                qty = float(p.get("quantity", 0))
+                outcome = p.get("outcome", "")
+                if qty <= 0:
+                    continue
+
+                token_id = self.yes_token_id if outcome == "Yes" else self.no_token_id
+                tick = self.yes_tick if outcome == "Yes" else self.no_tick
+                if not token_id:
+                    continue
+
+                book = self.client.get_book(token_id, depth=5)
+                bids = book.get("bids", [])
+                if bids and gov and gov.get_status().can_place_order:
+                    best_bid = float(bids[-1]["price"])
+                    res = self.client.place_order(
+                        token_id=token_id,
+                        side="SELL",
+                        size=qty,
+                        price=best_bid,
+                        order_type="GTC",
+                        tick_size=tick,
+                    )
+                    if res.success:
+                        evt = f"SESSION FLATTENED: Sold {qty:.0f} {outcome} @ ${best_bid:.3f} into best bid."
+                        events.append(evt)
+                        log.info(evt)
+                    else:
+                        log.warning(f"Failed to sell {outcome} during session exit: {res.error_msg}")
+                else:
+                    log.info(f"Session Flattener: Open inventory {qty:.0f} {outcome} held (order write limited).")
+        except Exception as e:
+            log.warning(f"Error during exit_session: {e}")
         return events
 
     def execute_active_starter_trade(self, size: float = 10.0) -> list[str]:
@@ -560,12 +736,12 @@ class PolySimulatorTrader:
                     fills.extend(initial_events)
                     initial_events = []
 
-                # 2. Manage open positions (take profit / rebalance)
+                # 2. Manage open positions (take profit / rebalance / complete-set merge)
                 pos_events = self.manage_positions()
                 if pos_events:
                     fills.extend(pos_events)
 
-                # 3. Refresh quotes
+                # 3. Refresh quotes (with Tier 1 inventory skewing)
                 self.refresh_quotes()
 
                 # 4. Evaluate 1-min reward epoch
@@ -580,8 +756,7 @@ class PolySimulatorTrader:
             print("\n[INFO] Interrupted by user. Shutting down...")
         finally:
             self._running = False
-            self.cancel_all_quotes()
-            self.client.cancel_all()
+            self.exit_session()
             final_bal = self.client.get_balance()
             cum_rewards = self.db.get_total_cumulative_rewards()
             print(f"\n[SESSION COMPLETED] Final Balance: ${final_bal.balance:.2f} | Equity: ${final_bal.total_value:.2f} | Rewards: ${cum_rewards:.2f}\n")

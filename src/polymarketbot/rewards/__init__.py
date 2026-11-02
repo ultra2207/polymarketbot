@@ -51,6 +51,11 @@ from polymarketbot.rewards.switching import (
     calculate_switching_cost,
     evaluate_switching_hurdle,
 )
+from polymarketbot.rewards.deskew import (
+    DeSkewDecision,
+    DeSkewPathway,
+    DynamicDeSkewOptimizer,
+)
 
 __all__ = [
     "CATEGORY_REGIMES",
@@ -88,5 +93,8 @@ __all__ = [
     "SwitchingConfig",
     "calculate_switching_cost",
     "evaluate_switching_hurdle",
+    "DeSkewDecision",
+    "DeSkewPathway",
+    "DynamicDeSkewOptimizer",
 ]
 
