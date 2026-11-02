@@ -29,6 +29,7 @@ from polymarketbot.rewards.scoring import (
     normalize_sample_score,
     quadratic_order_score,
 )
+from polymarketbot.risk import RiskConfig, RiskManager
 
 CATEGORY_REGIMES = {
     "politics": {
@@ -139,11 +140,13 @@ class LiquidityRewardsBotEngine:
         tick_size: float = 0.01,
         auto_merge: bool = True,
         seed: Optional[int] = 42,
+        risk_manager: Optional[RiskManager] = None,
     ) -> None:
         self.market = market
         self.quote_size = max(market.rewards_min_size, quote_size)
         self.max_inventory = max_inventory
         self.auto_merge = auto_merge
+        self.risk_manager = risk_manager
 
         self.regime = CATEGORY_REGIMES.get(
             market.category.lower(), CATEGORY_REGIMES["default"]
@@ -158,8 +161,21 @@ class LiquidityRewardsBotEngine:
             tick_size=tick_size,
         )
         self.queue_sim = OrderBookQueueSimulator()
-        self.position = CompleteSetPosition(auto_merge_threshold=100.0)
+        merge_thresh = (
+            self.risk_manager.config.min_merge_threshold_shares
+            if self.risk_manager
+            else 100.0
+        )
+        self.position = CompleteSetPosition(auto_merge_threshold=merge_thresh)
+        if self.risk_manager:
+            self.risk_manager.register_unquote_callback(self._on_risk_unquote)
+            self.position.can_merge_fn = lambda shares: self.risk_manager.can_merge(shares)[0]
+
         self.rng = random.Random(seed)
+
+    def _on_risk_unquote(self, asset_id: Optional[str], reason: str) -> None:
+        self.queue_sim.cancel_order("maker_bid_yes")
+        self.queue_sim.cancel_order("maker_ask_yes")
 
     def simulate_epoch(
         self,
@@ -226,6 +242,57 @@ class LiquidityRewardsBotEngine:
                 min_size=self.market.rewards_min_size,
             )
 
+            # Risk check: price volatility, cooldown, and pre-trade limits
+            if self.risk_manager:
+                is_healthy, _ = self.risk_manager.update_market_price(
+                    "token_yes", self.market.condition_id, mid_price
+                )
+                if (
+                    not is_healthy
+                    or self.risk_manager.volatility_monitor.is_in_cooldown("token_yes")
+                    or self.risk_manager.portfolio_state.is_halted
+                ):
+                    quotes.is_bid_active = False
+                    quotes.is_ask_active = False
+                else:
+                    if quotes.is_bid_active:
+                        ok, r, adj_sz, adj_px = self.risk_manager.validate_quote(
+                            asset_id="token_yes",
+                            condition_id=self.market.condition_id,
+                            side="BUY",
+                            price=quotes.bid_price,
+                            size=quotes.bid_size,
+                            current_pos_shares=self.position.shares_yes,
+                            current_pos_cost=self.position.cost_basis_yes,
+                            current_portfolio_inventory_usd=abs(self.position.net_inventory * mid_price),
+                            current_cash_usd=self.position.usdc_cash + self.risk_manager.config.total_bankroll_usd,
+                            mid_price=mid_price,
+                        )
+                        if not ok:
+                            quotes.is_bid_active = False
+                        else:
+                            quotes.bid_size = adj_sz
+                            quotes.bid_price = adj_px
+
+                    if quotes.is_ask_active:
+                        ok, r, adj_sz, adj_px = self.risk_manager.validate_quote(
+                            asset_id="token_yes",
+                            condition_id=self.market.condition_id,
+                            side="SELL",
+                            price=quotes.ask_price,
+                            size=quotes.ask_size,
+                            current_pos_shares=self.position.shares_yes,
+                            current_pos_cost=self.position.cost_basis_yes,
+                            current_portfolio_inventory_usd=abs(self.position.net_inventory * mid_price),
+                            current_cash_usd=self.position.usdc_cash + self.risk_manager.config.total_bankroll_usd,
+                            mid_price=mid_price,
+                        )
+                        if not ok:
+                            quotes.is_ask_active = False
+                        else:
+                            quotes.ask_size = adj_sz
+                            quotes.ask_price = adj_px
+
             # 4. Synchronize resting quotes with order book queue
             if quotes.is_bid_active:
                 comp_bid_depth = self.market.competing_touch_depth if quotes.bid_spread_cents <= 0.6 else self.market.competing_qualifying_depth * 0.25
@@ -284,13 +351,20 @@ class LiquidityRewardsBotEngine:
                     total_adverse_300s += f.adverse_selection_300s
                     total_adverse_3600s += f.adverse_selection_3600s
 
+                    if self.risk_manager:
+                        self.risk_manager.record_fill(
+                            "token_yes", self.market.condition_id, f.side, f.fill_price, f.fill_size
+                        )
+
                     # Update position and auto-merge complete sets
-                    self.position.record_fill(
+                    merge_evt = self.position.record_fill(
                         outcome=f.outcome,
                         side=f.side,
                         price=f.fill_price,
                         size=f.fill_size,
                     )
+                    if self.risk_manager and merge_evt:
+                        self.risk_manager.record_merge(merge_evt.shares_merged, merge_evt.gas_fee)
 
             # 6. Evaluate official Polymarket quadratic scoring for this sample minute
             active_maker_quotes = []

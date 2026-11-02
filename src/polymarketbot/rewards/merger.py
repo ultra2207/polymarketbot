@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 
 CTF_EXCHANGE_POLYGON = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -50,6 +50,7 @@ class CompleteSetPosition:
     total_gas_fees: float = 0.0
     gas_fee_per_merge: float = 0.015  # Polygon CTF mergePositions gas fee
     auto_merge_threshold: float = 100.0  # Merge whenever min(YES, NO) >= threshold (batched)
+    can_merge_fn: Optional[Callable[[float], bool]] = None  # Risk/Gas merge validation hook
     history: List[MergeEvent] = field(default_factory=list)
 
     @property
@@ -116,7 +117,8 @@ class CompleteSetPosition:
 
         # Check automated merge
         if self.mergeable_shares >= self.auto_merge_threshold:
-            return self.execute_merge(timestamp=timestamp)
+            if self.can_merge_fn is None or self.can_merge_fn(self.mergeable_shares):
+                return self.execute_merge(timestamp=timestamp)
         return None
 
     def execute_merge(self, timestamp: Optional[float] = None) -> MergeEvent:

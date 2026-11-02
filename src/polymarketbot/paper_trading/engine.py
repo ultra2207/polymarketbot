@@ -34,6 +34,7 @@ from polymarketbot.paper_trading.rewards import (
     compute_epoch_payout,
     compute_quadratic_score,
 )
+from polymarketbot.risk import RiskConfig, RiskManager
 
 logger = get_logger("paper_trading")
 
@@ -73,6 +74,7 @@ class PaperTradingEngine:
         auto_merge_threshold: float = 100.0,
         merge_gas_fee_usd: float = 0.015,
         ledger_path: str | Path = "data/processed/paper_trading/ledger.json",
+        risk_manager: Optional[RiskManager] = None,
     ) -> None:
         self.initial_cash_usd = float(initial_cash_usd)
         self.cash_usd = float(initial_cash_usd)
@@ -84,6 +86,9 @@ class PaperTradingEngine:
         self.merge_gas_fee_usd = float(merge_gas_fee_usd)
         self.ledger_path = Path(ledger_path)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        self.risk_manager = risk_manager
+        if self.risk_manager:
+            self.risk_manager.register_unquote_callback(self._on_risk_unquote)
 
         self.start_time = time.time()
         self.epoch_count = 0
@@ -138,6 +143,19 @@ class PaperTradingEngine:
             f"max_spread={config.rewards_max_spread}c, min_sz={config.rewards_min_size})"
         )
 
+    def _on_risk_unquote(self, asset_id: Optional[str], reason: str) -> None:
+        self.cancel_quotes(asset_id)
+
+    def cancel_quotes(self, asset_id: Optional[str] = None) -> None:
+        """Fast-cancel virtual resting quotes across one or all markets."""
+        if asset_id:
+            if asset_id in self.virtual_quotes:
+                self.virtual_quotes[asset_id] = {"bid": None, "ask": None}
+        else:
+            for aid in self.virtual_quotes:
+                self.virtual_quotes[aid] = {"bid": None, "ask": None}
+        logger.info(f"Quotes cancelled for {'all assets' if not asset_id else asset_id}")
+
     def update_orderbook(
         self,
         asset_id: str,
@@ -176,6 +194,10 @@ class PaperTradingEngine:
         cid = self.asset_to_condition[asset_id]
         mkt = self.markets[cid]
 
+        # Risk monitor: check high-frequency volatility / price jump
+        if self.risk_manager:
+            self.risk_manager.update_market_price(asset_id, cid, mid)
+
         # Calculate competing depth score
         comp_score, b_usd, a_usd = compute_competing_depth_score(
             valid_bids, valid_asks, mid, mkt.rewards_max_spread
@@ -206,6 +228,14 @@ class PaperTradingEngine:
         """Simulate virtual resting limit orders with queue priority and inventory skewing."""
         if asset_id not in self.asset_to_condition:
             return
+
+        if self.risk_manager:
+            if (
+                self.risk_manager.portfolio_state.is_halted
+                or self.risk_manager.volatility_monitor.is_in_cooldown(asset_id)
+            ):
+                self.virtual_quotes[asset_id] = {"bid": None, "ask": None}
+                return
 
         cid = self.asset_to_condition[asset_id]
         mkt = self.markets[cid]
@@ -252,6 +282,57 @@ class PaperTradingEngine:
         # If inventory is maxed out, pause buying or selling
         bid_size = quote_size if inv < self.max_inventory_shares else 0.0
         ask_size = quote_size if inv > -self.max_inventory_shares else 0.0
+
+        # Risk validation and asymmetric toxicity adjustments
+        if self.risk_manager and bid_size > 0:
+            pos_cost = abs(inv * pos.avg_cost)
+            port_inv = sum(abs(p.market_value) for p in self.positions.values())
+            ok, reason, adj_sz, adj_px = self.risk_manager.validate_quote(
+                asset_id=asset_id,
+                condition_id=cid,
+                side="BUY",
+                price=bid_price,
+                size=bid_size,
+                current_pos_shares=inv,
+                current_pos_cost=pos_cost,
+                current_portfolio_inventory_usd=port_inv,
+                current_cash_usd=self.cash_usd,
+                mid_price=mid,
+                tick_size=tick,
+            )
+            if not ok:
+                bid_size = 0.0
+            else:
+                bid_size = adj_sz
+                bid_price = adj_px
+                if bid_price >= best_ask:
+                    bid_price = round(min(best_bid, best_ask - tick), 4)
+                    post_only_bid = (bid_price < best_ask)
+
+        if self.risk_manager and ask_size > 0:
+            pos_cost = abs(inv * pos.avg_cost)
+            port_inv = sum(abs(p.market_value) for p in self.positions.values())
+            ok, reason, adj_sz, adj_px = self.risk_manager.validate_quote(
+                asset_id=asset_id,
+                condition_id=cid,
+                side="SELL",
+                price=ask_price,
+                size=ask_size,
+                current_pos_shares=inv,
+                current_pos_cost=pos_cost,
+                current_portfolio_inventory_usd=port_inv,
+                current_cash_usd=self.cash_usd,
+                mid_price=mid,
+                tick_size=tick,
+            )
+            if not ok:
+                ask_size = 0.0
+            else:
+                ask_size = adj_sz
+                ask_price = adj_px
+                if ask_price <= best_bid:
+                    ask_price = round(max(best_ask, best_bid + tick), 4)
+                    post_only_ask = (ask_price > best_bid)
 
         # Calculate actual spread offset in cents
         actual_bid_spread = round((mid - bid_price) * 100.0, 2)
@@ -466,6 +547,20 @@ class PaperTradingEngine:
             f"New Inventory: {new_shares:.1f} sh | Cash: ${self.cash_usd:,.2f}"
         )
 
+        if self.risk_manager:
+            self.risk_manager.record_fill(asset_id, cid, "BUY", fill_px, fill_sz, ts)
+            summary = self.get_portfolio_summary()
+            self.risk_manager.update_portfolio_pnl(
+                current_equity=summary["total_equity_usd"],
+                realized_pnl=summary["realized_pnl_usd"],
+                unrealized_pnl=summary["unrealized_pnl_usd"],
+                current_cash=self.cash_usd,
+                positions_market_value=summary["positions_market_value_usd"],
+                timestamp=ts,
+            )
+            if self.risk_manager.portfolio_state.is_halted:
+                self.cancel_quotes()
+
         # Check automated CTF complete-set merge
         self.check_and_execute_merge(cid, timestamp=ts)
 
@@ -542,6 +637,20 @@ class PaperTradingEngine:
             f"New Inventory: {new_shares:.1f} sh | Cash: ${self.cash_usd:,.2f}"
         )
 
+        if self.risk_manager:
+            self.risk_manager.record_fill(asset_id, cid, "SELL", fill_px, fill_sz, ts)
+            summary = self.get_portfolio_summary()
+            self.risk_manager.update_portfolio_pnl(
+                current_equity=summary["total_equity_usd"],
+                realized_pnl=summary["realized_pnl_usd"],
+                unrealized_pnl=summary["unrealized_pnl_usd"],
+                current_cash=self.cash_usd,
+                positions_market_value=summary["positions_market_value_usd"],
+                timestamp=ts,
+            )
+            if self.risk_manager.portfolio_state.is_halted:
+                self.cancel_quotes()
+
         # Check automated CTF complete-set merge
         self.check_and_execute_merge(cid, timestamp=ts)
 
@@ -589,7 +698,14 @@ class PaperTradingEngine:
         no_shares = max(0.0, no_pos.shares)
         mergeable = min(yes_shares, no_shares)
 
-        if mergeable >= self.auto_merge_threshold:
+        threshold = self.auto_merge_threshold
+        if self.risk_manager:
+            threshold = self.risk_manager.config.min_merge_threshold_shares
+            can_m, _ = self.risk_manager.can_merge(mergeable)
+            if not can_m:
+                return None
+
+        if mergeable >= threshold:
             return self.execute_merge(condition_id, amount=mergeable, timestamp=timestamp)
         return None
 
@@ -620,6 +736,9 @@ class PaperTradingEngine:
         self.cash_usd += (unlocked_usd - gas_fee)
         self.total_gas_fees_usd += gas_fee
         self.total_merges_count += 1
+
+        if self.risk_manager:
+            self.risk_manager.record_merge(merge_amount, gas_fee)
 
         # Realize PnL from merging:
         merged_cost = merge_amount * (yes_pos.avg_cost + no_pos.avg_cost)
@@ -733,7 +852,7 @@ class PaperTradingEngine:
         latest_snaps = self.epoch_snapshots[-len(self.asset_to_condition):] if self.epoch_snapshots else []
         projected_daily_rewards = sum(s.projected_daily_payout_usd for s in latest_snaps)
 
-        return {
+        summary = {
             "initial_cash_usd": round(self.initial_cash_usd, 2),
             "current_cash_usd": round(self.cash_usd, 2),
             "positions_market_value_usd": round(positions_market_value, 2),
@@ -749,6 +868,11 @@ class PaperTradingEngine:
             "projected_daily_rewards_usd": round(projected_daily_rewards, 2),
             "projected_annual_rewards_usd": round(projected_daily_rewards * 365.0, 2),
         }
+        if self.risk_manager:
+            summary["risk_status"] = self.risk_manager.portfolio_state.status.value
+            summary["kill_switch_active"] = self.risk_manager.portfolio_state.kill_switch_active
+            summary["is_halted"] = self.risk_manager.portfolio_state.is_halted
+        return summary
 
     def to_ledger_dict(self) -> dict[str, Any]:
         """Serialize complete engine state and metrics to JSON-compatible dictionary."""
