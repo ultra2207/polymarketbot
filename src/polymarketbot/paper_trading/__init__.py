@@ -15,6 +15,13 @@ from polymarketbot.paper_trading.rewards import (
 )
 from polymarketbot.paper_trading.engine import PaperTradingEngine
 from polymarketbot.paper_trading.client import PolymarketLiveClient
+from polymarketbot.paper_trading.polysim_client import (
+    PolySimulatorClient,
+    PolySimBalance,
+    PolySimOrderResult,
+)
+from polymarketbot.paper_trading.polysim_db import PolySimDatabase
+from polymarketbot.paper_trading.polysim_trader import PolySimulatorTrader
 
 __all__ = [
     "VirtualQuote",
@@ -28,4 +35,11 @@ __all__ = [
     "compute_epoch_payout",
     "PaperTradingEngine",
     "PolymarketLiveClient",
+    "PolySimulatorClient",
+    "PolySimBalance",
+    "PolySimOrderResult",
+    "PolySimulatorTrader",
+    "PolySimDatabase",
 ]
+
+
