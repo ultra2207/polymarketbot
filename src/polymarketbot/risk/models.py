@@ -101,6 +101,13 @@ class RiskConfig:
     heartbeat_timeout_seconds: float = 15.0  # Trip on WS/REST heartbeat loss > 15s
     auto_unquote_on_disconnect: bool = True
 
+    # 7. Institutional Hybrid Rebalancing & Active Synthetic Hedging (Regime B)
+    enable_synthetic_hedging: bool = True
+    q_urgency_threshold_shares: float = 60.0  # Switch from passive skew to active hedge
+    max_synthetic_cross_spread_cents: float = 0.5  # Max spread crossing slippage to lock pair
+    toxic_markout_threshold_cents: float = 1.5  # 30s markout loss > 1.5c triggers emergency cross
+    markout_window_seconds: float = 30.0  # Post-fill markout window
+
 
 @dataclass
 class MarketRiskState:

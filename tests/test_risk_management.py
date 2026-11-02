@@ -657,3 +657,68 @@ def test_liquidity_rewards_bot_engine_risk_integration():
     assert report.allocated_capital > 0.0
     # Net inventory must not blow past small capital limits
     assert abs(report.final_net_inventory) <= 200.0
+
+
+# =========================================================================
+# 8. Institutional Synthetic Hedging (Regime B)
+# =========================================================================
+
+def test_synthetic_hedging_trigger_on_urgency():
+    """Verify active synthetic hedge triggers when inventory exceeds urgency threshold."""
+    cfg = RiskConfig(
+        enable_synthetic_hedging=True,
+        q_urgency_threshold_shares=60.0,
+        max_synthetic_cross_spread_cents=0.5,
+        max_quote_size_shares=50.0,
+    )
+    rm = RiskManager(cfg)
+
+    # 1. Under urgency threshold (e.g. 40 shares): passive hold
+    should_cross, reason, sz = rm.evaluate_synthetic_hedge(
+        current_inventory_q=40.0,
+        fill_price=0.33,
+        complementary_best_ask=0.66,
+    )
+    assert should_cross is False
+    assert "passive" in reason
+
+    # 2. At or above urgency threshold (e.g. 70 shares) with good basis (0.33 + 0.66 = 0.99 <= 1.005)
+    should_cross, reason, sz = rm.evaluate_synthetic_hedge(
+        current_inventory_q=70.0,
+        fill_price=0.33,
+        complementary_best_ask=0.66,
+    )
+    assert should_cross is True
+    assert "urgent_hedge" in reason
+    assert sz == 50.0  # Capped at max_quote_size_shares
+
+    # 3. Urgency threshold met but spread slippage too wide (0.33 + 0.70 = 1.03 > 1.005)
+    should_cross, reason, sz = rm.evaluate_synthetic_hedge(
+        current_inventory_q=70.0,
+        fill_price=0.33,
+        complementary_best_ask=0.70,
+    )
+    assert should_cross is False
+    assert "exceeds max" in reason
+
+
+def test_synthetic_hedging_trigger_on_toxic_markout():
+    """Verify toxic markout (>1.5c) triggers urgent synthetic hedge even below inventory threshold."""
+    cfg = RiskConfig(
+        enable_synthetic_hedging=True,
+        q_urgency_threshold_shares=60.0,
+        toxic_markout_threshold_cents=1.5,
+        max_synthetic_cross_spread_cents=0.5,
+    )
+    rm = RiskManager(cfg)
+
+    # Low inventory (30 shares < 60 threshold), but markout loss is 2.0c > 1.5c
+    should_cross, reason, sz = rm.evaluate_synthetic_hedge(
+        current_inventory_q=30.0,
+        fill_price=0.33,
+        complementary_best_ask=0.665,  # 0.33 + 0.665 = 0.995 <= 1.005
+        recent_markout_loss_cents=2.0,
+    )
+    assert should_cross is True
+    assert "toxic markout" in reason
+    assert sz == 30.0

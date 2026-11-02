@@ -612,6 +612,41 @@ class RiskManager:
         self.portfolio_state.total_gas_spent_usd = self.gas_merge_manager.total_gas_spent
         self.portfolio_state.total_merges_count = self.gas_merge_manager.total_merges_count
 
+    def evaluate_synthetic_hedge(
+        self,
+        current_inventory_q: float,
+        fill_price: float,
+        complementary_best_ask: float,
+        recent_markout_loss_cents: float = 0.0,
+    ) -> tuple[bool, str, float]:
+        """Evaluate whether to trigger an active synthetic taker hedge on complementary asset (Regime B).
+
+        Returns:
+            (should_cross, reason, target_hedge_size)
+        """
+        if not self.config.enable_synthetic_hedging:
+            return False, "synthetic_hedging_disabled", 0.0
+
+        abs_q = abs(current_inventory_q)
+        is_urgent_inventory = abs_q >= self.config.q_urgency_threshold_shares
+        is_toxic_markout = recent_markout_loss_cents >= self.config.toxic_markout_threshold_cents
+
+        if not (is_urgent_inventory or is_toxic_markout):
+            return False, "inventory_within_passive_bounds", 0.0
+
+        # Check combined basis: fill_price + complementary_ask <= 1.00 + tolerance
+        combined_basis = fill_price + complementary_best_ask
+        max_acceptable_basis = 1.00 + (self.config.max_synthetic_cross_spread_cents / 100.0)
+
+        if combined_basis <= max_acceptable_basis:
+            reason = f"urgent_hedge: basis {combined_basis:.4f} <= max {max_acceptable_basis:.4f}"
+            if is_toxic_markout:
+                reason += f" (toxic markout: {recent_markout_loss_cents:.2f}c)"
+            hedge_size = min(abs_q, self.config.max_quote_size_shares)
+            return True, reason, hedge_size
+
+        return False, f"basis {combined_basis:.4f} exceeds max {max_acceptable_basis:.4f}", 0.0
+
     def resume(self, reset_peak: bool = False, reset_day_start: bool = False) -> None:
         """Safely resume after operator inspection."""
         self.portfolio_state.kill_switch_active = False
