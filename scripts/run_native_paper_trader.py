@@ -481,6 +481,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
 
     start_time = time.time()
     last_epoch_check = time.time()
+    last_render_time = 0.0
     running = True
 
     def handle_sigint(sig: int, frame: Any) -> None:
@@ -517,12 +518,15 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
                 engine.evaluate_quotes(timestamp=loop_now)
 
                 # Render dashboard
-                render_dashboard(
-                    engine=engine,
-                    market_info=market,
-                    start_time=start_time,
-                    clear_screen=not args.no_clear,
-                )
+                render_cadence = 10.0 if args.no_clear else 1.0
+                if (loop_now - last_render_time) >= render_cadence:
+                    render_dashboard(
+                        engine=engine,
+                        market_info=market,
+                        start_time=start_time,
+                        clear_screen=not args.no_clear,
+                    )
+                    last_render_time = loop_now
 
                 # Flush persistence
                 engine.flush_ledger()
