@@ -150,18 +150,28 @@ def run_production_backtest(
             report = engine.simulate_epoch(epoch_idx=day, n_minutes=1440)
             daily_reports.append(report)
 
-        # Aggregate multi-day statistics
-        avg_gross_rew = sum(r.gross_rewards for r in daily_reports) / days
-        avg_net_rew = sum(r.net_rewards for r in daily_reports) / days
-        avg_spread_pnl = sum(r.spread_captured for r in daily_reports) / days
-        avg_adverse_pnl = sum(r.adverse_selection for r in daily_reports) / days
-        avg_decay = sum(r.inventory_decay for r in daily_reports) / days
-        avg_net_pnl = sum(r.net_pnl for r in daily_reports) / days
+        # Cumulative actual totals across all simulated days
+        tot_gross_rew = sum(r.gross_rewards for r in daily_reports)
+        tot_net_rew = sum(r.net_rewards for r in daily_reports)
+        tot_spread_pnl = sum(r.spread_captured for r in daily_reports)
+        tot_adverse_pnl = sum(r.adverse_selection for r in daily_reports)
+        tot_adverse_60s = sum(r.adverse_selection_60s for r in daily_reports)
+        tot_adverse_300s = sum(r.adverse_selection_300s for r in daily_reports)
+        tot_adverse_3600s = sum(r.adverse_selection_3600s for r in daily_reports)
+        tot_decay = sum(r.inventory_decay for r in daily_reports)
+        tot_gas_fees = sum(r.gas_fees for r in daily_reports)
+        actual_net_revenue = sum(r.net_pnl for r in daily_reports)
         total_merged_usd = daily_reports[-1].complete_sets_merged_usd
         alloc_cap = daily_reports[0].allocated_capital
 
-        daily_roi = (avg_net_pnl / alloc_cap) * 100.0 if alloc_cap > 0 else 0.0
-        annual_roi = daily_roi * 365.0
+        avg_gross_rew = tot_gross_rew / days
+        avg_net_rew = tot_net_rew / days
+        avg_spread_pnl = tot_spread_pnl / days
+        avg_adverse_pnl = tot_adverse_pnl / days
+        avg_decay = tot_decay / days
+        avg_net_pnl = actual_net_revenue / days
+
+        actual_return_pct = (actual_net_revenue / alloc_cap) * 100.0 if alloc_cap > 0 else 0.0
         floor_pass_rate = sum(1 for r in daily_reports if r.passed_payout_floor) / days
 
         mkt_summary = {
@@ -172,17 +182,28 @@ def run_production_backtest(
             "allocated_capital": alloc_cap,
             "min_size": mkt.rewards_min_size,
             "max_spread_cents": mkt.rewards_max_spread,
+            "days_simulated": days,
+            # Actual cumulative totals over the period
+            "actual_gross_rewards_usd": round(tot_gross_rew, 2),
+            "actual_net_rewards_usd": round(tot_net_rew, 2),
+            "actual_spread_captured_usd": round(tot_spread_pnl, 2),
+            "actual_adverse_selection_usd": round(tot_adverse_pnl, 2),
+            "actual_adverse_60s_usd": round(tot_adverse_60s, 2),
+            "actual_adverse_300s_usd": round(tot_adverse_300s, 2),
+            "actual_adverse_3600s_usd": round(tot_adverse_3600s, 2),
+            "actual_inventory_decay_usd": round(tot_decay, 2),
+            "actual_gas_fees_usd": round(tot_gas_fees, 2),
+            "actual_net_revenue_usd": round(actual_net_revenue, 2),
+            "actual_return_pct": round(actual_return_pct, 1),
+            "total_complete_sets_merged_usd": round(total_merged_usd, 2),
+            "floor_pass_rate": round(floor_pass_rate, 3),
+            # Daily averages for reference
             "avg_daily_gross_rewards": round(avg_gross_rew, 2),
             "avg_daily_net_rewards": round(avg_net_rew, 2),
             "avg_daily_spread_captured": round(avg_spread_pnl, 2),
             "avg_daily_adverse_selection": round(avg_adverse_pnl, 2),
             "avg_daily_inventory_decay": round(avg_decay, 2),
             "avg_daily_net_pnl": round(avg_net_pnl, 2),
-            "daily_roi_pct": round(daily_roi, 2),
-            "annual_roi_pct": round(annual_roi, 1),
-            "total_complete_sets_merged_usd": round(total_merged_usd, 2),
-            "floor_pass_rate": round(floor_pass_rate, 3),
-            "days_simulated": days,
         }
         results.append(mkt_summary)
 
@@ -194,44 +215,73 @@ def run_production_backtest(
 
 
 def print_summary_table(results: List[Dict[str, Any]]) -> None:
-    """Print readable PnL and ROI table."""
+    """Print readable PnL and actual annual revenue table."""
+    days = results[0]["days_simulated"] if results else 365
+    title = f"POLYMARKET ACTUAL {days}-DAY REVENUE (CUMULATIVE MEASURED, NOT EXTRAPOLATED)"
     header = (
-        f"{'Market':<32} | {'Rate':<7} | {'Cap ($)':<8} | {'Rew ($)':<8} | "
-        f"{'Spr ($)':<8} | {'Adv ($)':<8} | {'Dec ($)':<8} | {'Net ($/d)':<9} | {'Ann ROI':<9} | {'Merged'}"
+        f"{'Market':<28} | {'Cap ($)':<8} | {'Act Rew ($)':<11} | {'Act Spr ($)':<11} | "
+        f"{'Act Adv ($)':<11} | {'Act Dec ($)':<11} | {'Gas ($)':<9} | {'Actual Net ($)':<14} | {'Return %':<10} | {'Merged ($)':<10}"
     )
     divider = "-" * len(header)
 
     print("\n" + "=" * len(header))
-    print("POLYMARKET LIQUIDITY REWARDS PRODUCTION BACKTEST SUMMARY")
+    print(title)
     print(header)
     print(divider)
 
-    for r in sorted(results, key=lambda x: x["avg_daily_net_pnl"], reverse=True):
-        q = r["question"][:31]
-        rate = f"${r['rate_per_day']:,.0f}"
+    total_cap = 0.0
+    total_rew = 0.0
+    total_spr = 0.0
+    total_adv = 0.0
+    total_dec = 0.0
+    total_gas = 0.0
+    total_net = 0.0
+    total_merged = 0.0
+
+    for r in sorted(results, key=lambda x: x["actual_net_revenue_usd"], reverse=True):
+        q = r["question"][:27]
         cap = f"${r['allocated_capital']:,.0f}"
-        rew = f"${r['avg_daily_net_rewards']:,.2f}"
-        spr = f"${r['avg_daily_spread_captured']:,.2f}"
-        adv = f"-${r['avg_daily_adverse_selection']:,.2f}"
-        dec = f"-${r['avg_daily_inventory_decay']:,.2f}"
-        net = f"${r['avg_daily_net_pnl']:,.2f}"
-        roi = f"{r['annual_roi_pct']:,.1f}%"
+        rew = f"${r['actual_net_rewards_usd']:,.2f}"
+        spr = f"${r['actual_spread_captured_usd']:,.2f}"
+        adv = f"-${r['actual_adverse_selection_usd']:,.2f}"
+        dec = f"-${r['actual_inventory_decay_usd']:,.2f}"
+        gas = f"-${r.get('actual_gas_fees_usd', 0.0):,.2f}"
+        net = f"${r['actual_net_revenue_usd']:,.2f}"
+        ret = f"{r['actual_return_pct']:,.1f}%"
         mrg = f"${r['total_complete_sets_merged_usd']:,.0f}"
+
+        total_cap += r["allocated_capital"]
+        total_rew += r["actual_net_rewards_usd"]
+        total_spr += r["actual_spread_captured_usd"]
+        total_adv += r["actual_adverse_selection_usd"]
+        total_dec += r["actual_inventory_decay_usd"]
+        total_gas += r.get("actual_gas_fees_usd", 0.0)
+        total_net += r["actual_net_revenue_usd"]
+        total_merged += r["total_complete_sets_merged_usd"]
+
         print(
-            f"{q:<32} | {rate:<7} | {cap:<8} | {rew:<8} | {spr:<8} | {adv:<8} | {dec:<8} | {net:<9} | {roi:<9} | {mrg}"
+            f"{q:<28} | {cap:<8} | {rew:<11} | {spr:<11} | {adv:<11} | {dec:<11} | {gas:<9} | {net:<14} | {ret:<10} | {mrg:<10}"
         )
 
+    print(divider)
+    tot_ret = (total_net / total_cap) * 100.0 if total_cap > 0 else 0.0
+    print(
+        f"{'PORTFOLIO TOTAL (' + str(len(results)) + ' mkts)':<28} | "
+        f"${total_cap:,.0f} | ${total_rew:,.2f} | ${total_spr:,.2f} | "
+        f"-${total_adv:,.2f} | -${total_dec:,.2f} | -${total_gas:,.2f} | ${total_net:,.2f} | "
+        f"{tot_ret:,.1f}% | ${total_merged:,.0f}"
+    )
     print("=" * len(header) + "\n")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Production Liquidity Rewards Backtest Suite")
     parser.add_argument("--input", default=str(DEFAULT_INPUT), help="Input pools JSON")
-    parser.add_argument("--days", type=int, default=7, help="Simulation duration in days (1,440 mins/day)")
+    parser.add_argument("--days", type=int, default=365, help="Simulation duration in days (default: 365 for full 1-year actuals)")
     parser.add_argument("--size", type=float, default=200.0, help="Base quote size in shares")
     parser.add_argument("--gamma", type=float, default=0.01, help="Avellaneda-Stoikov risk aversion gamma")
     parser.add_argument("--max-inv", type=float, default=2000.0, help="Max inventory limit in shares")
-    parser.add_argument("--limit", type=int, default=10, help="Limit number of markets to test")
+    parser.add_argument("--limit", type=int, default=12, help="Limit number of markets to test")
     parser.add_argument("--output", default=str(OUTPUT_DIR / "production_rewards_backtest_results.json"))
 
     args = parser.parse_args()

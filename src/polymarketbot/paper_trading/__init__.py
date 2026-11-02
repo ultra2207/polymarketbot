@@ -4,6 +4,7 @@ from polymarketbot.paper_trading.models import (
     VirtualQuote,
     Position,
     SimulatedFill,
+    MergeEvent,
     EpochSnapshot,
     MarketConfig,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "VirtualQuote",
     "Position",
     "SimulatedFill",
+    "MergeEvent",
     "EpochSnapshot",
     "MarketConfig",
     "compute_quadratic_score",

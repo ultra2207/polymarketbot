@@ -23,6 +23,7 @@ from polymarketbot.logs import get_logger
 from polymarketbot.paper_trading.models import (
     EpochSnapshot,
     MarketConfig,
+    MergeEvent,
     Position,
     SimulatedFill,
     TokenConfig,
@@ -37,6 +38,28 @@ from polymarketbot.paper_trading.rewards import (
 logger = get_logger("paper_trading")
 
 
+def _parse_price(x: Any) -> float:
+    try:
+        if isinstance(x, dict):
+            return float(x.get("price", 0.0))
+        if isinstance(x, (list, tuple)) and len(x) > 0:
+            return float(x[0])
+    except (ValueError, TypeError):
+        pass
+    return 0.0
+
+
+def _parse_size(x: Any) -> float:
+    try:
+        if isinstance(x, dict):
+            return float(x.get("size", 0.0))
+        if isinstance(x, (list, tuple)) and len(x) > 1:
+            return float(x[1])
+    except (ValueError, TypeError):
+        pass
+    return 0.0
+
+
 class PaperTradingEngine:
     """Manages virtual liquidity provision, order books, fills, and reward epochs."""
 
@@ -47,6 +70,8 @@ class PaperTradingEngine:
         default_quote_size: float = 100.0,
         max_inventory_shares: float = 1000.0,
         max_skew_cents: float = 0.5,
+        auto_merge_threshold: float = 100.0,
+        merge_gas_fee_usd: float = 0.015,
         ledger_path: str | Path = "data/processed/paper_trading/ledger.json",
     ) -> None:
         self.initial_cash_usd = float(initial_cash_usd)
@@ -55,12 +80,16 @@ class PaperTradingEngine:
         self.default_quote_size = float(default_quote_size)
         self.max_inventory_shares = float(max_inventory_shares)
         self.max_skew_cents = float(max_skew_cents)
+        self.auto_merge_threshold = float(auto_merge_threshold)
+        self.merge_gas_fee_usd = float(merge_gas_fee_usd)
         self.ledger_path = Path(ledger_path)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.start_time = time.time()
         self.epoch_count = 0
         self.total_rewards_earned_usd = 0.0
+        self.total_gas_fees_usd = 0.0
+        self.total_merges_count = 0
 
         # Market registry
         self.markets: dict[str, MarketConfig] = {}  # condition_id -> config
@@ -74,6 +103,7 @@ class PaperTradingEngine:
 
         # Metrics & audit trail
         self.fills: list[SimulatedFill] = []
+        self.merges: list[MergeEvent] = []
         self.epoch_snapshots: list[EpochSnapshot] = []
 
     def register_market(self, config: MarketConfig) -> None:
@@ -124,11 +154,11 @@ class PaperTradingEngine:
                 return float(x.get("price", 0.0))
             return float(x[0]) if isinstance(x, (list, tuple)) else 0.0
 
-        valid_bids = [b for b in bids if parse_price(b) > 0.0]
-        valid_asks = [a for a in asks if parse_price(a) > 0.0]
+        valid_bids = [b for b in bids if _parse_price(b) > 0.0]
+        valid_asks = [a for a in asks if _parse_price(a) > 0.0]
 
-        best_bid = max((parse_price(b) for b in valid_bids), default=0.0)
-        best_ask = min((parse_price(a) for a in valid_asks), default=1.0)
+        best_bid = max((_parse_price(b) for b in valid_bids), default=0.0)
+        best_ask = min((_parse_price(a) for a in valid_asks), default=1.0)
 
         if best_bid > 0.0 and best_ask < 1.0 and best_ask > best_bid:
             mid = (best_bid + best_ask) / 2.0
@@ -173,7 +203,7 @@ class PaperTradingEngine:
         self.generate_quotes(asset_id)
 
     def generate_quotes(self, asset_id: str) -> None:
-        """Simulate virtual resting limit orders at optimal spread offsets with post-only logic."""
+        """Simulate virtual resting limit orders with queue priority and inventory skewing."""
         if asset_id not in self.asset_to_condition:
             return
 
@@ -191,8 +221,6 @@ class PaperTradingEngine:
         inv = pos.shares
 
         # Inventory Skewing:
-        # Long inventory (inv > 0) -> widen bid (lower price), tighten ask (lower price to sell)
-        # Short inventory (inv < 0) -> tighten bid (higher price to buy), widen ask (higher price)
         inv_ratio = max(-1.0, min(1.0, inv / self.max_inventory_shares))
         skew_cents = inv_ratio * self.max_skew_cents
 
@@ -208,17 +236,13 @@ class PaperTradingEngine:
         ask_price = round(math.ceil(raw_ask_price / tick) * tick, 4)
 
         # Post-Only Logic Enforcement:
-        # Virtual BID must be passively resting (< best_ask)
         post_only_bid = True
         if bid_price >= best_ask:
-            # Peg passively behind or at best bid
             bid_price = round(min(best_bid, best_ask - tick), 4)
             post_only_bid = (bid_price < best_ask)
 
-        # Virtual ASK must be passively resting (> best_bid)
         post_only_ask = True
         if ask_price <= best_bid:
-            # Peg passively behind or at best ask
             ask_price = round(max(best_ask, best_bid + tick), 4)
             post_only_ask = (ask_price > best_bid)
 
@@ -238,27 +262,61 @@ class PaperTradingEngine:
         bid_score = compute_quadratic_score(v, actual_bid_spread, bid_size) if post_only_bid else 0.0
         ask_score = compute_quadratic_score(v, actual_ask_spread, ask_size) if post_only_ask else 0.0
 
-        # Update quotes
+        existing_quotes = self.virtual_quotes.get(asset_id, {})
+        old_bid = existing_quotes.get("bid")
+        old_ask = existing_quotes.get("ask")
+
+        book_bids = book.get("bids", [])
+        book_asks = book.get("asks", [])
+
+        # Update BID quote
         v_bid = None
         if bid_size > 0 and 0.001 <= bid_price < 1.0 and post_only_bid:
+            if old_bid is not None and abs(old_bid.price - bid_price) < 1e-6:
+                # Same price level: retain queue priority
+                bid_queue_ahead = old_bid.queue_ahead
+                current_bid_size = old_bid.size if 0.0 < old_bid.size < bid_size else bid_size
+            else:
+                # Price changed or new quote: reset queue_ahead to competing volume resting at or better than quote price
+                bid_queue_ahead = sum(
+                    _parse_size(b) for b in book_bids
+                    if _parse_price(b) >= bid_price - 1e-6
+                )
+                current_bid_size = bid_size
+
             v_bid = VirtualQuote(
                 side="BUY",
                 price=bid_price,
-                size=bid_size,
+                size=current_bid_size,
                 spread_from_mid_cents=actual_bid_spread,
                 score=bid_score,
                 post_only_valid=post_only_bid,
+                queue_ahead=round(bid_queue_ahead, 4),
             )
 
+        # Update ASK quote
         v_ask = None
         if ask_size > 0 and 0.001 < ask_price <= 0.999 and post_only_ask:
+            if old_ask is not None and abs(old_ask.price - ask_price) < 1e-6:
+                # Same price level: retain queue priority
+                ask_queue_ahead = old_ask.queue_ahead
+                current_ask_size = old_ask.size if 0.0 < old_ask.size < ask_size else ask_size
+            else:
+                # Price changed or new quote: reset queue_ahead to competing volume resting at or better than quote price
+                ask_queue_ahead = sum(
+                    _parse_size(a) for a in book_asks
+                    if 0.0 < _parse_price(a) <= ask_price + 1e-6
+                )
+                current_ask_size = ask_size
+
             v_ask = VirtualQuote(
                 side="SELL",
                 price=ask_price,
-                size=ask_size,
+                size=current_ask_size,
                 spread_from_mid_cents=actual_ask_spread,
                 score=ask_score,
                 post_only_valid=post_only_ask,
+                queue_ahead=round(ask_queue_ahead, 4),
             )
 
         self.virtual_quotes[asset_id] = {"bid": v_bid, "ask": v_ask}
@@ -271,7 +329,7 @@ class PaperTradingEngine:
         trade_side: str,
         timestamp: Optional[float] = None,
     ) -> Optional[SimulatedFill]:
-        """Process incoming trade and simulate fills when trades cross resting virtual orders.
+        """Process incoming trade and simulate fills adhering to FIFO queue priority.
 
         Args:
             asset_id: Polymarket asset/token ID.
@@ -286,130 +344,323 @@ class PaperTradingEngine:
         quotes = self.virtual_quotes.get(asset_id, {})
         v_bid = quotes.get("bid")
         v_ask = quotes.get("ask")
-        cid = self.asset_to_condition[asset_id]
-        outcome = self.asset_to_outcome.get(asset_id, "unknown")
-        pos = self.positions[asset_id]
         ts = timestamp or time.time()
 
         executed_fill: Optional[SimulatedFill] = None
 
-        # 1. Taker SELL crossed our resting limit BUY
-        if trade_side.upper() == "SELL" and v_bid and trade_price <= v_bid.price:
-            fill_sz = min(trade_size, v_bid.size)
-            fill_px = v_bid.price
-            fill_val = fill_sz * fill_px
+        # 1. Taker SELL against our resting limit BUY
+        if trade_side.upper() == "SELL" and v_bid:
+            # Crossed through our quote price: instant aggressive fill
+            if trade_price < v_bid.price - 1e-6:
+                fill_sz = min(trade_size, v_bid.size)
+                fill_px = v_bid.price
+                v_bid.queue_ahead = 0.0
+                trigger_reason = f"taker_sell_crossed_through_bid (px={trade_price} < quote={fill_px})"
+                executed_fill = self._execute_buy_fill(asset_id, fill_px, fill_sz, trigger_reason, ts)
 
-            # Execution updates
-            self.cash_usd -= fill_val
-            old_shares = pos.shares
-            old_cost = pos.avg_cost
-            realized_pnl = 0.0
-
-            if old_shares >= 0:
-                new_shares = old_shares + fill_sz
-                new_cost = ((old_shares * old_cost) + fill_val) / new_shares if new_shares > 0 else 0.0
-            else:
-                # Covering short position
-                covered = min(abs(old_shares), fill_sz)
-                realized_pnl = covered * (old_cost - fill_px)
-                new_shares = old_shares + fill_sz
-                if new_shares < 0:
-                    new_cost = old_cost
-                elif new_shares > 0:
-                    new_cost = fill_px
+            # Printed at our quote price level
+            elif abs(trade_price - v_bid.price) <= 1e-6:
+                if trade_size <= v_bid.queue_ahead:
+                    v_bid.queue_ahead -= trade_size
+                    logger.info(
+                        f"[QUEUE DEPLETED] Bid @ {v_bid.price:.3f} queue ahead reduced by "
+                        f"{trade_size:.1f} to {v_bid.queue_ahead:.1f}"
+                    )
+                    return None
                 else:
-                    new_cost = 0.0
+                    surplus = trade_size - v_bid.queue_ahead
+                    fill_sz = min(v_bid.size, surplus)
+                    fill_px = v_bid.price
+                    v_bid.queue_ahead = 0.0
+                    trigger_reason = f"taker_sell_depleted_queue_bid (px={trade_price} == quote={fill_px}, surplus={surplus:.2f})"
+                    executed_fill = self._execute_buy_fill(asset_id, fill_px, fill_sz, trigger_reason, ts)
 
-            pos.shares = new_shares
-            pos.avg_cost = new_cost
-            pos.realized_pnl += realized_pnl
-            pos.fills_count += 1
-            book_mid = self.orderbooks[asset_id]["mid"]
-            pos.update_mark(book_mid)
+        # 2. Taker BUY against our resting limit SELL
+        elif trade_side.upper() == "BUY" and v_ask:
+            # Crossed through our quote price: instant aggressive fill
+            if trade_price > v_ask.price + 1e-6:
+                fill_sz = min(trade_size, v_ask.size)
+                fill_px = v_ask.price
+                v_ask.queue_ahead = 0.0
+                trigger_reason = f"taker_buy_crossed_through_ask (px={trade_price} > quote={fill_px})"
+                executed_fill = self._execute_sell_fill(asset_id, fill_px, fill_sz, trigger_reason, ts)
 
-            executed_fill = SimulatedFill(
-                fill_id=str(uuid.uuid4())[:8],
-                timestamp=ts,
-                condition_id=cid,
-                asset_id=asset_id,
-                outcome=outcome,
-                side="BUY",
-                fill_price=fill_px,
-                fill_size=fill_sz,
-                fill_value_usd=fill_val,
-                cash_delta=-fill_val,
-                position_shares_after=new_shares,
-                avg_cost_after=new_cost,
-                realized_pnl=realized_pnl,
-                trigger_reason=f"taker_sell_crossed_bid (px={trade_price} <= quote={fill_px})",
-            )
-            self.fills.append(executed_fill)
-            logger.info(
-                f"[SIMULATED FILL] BUY {fill_sz:.1f} {outcome} @ ${fill_px:.3f} (${fill_val:.2f}) | "
-                f"New Inventory: {new_shares:.1f} sh | Cash: ${self.cash_usd:,.2f}"
-            )
-            # Re-generate quotes after fill
-            self.generate_quotes(asset_id)
-
-        # 2. Taker BUY crossed our resting limit SELL
-        elif trade_side.upper() == "BUY" and v_ask and trade_price >= v_ask.price:
-            fill_sz = min(trade_size, v_ask.size)
-            fill_px = v_ask.price
-            fill_val = fill_sz * fill_px
-
-            # Execution updates
-            self.cash_usd += fill_val
-            old_shares = pos.shares
-            old_cost = pos.avg_cost
-            realized_pnl = 0.0
-
-            if old_shares > 0:
-                # Closing long position
-                closed = min(old_shares, fill_sz)
-                realized_pnl = closed * (fill_px - old_cost)
-                new_shares = old_shares - fill_sz
-                if new_shares > 0:
-                    new_cost = old_cost
-                elif new_shares < 0:
-                    new_cost = fill_px
+            # Printed at our quote price level
+            elif abs(trade_price - v_ask.price) <= 1e-6:
+                if trade_size <= v_ask.queue_ahead:
+                    v_ask.queue_ahead -= trade_size
+                    logger.info(
+                        f"[QUEUE DEPLETED] Ask @ {v_ask.price:.3f} queue ahead reduced by "
+                        f"{trade_size:.1f} to {v_ask.queue_ahead:.1f}"
+                    )
+                    return None
                 else:
-                    new_cost = 0.0
-            else:
-                new_shares = old_shares - fill_sz
-                new_cost = ((abs(old_shares) * old_cost) + fill_val) / abs(new_shares) if new_shares != 0 else 0.0
-
-            pos.shares = new_shares
-            pos.avg_cost = new_cost
-            pos.realized_pnl += realized_pnl
-            pos.fills_count += 1
-            book_mid = self.orderbooks[asset_id]["mid"]
-            pos.update_mark(book_mid)
-
-            executed_fill = SimulatedFill(
-                fill_id=str(uuid.uuid4())[:8],
-                timestamp=ts,
-                condition_id=cid,
-                asset_id=asset_id,
-                outcome=outcome,
-                side="SELL",
-                fill_price=fill_px,
-                fill_size=fill_sz,
-                fill_value_usd=fill_val,
-                cash_delta=fill_val,
-                position_shares_after=new_shares,
-                avg_cost_after=new_cost,
-                realized_pnl=realized_pnl,
-                trigger_reason=f"taker_buy_crossed_ask (px={trade_price} >= quote={fill_px})",
-            )
-            self.fills.append(executed_fill)
-            logger.info(
-                f"[SIMULATED FILL] SELL {fill_sz:.1f} {outcome} @ ${fill_px:.3f} (${fill_val:.2f}) | "
-                f"New Inventory: {new_shares:.1f} sh | Cash: ${self.cash_usd:,.2f}"
-            )
-            # Re-generate quotes after fill
-            self.generate_quotes(asset_id)
+                    surplus = trade_size - v_ask.queue_ahead
+                    fill_sz = min(v_ask.size, surplus)
+                    fill_px = v_ask.price
+                    v_ask.queue_ahead = 0.0
+                    trigger_reason = f"taker_buy_depleted_queue_ask (px={trade_price} == quote={fill_px}, surplus={surplus:.2f})"
+                    executed_fill = self._execute_sell_fill(asset_id, fill_px, fill_sz, trigger_reason, ts)
 
         return executed_fill
+
+    def _execute_buy_fill(
+        self,
+        asset_id: str,
+        fill_px: float,
+        fill_sz: float,
+        trigger_reason: str,
+        ts: float,
+    ) -> SimulatedFill:
+        fill_val = fill_sz * fill_px
+        cid = self.asset_to_condition[asset_id]
+        outcome = self.asset_to_outcome.get(asset_id, "unknown")
+        pos = self.positions[asset_id]
+
+        self.cash_usd -= fill_val
+        old_shares = pos.shares
+        old_cost = pos.avg_cost
+        realized_pnl = 0.0
+
+        if old_shares >= 0:
+            new_shares = old_shares + fill_sz
+            new_cost = ((old_shares * old_cost) + fill_val) / new_shares if new_shares > 0 else 0.0
+        else:
+            # Covering short position
+            covered = min(abs(old_shares), fill_sz)
+            realized_pnl = covered * (old_cost - fill_px)
+            new_shares = old_shares + fill_sz
+            if new_shares < 0:
+                new_cost = old_cost
+            elif new_shares > 0:
+                new_cost = fill_px
+            else:
+                new_cost = 0.0
+
+        pos.shares = new_shares
+        pos.avg_cost = new_cost
+        pos.realized_pnl += realized_pnl
+        pos.fills_count += 1
+        book_mid = self.orderbooks[asset_id]["mid"]
+        pos.update_mark(book_mid)
+
+        executed_fill = SimulatedFill(
+            fill_id=str(uuid.uuid4())[:8],
+            timestamp=ts,
+            condition_id=cid,
+            asset_id=asset_id,
+            outcome=outcome,
+            side="BUY",
+            fill_price=fill_px,
+            fill_size=fill_sz,
+            fill_value_usd=fill_val,
+            cash_delta=-fill_val,
+            position_shares_after=new_shares,
+            avg_cost_after=new_cost,
+            realized_pnl=realized_pnl,
+            trigger_reason=trigger_reason,
+        )
+        self.fills.append(executed_fill)
+        logger.info(
+            f"[SIMULATED FILL] BUY {fill_sz:.1f} {outcome} @ ${fill_px:.3f} (${fill_val:.2f}) | "
+            f"New Inventory: {new_shares:.1f} sh | Cash: ${self.cash_usd:,.2f}"
+        )
+
+        # Check automated CTF complete-set merge
+        self.check_and_execute_merge(cid, timestamp=ts)
+
+        # Update resting quote status
+        v_bid = self.virtual_quotes.get(asset_id, {}).get("bid")
+        if v_bid:
+            if fill_sz >= v_bid.size - 1e-6:
+                self.virtual_quotes[asset_id]["bid"] = None
+            else:
+                v_bid.size -= fill_sz
+
+        self.generate_quotes(asset_id)
+        return executed_fill
+
+    def _execute_sell_fill(
+        self,
+        asset_id: str,
+        fill_px: float,
+        fill_sz: float,
+        trigger_reason: str,
+        ts: float,
+    ) -> SimulatedFill:
+        fill_val = fill_sz * fill_px
+        cid = self.asset_to_condition[asset_id]
+        outcome = self.asset_to_outcome.get(asset_id, "unknown")
+        pos = self.positions[asset_id]
+
+        self.cash_usd += fill_val
+        old_shares = pos.shares
+        old_cost = pos.avg_cost
+        realized_pnl = 0.0
+
+        if old_shares > 0:
+            # Closing long position
+            closed = min(old_shares, fill_sz)
+            realized_pnl = closed * (fill_px - old_cost)
+            new_shares = old_shares - fill_sz
+            if new_shares > 0:
+                new_cost = old_cost
+            elif new_shares < 0:
+                new_cost = fill_px
+            else:
+                new_cost = 0.0
+        else:
+            new_shares = old_shares - fill_sz
+            new_cost = ((abs(old_shares) * old_cost) + fill_val) / abs(new_shares) if new_shares != 0 else 0.0
+
+        pos.shares = new_shares
+        pos.avg_cost = new_cost
+        pos.realized_pnl += realized_pnl
+        pos.fills_count += 1
+        book_mid = self.orderbooks[asset_id]["mid"]
+        pos.update_mark(book_mid)
+
+        executed_fill = SimulatedFill(
+            fill_id=str(uuid.uuid4())[:8],
+            timestamp=ts,
+            condition_id=cid,
+            asset_id=asset_id,
+            outcome=outcome,
+            side="SELL",
+            fill_price=fill_px,
+            fill_size=fill_sz,
+            fill_value_usd=fill_val,
+            cash_delta=fill_val,
+            position_shares_after=new_shares,
+            avg_cost_after=new_cost,
+            realized_pnl=realized_pnl,
+            trigger_reason=trigger_reason,
+        )
+        self.fills.append(executed_fill)
+        logger.info(
+            f"[SIMULATED FILL] SELL {fill_sz:.1f} {outcome} @ ${fill_px:.3f} (${fill_val:.2f}) | "
+            f"New Inventory: {new_shares:.1f} sh | Cash: ${self.cash_usd:,.2f}"
+        )
+
+        # Check automated CTF complete-set merge
+        self.check_and_execute_merge(cid, timestamp=ts)
+
+        # Update resting quote status
+        v_ask = self.virtual_quotes.get(asset_id, {}).get("ask")
+        if v_ask:
+            if fill_sz >= v_ask.size - 1e-6:
+                self.virtual_quotes[asset_id]["ask"] = None
+            else:
+                v_ask.size -= fill_sz
+
+        self.generate_quotes(asset_id)
+        return executed_fill
+
+    def _get_yes_no_positions(self, condition_id: str) -> tuple[Optional[Position], Optional[Position]]:
+        """Retrieve YES and NO positions for a condition if both exist."""
+        mkt = self.markets.get(condition_id)
+        if not mkt:
+            return None, None
+        yes_pos = None
+        no_pos = None
+        for tok in mkt.tokens:
+            outcome = tok.outcome.strip().upper()
+            if outcome == "YES":
+                yes_pos = self.positions.get(tok.token_id)
+            elif outcome == "NO":
+                no_pos = self.positions.get(tok.token_id)
+        if (yes_pos is None or no_pos is None) and len(mkt.tokens) == 2:
+            p0 = self.positions.get(mkt.tokens[0].token_id)
+            p1 = self.positions.get(mkt.tokens[1].token_id)
+            return p0, p1
+        return yes_pos, no_pos
+
+    def check_and_execute_merge(
+        self,
+        condition_id: str,
+        timestamp: Optional[float] = None,
+    ) -> Optional[MergeEvent]:
+        """Check if condition has reached auto_merge_threshold complete sets and execute merge."""
+        yes_pos, no_pos = self._get_yes_no_positions(condition_id)
+        if not yes_pos or not no_pos:
+            return None
+
+        yes_shares = max(0.0, yes_pos.shares)
+        no_shares = max(0.0, no_pos.shares)
+        mergeable = min(yes_shares, no_shares)
+
+        if mergeable >= self.auto_merge_threshold:
+            return self.execute_merge(condition_id, amount=mergeable, timestamp=timestamp)
+        return None
+
+    def execute_merge(
+        self,
+        condition_id: str,
+        amount: Optional[float] = None,
+        timestamp: Optional[float] = None,
+    ) -> Optional[MergeEvent]:
+        """Merge complete sets of YES + NO tokens into USDC cash, deducting gas fee."""
+        yes_pos, no_pos = self._get_yes_no_positions(condition_id)
+        if not yes_pos or not no_pos:
+            return None
+
+        yes_shares = max(0.0, yes_pos.shares)
+        no_shares = max(0.0, no_pos.shares)
+        mergeable = min(yes_shares, no_shares)
+
+        merge_amount = min(mergeable, amount) if amount is not None else mergeable
+        if merge_amount <= 0.0:
+            return None
+
+        # 1 YES + 1 NO = $1.00 USDC cash collateral
+        unlocked_usd = merge_amount * 1.00
+        gas_fee = self.merge_gas_fee_usd
+
+        # Cash delta: +unlocked USDC - gas fee
+        self.cash_usd += (unlocked_usd - gas_fee)
+        self.total_gas_fees_usd += gas_fee
+        self.total_merges_count += 1
+
+        # Realize PnL from merging:
+        merged_cost = merge_amount * (yes_pos.avg_cost + no_pos.avg_cost)
+        net_merge_pnl = unlocked_usd - merged_cost - gas_fee
+        yes_pos.realized_pnl += net_merge_pnl / 2.0
+        no_pos.realized_pnl += net_merge_pnl / 2.0
+
+        yes_pos.shares -= merge_amount
+        no_pos.shares -= merge_amount
+
+        if yes_pos.shares <= 1e-6:
+            yes_pos.shares = 0.0
+            yes_pos.avg_cost = 0.0
+        if no_pos.shares <= 1e-6:
+            no_pos.shares = 0.0
+            no_pos.avg_cost = 0.0
+
+        # Update marks
+        if yes_pos.asset_id in self.orderbooks:
+            yes_pos.update_mark(self.orderbooks[yes_pos.asset_id]["mid"])
+        if no_pos.asset_id in self.orderbooks:
+            no_pos.update_mark(self.orderbooks[no_pos.asset_id]["mid"])
+
+        ts = timestamp or time.time()
+        event = MergeEvent(
+            timestamp=ts,
+            condition_id=condition_id,
+            shares_merged=round(merge_amount, 4),
+            usdc_unlocked=round(unlocked_usd, 4),
+            gas_fee_usd=round(gas_fee, 4),
+            remaining_yes=round(yes_pos.shares, 4),
+            remaining_no=round(no_pos.shares, 4),
+            cash_after=round(self.cash_usd, 2),
+        )
+        self.merges.append(event)
+        logger.info(
+            f"[CTF MERGE] Merged {merge_amount:.1f} complete sets (YES/NO) in {condition_id[:10]}... | "
+            f"Unlocked: +${unlocked_usd:.2f} | Gas Fee: -${gas_fee:.4f} | "
+            f"Remaining: YES={yes_pos.shares:.1f}, NO={no_pos.shares:.1f} | Cash: ${self.cash_usd:,.2f}"
+        )
+        return event
 
     def run_epoch_sample(self) -> list[EpochSnapshot]:
         """Simulate a 1-minute reward sampling epoch across all registered head pools."""
@@ -493,6 +744,8 @@ class PaperTradingEngine:
             "total_equity_usd": round(total_equity, 2),
             "total_pnl_usd": round(total_pnl, 2),
             "roi_pct": round(roi_pct, 4),
+            "total_gas_fees_usd": round(self.total_gas_fees_usd, 4),
+            "total_merges_count": self.total_merges_count,
             "projected_daily_rewards_usd": round(projected_daily_rewards, 2),
             "projected_annual_rewards_usd": round(projected_daily_rewards * 365.0, 2),
         }
@@ -557,7 +810,7 @@ class PaperTradingEngine:
 
         return {
             "system_info": {
-                "version": "1.0.0",
+                "version": "1.1.0",
                 "status": "RUNNING",
                 "start_time_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.start_time)),
                 "last_updated_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
@@ -569,6 +822,7 @@ class PaperTradingEngine:
             "portfolio": self.get_portfolio_summary(),
             "markets": markets_data,
             "recent_fills": [f.to_dict() for f in self.fills[-50:]],
+            "recent_merges": [m.to_dict() for m in self.merges[-50:]],
             "recent_epochs": [s.to_dict() for s in self.epoch_snapshots[-50:]],
         }
 

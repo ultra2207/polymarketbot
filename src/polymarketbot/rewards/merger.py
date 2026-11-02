@@ -33,6 +33,7 @@ class MergeEvent:
     remaining_yes: float
     remaining_no: float
     net_inventory: float
+    gas_fee: float = 0.015
 
 
 @dataclass
@@ -46,7 +47,9 @@ class CompleteSetPosition:
     usdc_cash: float = 0.0
     total_merged_shares: float = 0.0
     total_unlocked_usd: float = 0.0
-    auto_merge_threshold: float = 1.0  # Merge whenever min(YES, NO) >= threshold
+    total_gas_fees: float = 0.0
+    gas_fee_per_merge: float = 0.015  # Polygon CTF mergePositions gas fee
+    auto_merge_threshold: float = 100.0  # Merge whenever min(YES, NO) >= threshold (batched)
     history: List[MergeEvent] = field(default_factory=list)
 
     @property
@@ -127,6 +130,7 @@ class CompleteSetPosition:
                 remaining_yes=self.shares_yes,
                 remaining_no=self.shares_no,
                 net_inventory=self.net_inventory,
+                gas_fee=0.0,
             )
 
         # 1 YES + 1 NO = $1.00 USDC
@@ -138,7 +142,9 @@ class CompleteSetPosition:
         self.shares_yes -= amount
         self.shares_no -= amount
         unlocked = amount * 1.00
-        self.usdc_cash += unlocked
+        # Deduct Polygon gas fee from unlocked cash
+        self.usdc_cash += unlocked - self.gas_fee_per_merge
+        self.total_gas_fees += self.gas_fee_per_merge
 
         self.total_merged_shares += amount
         self.total_unlocked_usd += unlocked
@@ -150,6 +156,7 @@ class CompleteSetPosition:
             remaining_yes=round(self.shares_yes, 4),
             remaining_no=round(self.shares_no, 4),
             net_inventory=round(self.net_inventory, 4),
+            gas_fee=round(self.gas_fee_per_merge, 4),
         )
         self.history.append(event)
         return event

@@ -206,3 +206,204 @@ def test_epoch_sampling_and_ledger_persistence(tmp_path: Path):
     tok_data = data["markets"]["0xabc123"]["tokens"]["tok_yes"]
     assert tok_data["virtual_quotes"]["bid"]["quadratic_score"] > 0
     assert tok_data["virtual_quotes"]["ask"]["quadratic_score"] > 0
+
+
+def test_queue_depletion_and_surplus_fill(tmp_path: Path):
+    """Gap F1: Verify trade volume decrements queue_ahead and surplus volume generates fills."""
+    ledger_file = tmp_path / "ledger.json"
+    engine = PaperTradingEngine(
+        initial_cash_usd=10000.0,
+        base_spread_offset_cents=1.0,
+        default_quote_size=100.0,
+        max_skew_cents=0.0,
+        ledger_path=ledger_file,
+    )
+
+    mkt = MarketConfig(
+        condition_id="0xqueue1",
+        question="Queue Depletion Test",
+        rate_per_day=1000.0,
+        rewards_min_size=50.0,
+        rewards_max_spread=3.0,
+        tokens=[TokenConfig(token_id="tok_yes", outcome="Yes", price=0.50)],
+    )
+    engine.register_market(mkt)
+
+    # Orderbook: 300 resting at 0.49, 500 at 0.48. Asks at 0.51 (mid = 0.50)
+    bids = [{"price": "0.49", "size": "300"}, {"price": "0.48", "size": "500"}]
+    asks = [{"price": "0.51", "size": "500"}]
+    engine.update_orderbook("tok_yes", bids, asks, tick_size=0.01)
+
+    quote_bid = engine.virtual_quotes["tok_yes"]["bid"]
+    assert quote_bid.price == 0.49
+    # Queue ahead must equal competing volume at or better than quote price (300.0)
+    assert quote_bid.queue_ahead == 300.0
+
+    # 1. Trade size 100 <= queue_ahead 300 -> queue depleted to 200, NO fill
+    fill1 = engine.on_trade("tok_yes", trade_price=0.49, trade_size=100.0, trade_side="SELL")
+    assert fill1 is None
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 200.0
+    assert engine.positions["tok_yes"].shares == 0.0
+
+    # 2. Trade size 150 <= queue_ahead 200 -> queue depleted to 50, NO fill
+    fill2 = engine.on_trade("tok_yes", trade_price=0.49, trade_size=150.0, trade_side="SELL")
+    assert fill2 is None
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 50.0
+
+    # 3. Trade size 120 > queue_ahead 50 -> surplus is 70 (120 - 50). Fills 70 shares!
+    fill3 = engine.on_trade("tok_yes", trade_price=0.49, trade_size=120.0, trade_side="SELL")
+    assert fill3 is not None
+    assert fill3.fill_size == 70.0
+    assert fill3.fill_price == 0.49
+    assert engine.positions["tok_yes"].shares == 70.0
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 0.0
+
+
+def test_queue_priority_retention_and_price_change_reset(tmp_path: Path):
+    """Gap F1: Verify queue_ahead is retained on book updates if price is unchanged, and reset on price change."""
+    ledger_file = tmp_path / "ledger.json"
+    engine = PaperTradingEngine(
+        initial_cash_usd=10000.0,
+        base_spread_offset_cents=1.0,
+        default_quote_size=100.0,
+        ledger_path=ledger_file,
+    )
+
+    mkt = MarketConfig(
+        condition_id="0xqueue2",
+        question="Queue Retention Test",
+        rate_per_day=1000.0,
+        rewards_min_size=50.0,
+        rewards_max_spread=3.0,
+        tokens=[TokenConfig(token_id="tok_yes", outcome="Yes", price=0.50)],
+    )
+    engine.register_market(mkt)
+
+    bids = [{"price": "0.49", "size": "500"}]
+    asks = [{"price": "0.51", "size": "500"}]
+    engine.update_orderbook("tok_yes", bids, asks, tick_size=0.01)
+
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 500.0
+
+    # Deplete queue by 200 shares
+    engine.on_trade("tok_yes", trade_price=0.49, trade_size=200.0, trade_side="SELL")
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 300.0
+
+    # Update orderbook where depth grows at 0.49 to 1000 shares, but mid & quote price remain 0.49
+    bids_deeper = [{"price": "0.49", "size": "1000"}]
+    engine.update_orderbook("tok_yes", bids_deeper, asks, tick_size=0.01)
+
+    # Queue priority MUST be retained (does NOT reset to 1000)
+    assert engine.virtual_quotes["tok_yes"]["bid"].price == 0.49
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 300.0
+
+    # Book shifts: mid moves from 0.50 to 0.52 -> quote price moves to 0.51
+    bids_shifted = [{"price": "0.51", "size": "450"}]
+    asks_shifted = [{"price": "0.53", "size": "450"}]
+    engine.update_orderbook("tok_yes", bids_shifted, asks_shifted, tick_size=0.01)
+
+    new_bid = engine.virtual_quotes["tok_yes"]["bid"]
+    assert new_bid.price == 0.51
+    # Queue priority lost upon price change -> resets to competing depth at 0.51 (450.0)
+    assert new_bid.queue_ahead == 450.0
+
+
+def test_crossed_through_instant_aggressive_fill(tmp_path: Path):
+    """Gap F1: When real trade crosses through quote price, execute instant aggressive fill."""
+    ledger_file = tmp_path / "ledger.json"
+    engine = PaperTradingEngine(
+        initial_cash_usd=10000.0,
+        base_spread_offset_cents=1.0,
+        default_quote_size=100.0,
+        ledger_path=ledger_file,
+    )
+
+    mkt = MarketConfig(
+        condition_id="0xcross1",
+        question="Cross Through Test",
+        rate_per_day=1000.0,
+        rewards_min_size=50.0,
+        rewards_max_spread=3.0,
+        tokens=[TokenConfig(token_id="tok_yes", outcome="Yes", price=0.50)],
+    )
+    engine.register_market(mkt)
+
+    bids = [{"price": "0.49", "size": "1000"}]
+    asks = [{"price": "0.51", "size": "1000"}]
+    engine.update_orderbook("tok_yes", bids, asks, tick_size=0.01)
+
+    assert engine.virtual_quotes["tok_yes"]["bid"].queue_ahead == 1000.0
+
+    # Real trade sells aggressively at 0.48 (crossed through our 0.49 bid)
+    fill = engine.on_trade("tok_yes", trade_price=0.48, trade_size=100.0, trade_side="SELL")
+    assert fill is not None
+    assert fill.fill_price == 0.49
+    assert fill.fill_size == 100.0
+    assert "crossed_through" in fill.trigger_reason
+
+
+def test_batch_merging_and_gas_deduction(tmp_path: Path):
+    """Gap F5: Complete-set merges only execute when min(YES, NO) >= auto_merge_threshold, deducting $0.015 gas."""
+    ledger_file = tmp_path / "ledger.json"
+    engine = PaperTradingEngine(
+        initial_cash_usd=10000.0,
+        base_spread_offset_cents=1.0,
+        default_quote_size=100.0,
+        max_skew_cents=0.0,
+        auto_merge_threshold=100.0,
+        merge_gas_fee_usd=0.015,
+        ledger_path=ledger_file,
+    )
+
+    mkt = MarketConfig(
+        condition_id="0xmerge1",
+        question="Batch Merge Test Market",
+        rate_per_day=1000.0,
+        rewards_min_size=50.0,
+        rewards_max_spread=3.0,
+        tokens=[
+            TokenConfig(token_id="tok_yes", outcome="YES", price=0.50),
+            TokenConfig(token_id="tok_no", outcome="NO", price=0.50),
+        ],
+    )
+    engine.register_market(mkt)
+
+    # Initial books
+    engine.update_orderbook("tok_yes", [{"price": "0.49", "size": "0"}], [{"price": "0.51", "size": "1000"}])
+    engine.update_orderbook("tok_no", [{"price": "0.49", "size": "0"}], [{"price": "0.51", "size": "1000"}])
+
+    # 1. Fill 60 shares of YES and 60 shares of NO (min(YES, NO) = 60 < threshold 100)
+    engine.on_trade("tok_yes", trade_price=0.49, trade_size=60.0, trade_side="SELL")
+    engine.on_trade("tok_no", trade_price=0.49, trade_size=60.0, trade_side="SELL")
+
+    assert engine.positions["tok_yes"].shares == 60.0
+    assert engine.positions["tok_no"].shares == 60.0
+    # No merge executed yet
+    assert len(engine.merges) == 0
+    assert engine.total_merges_count == 0
+    assert engine.total_gas_fees_usd == 0.0
+    # Cash: 10000 - (60 * 0.49 + 60 * 0.49) = 10000 - 58.8 = 9941.20
+    assert pytest.approx(engine.cash_usd) == 9941.20
+
+    # 2. Fill the remaining resting 40 shares (from 100 quote size) of YES and NO -> inventory reaches 100 YES and 100 NO
+    # min(YES, NO) = 100 >= threshold 100 -> triggers automated merge!
+    engine.on_trade("tok_yes", trade_price=0.49, trade_size=50.0, trade_side="SELL")
+    engine.on_trade("tok_no", trade_price=0.49, trade_size=50.0, trade_side="SELL")
+
+    # 100 sets merged into 100 * 1.00 = $100.00 USDC, minus $0.015 gas fee = +$99.985
+    # Previous cash: 9941.20 - (40 * 0.49 + 40 * 0.49) = 9941.20 - 39.20 = 9902.00
+    # After merge: 9902.00 + 100.00 - 0.015 = 10001.985
+    assert len(engine.merges) == 1
+    assert engine.total_merges_count == 1
+    assert pytest.approx(engine.total_gas_fees_usd) == 0.015
+    assert pytest.approx(engine.cash_usd) == 10001.985
+    # Both positions cleared
+    assert engine.positions["tok_yes"].shares == 0.0
+    assert engine.positions["tok_no"].shares == 0.0
+
+    # Verify merge logged in ledger dict
+    ledger_data = engine.to_ledger_dict()
+    assert len(ledger_data["recent_merges"]) == 1
+    assert ledger_data["recent_merges"][0]["shares_merged"] == 100.0
+    assert ledger_data["recent_merges"][0]["gas_fee_usd"] == 0.015
+

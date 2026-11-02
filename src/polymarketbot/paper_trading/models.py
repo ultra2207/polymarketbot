@@ -17,6 +17,7 @@ class VirtualQuote:
     spread_from_mid_cents: float
     score: float = 0.0
     post_only_valid: bool = True
+    queue_ahead: float = 0.0
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict[str, Any]:
@@ -27,6 +28,7 @@ class VirtualQuote:
             "spread_from_mid_cents": round(self.spread_from_mid_cents, 2),
             "quadratic_score": round(self.score, 4),
             "post_only_valid": self.post_only_valid,
+            "queue_ahead": round(self.queue_ahead, 2),
             "timestamp": self.timestamp,
         }
 
@@ -102,6 +104,32 @@ class SimulatedFill:
             "avg_cost_after": round(self.avg_cost_after, 4),
             "realized_pnl": round(self.realized_pnl, 4),
             "trigger_reason": self.trigger_reason,
+        }
+
+
+@dataclass
+class MergeEvent:
+    """Record of a complete-set CTF merge execution."""
+
+    timestamp: float
+    condition_id: str
+    shares_merged: float
+    usdc_unlocked: float
+    gas_fee_usd: float
+    remaining_yes: float
+    remaining_no: float
+    cash_after: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "condition_id": self.condition_id,
+            "shares_merged": round(self.shares_merged, 4),
+            "usdc_unlocked": round(self.usdc_unlocked, 4),
+            "gas_fee_usd": round(self.gas_fee_usd, 4),
+            "remaining_yes": round(self.remaining_yes, 4),
+            "remaining_no": round(self.remaining_no, 4),
+            "cash_after": round(self.cash_after, 2),
         }
 
 

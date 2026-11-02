@@ -202,3 +202,36 @@ def calculate_epoch_payout(
     gross_payout = share * rate_per_day
     net_payout = gross_payout if gross_payout >= payout_floor_usd else 0.0
     return share, gross_payout, net_payout
+
+
+DEFAULT_COMPETITOR_LADDER = (
+    (0.35, 0.5),  # 35% of qualifying depth at s = 0.5c
+    (0.30, 1.0),  # 30% of qualifying depth at s = 1.0c
+    (0.20, 2.0),  # 20% of qualifying depth at s = 2.0c
+    (0.15, 3.5),  # 15% of qualifying depth at s = 3.5c
+)
+
+
+def compute_competitor_ladder_score(
+    max_spread_cents: float,
+    qualifying_depth: float,
+    ladder: Sequence[tuple[float, float]] = DEFAULT_COMPETITOR_LADDER,
+) -> float:
+    """Compute quadratic score for competing liquidity distributed across a multi-tier ladder.
+
+    Eliminates Jensen's Inequality distortion from lumping all competitor depth at one spread.
+    Default distribution:
+      - 35% of qualifying depth at s = 0.5c
+      - 30% of qualifying depth at s = 1.0c
+      - 20% of qualifying depth at s = 2.0c
+      - 15% of qualifying depth at s = 3.5c
+    """
+    total_score = 0.0
+    for weight, spread_cents in ladder:
+        size = qualifying_depth * weight
+        total_score += quadratic_order_score(
+            max_spread_cents=max_spread_cents,
+            spread_cents=spread_cents,
+            size=size,
+        )
+    return total_score

@@ -20,9 +20,11 @@ from polymarketbot.rewards.inventory import AvellanedaStoikovModel, SkewedQuote
 from polymarketbot.rewards.merger import CompleteSetPosition, MergeEvent
 from polymarketbot.rewards.queue import FillExecution, OrderBookQueueSimulator
 from polymarketbot.rewards.scoring import (
+    DEFAULT_COMPETITOR_LADDER,
     OrderQuote,
     calculate_epoch_payout,
     compute_book_side_scores,
+    compute_competitor_ladder_score,
     compute_minimum_score,
     normalize_sample_score,
     quadratic_order_score,
@@ -35,6 +37,8 @@ CATEGORY_REGIMES = {
         "jump_mean_cents": 12.0,
         "trade_rate_per_min": 0.25,
         "avg_trade_size": 250.0,
+        "decay_300s_ratio": 0.15,
+        "decay_3600s_ratio": 0.40,
     },
     "sports": {
         "vol_1m_bps": 35.0,
@@ -42,6 +46,8 @@ CATEGORY_REGIMES = {
         "jump_mean_cents": 8.0,
         "trade_rate_per_min": 0.60,
         "avg_trade_size": 180.0,
+        "decay_300s_ratio": 0.91,
+        "decay_3600s_ratio": 0.98,
     },
     "crypto": {
         "vol_1m_bps": 45.0,
@@ -49,6 +55,8 @@ CATEGORY_REGIMES = {
         "jump_mean_cents": 5.0,
         "trade_rate_per_min": 0.85,
         "avg_trade_size": 300.0,
+        "decay_300s_ratio": 0.91,
+        "decay_3600s_ratio": 0.98,
     },
     "geopolitics": {
         "vol_1m_bps": 15.0,
@@ -56,6 +64,8 @@ CATEGORY_REGIMES = {
         "jump_mean_cents": 15.0,
         "trade_rate_per_min": 0.30,
         "avg_trade_size": 200.0,
+        "decay_300s_ratio": 0.70,
+        "decay_3600s_ratio": 0.85,
     },
     "default": {
         "vol_1m_bps": 20.0,
@@ -63,6 +73,8 @@ CATEGORY_REGIMES = {
         "jump_mean_cents": 10.0,
         "trade_rate_per_min": 0.35,
         "avg_trade_size": 220.0,
+        "decay_300s_ratio": 0.50,
+        "decay_3600s_ratio": 0.75,
     },
 }
 
@@ -109,6 +121,10 @@ class EpochReport:
     final_no_inventory: float
     final_net_inventory: float
     passed_payout_floor: bool
+    gas_fees: float = 0.0
+    adverse_selection_60s: float = 0.0
+    adverse_selection_300s: float = 0.0
+    adverse_selection_3600s: float = 0.0
 
 
 class LiquidityRewardsBotEngine:
@@ -142,7 +158,7 @@ class LiquidityRewardsBotEngine:
             tick_size=tick_size,
         )
         self.queue_sim = OrderBookQueueSimulator()
-        self.position = CompleteSetPosition(auto_merge_threshold=1.0)
+        self.position = CompleteSetPosition(auto_merge_threshold=100.0)
         self.rng = random.Random(seed)
 
     def simulate_epoch(
@@ -160,34 +176,45 @@ class LiquidityRewardsBotEngine:
 
         total_spread_captured = 0.0
         total_adverse_selection = 0.0
+        total_adverse_60s = 0.0
+        total_adverse_300s = 0.0
+        total_adverse_3600s = 0.0
         total_fills_count = 0
         total_shares_traded = 0.0
+        gas_fees_start = self.position.total_gas_fees
 
-        # Competing score estimation
-        comp_spread = min(1.0, self.market.rewards_max_spread * 0.5)
-        comp_q1 = quadratic_order_score(
-            self.market.rewards_max_spread,
-            comp_spread,
-            self.market.competing_qualifying_depth * 0.5,
+        # 1. Competing score estimation across 4-tier competitor depth ladder (Fix Gap B2)
+        comp_side_depth = self.market.competing_qualifying_depth * 0.5
+        comp_q1 = compute_competitor_ladder_score(
+            max_spread_cents=self.market.rewards_max_spread,
+            qualifying_depth=comp_side_depth,
+            ladder=DEFAULT_COMPETITOR_LADDER,
         )
         comp_q2 = comp_q1
         comp_min = compute_minimum_score(comp_q1, comp_q2, mid_price)
 
-        for minute in range(n_minutes):
-            # 1. Price dynamics: Brownian motion + discrete jump arrivals
-            dt_vol = (self.regime["vol_1m_bps"] / 10000.0) * mid_price
+        # 2. Pre-simulate price trajectory for multi-horizon adverse selection (Fix Gap B4)
+        mid_prices = [mid_price]
+        cur = mid_price
+        p_jump = self.regime["jump_prob_1h"] / 60.0
+        for _ in range(n_minutes + 60):
+            dt_vol = (self.regime["vol_1m_bps"] / 10000.0) * cur
             drift = self.rng.gauss(0.0, dt_vol)
-
-            p_jump = self.regime["jump_prob_1h"] / 60.0
             jump = 0.0
             if self.rng.random() < p_jump:
                 direction = 1.0 if self.rng.random() > 0.5 else -1.0
                 jump_cents = self.rng.expovariate(1.0 / self.regime["jump_mean_cents"])
                 jump = direction * (jump_cents / 100.0)
+            cur = max(0.01, min(0.99, cur + drift + jump))
+            mid_prices.append(cur)
 
-            next_mid = max(0.01, min(0.99, mid_price + drift + jump))
+        for minute in range(n_minutes):
+            mid_price = mid_prices[minute]
+            next_mid_60s = mid_prices[minute + 1]
+            next_mid_300s = mid_prices[minute + 5]
+            next_mid_3600s = mid_prices[minute + 60]
 
-            # 2. Avellaneda-Stoikov inventory skewing
+            # 3. Avellaneda-Stoikov inventory skewing
             # When q = 0: quote symmetrically at 1.0c touch (mid - 0.5c, mid + 0.5c)
             # When q != 0: skew quote prices (widen accumulating side, tighten reducing side)
             net_q = self.position.net_inventory
@@ -199,7 +226,7 @@ class LiquidityRewardsBotEngine:
                 min_size=self.market.rewards_min_size,
             )
 
-            # 3. Synchronize resting quotes with order book queue
+            # 4. Synchronize resting quotes with order book queue
             if quotes.is_bid_active:
                 comp_bid_depth = self.market.competing_touch_depth if quotes.bid_spread_cents <= 0.6 else self.market.competing_qualifying_depth * 0.25
                 self.queue_sim.sync_quote(
@@ -228,7 +255,7 @@ class LiquidityRewardsBotEngine:
             else:
                 self.queue_sim.cancel_order("maker_ask_yes")
 
-            # 4. Market trade arrival & fill execution (including crosses)
+            # 5. Market trade arrival & fill execution (including crosses)
             if self.rng.random() < self.regime["trade_rate_per_min"]:
                 trade_side = "BUY" if self.rng.random() > 0.5 else "SELL"
                 trade_sz = self.rng.expovariate(1.0 / self.regime["avg_trade_size"])
@@ -241,8 +268,11 @@ class LiquidityRewardsBotEngine:
                     trade_price=trade_px,
                     trade_volume=trade_sz,
                     current_mid=mid_price,
-                    next_mid_60s=next_mid,
+                    next_mid_60s=next_mid_60s,
                     current_epoch=minute,
+                    next_mid_300s=next_mid_300s,
+                    next_mid_3600s=next_mid_3600s,
+                    decay_ratio=self.regime.get("decay_300s_ratio", 0.0),
                 )
 
                 for f in fills:
@@ -250,6 +280,9 @@ class LiquidityRewardsBotEngine:
                     total_shares_traded += f.fill_size
                     total_spread_captured += f.spread_captured
                     total_adverse_selection += f.adverse_selection_loss
+                    total_adverse_60s += f.adverse_selection_60s
+                    total_adverse_300s += f.adverse_selection_300s
+                    total_adverse_3600s += f.adverse_selection_3600s
 
                     # Update position and auto-merge complete sets
                     self.position.record_fill(
@@ -259,7 +292,7 @@ class LiquidityRewardsBotEngine:
                         size=f.fill_size,
                     )
 
-            # 5. Evaluate official Polymarket quadratic scoring for this sample minute
+            # 6. Evaluate official Polymarket quadratic scoring for this sample minute
             active_maker_quotes = []
             if quotes.is_bid_active and quotes.bid_size >= self.market.rewards_min_size:
                 active_maker_quotes.append(
@@ -298,9 +331,7 @@ class LiquidityRewardsBotEngine:
             sample_maker_q_min.append(maker_q_min)
             sample_competing_q_min.append(comp_min)
 
-            mid_price = next_mid
-
-        # 6. Accumulate normalized epoch score and calculate payouts
+        # 7. Accumulate normalized epoch score and calculate payouts
         sample_q_normals = []
         for m_q, c_q in zip(sample_maker_q_min, sample_competing_q_min):
             sample_sum = m_q + c_q
@@ -317,17 +348,25 @@ class LiquidityRewardsBotEngine:
             payout_floor_usd=1.00,
         )
 
-        # 7. Inventory Decay / Mark-to-market markout
+        # 8. Inventory Decay / Mark-to-market markout
         # Evaluate open position against final mid price
-        mark_to_market_val = (self.position.shares_yes * mid_price) + (
-            self.position.shares_no * (1.0 - mid_price)
+        final_mid = mid_prices[n_minutes]
+        mark_to_market_val = (self.position.shares_yes * final_mid) + (
+            self.position.shares_no * (1.0 - final_mid)
         )
         open_cost_basis = self.position.cost_basis_yes + self.position.cost_basis_no
         inventory_decay = max(0.0, open_cost_basis - mark_to_market_val)
 
-        # 8. Comprehensive PnL Accounting:
-        # Net PnL = Gross Rewards + Spread Captured - Adverse Selection - Inventory Decay
-        net_pnl = net_rewards + total_spread_captured - total_adverse_selection - inventory_decay
+        # 9. Comprehensive PnL Accounting:
+        # Net PnL = Gross Rewards + Spread Captured - Adverse Selection - Inventory Decay - Gas Fees
+        epoch_gas_fees = self.position.total_gas_fees - gas_fees_start
+        net_pnl = (
+            net_rewards
+            + total_spread_captured
+            - total_adverse_selection
+            - inventory_decay
+            - epoch_gas_fees
+        )
 
         # Capital allocated requirement: quoting both sides at touch
         allocated_capital = max(100.0, self.quote_size * max(0.20, initial_mid) * 2.0)
@@ -358,4 +397,8 @@ class LiquidityRewardsBotEngine:
             final_no_inventory=round(self.position.shares_no, 2),
             final_net_inventory=round(self.position.net_inventory, 2),
             passed_payout_floor=net_rewards >= 1.00,
+            gas_fees=round(epoch_gas_fees, 3),
+            adverse_selection_60s=round(total_adverse_60s, 2),
+            adverse_selection_300s=round(total_adverse_300s, 2),
+            adverse_selection_3600s=round(total_adverse_3600s, 2),
         )

@@ -21,9 +21,11 @@ from polymarketbot.rewards.queue import (
     RestingOrder,
 )
 from polymarketbot.rewards.scoring import (
+    DEFAULT_COMPETITOR_LADDER,
     OrderQuote,
     calculate_epoch_payout,
     compute_book_side_scores,
+    compute_competitor_ladder_score,
     compute_minimum_score,
     normalize_sample_score,
     order_spread_cents,
@@ -43,9 +45,11 @@ __all__ = [
     "FillExecution",
     "OrderBookQueueSimulator",
     "RestingOrder",
+    "DEFAULT_COMPETITOR_LADDER",
     "OrderQuote",
     "calculate_epoch_payout",
     "compute_book_side_scores",
+    "compute_competitor_ladder_score",
     "compute_minimum_score",
     "normalize_sample_score",
     "order_spread_cents",

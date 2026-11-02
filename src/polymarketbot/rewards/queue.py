@@ -51,7 +51,10 @@ class FillExecution:
     mid_at_fill: float
     is_cross: bool  # True if filled because market trade crossed our price
     spread_captured: float  # (price - mid) for sell, (mid - price) for buy
-    adverse_selection_loss: float = 0.0  # Markout loss if price moves against fill
+    adverse_selection_loss: float = 0.0  # Effective markout loss across horizons & decay
+    adverse_selection_60s: float = 0.0
+    adverse_selection_300s: float = 0.0
+    adverse_selection_3600s: float = 0.0
 
 
 class OrderBookQueueSimulator:
@@ -116,6 +119,9 @@ class OrderBookQueueSimulator:
         current_mid: float,
         next_mid_60s: float,
         current_epoch: int,
+        next_mid_300s: Optional[float] = None,
+        next_mid_3600s: Optional[float] = None,
+        decay_ratio: float = 0.0,
     ) -> List[FillExecution]:
         """Simulate trade execution against resting quotes in the book.
 
@@ -175,17 +181,24 @@ class OrderBookQueueSimulator:
             if filled_qty > 0.0:
                 order.filled_size += filled_qty
 
-                # Calculate spread captured and adverse selection markout
+                mid_300s = next_mid_60s if next_mid_300s is None else next_mid_300s
+                mid_3600s = mid_300s if next_mid_3600s is None else next_mid_3600s
+
+                # Calculate spread captured and multi-horizon adverse selection markouts
                 if order.side == "BUY":
                     spread_captured = (current_mid - order.price) * filled_qty
-                    # If mid drops below fill price, we suffer adverse selection
-                    markout_drop = max(0.0, order.price - next_mid_60s)
-                    adverse_loss = markout_drop * filled_qty
+                    loss_60s = max(0.0, order.price - next_mid_60s) * filled_qty
+                    decay_penalty = spread_captured * decay_ratio
+                    loss_300s = max(max(0.0, order.price - mid_300s) * filled_qty, decay_penalty)
+                    loss_3600s = max(max(0.0, order.price - mid_3600s) * filled_qty, decay_penalty)
                 else:
                     spread_captured = (order.price - current_mid) * filled_qty
-                    # If mid rises above fill price, we suffer adverse selection
-                    markout_rise = max(0.0, next_mid_60s - order.price)
-                    adverse_loss = markout_rise * filled_qty
+                    loss_60s = max(0.0, next_mid_60s - order.price) * filled_qty
+                    decay_penalty = spread_captured * decay_ratio
+                    loss_300s = max(max(0.0, mid_300s - order.price) * filled_qty, decay_penalty)
+                    loss_3600s = max(max(0.0, mid_3600s - order.price) * filled_qty, decay_penalty)
+
+                adverse_loss = max(loss_60s, loss_300s, loss_3600s)
 
                 fill_event = FillExecution(
                     epoch=current_epoch,
@@ -198,6 +211,9 @@ class OrderBookQueueSimulator:
                     is_cross=is_cross,
                     spread_captured=round(spread_captured, 4),
                     adverse_selection_loss=round(adverse_loss, 4),
+                    adverse_selection_60s=round(loss_60s, 4),
+                    adverse_selection_300s=round(loss_300s, 4),
+                    adverse_selection_3600s=round(loss_3600s, 4),
                 )
                 fills.append(fill_event)
                 self.fills_history.append(fill_event)

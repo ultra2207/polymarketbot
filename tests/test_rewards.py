@@ -195,6 +195,7 @@ def test_avellaneda_stoikov_inventory_skew() -> None:
 
 def test_complete_set_merge_logic() -> None:
     pos = CompleteSetPosition(auto_merge_threshold=10.0)
+    assert CompleteSetPosition().auto_merge_threshold == 100.0
 
     # Buy 500 YES shares @ $0.40
     pos.record_fill(outcome="YES", side="BUY", price=0.40, size=500.0)
@@ -206,6 +207,7 @@ def test_complete_set_merge_logic() -> None:
 
     # Buy 300 NO shares @ $0.58
     # Holding 500 YES and 300 NO -> 300 complete sets can merge into $300 USDC!
+    # Deducts $0.015 gas fee per batch merge
     pos.record_fill(outcome="NO", side="BUY", price=0.58, size=300.0)
 
     # Auto-merge should have executed
@@ -215,8 +217,9 @@ def test_complete_set_merge_logic() -> None:
     assert pos.shares_no == 0.0
     # Net inventory before was 500 - 300 = 200; after merge it is still 200 - 0 = 200!
     assert pos.net_inventory == 200.0
-    # Cash: -200 (YES buy) - 174 (NO buy) + 300 (Merge unlock) = -74 USDC
-    assert pos.usdc_cash == pytest.approx(-74.0)
+    # Cash: -200 (YES buy) - 174 (NO buy) + 300 (Merge unlock) - 0.015 (gas fee) = -74.015 USDC
+    assert pos.usdc_cash == pytest.approx(-74.015)
+    assert pos.total_gas_fees == pytest.approx(0.015)
 
     # Test CTF transaction builder
     tx = build_ctf_merge_transaction(condition_id="0xabc123", amount_shares=100.0)
@@ -234,15 +237,70 @@ def test_short_sale_split_and_merge() -> None:
     assert pos.usdc_cash == pytest.approx(-49.0)
     assert pos.net_inventory == -100.0
 
-    # Buy 100 YES @ 0.49: now holds 100 YES and 100 NO -> auto-merges into $100 USDC!
+    # Buy 100 YES @ 0.49: now holds 100 YES and 100 NO -> auto-merges into $100 USDC (-0.015 gas fee)!
     pos.record_fill(outcome="YES", side="BUY", price=0.49, size=100.0)
     assert pos.shares_yes == 0.0
     assert pos.shares_no == 0.0
     assert pos.net_inventory == 0.0
     assert pos.total_merged_shares == 100.0
     assert pos.total_unlocked_usd == 100.0
-    assert pos.usdc_cash == pytest.approx(2.0)  # Captured full 2c spread ($2.00)
+    assert pos.usdc_cash == pytest.approx(1.985)  # 2.0c spread ($2.00) - $0.015 gas fee
 
+
+def test_batch_merge_threshold_and_gas_fee() -> None:
+    # Default threshold is 100.0 shares
+    pos = CompleteSetPosition()
+    assert pos.auto_merge_threshold == 100.0
+    assert pos.gas_fee_per_merge == 0.015
+
+    # Buy 90 YES and 90 NO: threshold 100 not met -> no merge executed
+    pos.record_fill(outcome="YES", side="BUY", price=0.50, size=90.0)
+    pos.record_fill(outcome="NO", side="BUY", price=0.50, size=90.0)
+    assert pos.total_merged_shares == 0.0
+    assert pos.total_gas_fees == 0.0
+    assert pos.shares_yes == 90.0
+    assert pos.shares_no == 90.0
+
+    # Buy another 15 YES and 15 NO: total 105 >= 100 -> batch merge triggers!
+    pos.record_fill(outcome="YES", side="BUY", price=0.50, size=15.0)
+    pos.record_fill(outcome="NO", side="BUY", price=0.50, size=15.0)
+    assert pos.total_merged_shares == 105.0
+    assert pos.total_gas_fees == pytest.approx(0.015)
+    assert pos.shares_yes == 0.0
+    assert pos.shares_no == 0.0
+
+
+def test_competitor_depth_ladder_and_jensens_inequality() -> None:
+    from polymarketbot.rewards.scoring import (
+        DEFAULT_COMPETITOR_LADDER,
+        compute_competitor_ladder_score,
+    )
+
+    v = 3.5  # 3.5c max qualifying spread
+    depth = 10_000.0  # 10,000 shares qualifying depth
+
+    # Lumped assumption at s = 1.5c:
+    lumped_score = quadratic_order_score(max_spread_cents=v, spread_cents=1.5, size=depth)
+    # ((3.5 - 1.5)/3.5)^2 * 10000 = (2.0/3.5)^2 * 10000 = 0.32653 * 10000 = 3265.31
+
+    # Realistic 4-tier ladder:
+    ladder_score = compute_competitor_ladder_score(
+        max_spread_cents=v,
+        qualifying_depth=depth,
+        ladder=DEFAULT_COMPETITOR_LADDER,
+    )
+
+    # Jensen's inequality: convexity of ((v - s)/v)^2 means ladder score must be strictly greater than lumped!
+    assert ladder_score > lumped_score
+    # Exact calculation for ladder:
+    # 35% @ 0.5c: ((3.0/3.5)^2) * 3500 = 0.73469 * 3500 = 2571.43
+    # 30% @ 1.0c: ((2.5/3.5)^2) * 3000 = 0.51020 * 3000 = 1530.61
+    # 20% @ 2.0c: ((1.5/3.5)^2) * 2000 = 0.18367 * 2000 = 367.35
+    # 15% @ 3.5c: ((0.0/3.5)^2) * 1500 = 0
+    # Total = 2571.43 + 1530.61 + 367.35 = 4469.39
+    assert ladder_score == pytest.approx(4469.39, rel=1e-3)
+    # Ladder score is ~36.9% higher than lumped score
+    assert (ladder_score / lumped_score) == pytest.approx(1.3687, rel=1e-3)
 
 
 def test_order_book_queue_and_fills() -> None:
@@ -280,6 +338,9 @@ def test_order_book_queue_and_fills() -> None:
         current_mid=0.50,
         next_mid_60s=0.485,
         current_epoch=2,
+        next_mid_300s=0.480,
+        next_mid_3600s=0.470,
+        decay_ratio=0.15,
     )
     assert len(fills2) == 1
     f = fills2[0]
@@ -288,8 +349,14 @@ def test_order_book_queue_and_fills() -> None:
     assert f.fill_size == 100.0
     # Spread captured: (0.50 mid - 0.49 fill) * 100 = 1.00 USD
     assert f.spread_captured == pytest.approx(1.0)
-    # Adverse selection markout: fill 0.49 vs next_mid 0.485 = (0.49 - 0.485) * 100 = 0.50 USD
-    assert f.adverse_selection_loss == pytest.approx(0.5)
+    # Multi-horizon markout losses:
+    # 60s: (0.49 - 0.485) * 100 = 0.50 USD
+    assert f.adverse_selection_60s == pytest.approx(0.50)
+    # 300s: max((0.49 - 0.480) * 100 = 1.00, 1.0 * 0.15 = 0.15) = 1.00 USD
+    assert f.adverse_selection_300s == pytest.approx(1.00)
+    # 3600s: max((0.49 - 0.470) * 100 = 2.00, 1.0 * 0.15 = 0.15) = 2.00 USD
+    assert f.adverse_selection_3600s == pytest.approx(2.00)
+    assert f.adverse_selection_loss == pytest.approx(2.00)
 
 
 def test_engine_epoch_simulation() -> None:
@@ -324,7 +391,13 @@ def test_engine_epoch_simulation() -> None:
         report.net_rewards
         + report.spread_captured
         - report.adverse_selection
-        - report.inventory_decay,
+        - report.inventory_decay
+        - report.gas_fees,
         rel=1e-2,
     )
     assert isinstance(report.passed_payout_floor, bool)
+    assert report.adverse_selection >= 0.0
+    assert report.adverse_selection_60s >= 0.0
+    assert report.adverse_selection_300s >= 0.0
+    assert report.adverse_selection_3600s >= 0.0
+    assert report.gas_fees >= 0.0
