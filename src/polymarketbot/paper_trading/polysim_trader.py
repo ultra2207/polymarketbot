@@ -173,7 +173,26 @@ class PolySimulatorTrader:
         elif len(self.active_quotes) < 2:
             needs_requote = True
 
+        if time.time() < getattr(self, "_quote_cooldown_until", 0.0):
+            return
+
         if not needs_requote:
+            return
+
+        # Dynamically size quote based on actual available cash
+        bal = self.client.get_balance()
+        available_cash = max(0.0, bal.balance)
+        unit_cost = yes_bid + no_bid
+
+        max_affordable_shares = int((available_cash * 0.90) / unit_cost) if unit_cost > 0 else 0
+        actual_size = min(self.quote_size, float(max_affordable_shares))
+
+        if actual_size < 10.0:
+            log.warning(
+                f"Available cash (${available_cash:.2f}) insufficient for two-sided quoting "
+                f"(needs ${unit_cost * 10:.2f} for 10 shares). Holding existing inventory."
+            )
+            self._quote_cooldown_until = time.time() + 30.0
             return
 
         self.cancel_all_quotes()
@@ -187,7 +206,7 @@ class PolySimulatorTrader:
         r_yes = self.client.place_order(
             token_id=self.yes_token_id,
             side="BUY",
-            size=self.quote_size,
+            size=actual_size,
             price=yes_bid,
             order_type="GTC",
             tick_size=self.yes_tick,
@@ -199,18 +218,22 @@ class PolySimulatorTrader:
                 outcome="Yes",
                 side="BUY",
                 price=yes_bid,
-                size=self.quote_size,
+                size=actual_size,
             )
             self.db.record_order(
                 order_id=r_yes.order_id,
                 token_id=self.yes_token_id,
                 side="BUY",
                 price=yes_bid,
-                size=self.quote_size,
+                size=actual_size,
                 status="live",
                 market_id=cond_id,
                 outcome="Yes",
             )
+        elif not r_yes.success:
+            log.warning(f"BUY YES rejected: {r_yes.error_msg}. Cooling down quotes.")
+            self._quote_cooldown_until = time.time() + 30.0
+            return
 
         time.sleep(0.6)  # rate limit courtesy
 
@@ -218,7 +241,7 @@ class PolySimulatorTrader:
         r_no = self.client.place_order(
             token_id=self.no_token_id,
             side="BUY",
-            size=self.quote_size,
+            size=actual_size,
             price=no_bid,
             order_type="GTC",
             tick_size=self.no_tick,
@@ -230,18 +253,21 @@ class PolySimulatorTrader:
                 outcome="No",
                 side="BUY",
                 price=no_bid,
-                size=self.quote_size,
+                size=actual_size,
             )
             self.db.record_order(
                 order_id=r_no.order_id,
                 token_id=self.no_token_id,
                 side="BUY",
                 price=no_bid,
-                size=self.quote_size,
+                size=actual_size,
                 status="live",
                 market_id=cond_id,
                 outcome="No",
             )
+        elif not r_no.success:
+            log.warning(f"BUY NO rejected: {r_no.error_msg}. Cooling down quotes.")
+            self._quote_cooldown_until = time.time() + 30.0
 
     def cancel_all_quotes(self) -> None:
         """Cancel resting quotes and update SQLite."""

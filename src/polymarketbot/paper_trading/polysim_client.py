@@ -112,6 +112,10 @@ class PolySimulatorClient:
                 )
                 if resp.status_code == 429:
                     wait_sec = float(resp.headers.get("Retry-After", 1.5 * (2**attempt)))
+                    code = resp.headers.get("X-Polysim-Code", "")
+                    if wait_sec > 10.0 or code == "FREE_TIER_DAILY_LIMIT":
+                        log.error(f"PolySimulator daily order limit reached ({wait_sec:.0f}s reset). Returning response immediately.")
+                        return resp
                     log.warning(f"PolySimulator rate limit hit (429). Retrying in {wait_sec:.1f}s...")
                     time.sleep(wait_sec)
                     continue

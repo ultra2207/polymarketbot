@@ -64,10 +64,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional filter keyword to select target market (e.g. 'Netanyahu', 'Fed').",
     )
     parser.add_argument(
+        "--requote-threshold",
+        type=float,
+        default=2.0,
+        help="Requote threshold in cents before pulling and replacing resting orders (default: 2.0c).",
+    )
+    parser.add_argument(
         "--poll-interval",
         type=float,
-        default=3.5,
-        help="Poll interval in seconds (default: 3.5s).",
+        default=5.0,
+        help="Poll interval in seconds (default: 5.0s).",
     )
     parser.add_argument(
         "--dry-run",
@@ -111,6 +117,7 @@ def main() -> int:
         unlocked_capital_usd=args.capital,
         client=client,
         spread_offset_cents=args.spread_offset,
+        requote_threshold_cents=args.requote_threshold,
         poll_interval_seconds=args.poll_interval,
         quote_size=args.quote_size,
     )
