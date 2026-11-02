@@ -606,7 +606,8 @@ class NativePaperTradingEngine:
         existing = self.active_quotes.get(qid)
         if existing and abs(existing["price"] - price) < 1e-4 and abs(existing["size"] - size) < 1e-4:
             # Price unchanged: retain FIFO priority
-            q_ahead = impact.compute_queue_ahead(quote_side, price, book=book)
+            tracker = impact.quotes.get(qid)
+            q_ahead = tracker.queue_ahead if tracker is not None else impact.compute_queue_ahead(quote_side, price, book=book)
             existing["queue_ahead"] = q_ahead
             return
 
