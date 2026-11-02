@@ -618,10 +618,9 @@ class LivePolymarketFeed:
                 logger.info(f"Connecting to Polymarket CLOB WebSocket: {self.ws_url}")
                 async with websockets.connect(
                     self.ws_url,
-                    ping_interval=None,
-                    ping_timeout=None,
+                    ping_interval=20,
+                    ping_timeout=20,
                     close_timeout=5,
-                    additional_headers={"User-Agent": "polymarketbot/research"},
                 ) as ws:
                     self._active_ws = ws
                     self._ws_connected = True
