@@ -211,6 +211,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         if self.clob_client.dry_run or self.ctf_client.dry_run:
             self.dry_run = True
 
+        if self.dry_run and hasattr(self.clob_client, "_mock_balance_usd"):
+            self.clob_client._mock_balance_usd = self.total_wallet_balance
+
         # Wallet & Inventory State
         self.cash: float = self.initial_cash
         self.pol_balance: float = 0.50

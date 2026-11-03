@@ -555,6 +555,9 @@ async def run_real_money_trader_async(args: argparse.Namespace) -> int:
     budget_disp = budget_pct * 100.0
     budget_pct_str = f"{budget_disp:.0f}%" if budget_disp.is_integer() else f"{budget_disp:.1f}%"
 
+    if dry_run or not creds.is_configured:
+        clob_client._mock_balance_usd = total_wallet
+
     log.info(
         f"[LIVE BUDGET ALLOCATION] Live Wallet Balance: ${total_wallet:.2f} USDC | "
         f"Budget: {budget_pct_str} -> Allocated Trading Bankroll: ${trading_bankroll:.2f} USDC "
