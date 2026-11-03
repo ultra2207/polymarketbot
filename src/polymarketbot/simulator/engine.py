@@ -695,12 +695,20 @@ class NativePaperTradingEngine:
         self.active_quotes[qid] = quote_data
 
     def _cancel_virtual_quote(self, qid: str) -> None:
-        """Cancel an active virtual quote."""
+        """Cancel an active virtual quote from book, tracker, and active registry."""
         if qid in self.active_quotes:
             quote_data = self.active_quotes.pop(qid)
             tok = quote_data.get("token_side", "YES")
             impact = self.impact_yes if tok == "YES" else self.impact_no
+            book = self.book_yes if tok == "YES" else self.book_no
             impact.cancel_quote(qid)
+            book.cancel_quote(qid)
+
+    def cancel_all_virtual_quotes(self) -> None:
+        """Cancel all resting virtual maker quotes across all sides and tokens."""
+        qids = list(self.active_quotes.keys())
+        for qid in qids:
+            self._cancel_virtual_quote(qid)
 
     def _record_deskew_event(self, decision: DeSkewDecision, ts: float) -> None:
         """Persist a dynamic de-skew decision to SQLite."""
@@ -775,7 +783,180 @@ class NativePaperTradingEngine:
             self.flush_ledger()
         return res
 
-    # -------------------------------------------------------------------------
+    def liquidate_all_positions(self, timestamp: Optional[float] = None) -> dict[str, Any]:
+        """Liquidate all open positions to 100% USDC cash, accounting for all real-world closing costs.
+
+        Rules:
+        1. Cancels all active resting maker quotes across all tokens.
+        2. Merges complete sets first: min(YES, NO) -> $1.00 USDC (-$0.015 Polygon PoS gas fee).
+        3. For any residual directional tokens (unpaired YES or NO):
+           - Sells aggressively into real CLOB bids by walking the order book depth ladder.
+           - Deducts the full bid-ask spread crossing friction, depth slippage, and taker fees.
+        4. Recomputes ledger so open_positions == 0, unrealized_pnl == 0.0, and equity == cash.
+        5. Returns a comprehensive 100% cash-settlement liquidation report.
+        """
+        ts = timestamp or time.time()
+        self.cancel_all_virtual_quotes()
+
+        initial_cash = self.portfolio.initial_cash
+        pre_liq_cash = self.portfolio.cash
+        pos = self.portfolio.get_position(self.condition_id)
+
+        pre_shares_yes = pos.shares_yes
+        pre_shares_no = pos.shares_no
+        pre_equity = self.portfolio.get_equity(
+            {self.condition_id: (self.book_yes.mid_price or 0.50, self.book_no.mid_price or 0.50)}
+        )
+
+        merges_executed = []
+        liquidation_fills = []
+        total_gas_fees_liq = 0.0
+        spread_crossing_loss = 0.0
+
+        # Step 1: Merge any complete sets first (zero spread crossing cost, $0.015 gas)
+        if pos.complete_sets > 0:
+            m_res = self.trigger_ctf_merge(pos.complete_sets)
+            if m_res is not None:
+                merges_executed.append(m_res)
+                total_gas_fees_liq += m_res.gas_fee_deducted
+
+        # Step 2: Liquidate residual YES shares if any
+        if pos.shares_yes > 1e-4:
+            shares_to_sell = pos.shares_yes
+            book = self.book_yes
+            real_bids = sorted(book._real_bids.items(), key=lambda x: x[0], reverse=True)
+            shares_rem = shares_to_sell
+            total_proceeds = 0.0
+
+            for px, sz in real_bids:
+                if sz <= 1e-6 or shares_rem <= 1e-6:
+                    continue
+                fill_amt = min(shares_rem, sz)
+                total_proceeds += fill_amt * px
+                shares_rem -= fill_amt
+                if shares_rem <= 1e-6:
+                    break
+
+            if shares_rem > 1e-6:
+                worst_bid = real_bids[-1][0] if real_bids else (book.best_bid_real or 0.50)
+                penalized_px = max(0.01, worst_bid - 0.01)
+                total_proceeds += shares_rem * penalized_px
+                shares_rem = 0.0
+
+            avg_sell_px = total_proceeds / shares_to_sell
+            mid_ref = book.mid_price or avg_sell_px
+            spread_loss = max(0.0, (mid_ref - avg_sell_px) * shares_to_sell)
+            spread_crossing_loss += spread_loss
+
+            self.portfolio.process_fill(
+                condition_id=self.condition_id,
+                side="SELL",
+                outcome="YES",
+                price=avg_sell_px,
+                size=shares_to_sell,
+                is_maker=False,
+                notes=f"Shutdown Taker Liquidation: Sold {shares_to_sell:.1f} YES @ avg ${avg_sell_px:.3f}",
+            )
+            fill_rec = FillRecord(
+                fill_id=str(uuid.uuid4())[:8],
+                timestamp=ts,
+                condition_id=self.condition_id,
+                token_side="YES",
+                side="SELL",
+                fill_price=avg_sell_px,
+                fill_size=shares_to_sell,
+                is_maker=False,
+                slippage_cents=(mid_ref - avg_sell_px) * 100.0,
+                notes="Shutdown Taker Liquidation",
+            )
+            self.fills_history.append(fill_rec)
+            liquidation_fills.append({
+                "outcome": "YES",
+                "shares": shares_to_sell,
+                "avg_price": avg_sell_px,
+                "gross_proceeds": total_proceeds,
+                "spread_crossing_loss": spread_loss,
+            })
+
+        # Step 3: Liquidate residual NO shares if any
+        if pos.shares_no > 1e-4:
+            shares_to_sell = pos.shares_no
+            book = self.book_no
+            real_bids = sorted(book._real_bids.items(), key=lambda x: x[0], reverse=True)
+            shares_rem = shares_to_sell
+            total_proceeds = 0.0
+
+            for px, sz in real_bids:
+                if sz <= 1e-6 or shares_rem <= 1e-6:
+                    continue
+                fill_amt = min(shares_rem, sz)
+                total_proceeds += fill_amt * px
+                shares_rem -= fill_amt
+                if shares_rem <= 1e-6:
+                    break
+
+            if shares_rem > 1e-6:
+                worst_bid = real_bids[-1][0] if real_bids else (book.best_bid_real or 0.50)
+                penalized_px = max(0.01, worst_bid - 0.01)
+                total_proceeds += shares_rem * penalized_px
+                shares_rem = 0.0
+
+            avg_sell_px = total_proceeds / shares_to_sell
+            mid_ref = book.mid_price or avg_sell_px
+            spread_loss = max(0.0, (mid_ref - avg_sell_px) * shares_to_sell)
+            spread_crossing_loss += spread_loss
+
+            self.portfolio.process_fill(
+                condition_id=self.condition_id,
+                side="SELL",
+                outcome="NO",
+                price=avg_sell_px,
+                size=shares_to_sell,
+                is_maker=False,
+                notes=f"Shutdown Taker Liquidation: Sold {shares_to_sell:.1f} NO @ avg ${avg_sell_px:.3f}",
+            )
+            fill_rec = FillRecord(
+                fill_id=str(uuid.uuid4())[:8],
+                timestamp=ts,
+                condition_id=self.condition_id,
+                token_side="NO",
+                side="SELL",
+                fill_price=avg_sell_px,
+                fill_size=shares_to_sell,
+                is_maker=False,
+                slippage_cents=(mid_ref - avg_sell_px) * 100.0,
+                notes="Shutdown Taker Liquidation",
+            )
+            self.fills_history.append(fill_rec)
+            liquidation_fills.append({
+                "outcome": "NO",
+                "shares": shares_to_sell,
+                "avg_price": avg_sell_px,
+                "gross_proceeds": total_proceeds,
+                "spread_crossing_loss": spread_loss,
+            })
+
+        self.flush_ledger()
+        final_cash = self.portfolio.cash
+        net_realized_pnl = final_cash - initial_cash
+        net_return_pct = (net_realized_pnl / initial_cash) * 100.0 if initial_cash > 0 else 0.0
+
+        return {
+            "initial_cash": initial_cash,
+            "pre_liquidation_equity": pre_equity,
+            "pre_liquidation_cash": pre_liq_cash,
+            "shares_yes_liquidated": pre_shares_yes,
+            "shares_no_liquidated": pre_shares_no,
+            "final_cash_settlement": final_cash,
+            "final_open_positions_count": 0,
+            "total_realized_pnl": net_realized_pnl,
+            "net_return_pct": net_return_pct,
+            "spread_crossing_loss": spread_crossing_loss,
+            "total_gas_fees_liq": total_gas_fees_liq,
+            "liquidation_costs_total": spread_crossing_loss + total_gas_fees_liq,
+            "merges_executed": len(merges_executed),
+            "fills_executed": len(liquidation_fills),
+        }
     # Polymarket Quadratic Rewards 1-Minute Epoch Scoring
     # -------------------------------------------------------------------------
 

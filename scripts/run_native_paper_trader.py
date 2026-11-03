@@ -536,9 +536,30 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
 
             await asyncio.sleep(args.poll_interval)
     finally:
+        log.info("Session concluding. Executing mandatory liquidation of all open positions...")
+        liq = engine.liquidate_all_positions()
         log.info("Stopping live feed and flushing final ledger...")
         await feed.stop()
         engine.flush_ledger()
+
+        # Print final 100% Cash-Settlement Report
+        sys.stdout.write("\n" + "=" * 88 + "\n")
+        sys.stdout.write("  [SESSION FINAL SETTLEMENT] 100% CASH-SETTLED AUDIT REPORT (ZERO OPEN INVENTORY)\n")
+        sys.stdout.write("=" * 88 + "\n")
+        sys.stdout.write(f"  Initial Bankroll:             ${liq['initial_cash']:.4f} USDC\n")
+        sys.stdout.write(f"  Pre-Liquidation Equity:       ${liq['pre_liquidation_equity']:.4f} USDC (Mark-to-Mid)\n")
+        sys.stdout.write(f"  Pre-Liquidation Cash:         ${liq['pre_liquidation_cash']:.4f} USDC\n")
+        sys.stdout.write(f"  Shares YES Liquidated:        {liq['shares_yes_liquidated']:.2f} shares\n")
+        sys.stdout.write(f"  Shares NO Liquidated:         {liq['shares_no_liquidated']:.2f} shares\n")
+        sys.stdout.write(f"  Spread Crossing Friction:    -${liq['spread_crossing_loss']:.4f} USDC\n")
+        sys.stdout.write(f"  Liquidation Gas Fees:        -${liq['total_gas_fees_liq']:.4f} USDC\n")
+        sys.stdout.write(f"  Total Liquidation Costs:     -${liq['liquidation_costs_total']:.4f} USDC\n")
+        sys.stdout.write("  " + "-" * 84 + "\n")
+        sys.stdout.write(f"  FINAL CASH SETTLEMENT:        ${liq['final_cash_settlement']:.4f} USDC (100% Cash)\n")
+        sys.stdout.write(f"  FINAL OPEN POSITIONS:         {liq['final_open_positions_count']} shares\n")
+        sys.stdout.write(f"  NET REALIZED PnL:             ${liq['total_realized_pnl']:+.4f} USDC ({liq['net_return_pct']:+.2f}%)\n")
+        sys.stdout.write("=" * 88 + "\n\n")
+        sys.stdout.flush()
         log.info(f"Native paper trading completed. State saved to {args.db_path} and {args.ledger_path}.")
 
     return 0

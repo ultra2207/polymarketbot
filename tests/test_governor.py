@@ -61,7 +61,7 @@ def test_governor_utc_day_rollover():
 
     # Simulate rollover to next day
     with patch("polymarketbot.paper_trading.governor.datetime") as mock_dt:
-        mock_dt.now.return_value.strftime.return_value = "2026-11-03"
+        mock_dt.now.return_value.strftime.return_value = "2099-12-31"
         gov._sync_utc_day()
         st = gov.get_status()
         assert st.orders_placed_today == 0

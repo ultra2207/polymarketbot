@@ -114,3 +114,67 @@ def test_emergency_circuit_breaker_synthetic_cross():
     pos = mm.portfolio.get_position("0xabc123")
     assert pos.net_exposure == 0.0
     assert pos.complete_sets == 0.0
+
+
+def test_session_end_liquidation_to_cash(tmp_path):
+    from polymarketbot.simulator.engine import NativePaperTradingEngine
+
+    db_path = str(tmp_path / "test_liq.db")
+    ledger_path = str(tmp_path / "test_liq.json")
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xliqtest",
+        asset_id_yes="0xliq_YES",
+        asset_id_no="0xliq_NO",
+        initial_cash=150.0,
+        quote_size=45.0,
+        db_path=db_path,
+        ledger_path=ledger_path,
+        institutional_mode=True,
+    )
+
+    # Ingest real order book depth
+    engine.update_orderbook_snapshot(
+        token_side="YES",
+        bids=[{"price": 0.76, "size": 100.0}, {"price": 0.75, "size": 100.0}],
+        asks=[{"price": 0.77, "size": 100.0}],
+    )
+    engine.update_orderbook_snapshot(
+        token_side="NO",
+        bids=[{"price": 0.23, "size": 100.0}],
+        asks=[{"price": 0.24, "size": 100.0}],
+    )
+    engine.evaluate_quotes()
+    assert len(engine.active_quotes) > 0
+
+    # Simulate an open position of 45 YES shares bought at $0.76
+    engine.portfolio.process_fill(
+        condition_id="0xliqtest",
+        side="BUY",
+        outcome="YES",
+        price=0.76,
+        size=45.0,
+        is_maker=True,
+    )
+    pos = engine.portfolio.get_position("0xliqtest")
+    assert pos.shares_yes == 45.0
+    assert engine.portfolio.cash == round(150.0 - 45.0 * 0.76, 4)
+
+    # Call session-end liquidation
+    liq_res = engine.liquidate_all_positions()
+
+    # All quotes cancelled
+    assert len(engine.active_quotes) == 0
+
+    # All inventory liquidated to 100% cash
+    pos_after = engine.portfolio.get_position("0xliqtest")
+    assert pos_after.shares_yes == 0.0
+    assert pos_after.shares_no == 0.0
+    assert pos_after.net_exposure == 0.0
+    assert liq_res["final_open_positions_count"] == 0
+
+    # 45 shares sold at best bid 0.76 -> cash restored to 150.0
+    assert abs(liq_res["final_cash_settlement"] - 150.0) < 1e-3
+    assert engine.portfolio.cash == liq_res["final_cash_settlement"]
+    assert liq_res["shares_yes_liquidated"] == 45.0
+
