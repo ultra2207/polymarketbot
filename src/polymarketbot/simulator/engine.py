@@ -31,6 +31,7 @@ from polymarketbot.rewards.deskew import (
     DeSkewPathway,
     DynamicDeSkewOptimizer,
 )
+from polymarketbot.rewards.microstructure import MicrostructureEngine
 from polymarketbot.rewards.scoring import quadratic_order_score
 from polymarketbot.simulator.book import (
     DepthInfo,
@@ -191,6 +192,10 @@ class NativePaperTradingEngine:
             q_hard_threshold=100.0,
             max_holding_seconds=300.0,
         )
+
+        # Microstructure Sentinels for OFI & Micro-Price Drift
+        self.microstructure_yes = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
+        self.microstructure_no = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
 
         # Virtual Maker Quote Registry: quote_id -> dict
         self.active_quotes: Dict[str, dict[str, Any]] = {}
@@ -365,10 +370,41 @@ class NativePaperTradingEngine:
         ts = timestamp or time.time()
         token_norm = token_side.upper()
 
+        def _get_lvl(lvl: Any) -> tuple[float, float]:
+            if hasattr(lvl, "price") and hasattr(lvl, "size"):
+                return float(lvl.price), float(lvl.size)
+            if isinstance(lvl, dict):
+                return float(lvl.get("price", 0.0) or 0.0), float(lvl.get("size", 0.0) or 0.0)
+            if isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                return float(lvl[0] or 0.0), float(lvl[1] or 0.0)
+            return 0.0, 0.0
+
         if token_norm == "YES":
             self.book_yes.apply_snapshot(bids=bids, asks=asks, timestamp=ts)
+            if bids and asks:
+                b_px, b_sz = _get_lvl(bids[0])
+                a_px, a_sz = _get_lvl(asks[0])
+                if b_px > 0 and a_px > 0:
+                    self.microstructure_yes.update(
+                        best_bid_price=b_px,
+                        best_bid_size=b_sz,
+                        best_ask_price=a_px,
+                        best_ask_size=a_sz,
+                        timestamp=ts,
+                    )
         elif token_norm == "NO":
             self.book_no.apply_snapshot(bids=bids, asks=asks, timestamp=ts)
+            if bids and asks:
+                b_px, b_sz = _get_lvl(bids[0])
+                a_px, a_sz = _get_lvl(asks[0])
+                if b_px > 0 and a_px > 0:
+                    self.microstructure_no.update(
+                        best_bid_price=b_px,
+                        best_bid_size=b_sz,
+                        best_ask_price=a_px,
+                        best_ask_size=a_sz,
+                        timestamp=ts,
+                    )
         else:
             raise ValueError(f"Unknown token side: {token_side}")
 
@@ -470,7 +506,12 @@ class NativePaperTradingEngine:
 
         mid_yes = (b_yes + a_yes) / 2.0
 
-        # Evaluate skew using DynamicDeSkewOptimizer
+        # Extract live microstructure signals from Cont-Kukanov-Stoikov OFI and Stoikov micro-price
+        state_yes = self.microstructure_yes.latest_state
+        rolling_ofi = state_yes.ofi_10_events if state_yes else 0.0
+        drift_cents = state_yes.drift_cents if state_yes else 0.0
+
+        # Evaluate skew using DynamicDeSkewOptimizer with live microstructure signals
         decision = self.deskew_optimizer.evaluate_skew(
             shares_yes=pos.shares_yes,
             shares_no=pos.shares_no,
@@ -478,6 +519,8 @@ class NativePaperTradingEngine:
             best_ask_yes=a_yes,
             best_bid_no=b_no,
             best_ask_no=a_no,
+            rolling_ofi=rolling_ofi,
+            micro_price_drift_cents=drift_cents,
             time_to_resolution_days=7.0,
         )
         self.latest_deskew_decision = decision
@@ -525,13 +568,17 @@ class NativePaperTradingEngine:
                 # Long YES -> tighten NO bid to complete sets; fade/widen YES bid
                 target_bid_no = round(min(0.98, max(0.01, 1.00 - max(best_bid_yes + 0.001, decision.target_price))), 3)
                 faded_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, r_yes - offset - 0.01)), 3)
-                self._set_virtual_quote("NO", "BUY", target_bid_no, self.quote_size, ts)
+                # Size neutralizing leg to net_q to completely flatten position on fill
+                deskew_size = max(self.quote_size, net_q)
+                self._set_virtual_quote("NO", "BUY", target_bid_no, deskew_size, ts)
                 self._set_virtual_quote("YES", "BUY", faded_bid_yes, self.quote_size, ts)
             else:
                 # Long NO -> tighten YES bid to complete sets; fade/widen NO bid
                 target_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, decision.target_price)), 3)
                 faded_bid_no = round(max(0.01, min(0.98, 1.00 - (r_yes + offset + 0.01))), 3)
-                self._set_virtual_quote("YES", "BUY", target_bid_yes, self.quote_size, ts)
+                # Size neutralizing leg to abs(net_q) to completely flatten position on fill
+                deskew_size = max(self.quote_size, abs(net_q))
+                self._set_virtual_quote("YES", "BUY", target_bid_yes, deskew_size, ts)
                 self._set_virtual_quote("NO", "BUY", faded_bid_no, self.quote_size, ts)
 
             self._cancel_virtual_quote("SELL_YES")

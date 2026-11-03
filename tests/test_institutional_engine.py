@@ -178,3 +178,72 @@ def test_session_end_liquidation_to_cash(tmp_path):
     assert engine.portfolio.cash == liq_res["final_cash_settlement"]
     assert liq_res["shares_yes_liquidated"] == 45.0
 
+
+def test_microstructure_integration_and_deskew_sizing(tmp_path):
+    from polymarketbot.simulator.engine import NativePaperTradingEngine
+
+    db_path = str(tmp_path / "test_micro.db")
+    ledger_path = str(tmp_path / "test_micro.json")
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xmicrotest",
+        asset_id_yes="0xmicro_YES",
+        asset_id_no="0xmicro_NO",
+        initial_cash=200.0,
+        quote_size=20.0,
+        db_path=db_path,
+        ledger_path=ledger_path,
+        institutional_mode=True,
+    )
+
+    # 1. First snapshot
+    engine.update_orderbook_snapshot(
+        token_side="YES",
+        bids=[{"price": 0.50, "size": 1000.0}],
+        asks=[{"price": 0.52, "size": 1000.0}],
+    )
+    # 2. Second snapshot with mild benign flow (OFI = -100 < 850 threshold)
+    engine.update_orderbook_snapshot(
+        token_side="YES",
+        bids=[{"price": 0.50, "size": 950.0}],
+        asks=[{"price": 0.52, "size": 1050.0}],
+    )
+
+    # Verify microstructure tracking
+    state = engine.microstructure_yes.latest_state
+    assert state is not None
+    assert state.best_bid == 0.50
+    assert state.best_ask == 0.52
+    assert state.bid_size == 950.0
+    assert state.ask_size == 1050.0
+    # Negative OFI from bid dropping (-50) and ask growing (+50)
+    assert state.ofi_10_events == -100.0
+    assert state.is_toxic is False
+
+    # 3. Test de-skew sizing optimization: Simulate long 45 YES under benign flow
+    engine.portfolio.process_fill(
+        condition_id="0xmicrotest",
+        side="BUY",
+        outcome="YES",
+        price=0.50,
+        size=45.0,
+        is_maker=True,
+    )
+    engine.evaluate_quotes()
+
+    # In Tier 1 Passive Fade, the BUY NO de-skew quote should be sized to exactly 45.0 (net_q)
+    assert "BUY_NO" in engine.active_quotes
+    quote_no = engine.active_quotes["BUY_NO"]
+    assert quote_no["size"] == 45.0
+
+    # 4. Now simulate extreme toxic flow (|OFI| > 850) and verify Tier 2 trigger
+    engine.update_orderbook_snapshot(
+        token_side="YES",
+        bids=[{"price": 0.50, "size": 50.0}],
+        asks=[{"price": 0.52, "size": 3000.0}],
+    )
+    state_toxic = engine.microstructure_yes.latest_state
+    assert state_toxic.is_toxic is True
+    assert abs(state_toxic.ofi_10_events) > 850.0
+
+

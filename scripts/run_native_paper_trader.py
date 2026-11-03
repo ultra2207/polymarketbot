@@ -174,9 +174,28 @@ def resolve_market_details(
                 target_market = m
                 break
     elif markets:
-        # Pick market with highest daily reward rate
+        # Sort markets by daily reward rate descending
         markets_sorted = sorted(markets, key=_get_rate, reverse=True)
-        target_market = markets_sorted[0] if markets_sorted else None
+        # Find the highest-yield market that is active, open, and has verified live orderbook liquidity
+        for m in markets_sorted:
+            if m.get("closed") is True or m.get("active") is False:
+                continue
+            tokens = m.get("tokens", [])
+            if len(tokens) < 2:
+                continue
+            t0 = tokens[0].get("token_id")
+            if not t0:
+                continue
+            try:
+                book = feed.get_book_sync(t0)
+                if book and len(book.bids) > 0 and len(book.asks) > 0:
+                    target_market = m
+                    log.info(f"Auto-selected active liquid market: {m.get('question')} (Pool: ${_get_rate(m):,.2f}/day)")
+                    break
+            except Exception:
+                continue
+        if not target_market and markets_sorted:
+            target_market = markets_sorted[0]
 
     cid = requested_cid or (target_market.get("condition_id") if target_market else None) or "0x221319cd...demo"
     question = (target_market.get("question") if target_market else None) or f"Market Condition {cid[:14]}..."
