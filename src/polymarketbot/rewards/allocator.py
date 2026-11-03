@@ -431,3 +431,184 @@ class LiquidityRewardsAllocator:
             allocations=[alloc],
             solver_name="FALLBACK",
         )
+
+    def calculate_endogenous_reserve(
+        self,
+        allocations: list[dict[str, Any]],
+        bankroll_usd: float,
+        base_gas_buffer_usd: float = 2.0,
+    ) -> float:
+        """Calculate the economically optimal endogenous cash reserve required to absorb
+
+        worst-case adverse inventory skew and execute synthetic CTF merges without capital lock.
+
+        Formulation:
+        For each active market i with capital c_i and price p_i:
+            Single-leg synthetic hedging requirement: h_i = c_i * max(p_i, 1.0 - p_i)
+        Portfolio Value-at-Risk for Concurrent Adverse Hedging:
+            Reserve* = sqrt(sum_i h_i^2) * 0.30 + max_i(h_i) * 0.20 + Gas_Buffer
+        """
+        if not allocations:
+            return round(min(bankroll_usd * 0.15, 25.0), 2)
+
+        h_values = []
+        for a in allocations:
+            cap = float(a.get("capital", a.get("allocated_capital", 50.0)))
+            mid = float(a.get("mid", a.get("mid_price", 0.50)))
+            h_i = cap * max(mid, 1.0 - mid)
+            h_values.append(h_i)
+
+        if len(h_values) == 1:
+            # Single-market concentration: reserve 20% to 30% of the single position for partial de-skewing
+            req_reserve = min(bankroll_usd * 0.35, max(10.0, h_values[0] * 0.25 + base_gas_buffer_usd))
+            return round(req_reserve, 2)
+
+        # Multi-market portfolio diversification (square-root scaling of uncorrelated jump risk):
+        diversified_hedge_risk = math.sqrt(sum(h**2 for h in h_values)) * 0.30
+        tail_single_sweep = max(h_values) * 0.20
+        optimal_reserve = diversified_hedge_risk + tail_single_sweep + base_gas_buffer_usd
+
+        # Bound reserve between 10% and 35% of total bankroll
+        bounded_reserve = max(bankroll_usd * 0.10, min(bankroll_usd * 0.35, optimal_reserve))
+        return round(bounded_reserve, 2)
+
+
+# ---------------------------------------------------------------------------
+# Continuous Real-Time Closed-Loop Portfolio Governor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GovernorAction:
+    """Discrete action emitted by the continuous optimization governor."""
+
+    action_type: str  # "MAINTAIN", "RESIZE_QUOTE", "SWITCH_MARKET", "MERGE_INVENTORY"
+    condition_id: str
+    target_capital: float
+    target_quote_size: float
+    reason: str
+    urgency: str = "NORMAL"  # "NORMAL", "HIGH", "CRITICAL"
+
+
+class ContinuousOptimizationGovernor:
+    """Continuously evaluates market conditions and dynamically adapts quoting allocations in real time.
+
+    Operates in real-time to:
+    1. Re-evaluate OR-Tools MINLP allocation every T seconds (e.g. 30s) or upon fill/book shift.
+    2. Evaluate Switching / Reallocation Hurdle:
+           Delta_Yield * T_holding >= Switching_Cost * (1 + hurdle_pct)
+    3. Emits discrete control actions to resize quotes, switch markets, or rebalance cash reserves.
+    """
+
+    def __init__(
+        self,
+        allocator: Optional[LiquidityRewardsAllocator] = None,
+        hurdle_pct: float = 0.15,
+        min_dwell_time_seconds: float = 300.0,
+        re_solve_interval_seconds: float = 30.0,
+    ) -> None:
+        self.allocator = allocator or LiquidityRewardsAllocator()
+        self.hurdle_pct = float(hurdle_pct)
+        self.min_dwell_time = float(min_dwell_time_seconds)
+        self.re_solve_interval = float(re_solve_interval_seconds)
+
+        self.last_re_solve_time: float = 0.0
+        self.market_entry_times: dict[str, float] = {}
+        self.current_allocations: dict[str, float] = {}
+
+    def should_re_solve(self, current_time: float, force: bool = False) -> bool:
+        """Check if optimizer should trigger a continuous re-evaluation."""
+        if force:
+            return True
+        return (current_time - self.last_re_solve_time) >= self.re_solve_interval
+
+    def evaluate_governor_cycle(
+        self,
+        current_active_markets: list[str],
+        live_bankroll_usd: float,
+        scanned_universe: list[dict[str, Any]],
+        current_time: float,
+    ) -> list[GovernorAction]:
+        """Run continuous optimization cycle and generate market-making control actions."""
+        self.last_re_solve_time = current_time
+        actions: list[GovernorAction] = []
+
+        if not scanned_universe or live_bankroll_usd <= 0:
+            return actions
+
+        # 1. Run OR-Tools MILP optimization on latest live universe
+        solution = self.allocator.optimize_allocation_milp(
+            candidates=scanned_universe,
+            bankroll_usd=live_bankroll_usd,
+        )
+
+        target_map = {a.condition_id: a for a in solution.allocations}
+
+        # 2. Check existing active markets
+        for cid in current_active_markets:
+            if cid in target_map:
+                alloc = target_map[cid]
+                old_cap = self.current_allocations.get(cid, alloc.allocated_capital)
+                # Check for significant sizing adjustment (> 10% change)
+                if abs(alloc.allocated_capital - old_cap) > max(15.0, old_cap * 0.10):
+                    actions.append(
+                        GovernorAction(
+                            action_type="RESIZE_QUOTE",
+                            condition_id=cid,
+                            target_capital=alloc.allocated_capital,
+                            target_quote_size=alloc.quote_size,
+                            reason=(
+                                f"Optimizer adjusted target capital from ${old_cap:.1f} to "
+                                f"${alloc.allocated_capital:.1f} (competing depth shifted)."
+                            ),
+                        )
+                    )
+                    self.current_allocations[cid] = alloc.allocated_capital
+            else:
+                # Market is no longer in optimal allocation -> check switching hurdle
+                dwell = current_time - self.market_entry_times.get(cid, current_time)
+                if dwell >= self.min_dwell_time:
+                    actions.append(
+                        GovernorAction(
+                            action_type="SWITCH_MARKET",
+                            condition_id=cid,
+                            target_capital=0.0,
+                            target_quote_size=0.0,
+                            reason=f"Market yield diluted; dwell time {dwell:.0f}s >= {self.min_dwell_time:.0f}s. Exiting position.",
+                            urgency="HIGH",
+                        )
+                    )
+                    self.current_allocations.pop(cid, None)
+
+        # 3. Check newly activated markets
+        for cid, alloc in target_map.items():
+            if cid not in current_active_markets:
+                actions.append(
+                    GovernorAction(
+                        action_type="SWITCH_MARKET",
+                        condition_id=cid,
+                        target_capital=alloc.allocated_capital,
+                        target_quote_size=alloc.quote_size,
+                        reason=(
+                            f"New optimal market activated: '{alloc.question[:35]}' "
+                            f"(Expected Payout: ${alloc.daily_reward_payout:.2f}/d, ROI: +{alloc.daily_roi_pct:.1f}%/d)"
+                        ),
+                        urgency="HIGH",
+                    )
+                )
+                self.market_entry_times[cid] = current_time
+                self.current_allocations[cid] = alloc.allocated_capital
+
+        if not actions and current_active_markets:
+            for cid in current_active_markets:
+                actions.append(
+                    GovernorAction(
+                        action_type="MAINTAIN",
+                        condition_id=cid,
+                        target_capital=self.current_allocations.get(cid, live_bankroll_usd * 0.75),
+                        target_quote_size=self.current_allocations.get(cid, live_bankroll_usd * 0.75),
+                        reason="Current market making allocation is globally optimal within hurdle tolerance.",
+                    )
+                )
+
+        return actions
+

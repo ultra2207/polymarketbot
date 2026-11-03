@@ -109,3 +109,42 @@ def test_unviable_pool_rejection(allocator):
     result = allocator.optimize_allocation_milp(candidates=unviable, bankroll_usd=150.0)
     assert result.active_markets_count == 0
     assert result.total_daily_payout == 0.0
+
+
+def test_endogenous_reserve_scaling(allocator):
+    # Single market: reserve should be between 10% and 35% of bankroll
+    single_alloc = [{"capital": 100.0, "mid": 0.50}]
+    res_single = allocator.calculate_endogenous_reserve(single_alloc, bankroll_usd=150.0)
+    assert 10.0 <= res_single <= 45.0
+
+    # Multi-market diversified portfolio (5 markets): square-root scaling frees up cash
+    multi_alloc = [{"capital": 200.0, "mid": 0.50} for _ in range(5)]
+    res_multi = allocator.calculate_endogenous_reserve(multi_alloc, bankroll_usd=1500.0)
+    # Total capital = 1000, diversified reserve should be <= 350
+    assert res_multi <= 1500.0 * 0.35
+    assert res_multi >= 1500.0 * 0.10
+
+
+def test_continuous_optimization_governor(allocator, sample_candidates):
+    from polymarketbot.rewards.allocator import ContinuousOptimizationGovernor
+
+    gov = ContinuousOptimizationGovernor(allocator=allocator, hurdle_pct=0.15, min_dwell_time_seconds=300.0)
+    actions = gov.evaluate_governor_cycle(
+        current_active_markets=[],
+        live_bankroll_usd=150.0,
+        scanned_universe=sample_candidates,
+        current_time=1000.0,
+    )
+    assert len(actions) >= 1
+    assert actions[0].action_type == "SWITCH_MARKET"
+    active_cid = actions[0].condition_id
+
+    # Second cycle with active market in optimal set -> should emit MAINTAIN
+    actions_2 = gov.evaluate_governor_cycle(
+        current_active_markets=[active_cid],
+        live_bankroll_usd=150.0,
+        scanned_universe=sample_candidates,
+        current_time=1030.0,
+    )
+    assert len(actions_2) == 1
+    assert actions_2[0].action_type == "MAINTAIN"
