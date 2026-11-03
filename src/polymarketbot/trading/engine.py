@@ -136,6 +136,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         governor: Optional[ContinuousOptimizationGovernor] = None,
         risk_manager: Optional[RiskManager] = None,
         dry_run: bool = False,
+        total_wallet_balance: Optional[float] = None,
+        budget_pct: float = 1.0,
+        max_budget: Optional[float] = None,
     ) -> None:
         init_cash = float(initial_cash)
         rm = risk_manager or RiskManager(
@@ -178,7 +181,18 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             risk_manager=rm,
         )
 
+        b_pct = float(budget_pct)
+        if b_pct > 1.0:
+            b_pct = b_pct / 100.0
+        self.budget_pct: float = max(0.01, min(1.0, b_pct))
+        self.max_budget: Optional[float] = float(max_budget) if max_budget is not None else None
+
         self.initial_cash = init_cash
+        self.total_wallet_balance: float = (
+            float(total_wallet_balance) if total_wallet_balance is not None else init_cash
+        )
+        self.trading_bankroll: float = init_cash
+        self.isolated_cash: float = max(0.0, self.total_wallet_balance - init_cash)
         self.dry_run = bool(dry_run)
 
         # Clients
@@ -220,9 +234,11 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         # Histories
         self.fills_history: List[RealMoneyFillRecord] = []
         self.merges_history: List[MergeExecutionResult] = []
+        self._canceled_order_ids: set[str] = set()
 
-        # Auto sync initial balances
-        self.sync_balances()
+        # Auto sync initial balances for live mode or configured credentials
+        if not self.dry_run or (self.clob_client.credentials and self.clob_client.credentials.is_configured):
+            self.sync_balances()
 
         logger.info(
             f"RealMoneyTradingEngine initialized for condition {self.condition_id[:14]}... | "
@@ -304,18 +320,45 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
     # Balance & State Synchronization
     # -------------------------------------------------------------------------
 
-    def sync_balances(self) -> None:
+    def sync_live_balances(self) -> dict[str, float]:
         """Synchronize on-chain and CLOB balances for USDC, POL, and token shares."""
+        balances: dict[str, float] = {"cash": self.cash, "pol": self.pol_balance}
         try:
             bal_data = self.clob_client.get_balance()
+            clob_cash = None
             if bal_data and bal_data.get("available") is not None:
-                self.cash = float(bal_data["available"])
-            if self.clob_client.address:
-                self.pol_balance = self.ctf_client.get_pol_balance(self.clob_client.address)
+                clob_cash = float(bal_data["available"])
+
+            addr = self.clob_client.address
+            if not addr and hasattr(self.ctf_client, "private_key") and self.ctf_client.private_key:
+                addr = getattr(self.clob_client.credentials, "address", "")
+
+            onchain_usdc = 0.0
+            if addr:
+                self.pol_balance = self.ctf_client.get_pol_balance(addr)
+                onchain_usdc = self.ctf_client.get_usdc_balance(addr)
+
+            raw_wallet = max(clob_cash or 0.0, onchain_usdc or 0.0)
+            if raw_wallet > 0.0:
+                self.total_wallet_balance = raw_wallet
+                budgeted = raw_wallet * getattr(self, "budget_pct", 1.0)
+                if getattr(self, "max_budget", None) is not None and self.max_budget > 0:
+                    budgeted = min(budgeted, self.max_budget)
+                self.cash = round(budgeted, 2)
+            elif not self.dry_run and not (self.clob_client.credentials and self.clob_client.credentials.is_configured):
+                self.cash = 0.0
+
+            balances["cash"] = self.cash
+            balances["pol"] = self.pol_balance
         except Exception as e:
             logger.debug(f"Failed to sync live balances: {e}")
 
         self.sync_rewards()
+        return balances
+
+    def sync_balances(self) -> None:
+        """Alias for sync_live_balances()."""
+        self.sync_live_balances()
 
     def sync_rewards(self) -> None:
         """Synchronize ground-truth reward and rebate balances from Polymarket APIs."""
@@ -399,7 +442,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
 
         # Cancel previous resting order if modifying price or size
         if existing and existing.get("order_id"):
-            self.clob_client.cancel_order(existing["order_id"])
+            old_oid = existing["order_id"]
+            self._canceled_order_ids.add(old_oid)
+            self.clob_client.cancel_order(old_oid)
 
         # Place new signed order
         res = self.clob_client.place_order(
@@ -439,6 +484,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             "side": quote_side.upper(),
             "price": price,
             "size": size,
+            "size_matched": 0.0,
             "queue_ahead": 0.0,
             "score": round(score, 4),
             "v_queue": round(vq_res.net_queue_value_usd, 4),
@@ -477,10 +523,15 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             quote_data = self.active_quotes.pop(qid)
             order_id = quote_data.get("order_id", "")
             if order_id:
+                self._canceled_order_ids.add(order_id)
                 self.clob_client.cancel_order(order_id)
 
     def cancel_all_quotes(self) -> None:
         """Cancel all resting orders on Polymarket CLOB."""
+        for qdata in self.active_quotes.values():
+            order_id = qdata.get("order_id", "")
+            if order_id:
+                self._canceled_order_ids.add(order_id)
         self.active_quotes.clear()
         self.clob_client.cancel_all_orders()
 
@@ -548,12 +599,32 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
     def trigger_ctf_merge(self, amount_sets: Optional[float] = None) -> Optional[MergeExecutionResult]:
         """Execute on-chain CTF complete-set merge via PolygonCtfClient."""
         pos = self.get_position(self.condition_id)
-        sets_to_merge = amount_sets if amount_sets is not None else pos.complete_sets
+        available_sets = min(pos.shares_yes, pos.shares_no)
+
+        if available_sets <= 0.0:
+            logger.debug(
+                f"CTF merge skipped: no complete sets held (YES: {pos.shares_yes:.2f}, NO: {pos.shares_no:.2f})"
+            )
+            return None
+
+        if amount_sets is not None:
+            if amount_sets > available_sets:
+                logger.warning(
+                    f"Requested CTF merge amount ({amount_sets:.2f}) exceeds available complete sets "
+                    f"({available_sets:.2f}). Clamping to {available_sets:.2f}."
+                )
+                sets_to_merge = available_sets
+            else:
+                sets_to_merge = float(amount_sets)
+        else:
+            sets_to_merge = available_sets
 
         if sets_to_merge < self.auto_merge_threshold and amount_sets is None:
             return None
 
-        if sets_to_merge <= 0.0:
+        # Verify that actual complete sets are held before broadcasting on-chain mergePositions
+        if sets_to_merge <= 0.0 or sets_to_merge > min(pos.shares_yes, pos.shares_no):
+            logger.warning(f"Aborting CTF merge: sets_to_merge={sets_to_merge:.2f} is invalid or exceeds inventory.")
             return None
 
         res = self.ctf_client.merge_positions(
@@ -676,6 +747,130 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         # Re-evaluate quotes
         self.evaluate_quotes(timestamp=ts)
 
+    def _apply_fill(self, tok: str, side: str, fill_sz: float, fill_px: float) -> None:
+        """Apply inventory, cash, and volume changes resulting from a confirmed fill."""
+        if fill_sz <= 0.0:
+            return
+
+        if side == "BUY":
+            if tok == "YES":
+                self.shares_yes += fill_sz
+            else:
+                self.shares_no += fill_sz
+            self.cash -= fill_sz * fill_px
+        else:
+            if tok == "YES":
+                self.shares_yes = max(0.0, self.shares_yes - fill_sz)
+            else:
+                self.shares_no = max(0.0, self.shares_no - fill_sz)
+            self.cash += fill_sz * fill_px
+
+        self.total_volume_traded_usd += fill_sz * fill_px
+
+        # Check CTF auto-merge
+        pos = self.get_position(self.condition_id)
+        if pos.complete_sets >= self.auto_merge_threshold:
+            self.trigger_ctf_merge()
+
+    def sync_live_orders_and_fills(self, timestamp: Optional[float] = None) -> List[RealMoneyFillRecord]:
+        """Reconcile active resting orders and fills against live CLOB open orders.
+
+        Queries the CLOB exchange /orders API for active orders.
+        Reconciles size_matched for resting orders, and emits authentic RealMoneyFillRecord
+        when matched size increases or an order leaves open orders without being explicitly canceled.
+        """
+        ts = timestamp or time.time()
+        new_fills: List[RealMoneyFillRecord] = []
+
+        try:
+            open_orders_list = self.clob_client.get_open_orders()
+        except Exception as e:
+            logger.error(f"Failed to fetch live open orders from CLOB: {e}")
+            return new_fills
+
+        # Map by order ID
+        open_orders_by_id: dict[str, dict[str, Any]] = {}
+        for ord_info in open_orders_list:
+            if isinstance(ord_info, dict):
+                oid = str(ord_info.get("orderID") or ord_info.get("id") or ord_info.get("order_id") or "")
+                if oid:
+                    open_orders_by_id[oid] = ord_info
+
+        # Reconcile each active quote in our engine
+        for qid, qdata in list(self.active_quotes.items()):
+            order_id = str(qdata.get("order_id", ""))
+            if not order_id:
+                continue
+
+            quote_sz = float(qdata.get("size", 0.0))
+            quote_px = float(qdata.get("price", 0.0))
+            side = str(qdata.get("side", "BUY")).upper()
+            tok = str(qdata.get("token_side", "YES")).upper()
+            prev_matched = float(qdata.get("size_matched", 0.0))
+
+            if order_id in open_orders_by_id:
+                # Order is still active on exchange
+                live_ord = open_orders_by_id[order_id]
+                current_matched = float(
+                    live_ord.get("size_matched", live_ord.get("matched_size", live_ord.get("sizeMatched", 0.0))) or 0.0
+                )
+                status = str(live_ord.get("status", "LIVE")).upper()
+
+                matched_delta = current_matched - prev_matched
+                if matched_delta > 0.0:
+                    fill_sz = min(matched_delta, max(0.0, quote_sz - prev_matched))
+                    fill_rec = RealMoneyFillRecord(
+                        fill_id=str(uuid.uuid4())[:8],
+                        timestamp=ts,
+                        condition_id=self.condition_id,
+                        token_side=tok,
+                        side=side,
+                        fill_price=quote_px,
+                        fill_size=fill_sz,
+                        is_maker=True,
+                        order_id=order_id,
+                        notes="Live CLOB maker fill synchronized from exchange open orders",
+                    )
+                    self.fills_history.append(fill_rec)
+                    new_fills.append(fill_rec)
+                    self._apply_fill(tok=tok, side=side, fill_sz=fill_sz, fill_px=quote_px)
+                    qdata["size_matched"] = current_matched
+
+                if current_matched >= quote_sz or status in ("FILLED", "MATCHED", "CLOSED"):
+                    # Order is completely filled
+                    self.active_quotes.pop(qid, None)
+
+            else:
+                # Order is no longer present in open orders on exchange
+                if order_id in self._canceled_order_ids:
+                    # Explicitly canceled by our engine
+                    self.active_quotes.pop(qid, None)
+                else:
+                    # Disappeared without cancellation: order was fully filled on CLOB!
+                    unfilled_sz = max(0.0, quote_sz - prev_matched)
+                    if unfilled_sz > 0.0:
+                        fill_rec = RealMoneyFillRecord(
+                            fill_id=str(uuid.uuid4())[:8],
+                            timestamp=ts,
+                            condition_id=self.condition_id,
+                            token_side=tok,
+                            side=side,
+                            fill_price=quote_px,
+                            fill_size=unfilled_sz,
+                            is_maker=True,
+                            order_id=order_id,
+                            notes="Live CLOB maker fill inferred from completed open order",
+                        )
+                        self.fills_history.append(fill_rec)
+                        new_fills.append(fill_rec)
+                        self._apply_fill(tok=tok, side=side, fill_sz=unfilled_sz, fill_px=quote_px)
+                    self.active_quotes.pop(qid, None)
+
+        if new_fills:
+            self.flush_ledger()
+
+        return new_fills
+
     def on_trade_update(
         self,
         token_side: str,
@@ -695,7 +890,34 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                 self.cancel_all_quotes()
             return
 
-        # Check if our active quote was crossed/filled
+        # Price jump circuit breaker check from public trades
+        asset_id = self.asset_id_yes if tok == "YES" else self.asset_id_no
+        jump, delta = self.risk_manager.volatility_monitor.record_price(
+            asset_id=asset_id,
+            condition_id=self.condition_id,
+            mid_price=trade_price,
+            timestamp=ts,
+        )
+        if jump:
+            self.risk_manager.trip_circuit_breaker(
+                reason=CircuitBreakerReason.VOLATILITY_SPIKE,
+                details=f"Price jump {delta:.2f}c exceeded threshold on {tok}",
+                condition_id=self.condition_id,
+                asset_id=asset_id,
+            )
+            self.cancel_all_quotes()
+            return
+
+        if not self.dry_run:
+            # IN LIVE REAL-MONEY MODE:
+            # Public market trades between third parties do NOT infer simulated fills on our resting orders!
+            # Resting maker quotes are queued in the CLOB order book; fills occur via exchange matching.
+            # Synchronize our authentic open orders and fills from the exchange:
+            self.sync_live_orders_and_fills(timestamp=ts)
+            return
+
+        # IN DRY-RUN / SIMULATED MODE ONLY:
+        # Check if our active quote was crossed/filled for testing harness
         for qid, qdata in list(self.active_quotes.items()):
             if qdata.get("token_side") == tok:
                 side = qdata.get("side")
@@ -718,31 +940,10 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                         fill_size=fill_sz,
                         is_maker=True,
                         order_id=qdata.get("order_id", ""),
-                        notes="Live CLOB maker fill matched against market trade",
+                        notes="Simulated maker fill matched against market trade (Dry-Run)",
                     )
                     self.fills_history.append(fill_rec)
-
-                    # Update inventory
-                    if side == "BUY":
-                        if tok == "YES":
-                            self.shares_yes += fill_sz
-                        else:
-                            self.shares_no += fill_sz
-                        self.cash -= fill_sz * q_px
-                    else:
-                        if tok == "YES":
-                            self.shares_yes = max(0.0, self.shares_yes - fill_sz)
-                        else:
-                            self.shares_no = max(0.0, self.shares_no - fill_sz)
-                        self.cash += fill_sz * q_px
-
-                    self.total_volume_traded_usd += fill_sz * q_px
-
-                    # Check CTF auto-merge
-                    pos = self.get_position(self.condition_id)
-                    if pos.complete_sets >= self.auto_merge_threshold:
-                        self.trigger_ctf_merge()
-
+                    self._apply_fill(tok=tok, side=side, fill_sz=fill_sz, fill_px=q_px)
                     self.evaluate_quotes(timestamp=ts)
                     self.flush_ledger()
 
@@ -807,6 +1008,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             "mode": "DRY_RUN" if self.dry_run else "REAL_MONEY",
             "portfolio": {
                 "cash": cash_val,
+                "total_wallet_balance": getattr(self, "total_wallet_balance", cash_val),
+                "budget_pct": getattr(self, "budget_pct", 1.0),
+                "trading_bankroll": getattr(self, "trading_bankroll", self.initial_cash),
                 "pol_balance": self.pol_balance,
                 "equity": equity_val,
                 "unrealized_pnl": equity_val - cash_val,
@@ -854,7 +1058,17 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         init_cash = max(1.0, self.initial_cash)
         nominal_apr = (daily_yield / init_cash) * 365.25 * 100.0
         r_daily = max(0.0, daily_yield / init_cash)
-        compounding_apr = (math.pow(1.0 + r_daily, 365.25) - 1.0) * 100.0 if r_daily > 0 else 0.0
+        try:
+            compounding_apr = (
+                (math.pow(1.0 + r_daily, 365.25) - 1.0) * 100.0
+                if (0.0 < r_daily <= 5.0)
+                else (99999.9 if r_daily > 5.0 else 0.0)
+            )
+        except (OverflowError, ValueError):
+            compounding_apr = 99999.9
+        total_wb = getattr(self, "total_wallet_balance", cash_val)
+        b_pct = getattr(self, "budget_pct", 1.0) * 100.0
+        t_bankroll = getattr(self, "trading_bankroll", self.initial_cash)
 
         return {
             "timestamp": time.time(),
@@ -862,6 +1076,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             "mode": "DRY_RUN" if self.dry_run else "REAL_MONEY",
             "equity": round(equity_val, 2),
             "cash": round(cash_val, 2),
+            "total_wallet_balance": round(total_wb, 2),
+            "budget_pct": round(b_pct, 1),
+            "trading_bankroll": round(t_bankroll, 2),
             "pol_balance": round(self.pol_balance, 4),
             "market_value": round(equity_val - cash_val, 2),
             "realized_pnl": round(pos.realized_pnl, 4),

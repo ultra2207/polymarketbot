@@ -247,7 +247,7 @@ def test_microstructure_integration_and_deskew_sizing(tmp_path):
     assert abs(state_toxic.ofi_10_events) > 850.0
 
 
-def test_dynamic_threshold_initialization_defaults():
+def test_dynamic_threshold_initialization_defaults(monkeypatch):
     """Verify JaneStreetMarketMaker defaults to dynamic threshold calculators when params are None."""
     from polymarketbot.rewards.deskew import DynamicThresholdCalculator
     from polymarketbot.rewards.microstructure import (
@@ -255,6 +255,8 @@ def test_dynamic_threshold_initialization_defaults():
         compute_dynamic_ofi_threshold,
     )
     from polymarketbot.trading.ctf import estimate_merge_cost_usd
+
+    monkeypatch.setattr("polymarketbot.simulator.institutional.estimate_merge_cost_usd", lambda *args, **kwargs: 0.0028)
 
     mm = JaneStreetMarketMaker(
         condition_id="0xdyn_init",
@@ -264,7 +266,7 @@ def test_dynamic_threshold_initialization_defaults():
 
     # 1. Dynamic gas fee
     assert mm._dynamic_gas_fee is True
-    assert mm.gas_fee_merge == pytest.approx(estimate_merge_cost_usd(), 1e-6)
+    assert mm.gas_fee_merge == pytest.approx(0.0028, 1e-6)
     assert mm.portfolio.gas_fee_merge == mm.gas_fee_merge
 
     # 2. Dynamic threshold calculator instantiated

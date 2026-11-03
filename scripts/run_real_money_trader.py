@@ -76,10 +76,22 @@ def parse_args() -> argparse.Namespace:
         help="Asset/Token ID for NO outcome (optional, auto-resolved if omitted).",
     )
     parser.add_argument(
+        "--budget-pct",
+        type=float,
+        default=1.0,
+        help="Fraction of total wallet balance to allocate for trading (e.g. 0.20 for 20%%, 1.0 for 100%%, default: 1.0).",
+    )
+    parser.add_argument(
+        "--max-budget",
+        type=float,
+        default=None,
+        help="Absolute ceiling in USD to allocate for trading bankroll (e.g. 70.0, default: None).",
+    )
+    parser.add_argument(
         "--initial-cash",
         type=float,
         default=100.0,
-        help="Initial reference cash balance in USD (default: $100.00).",
+        help="Fallback reference cash balance in USD for dry-run or unconfigured balance (default: $100.00).",
     )
     parser.add_argument(
         "--quote-size",
@@ -365,11 +377,20 @@ def render_dashboard(
     lines.append(f"{C_DIM}Tokens:{C_RESET} YES: {market_info['token_yes'][:18]}... | NO: {market_info['token_no'][:18]}...")
     lines.append(f"{C_CYAN}----------------------------------------------------------------------------------------{C_RESET}")
 
+    total_wallet = t.get("total_wallet_balance", t["cash"])
+    budget_pct_val = t.get("budget_pct", 100.0)
+    bankroll_val = t.get("trading_bankroll", engine.initial_cash)
+
     lines.append(f"{C_BOLD}[WALLET & BALANCES] LIVE WALLET & CLOB ACCOUNTING{C_RESET}")
     lines.append(
-        f"  {C_BOLD}USDC Balance:{C_RESET}   {equity_color}${t['cash']:>8.2f}{C_RESET}    "
-        f"{C_BOLD}POL Gas Balance:{C_RESET}{t['pol_balance']:>8.4f} POL  "
-        f"{C_BOLD}Total Equity:{C_RESET}   {equity_color}${t['equity']:>8.2f}{C_RESET}"
+        f"  {C_BOLD}Total Wallet:{C_RESET}   ${total_wallet:>8.2f}    "
+        f"{C_BOLD}Budget % Alloc:{C_RESET}  {budget_pct_val:>5.1f}%     "
+        f"{C_BOLD}Trading Bankroll:{C_RESET} ${bankroll_val:>8.2f}"
+    )
+    lines.append(
+        f"  {C_BOLD}Active Cash:{C_RESET}    {equity_color}${t['cash']:>8.2f}{C_RESET}    "
+        f"{C_BOLD}POL Gas Balance:{C_RESET} {t['pol_balance']:>8.4f} POL "
+        f"{C_BOLD}Total Equity:{C_RESET}     {equity_color}${t['equity']:>8.2f}{C_RESET}"
     )
     lines.append(
         f"  {C_BOLD}Shares YES:{C_RESET}     {t['shares_yes']:>8.2f}    "
@@ -478,13 +499,75 @@ def render_dashboard(
 
 async def run_real_money_trader_async(args: argparse.Namespace) -> int:
     """Async main execution loop for Polymarket Real-Money Trading Engine."""
+    # Initialize credentials and clients first to discover live wallet balances
+    creds = ClobAuthCredentials.from_env()
+    dry_run = args.dry_run if args.dry_run is not None else (not creds.is_configured)
+
+    clob_client = LiveClobClient(
+        credentials=creds,
+        dry_run=dry_run,
+    )
+    ctf_client = PolygonCtfClient(
+        rpc_url=args.rpc_url,
+        private_key=creds.private_key,
+        dry_run=dry_run,
+    )
+
+    # Discover live balances from CLOB accounting and on-chain Polygon CTF USDC
+    clob_bal = 0.0
+    try:
+        bal_dict = clob_client.get_balance()
+        if bal_dict and bal_dict.get("available") is not None:
+            clob_bal = float(bal_dict["available"])
+    except Exception as e:
+        log.warning(f"Could not fetch CLOB balance: {e}")
+
+    onchain_bal = 0.0
+    wallet_addr = clob_client.address or getattr(creds, "address", "")
+    if wallet_addr:
+        try:
+            onchain_bal = ctf_client.get_usdc_balance(wallet_addr)
+        except Exception as e:
+            log.warning(f"Could not fetch on-chain USDC balance: {e}")
+
+    live_balance = max(clob_bal, onchain_bal)
+
+    # Normalize budget percentage (supports 0.20 or 20.0 for 20%)
+    raw_b_pct = float(args.budget_pct)
+    if raw_b_pct > 1.0:
+        raw_b_pct = raw_b_pct / 100.0
+    budget_pct = max(0.01, min(1.0, raw_b_pct))
+    max_budget = float(args.max_budget) if args.max_budget is not None else None
+
+    # Calculate dynamic trading bankroll with fallback to --initial-cash
+    if live_balance > 0.0 and (not dry_run or creds.is_configured):
+        total_wallet = live_balance
+    else:
+        # Fallback reference cash in dry-run or when balance is $0 / credentials unconfigured
+        total_wallet = float(args.initial_cash)
+
+    trading_bankroll = total_wallet * budget_pct
+    if max_budget is not None and max_budget > 0:
+        trading_bankroll = min(trading_bankroll, max_budget)
+    trading_bankroll = round(trading_bankroll, 2)
+
+    isolated_cash = max(0.0, total_wallet - trading_bankroll)
+    budget_disp = budget_pct * 100.0
+    budget_pct_str = f"{budget_disp:.0f}%" if budget_disp.is_integer() else f"{budget_disp:.1f}%"
+
+    log.info(
+        f"[LIVE BUDGET ALLOCATION] Live Wallet Balance: ${total_wallet:.2f} USDC | "
+        f"Budget: {budget_pct_str} -> Allocated Trading Bankroll: ${trading_bankroll:.2f} USDC "
+        f"(Safely isolated: ${isolated_cash:.2f} USDC)"
+    )
+
     feed = LivePolymarketFeed(fallback_poll_interval=2.0)
     market = resolve_market_details(
         feed=feed,
         requested_cid=args.condition_id,
         requested_yes=args.token_yes,
         requested_no=args.token_no,
-        initial_cash=args.initial_cash,
+        initial_cash=trading_bankroll,
     )
 
     daily_rew = args.daily_reward if args.daily_reward is not None else market["daily_reward"]
@@ -497,7 +580,7 @@ async def run_real_money_trader_async(args: argparse.Namespace) -> int:
         quote_sz = args.quote_size
     else:
         quote_sz = derive_quote_size(
-            initial_cash=args.initial_cash,
+            initial_cash=trading_bankroll,
             mid_price=market["mid_price"],
             min_size=min_sz,
         )
@@ -515,27 +598,16 @@ async def run_real_money_trader_async(args: argparse.Namespace) -> int:
             category=market.get("category", "default"),
         )
 
-    # Initialize clients
-    creds = ClobAuthCredentials.from_env()
-    dry_run = args.dry_run if args.dry_run is not None else (not creds.is_configured)
-
-    clob_client = LiveClobClient(
-        credentials=creds,
-        dry_run=dry_run,
-    )
-    ctf_client = PolygonCtfClient(
-        rpc_url=args.rpc_url,
-        private_key=creds.private_key,
-        dry_run=dry_run,
-    )
-
     engine = RealMoneyTradingEngine(
         condition_id=market["condition_id"],
         asset_id_yes=market["token_yes"],
         asset_id_no=market["token_no"],
         clob_client=clob_client,
         ctf_client=ctf_client,
-        initial_cash=args.initial_cash,
+        initial_cash=trading_bankroll,
+        total_wallet_balance=total_wallet,
+        budget_pct=budget_pct,
+        max_budget=max_budget,
         quote_size=quote_sz,
         spread_offset_cents=spread_off,
         daily_reward_rate=daily_rew,
@@ -595,6 +667,7 @@ async def run_real_money_trader_async(args: argparse.Namespace) -> int:
 
     start_time = time.time()
     last_epoch_check = time.time()
+    last_sync_time = 0.0
     last_render_time = 0.0
     running = True
 
@@ -619,6 +692,12 @@ async def run_real_money_trader_async(args: argparse.Namespace) -> int:
                 log.info(f"Target duration of {args.duration:.1f}s reached.")
                 break
 
+            # Periodic open order & fill reconciliation and live balance sync (every 5 seconds)
+            if now - last_sync_time >= 5.0:
+                engine.sync_live_orders_and_fills(timestamp=now)
+                engine.sync_live_balances()
+                last_sync_time = now
+
             # 60s reward sampling epoch
             if now - last_epoch_check >= 60.0:
                 engine.process_reward_epoch(timestamp=now)
@@ -639,10 +718,10 @@ async def run_real_money_trader_async(args: argparse.Namespace) -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutdown requested by operator or system interrupt.")
     finally:
+        await feed.stop()
         engine.cancel_all_quotes()
         engine.flush_ledger()
         engine.close()
-        await feed.stop()
         log.info("Real-Money Trading Engine safely shut down.")
 
     return 0

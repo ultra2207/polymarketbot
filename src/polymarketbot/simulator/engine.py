@@ -1792,7 +1792,14 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         init_cash = max(1.0, self.portfolio.initial_cash)
         nominal_apr = (daily_yield / init_cash) * 365.25 * 100.0
         r_daily = max(0.0, daily_yield / init_cash)
-        compounding_apr = (math.pow(1.0 + r_daily, 365.25) - 1.0) * 100.0 if r_daily > 0 else 0.0
+        try:
+            compounding_apr = (
+                (math.pow(1.0 + r_daily, 365.25) - 1.0) * 100.0
+                if (0.0 < r_daily <= 5.0)
+                else (99999.9 if r_daily > 5.0 else 0.0)
+            )
+        except (OverflowError, ValueError):
+            compounding_apr = 99999.9
 
         return {
             "timestamp": time.time(),

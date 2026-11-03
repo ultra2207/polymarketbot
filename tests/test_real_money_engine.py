@@ -977,3 +977,375 @@ def test_order_book_levels_dataclass_ingestion():
             engine.close()
 
 
+def test_live_vs_dry_run_trade_update_fill_behavior():
+    """Verify on_trade_update does NOT infer simulated fills in live mode, but retains them in dry-run mode."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "test_trading.db"
+        ledger_path = Path(tmpdir) / "test_ledger.json"
+
+        # --- 1. Dry Run Mode ---
+        clob_dry = LiveClobClient(dry_run=True)
+        ctf_dry = PolygonCtfClient(dry_run=True)
+        with patch.object(ctf_dry, "get_dynamic_gas_price_gwei", return_value=40.0), \
+             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+            engine_dry = RealMoneyTradingEngine(
+                condition_id="0xTEST_DRY",
+                clob_client=clob_dry,
+                ctf_client=ctf_dry,
+                initial_cash=100.0,
+                quote_size=20.0,
+                db_path=db_path,
+                ledger_path=ledger_path,
+                dry_run=True,
+            )
+
+        try:
+            # Place resting quote
+            engine_dry.on_book_update("YES", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}])
+            assert len(engine_dry.active_quotes) > 0
+
+            # Public trade crossing our bid price at 0.48
+            engine_dry.on_trade_update("YES", trade_price=0.48, trade_size=10.0, trade_side="SELL")
+            # In dry run, simulated fill MUST be recorded
+            assert len(engine_dry.fills_history) == 1
+            assert engine_dry.shares_yes == 10.0
+        finally:
+            engine_dry.close()
+
+        # --- 2. Live Mode (dry_run=False) ---
+        clob_live = LiveClobClient(
+            credentials=ClobAuthCredentials(
+                api_key="12345678-1234-4234-8234-123456789abc",
+                api_secret="dGVzdF9zZWNyZXQ=",
+                passphrase="valid_passphrase",
+                private_key=SAMPLE_PRIVATE_KEY,
+            ),
+            dry_run=False,
+        )
+        ctf_live = PolygonCtfClient(private_key=SAMPLE_PRIVATE_KEY, dry_run=False)
+
+        with patch.object(ctf_live, "get_dynamic_gas_price_gwei", return_value=40.0), \
+             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
+             patch.object(clob_live, "get_allowances", return_value={"approved": True}), \
+             patch.object(clob_live, "get_balance", return_value={"available": 100.0}), \
+             patch.object(clob_live, "get_total_rewards", return_value={}), \
+             patch.object(clob_live, "get_daily_rewards", return_value={}), \
+             patch.object(ctf_live.chain_client, "block_number", return_value=12345678), \
+             patch.object(clob_live, "place_order") as mock_place, \
+             patch.object(clob_live, "get_open_orders") as mock_open:
+            
+            from polymarketbot.trading.client import OrderPlacementResult
+            mock_place.return_value = OrderPlacementResult(
+                success=True,
+                order_id="live_order_123",
+                status="LIVE",
+                side="BUY",
+                price=0.49,
+                size=20.0,
+                is_dry_run=False,
+            )
+            # The resting order remains open on the exchange with 0 matched size
+            mock_open.return_value = [
+                {"orderID": "live_order_123", "size_matched": 0.0, "status": "LIVE"}
+            ]
+
+            engine_live = RealMoneyTradingEngine(
+                condition_id="0xTEST_LIVE",
+                clob_client=clob_live,
+                ctf_client=ctf_live,
+                initial_cash=100.0,
+                quote_size=20.0,
+                db_path=Path(tmpdir) / "live_trading.db",
+                ledger_path=Path(tmpdir) / "live_ledger.json",
+                dry_run=False,
+            )
+
+            try:
+                assert engine_live.dry_run is False
+                # Place live quote
+                engine_live.on_book_update("YES", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}])
+                assert "BUY_YES" in engine_live.active_quotes
+
+                # Public trade crosses at 0.48. In LIVE mode, this MUST NOT produce a simulated fill!
+                # It only triggers sync_live_orders_and_fills() and updates heartbeat/monitors.
+                # Since the exchange still reports our order as LIVE with 0 matched, fills_history remains empty.
+                engine_live.on_trade_update("YES", trade_price=0.48, trade_size=10.0, trade_side="SELL")
+                assert len(engine_live.fills_history) == 0
+                assert engine_live.shares_yes == 0.0
+            finally:
+                engine_live.close()
+
+
+def test_sync_live_orders_and_fills_partial_and_full():
+    """Verify sync_live_orders_and_fills accurately reconciles partial and full fills from CLOB."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clob = LiveClobClient(dry_run=True)
+        ctf = PolygonCtfClient(dry_run=True)
+
+        with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
+             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+            engine = RealMoneyTradingEngine(
+                condition_id="0xTEST_SYNC",
+                clob_client=clob,
+                ctf_client=ctf,
+                initial_cash=100.0,
+                quote_size=20.0,
+                db_path=Path(tmpdir) / "sync_trading.db",
+                ledger_path=Path(tmpdir) / "sync_ledger.json",
+                dry_run=True,
+            )
+
+        try:
+            # Place resting quote
+            engine.on_book_update("YES", bids=[{"price": 0.50, "size": 20.0}], asks=[{"price": 0.52, "size": 20.0}])
+            qid = "BUY_YES"
+            assert qid in engine.active_quotes
+            order_id = engine.active_quotes[qid]["order_id"]
+            quote_px = engine.active_quotes[qid]["price"]
+            no_oid = engine.active_quotes.get("BUY_NO", {}).get("order_id", "")
+
+            # Scenario 1: Partial fill on exchange (8.0 shares matched of YES; NO remains open)
+            open_list = [{"orderID": order_id, "size_matched": 8.0, "status": "LIVE"}]
+            if no_oid:
+                open_list.append({"orderID": no_oid, "size_matched": 0.0, "status": "LIVE"})
+
+            with patch.object(clob, "get_open_orders", return_value=open_list):
+                new_fills = engine.sync_live_orders_and_fills()
+                assert len(new_fills) == 1
+                assert new_fills[0].token_side == "YES"
+                assert new_fills[0].fill_size == 8.0
+                assert abs(new_fills[0].fill_price - quote_px) < 1e-4
+                assert engine.shares_yes == 8.0
+                assert abs(engine.cash - (100.0 - (8.0 * quote_px))) < 1e-4
+                assert engine.active_quotes[qid]["size_matched"] == 8.0
+
+            # Scenario 2: YES order disappears from open orders without cancellation -> full fill of remainder (12.0 shares)
+            open_list_2 = []
+            if no_oid:
+                open_list_2.append({"orderID": no_oid, "size_matched": 0.0, "status": "LIVE"})
+
+            with patch.object(clob, "get_open_orders", return_value=open_list_2):
+                new_fills2 = engine.sync_live_orders_and_fills()
+                assert len(new_fills2) == 1
+                assert new_fills2[0].token_side == "YES"
+                assert new_fills2[0].fill_size == 12.0
+                assert engine.shares_yes == 20.0
+                assert abs(engine.cash - (100.0 - (20.0 * quote_px))) < 1e-4
+                assert qid not in engine.active_quotes
+
+            # Scenario 3: Explicit cancellation does NOT emit fill
+            engine.on_book_update("YES", bids=[{"price": 0.50, "size": 20.0}], asks=[{"price": 0.52, "size": 20.0}])
+            assert qid in engine.active_quotes
+            canceled_oid = engine.active_quotes[qid]["order_id"]
+            engine._cancel_quote(qid)
+            assert canceled_oid in engine._canceled_order_ids
+
+            # Cancel any other remaining quotes
+            for rem_qid in list(engine.active_quotes.keys()):
+                engine._cancel_quote(rem_qid)
+
+            with patch.object(clob, "get_open_orders", return_value=[]):
+                new_fills3 = engine.sync_live_orders_and_fills()
+                assert len(new_fills3) == 0
+        finally:
+            engine.close()
+
+
+def test_safe_ctf_merge_complete_set_verification():
+    """Verify trigger_ctf_merge safely verifies held complete sets before executing."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clob = LiveClobClient(dry_run=True)
+        ctf = PolygonCtfClient(dry_run=True)
+
+        with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
+             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
+             patch.object(ctf, "merge_positions") as mock_merge:
+
+            mock_merge.return_value = MergeExecutionResult(
+                success=True,
+                tx_hash="0xmock_merge_tx",
+                condition_id="0xTEST_MERGE",
+                complete_sets_merged=10.0,
+                usdc_unlocked=10.0,
+                gas_fee_usd=0.015,
+                gas_units_used=78000,
+                is_dry_run=True,
+            )
+
+            engine = RealMoneyTradingEngine(
+                condition_id="0xTEST_MERGE",
+                clob_client=clob,
+                ctf_client=ctf,
+                initial_cash=100.0,
+                auto_merge_threshold=10.0,
+                db_path=Path(tmpdir) / "merge_trading.db",
+                ledger_path=Path(tmpdir) / "merge_ledger.json",
+                dry_run=True,
+            )
+
+            try:
+                # Case 1: No complete sets (YES=15, NO=0)
+                engine.shares_yes = 15.0
+                engine.shares_no = 0.0
+                res = engine.trigger_ctf_merge()
+                assert res is None
+                mock_merge.assert_not_called()
+
+                # Case 2: Complete sets available (YES=10, NO=10)
+                engine.shares_no = 10.0
+                res2 = engine.trigger_ctf_merge()
+                assert res2 is not None
+                mock_merge.assert_called_once_with(condition_id="0xTEST_MERGE", amount_shares=10.0)
+
+                # Case 3: Requested amount_sets exceeds available complete sets -> clamped safely
+                mock_merge.reset_mock()
+                engine.shares_yes = 5.0
+                engine.shares_no = 5.0
+                mock_merge.return_value.complete_sets_merged = 5.0
+                mock_merge.return_value.usdc_unlocked = 5.0
+
+                res3 = engine.trigger_ctf_merge(amount_sets=25.0)  # requested 25, only 5 available
+                assert res3 is not None
+                mock_merge.assert_called_once_with(condition_id="0xTEST_MERGE", amount_shares=5.0)
+            finally:
+                engine.close()
+
+
+def test_sync_live_balances_and_alias():
+    """Verify sync_live_balances queries CLOB & CTF balances and sync_balances aliases it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clob = LiveClobClient(dry_run=True)
+        ctf = PolygonCtfClient(dry_run=True)
+
+        with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
+             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+            engine = RealMoneyTradingEngine(
+                condition_id="0xTEST_BAL",
+                clob_client=clob,
+                ctf_client=ctf,
+                initial_cash=50.0,
+                db_path=Path(tmpdir) / "bal_trading.db",
+                ledger_path=Path(tmpdir) / "bal_ledger.json",
+                dry_run=True,
+            )
+
+        try:
+            with patch.object(clob, "get_balance", return_value={"available": 250.0}), \
+                 patch.object(ctf, "get_pol_balance", return_value=1.85), \
+                 patch.object(ctf, "get_usdc_balance", return_value=250.0):
+                
+                bals = engine.sync_live_balances()
+                assert bals["cash"] == 250.0
+                assert bals["pol"] == 1.85
+                assert engine.cash == 250.0
+                assert engine.pol_balance == 1.85
+
+                # Verify alias
+                engine.cash = 0.0
+                engine.sync_balances()
+                assert engine.cash == 250.0
+        finally:
+            engine.close()
+
+
+def test_dynamic_budget_percentage_allocation_and_isolation():
+    """Verify dynamic budget percentage sizing isolates remaining balance and bounds trading bankroll."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        clob = LiveClobClient(dry_run=True)
+        ctf = PolygonCtfClient(dry_run=True)
+
+        with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
+             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+
+            # Case 1: 20% budget of $1,000 wallet with $70 cap -> bankroll capped at $70.00
+            engine = RealMoneyTradingEngine(
+                condition_id="0xTEST_BUDGET",
+                clob_client=clob,
+                ctf_client=ctf,
+                initial_cash=70.0,
+                total_wallet_balance=1000.0,
+                budget_pct=0.20,
+                max_budget=70.0,
+                db_path=Path(tmpdir) / "budget_trading.db",
+                ledger_path=Path(tmpdir) / "budget_ledger.json",
+                dry_run=True,
+            )
+
+            try:
+                assert engine.total_wallet_balance == 1000.0
+                assert engine.budget_pct == 0.20
+                assert engine.max_budget == 70.0
+                assert engine.cash == 70.0
+                assert engine.isolated_cash == 930.0
+
+                t = engine.get_telemetry()
+                assert t["total_wallet_balance"] == 1000.0
+                assert t["budget_pct"] == 20.0
+                assert t["trading_bankroll"] == 70.0
+                assert t["cash"] == 70.0
+
+                # Sync balances with $1200 discovered wallet balance
+                with patch.object(clob, "get_balance", return_value={"available": 1200.0}):
+                    engine.sync_balances()
+                    # 20% of $1200 is $240, but capped by max_budget at $70.00
+                    assert engine.total_wallet_balance == 1200.0
+                    assert engine.cash == 70.0
+            finally:
+                engine.close()
+
+            # Case 2: 25% budget of $400 wallet without cap -> bankroll is $100.00
+            engine2 = RealMoneyTradingEngine(
+                condition_id="0xTEST_BUDGET2",
+                clob_client=clob,
+                ctf_client=ctf,
+                initial_cash=100.0,
+                total_wallet_balance=400.0,
+                budget_pct=0.25,
+                max_budget=None,
+                db_path=Path(tmpdir) / "budget_trading2.db",
+                ledger_path=Path(tmpdir) / "budget_ledger2.json",
+                dry_run=True,
+            )
+
+            try:
+                assert engine2.total_wallet_balance == 400.0
+                assert engine2.budget_pct == 0.25
+                assert engine2.cash == 100.0
+                assert engine2.isolated_cash == 300.0
+
+                # Sync balances when wallet is $500
+                with patch.object(clob, "get_balance", return_value={"available": 500.0}):
+                    engine2.sync_balances()
+                    # 25% of $500 = $125.00
+                    assert engine2.total_wallet_balance == 500.0
+                    assert engine2.cash == 125.0
+            finally:
+                engine2.close()
+
+
+def test_real_money_trader_cli_budget_args():
+    """Verify CLI argument parsing and normalization for --budget-pct and --max-budget."""
+    import sys
+    scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import run_real_money_trader
+    parse_args = run_real_money_trader.parse_args
+
+    test_args = ["run_real_money_trader.py", "--budget-pct", "0.20", "--max-budget", "70.0", "--initial-cash", "50.0"]
+    with patch.object(sys, "argv", test_args):
+        args = parse_args()
+        assert args.budget_pct == 0.20
+        assert args.max_budget == 70.0
+        assert args.initial_cash == 50.0
+
+    # Test defaults
+    with patch.object(sys, "argv", ["run_real_money_trader.py"]):
+        args_default = parse_args()
+        assert args_default.budget_pct == 1.0
+        assert args_default.max_budget is None
+        assert args_default.initial_cash == 100.0
+
+
+
+
