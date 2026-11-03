@@ -33,11 +33,14 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
+
+from polymarketbot.logs import get_logger
+
+logger = get_logger("chain")
 
 # Ordered fallbacks. The first is the only one verified to serve historical
 # eth_getLogs on a free tier.
@@ -163,6 +166,6 @@ class ChainClient:
                 self.chunk //= 2
                 continue
             if progress:
-                print(f"  blocks {start:,}-{end:,}  logs so far {len(out):,}")
+                logger.info(f"  blocks {start:,}-{end:,}  logs so far {len(out):,}")
             start = end + 1
         return out
