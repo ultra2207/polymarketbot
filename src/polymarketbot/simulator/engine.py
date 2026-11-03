@@ -21,18 +21,34 @@ import os
 import sqlite3
 import time
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from polymarketbot.logs import get_logger
+from polymarketbot.rewards.allocator import (
+    ContinuousOptimizationGovernor,
+    GovernorAction,
+)
 from polymarketbot.rewards.deskew import (
     DeSkewDecision,
     DeSkewPathway,
     DynamicDeSkewOptimizer,
 )
-from polymarketbot.rewards.microstructure import MicrostructureEngine
+from polymarketbot.rewards.microstructure import (
+    MicrostructureEngine,
+    compute_dynamic_cooldown_duration,
+    compute_dynamic_volatility_breaker_threshold,
+)
+from polymarketbot.rewards.queue_valuation import (
+    CapitalMigrationEngine,
+    HurdleDecision,
+    LiquidationRoute,
+    SwitchingCostDecomposition,
+)
 from polymarketbot.rewards.scoring import quadratic_order_score
+from polymarketbot.trading.base import BaseMarketMakingEngine
 from polymarketbot.simulator.book import (
     DepthInfo,
     SyntheticOrderBook,
@@ -131,7 +147,7 @@ class OrderMatcherBridge:
 # Native Paper Trading Engine
 # ---------------------------------------------------------------------------
 
-class NativePaperTradingEngine:
+class NativePaperTradingEngine(BaseMarketMakingEngine):
     """Production Polymarket paper trading orchestrator and execution simulator."""
 
     def __init__(
@@ -145,39 +161,42 @@ class NativePaperTradingEngine:
         daily_reward_rate: float = 20.0,
         rewards_max_spread_cents: float = 1.0,
         rewards_min_size: float = 20.0,
-        auto_merge_threshold: float = 10.0,
-        gas_fee_merge: float = 0.015,
+        auto_merge_threshold: Optional[float] = None,
+        gas_fee_merge: Optional[float] = None,
         institutional_mode: bool = True,
         gamma: float = 0.02,
         competing_score_override: Optional[float] = None,
         db_path: Union[str, Path] = "data/native_paper_trading.db",
         ledger_path: Union[str, Path] = "data/native_paper_trading_ledger.json",
         deskew_optimizer: Optional[DynamicDeSkewOptimizer] = None,
+        migration_engine: Optional[CapitalMigrationEngine] = None,
+        governor: Optional[ContinuousOptimizationGovernor] = None,
     ) -> None:
-        self.condition_id = condition_id
-        self.asset_id_yes = asset_id_yes
-        self.asset_id_no = asset_id_no
-        self.quote_size = float(quote_size)
-        self.spread_offset_cents = float(spread_offset_cents)
-        self.daily_reward_rate = float(daily_reward_rate)
-        self.rewards_max_spread = float(rewards_max_spread_cents)
-        self.rewards_min_size = float(rewards_min_size)
-        self.auto_merge_threshold = float(auto_merge_threshold)
-        self.gas_fee_merge = float(gas_fee_merge)
-        self.institutional_mode = bool(institutional_mode)
-        self.gamma = float(gamma)
-        self.competing_score_override = float(competing_score_override) if competing_score_override is not None else None
-
-        # Paths
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.ledger_path = Path(ledger_path)
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(
+            condition_id=condition_id,
+            asset_id_yes=asset_id_yes,
+            asset_id_no=asset_id_no,
+            quote_size=quote_size,
+            spread_offset_cents=spread_offset_cents,
+            daily_reward_rate=daily_reward_rate,
+            rewards_max_spread_cents=rewards_max_spread_cents,
+            rewards_min_size=rewards_min_size,
+            auto_merge_threshold=auto_merge_threshold,
+            gas_fee_merge=gas_fee_merge,
+            institutional_mode=institutional_mode,
+            gamma=gamma,
+            competing_score_override=competing_score_override,
+            db_path=db_path,
+            ledger_path=ledger_path,
+            deskew_optimizer=deskew_optimizer,
+            migration_engine=migration_engine,
+            governor=governor,
+        )
 
         # Core Simulator Modules
         self.portfolio = SimulatedPortfolio(
             initial_cash=initial_cash,
-            gas_fee_merge=gas_fee_merge,
+            gas_fee_merge=self.gas_fee_merge,
             taker_fee_bps=0.0,  # 0 bps default on Polymarket binary contracts
         )
         self.book_yes = SyntheticOrderBook(asset_id=asset_id_yes)
@@ -186,46 +205,75 @@ class NativePaperTradingEngine:
         self.impact_no = MarketImpactEngine(book=self.book_no)
         self.matcher = OrderMatcherBridge(condition_id=self.condition_id)
 
-        # 2-Tier Dynamic De-Skew Optimizer
-        self.deskew_optimizer = deskew_optimizer or DynamicDeSkewOptimizer(
-            gamma=0.02,
-            gas_cost_merge_usd=self.gas_fee_merge,
-            q_soft_threshold=15.0,
-            q_hard_threshold=100.0,
-            max_holding_seconds=300.0,
-        )
+        if self.condition_id not in self.governor.current_allocations:
+            init_reserve_pct = getattr(self.governor.allocator, "reserve_pct", 0.25)
+            self.governor.current_allocations[self.condition_id] = self.portfolio.cash * (1.0 - init_reserve_pct)
 
-        # Microstructure Sentinels for OFI & Micro-Price Drift
-        self.microstructure_yes = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
-        self.microstructure_no = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
-
-        # Virtual Maker Quote Registry: quote_id -> dict
-        self.active_quotes: Dict[str, dict[str, Any]] = {}
-
-        # Epoch & Telemetry State
-        self.epoch_index: int = 0
-        self.last_epoch_ts: float = time.time()
-        self.total_rewards_credited: float = 0.0
-        self.latest_deskew_decision: Optional[DeSkewDecision] = None
         self.fills_history: List[FillRecord] = []
         self.merges_history: List[MergeResult] = []
         self.splits_history: List[SplitResult] = []
-
-        # SQLite Connection
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._init_sqlite()
+        self._last_toxicity_log_time: float = 0.0
 
         log.info(
             f"NativePaperTradingEngine initialized for condition {self.condition_id[:12]}... "
             f"Initial Cash: ${initial_cash:.2f} | DB: {self.db_path}"
         )
 
+
+    @property
+    def fills_count(self) -> int:
+        return len(self.fills_history)
+
+    def get_cash(self) -> float:
+        return self.portfolio.cash
+
+    def get_position(self, condition_id: Optional[str] = None):
+        return self.portfolio.get_position(condition_id or self.condition_id)
+
+    def get_equity(self, prices: Optional[dict[str, tuple[float, float]]] = None) -> float:
+        marks = prices or {
+            self.condition_id: (
+                self.book_yes.mid_price or 0.50,
+                self.book_no.mid_price or 0.50,
+            )
+        }
+        return self.portfolio.get_equity(marks)
+
+    def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
+        book = self.book_yes if token_side.upper() == "YES" else self.book_no
+        b = book.best_bid_real or 0.49
+        a = book.best_ask_real or 0.51
+        return b, a
+
+    def credit_reward(self, amount: float, condition_id: str, note: str = "") -> None:
+        self.portfolio.credit_reward(amount, condition_id=condition_id, note=note)
+
+    def _set_quote(
+        self,
+        token_side: str,
+        quote_side: str,
+        price: float,
+        size: float,
+        ts: float,
+    ) -> None:
+        self._set_virtual_quote(token_side, quote_side, price, size, ts)
+
+    def _cancel_quote(self, qid: str) -> None:
+        self._cancel_virtual_quote(qid)
+
+    def cancel_all_quotes(self) -> None:
+        self.cancel_all_virtual_quotes()
+
     # -------------------------------------------------------------------------
     # Database Initialization & Persistence
     # -------------------------------------------------------------------------
 
     def _init_sqlite(self) -> None:
-        """Create high-performance SQLite schema with WAL journal mode."""
+        """Backward-compatible alias for _init_db."""
+        self._init_db()
+
+    def _init_db(self) -> None:
+        """Create high-performance SQLite schema with WAL journal mode and indices."""
         cur = self._conn.cursor()
         cur.execute("PRAGMA journal_mode = WAL;")
         cur.execute("PRAGMA synchronous = NORMAL;")
@@ -354,6 +402,26 @@ class NativePaperTradingEngine:
                 reason TEXT NOT NULL
             );
         """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_migrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                from_condition_id TEXT NOT NULL,
+                to_condition_id TEXT NOT NULL,
+                delta_yield_daily REAL NOT NULL,
+                switching_cost REAL NOT NULL,
+                net_alpha_holding REAL NOT NULL,
+                unlocked_cash REAL NOT NULL,
+                reason TEXT NOT NULL
+            );
+        """)
+
+        # Indexes for high-frequency queries and monitoring
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reward_epochs_ts ON reward_epochs(timestamp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_positions_cond ON positions(condition_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_migrations_ts ON market_migrations(timestamp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_deskew_ts ON deskew_events(timestamp);")
 
         self._conn.commit()
 
@@ -495,6 +563,89 @@ class NativePaperTradingEngine:
     # Quoting Logic & 2-Tier De-Skewing Execution
     # -------------------------------------------------------------------------
 
+    @property
+    def is_volatility_cooldown_active(self) -> bool:
+        """Check if volatility cooldown is currently active."""
+        if self._rolling_price_ticks:
+            latest_tick_ts = self._rolling_price_ticks[-1][0]
+            if latest_tick_ts < 1e8:  # Simulated relative timestamp
+                return latest_tick_ts < self._volatility_cooldown_until
+        return time.time() < self._volatility_cooldown_until
+
+    @property
+    def volatility_cooldown_until(self) -> float:
+        """Timestamp until which volatility cooldown remains active."""
+        return self._volatility_cooldown_until
+
+    def _check_volatility_breaker(self, mid_yes: float, ts: Optional[float] = None) -> bool:
+        """Track rolling price ticks in _check_volatility_breaker(mid_yes, ts).
+
+        If mid-price jumps by > 2.0c within 60s, cancel active virtual quotes and enter a 300s cooldown.
+
+        Args:
+            mid_yes: Current YES token midpoint price.
+            ts: Optional timestamp of the observation.
+
+        Returns:
+            True if volatility breaker triggered or cooldown currently active, False otherwise.
+        """
+        now = ts if ts is not None else time.time()
+
+        # 1. If currently in cooldown, cancel/suppress quotes and return True
+        if now < self._volatility_cooldown_until:
+            if self.active_quotes:
+                self.cancel_all_virtual_quotes()
+            # Throttle repetitive logging to once every 5.0 seconds
+            if now - self._last_cooldown_log_time >= 5.0:
+                self._last_cooldown_log_time = now
+                log.warning(
+                    f"[ASYMMETRIC TOXICITY DEFENSE] Volatility cooldown active for condition {self.condition_id} "
+                    f"({self._volatility_cooldown_until - now:.1f}s remaining). Virtual quotes cancelled/suppressed."
+                )
+            return True
+
+        # 2. Prune rolling price ticks older than 60 seconds
+        cutoff = now - 60.0
+        while self._rolling_price_ticks and self._rolling_price_ticks[0][0] < cutoff:
+            self._rolling_price_ticks.popleft()
+
+        # 3. Add current tick (avoid appending redundant duplicate tick with same timestamp and price)
+        if not (self._rolling_price_ticks and self._rolling_price_ticks[-1] == (now, float(mid_yes))):
+            self._rolling_price_ticks.append((now, float(mid_yes)))
+
+        # 4. Check price jump within the 60s window
+        prices = [p for _, p in self._rolling_price_ticks]
+        max_px = max(prices)
+        min_px = min(prices)
+        jump_cents = (max_px - min_px) * 100.0
+
+        if self.price_jump_threshold_cents is not None:
+            dyn_thresh = self.price_jump_threshold_cents
+        else:
+            dyn_thresh = compute_dynamic_volatility_breaker_threshold(mid_price=float(mid_yes), spread_cents=1.0)
+
+        if jump_cents > dyn_thresh:
+            if self.cooldown_duration_seconds is not None:
+                cooldown_dur = self.cooldown_duration_seconds
+            else:
+                cooldown_dur = compute_dynamic_cooldown_duration(
+                    jump_cents_observed=jump_cents,
+                    breaker_threshold_cents=dyn_thresh,
+                )
+            self._volatility_cooldown_until = now + cooldown_dur
+            self._trigger_instant_scan = True
+            self._last_cooldown_log_time = now
+            self.cancel_all_virtual_quotes()
+            log.warning(
+                f"[ASYMMETRIC TOXICITY DEFENSE] Dynamic price jump volatility breaker triggered: "
+                f"mid-price jump {jump_cents:.2f}c > {dyn_thresh:.2f}c within 60s. "
+                f"Active virtual quotes cancelled; entering {cooldown_dur:.0f}s cooldown until ts={self._volatility_cooldown_until:.1f}. "
+                f"Triggering instant opportunity scanner for market rotation."
+            )
+            return True
+
+        return False
+
     def evaluate_quotes(self, timestamp: Optional[float] = None) -> None:
         """Run 2-Tier Dynamic De-Skewing Optimizer and generate virtual maker quotes."""
         ts = timestamp or time.time()
@@ -507,6 +658,10 @@ class NativePaperTradingEngine:
         a_no = self.book_no.best_ask_real or (1.0 - b_yes)
 
         mid_yes = (b_yes + a_yes) / 2.0
+
+        # Check price jump volatility circuit breaker
+        if self._check_volatility_breaker(mid_yes, ts):
+            return
 
         # Extract live microstructure signals from Cont-Kukanov-Stoikov OFI and Stoikov micro-price
         state_yes = self.microstructure_yes.latest_state
@@ -538,11 +693,22 @@ class NativePaperTradingEngine:
         # TIER 1: Passive Avellaneda-Stoikov Quote Fading
         # ---------------------------------------------------------------------
         if decision.pathway == DeSkewPathway.PASSIVE_FADE:
-            self._execute_tier1_passive_fade(decision, mid_yes, b_yes, a_yes, ts)
-            return
+            net_q = pos.shares_yes - pos.shares_no
+            if abs(net_q) >= self.deskew_optimizer.q_soft:
+                self._execute_tier1_passive_fade(decision, mid_yes, b_yes, a_yes, ts)
+                return
+            else:
+                self._record_deskew_event(decision, ts)
+                if ts - self._last_toxicity_log_time >= 5.0:
+                    self._last_toxicity_log_time = ts
+                    log.warning(
+                        f"[ASYMMETRIC TOXICITY DEFENSE] {decision.reason} "
+                        f"(fading {decision.action_side} {decision.target_token})"
+                    )
+
 
         # ---------------------------------------------------------------------
-        # NEUTRAL: Two-Sided Maker Quoting around Mid
+        # NEUTRAL: Two-Sided Maker Quoting around Mid (with Asymmetric Toxicity Defense)
         # ---------------------------------------------------------------------
         self._execute_neutral_maker_quoting(mid_yes, b_yes, a_yes, ts)
 
@@ -574,7 +740,7 @@ class NativePaperTradingEngine:
                 deskew_size = max(self.quote_size, net_q)
                 self._set_virtual_quote("NO", "BUY", target_bid_no, deskew_size, ts)
                 self._set_virtual_quote("YES", "BUY", faded_bid_yes, self.quote_size, ts)
-            else:
+            elif net_q < 0:
                 # Long NO -> tighten YES bid to complete sets; fade/widen NO bid
                 target_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, decision.target_price)), 3)
                 faded_bid_no = round(max(0.01, min(0.98, 1.00 - (r_yes + offset + 0.01))), 3)
@@ -582,6 +748,10 @@ class NativePaperTradingEngine:
                 deskew_size = max(self.quote_size, abs(net_q))
                 self._set_virtual_quote("YES", "BUY", target_bid_yes, deskew_size, ts)
                 self._set_virtual_quote("NO", "BUY", faded_bid_no, self.quote_size, ts)
+            else:
+                # Neutral inventory: route to neutral maker quoting with asymmetric toxicity defense
+                self._execute_neutral_maker_quoting(mid_yes, best_bid_yes, best_ask_yes, ts)
+                return
 
             self._cancel_virtual_quote("SELL_YES")
             self._cancel_virtual_quote("SELL_NO")
@@ -592,10 +762,12 @@ class NativePaperTradingEngine:
             faded_ask = min(best_ask_yes, max(best_bid_yes + 0.001, decision.target_price))
             self._set_virtual_quote("YES", "SELL", faded_ask, self.quote_size, ts)
             self._cancel_virtual_quote("BID_YES")
+            self._cancel_virtual_quote("BUY_YES")
         elif decision.target_token == "YES" and decision.action_side == "BUY":
             faded_bid = max(best_bid_yes, min(best_ask_yes - 0.001, decision.target_price))
             self._set_virtual_quote("YES", "BUY", faded_bid, self.quote_size, ts)
             self._cancel_virtual_quote("ASK_YES")
+            self._cancel_virtual_quote("SELL_YES")
 
     def _execute_tier2_taker_deskew(self, decision: DeSkewDecision, ts: float) -> None:
         """Tier 2: Emergency cross-spread taker execution."""
@@ -649,8 +821,54 @@ class NativePaperTradingEngine:
         best_ask_yes: float,
         ts: float,
     ) -> None:
-        """Standard two-sided virtual maker quotes inside the qualifying spread."""
+        """Standard two-sided virtual maker quotes inside the qualifying spread with asymmetric toxicity defense."""
+        if self._check_volatility_breaker(mid_yes, ts):
+            return
+
         offset = self.spread_offset_cents / 100.0
+
+        # Query microstructure quote actions for BUY and SELL
+        action_buy = self.microstructure_yes.evaluate_quote_action("BUY")
+        action_sell = self.microstructure_yes.evaluate_quote_action("SELL")
+
+        bid_offset = offset
+        ask_offset = offset
+        suppress_bid = False
+        suppress_ask = False
+
+        should_log_tox = (ts - self._last_toxicity_log_time) >= 5.0
+        if action_sell.should_pull:
+            suppress_ask = True
+            if should_log_tox:
+                self._last_toxicity_log_time = ts
+                log.warning(
+                    f"[ASYMMETRIC TOXICITY DEFENSE] Suppressing ask quote (toxic buying flow): {action_sell.reason}"
+                )
+        elif action_sell.should_widen:
+            widen_val = action_sell.spread_offset_cents / 100.0
+            ask_offset += widen_val
+            if should_log_tox:
+                self._last_toxicity_log_time = ts
+                log.warning(
+                    f"[ASYMMETRIC TOXICITY DEFENSE] Widening ask offset by +{action_sell.spread_offset_cents:.2f}c: {action_sell.reason}"
+                )
+
+        if action_buy.should_pull:
+            suppress_bid = True
+            if should_log_tox:
+                self._last_toxicity_log_time = ts
+                log.warning(
+                    f"[ASYMMETRIC TOXICITY DEFENSE] Suppressing bid quote (toxic selling flow): {action_buy.reason}"
+                )
+        elif action_buy.should_widen:
+            widen_val = action_buy.spread_offset_cents / 100.0
+            bid_offset += widen_val
+            if should_log_tox:
+                self._last_toxicity_log_time = ts
+                log.warning(
+                    f"[ASYMMETRIC TOXICITY DEFENSE] Widening bid offset by +{action_buy.spread_offset_cents:.2f}c: {action_buy.reason}"
+                )
+
 
         if self.institutional_mode:
             # Jane Street Institutional Dual-Cash Quoting (BUY YES + BUY NO)
@@ -661,8 +879,8 @@ class NativePaperTradingEngine:
             r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
 
             skew_adj = net_q * 0.0005
-            target_bid_yes = r_yes - offset - max(0.0, skew_adj)
-            target_ask_yes = r_yes + offset - min(0.0, skew_adj)
+            target_bid_yes = r_yes - bid_offset - max(0.0, skew_adj)
+            target_ask_yes = r_yes + ask_offset - min(0.0, skew_adj)
 
             target_bid_yes = min(best_ask_yes - 0.001, target_bid_yes)
             target_ask_yes = max(best_bid_yes + 0.001, target_ask_yes)
@@ -672,27 +890,51 @@ class NativePaperTradingEngine:
             target_bid_no = round(1.00 - target_ask_yes, 3)
 
             # Enforce cash sizing bounds
-            req_cash = (target_bid_yes + target_bid_no) * self.quote_size
-            eff_size = self.quote_size if self.portfolio.cash >= req_cash else max(5.0, math.floor(self.portfolio.cash / (target_bid_yes + target_bid_no)))
+            active_price_sum = 0.0
+            if not suppress_bid:
+                active_price_sum += target_bid_yes
+            if not suppress_ask:
+                active_price_sum += target_bid_no
 
-            # Place pure dual-cash bids
-            self._set_virtual_quote("YES", "BUY", target_bid_yes, eff_size, ts)
-            self._set_virtual_quote("NO", "BUY", target_bid_no, eff_size, ts)
+            if active_price_sum > 0:
+                req_cash = active_price_sum * self.quote_size
+                eff_size = self.quote_size if self.portfolio.cash >= req_cash else max(5.0, math.floor(self.portfolio.cash / active_price_sum))
+            else:
+                eff_size = self.quote_size
+
+            # Place pure dual-cash bids or cancel if suppressed
+            if not suppress_bid:
+                self._set_virtual_quote("YES", "BUY", target_bid_yes, eff_size, ts)
+            else:
+                self._cancel_virtual_quote("BUY_YES")
+
+            if not suppress_ask:
+                self._set_virtual_quote("NO", "BUY", target_bid_no, eff_size, ts)
+            else:
+                self._cancel_virtual_quote("BUY_NO")
+
             self._cancel_virtual_quote("SELL_YES")
             self._cancel_virtual_quote("SELL_NO")
             return
 
         # Legacy Single-Token Mode
-        target_bid = round(max(0.01, mid_yes - offset), 3)
-        target_ask = round(min(0.99, mid_yes + offset), 3)
+        target_bid = round(max(0.01, mid_yes - bid_offset), 3)
+        target_ask = round(min(0.99, mid_yes + ask_offset), 3)
 
         if target_bid >= best_ask_yes:
             target_bid = round(best_ask_yes - 0.001, 3)
         if target_ask <= best_bid_yes:
             target_ask = round(best_bid_yes + 0.001, 3)
 
-        self._set_virtual_quote("YES", "BUY", target_bid, self.quote_size, ts)
-        self._set_virtual_quote("YES", "SELL", target_ask, self.quote_size, ts)
+        if not suppress_bid:
+            self._set_virtual_quote("YES", "BUY", target_bid, self.quote_size, ts)
+        else:
+            self._cancel_virtual_quote("BUY_YES")
+
+        if not suppress_ask:
+            self._set_virtual_quote("YES", "SELL", target_ask, self.quote_size, ts)
+        else:
+            self._cancel_virtual_quote("SELL_YES")
 
     def _set_virtual_quote(
         self,
@@ -714,6 +956,14 @@ class NativePaperTradingEngine:
             tracker = impact.quotes.get(qid)
             q_ahead = tracker.queue_ahead if tracker is not None else impact.compute_queue_ahead(quote_side, price, book=book)
             existing["queue_ahead"] = q_ahead
+            existing_mid = book.mid_price or 0.50
+            vq_res = self.migration_engine.queue_model.evaluate_queue_value(
+                quote_size=existing["size"],
+                queue_ahead=q_ahead,
+                half_spread_cents=max(0.1, abs(existing["price"] - existing_mid) * 100.0),
+                token_mid_price=existing_mid,
+            )
+            existing["v_queue"] = round(vq_res.net_queue_value_usd, 4)
             return
 
         # Price revision or new quote: queue resets
@@ -730,6 +980,13 @@ class NativePaperTradingEngine:
             min_size=self.rewards_min_size,
         )
 
+        vq_res = self.migration_engine.queue_model.evaluate_queue_value(
+            quote_size=size,
+            queue_ahead=q_ahead,
+            half_spread_cents=max(0.1, spread_cents),
+            token_mid_price=mid,
+        )
+
         quote_data = {
             "quote_id": qid,
             "token_side": token_side,
@@ -738,6 +995,7 @@ class NativePaperTradingEngine:
             "size": size,
             "queue_ahead": round(q_ahead, 2),
             "score": round(score, 4),
+            "v_queue": round(vq_res.net_queue_value_usd, 4),
             "timestamp": ts,
             "status": "ACTIVE",
         }
@@ -758,6 +1016,39 @@ class NativePaperTradingEngine:
         qids = list(self.active_quotes.keys())
         for qid in qids:
             self._cancel_virtual_quote(qid)
+
+    def update_quote_size(self, new_quote_size: float, timestamp: Optional[float] = None) -> bool:
+        """Safely update self.quote_size and re-evaluate active resting virtual quotes if size changes by >= 5.0 shares.
+
+        Args:
+            new_quote_size: Target new quote size in shares.
+            timestamp: Optional timestamp for quote placement.
+
+        Returns:
+            True if quote size changed by >= 5.0 shares and quotes were re-evaluated, False otherwise.
+        """
+        new_size = round(max(5.0, float(new_quote_size)), 1)
+        size_diff = abs(new_size - self.quote_size)
+        old_size = self.quote_size
+        self.quote_size = new_size
+
+        if size_diff >= 5.0:
+            ts = timestamp or time.time()
+            log.info(
+                f"Quote size compounded: {old_size:.1f} -> {new_size:.1f} shares "
+                f"(diff={size_diff:.1f} >= 5.0). Re-evaluating active resting quotes."
+            )
+            # Re-evaluate active resting virtual quotes with updated size
+            if self.active_quotes:
+                for qid, qdata in list(self.active_quotes.items()):
+                    tok_side = qdata.get("token_side", "YES")
+                    side = qdata.get("side", "BUY")
+                    px = qdata.get("price", 0.50)
+                    self._set_virtual_quote(tok_side, side, px, self.quote_size, ts)
+            self.evaluate_quotes(timestamp=ts)
+            return True
+
+        return False
 
     def _record_deskew_event(self, decision: DeSkewDecision, ts: float) -> None:
         """Persist a dynamic de-skew decision to SQLite."""
@@ -1006,6 +1297,236 @@ class NativePaperTradingEngine:
             "merges_executed": len(merges_executed),
             "fills_executed": len(liquidation_fills),
         }
+
+    # -------------------------------------------------------------------------
+    # Dynamic Opportunistic Switching & Capital Migration
+    # -------------------------------------------------------------------------
+
+    def compute_resting_queue_value(self) -> float:
+        """Compute the total economic value ($V_queue) of resting FIFO queue priority across all active quotes."""
+        total_v = 0.0
+        for q in self.active_quotes.values():
+            sz = float(q.get("size", 0.0))
+            if sz <= 0.0:
+                continue
+            q_ahead = float(q.get("queue_ahead", 0.0))
+            tok = q.get("token_side", "YES")
+            book = self.book_yes if tok == "YES" else self.book_no
+            mid = book.mid_price or 0.50
+            px = float(q.get("price", mid))
+            spread_c = abs(px - mid) * 100.0
+            val = self.migration_engine.queue_model.evaluate_queue_value(
+                quote_size=sz,
+                queue_ahead=q_ahead,
+                half_spread_cents=max(0.1, spread_c),
+                token_mid_price=mid,
+            )
+            total_v += val.net_queue_value_usd
+        return round(total_v, 4)
+
+    def get_current_daily_yield(self) -> float:
+        """Calculate current daily reward payout ($/day) based on active quote score or empirical run-rate."""
+        user_score = sum(q.get("score", 0.0) for q in self.active_quotes.values())
+        if user_score <= 0.0 and self.quote_size > 0.0 and self.rewards_max_spread > 0.0:
+            # Expected target quote score for current market
+            v = self.rewards_max_spread
+            s = self.spread_offset_cents
+            if s < v:
+                eff_score = ((v - s) / v) ** 2 * self.quote_size
+                # Since dual-cash quotes 2 sides (YES and NO)
+                user_score = eff_score * 2.0
+
+        comp_score = self.competing_score_override if self.competing_score_override is not None else 1000.0
+        tot = user_score + comp_score
+        share_payout = (user_score / tot) * self.daily_reward_rate if tot > 0 else 0.0
+        if self.epoch_index >= 5 and self.total_rewards_credited > 0:
+            proj = (self.total_rewards_credited / self.epoch_index) * 1440.0
+            return max(share_payout, proj)
+        return share_payout
+
+    def compute_switching_cost(
+        self,
+        daily_yield: Optional[float] = None,
+        transit_latency_seconds: float = 4.5,
+    ) -> SwitchingCostDecomposition:
+        """Compute exact economic switching friction to migrate away from active market M_A.
+
+        Accounts for:
+        1. Resting FIFO queue priority value surrendered (V_queue)
+        2. Inventory liquidation friction (direct crossing vs synthetic completion)
+        3. Complete set CTF merge gas
+        4. Opportunity cost during unquoted transit / qualification downtime
+        """
+        pos = self.portfolio.get_position(self.condition_id)
+        net_q = pos.shares_yes - pos.shares_no
+
+        mid_yes = self.book_yes.mid_price or 0.50
+        bid_yes = self.book_yes.best_bid_real or max(0.01, mid_yes - 0.01)
+        ask_no = self.book_no.best_ask_real or (1.00 - bid_yes)
+
+        bid_quote = self.active_quotes.get("BUY_YES")
+        ask_quote = self.active_quotes.get("BUY_NO") or self.active_quotes.get("SELL_YES")
+
+        resting_bid_sz = float(bid_quote.get("size", 0.0)) if bid_quote else 0.0
+        q_ahead_bid = float(bid_quote.get("queue_ahead", 0.0)) if bid_quote else 0.0
+
+        resting_ask_sz = float(ask_quote.get("size", 0.0)) if ask_quote else 0.0
+        q_ahead_ask = float(ask_quote.get("queue_ahead", 0.0)) if ask_quote else 0.0
+
+        y_a = daily_yield if daily_yield is not None else self.get_current_daily_yield()
+
+        decomp = self.migration_engine.compute_switching_cost(
+            q_a=net_q,
+            p_mid_a=mid_yes,
+            p_bid_a=bid_yes,
+            p_ask_opp_a=ask_no,
+            resting_bid_size=resting_bid_sz,
+            resting_ask_size=resting_ask_sz,
+            queue_ahead_bid=q_ahead_bid,
+            queue_ahead_ask=q_ahead_ask,
+            half_spread_cents_a=self.spread_offset_cents,
+            daily_yield_a=y_a,
+            has_matched_complete_sets=(pos.complete_sets > 0),
+            transit_latency_seconds=transit_latency_seconds,
+        )
+        self.latest_switching_cost = decomp
+        return decomp
+
+    def evaluate_migration_hurdle(
+        self,
+        candidate_daily_yield: float,
+        holding_horizon_hours: float = 4.0,
+        daily_yield_a: Optional[float] = None,
+    ) -> Tuple[bool, HurdleDecision, SwitchingCostDecomposition]:
+        """Evaluate Net Alpha Hurdle: Delta_Yield * Tau >= Cost_switch."""
+        y_a = daily_yield_a if daily_yield_a is not None else self.get_current_daily_yield()
+        cost = self.compute_switching_cost(daily_yield=y_a)
+        decision = self.migration_engine.evaluate_switching_hurdle(
+            y_net_a_daily=y_a,
+            y_net_b_daily=candidate_daily_yield,
+            switching_cost_usd=cost.total_switching_cost_usd,
+            holding_horizon_hours=holding_horizon_hours,
+        )
+        self.latest_hurdle_decision = decision
+        return decision.should_switch, decision, cost
+
+    def migrate_to_market(
+        self,
+        new_condition_id: str,
+        new_asset_id_yes: str,
+        new_asset_id_no: str,
+        new_daily_reward_rate: float,
+        new_rewards_max_spread_cents: float,
+        new_rewards_min_size: float,
+        new_competing_score: Optional[float] = None,
+        new_quote_size: Optional[float] = None,
+        new_spread_offset_cents: Optional[float] = None,
+        reason: str = "",
+        timestamp: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Execute clean atomic market migration:
+
+        1. Cancel quotes on M_A.
+        2. Merge complete sets on M_A to unlock cash.
+        3. Register M_B and reset synthetic order books and impact trackers.
+        4. Flush persistence and return migration audit record.
+        """
+        ts = timestamp or time.time()
+        old_cid = self.condition_id
+
+        # 1. Cleanly cancel all quotes on M_A
+        self.cancel_all_virtual_quotes()
+
+        # 2. Merge complete sets on M_A
+        pos = self.portfolio.get_position(old_cid)
+        unlocked_cash = 0.0
+        if pos.complete_sets > 0:
+            m_res = self.trigger_ctf_merge(pos.complete_sets)
+            if m_res is not None:
+                unlocked_cash = m_res.net_cash_unlocked
+
+        # 3. Register M_B
+        self.condition_id = new_condition_id
+        self.asset_id_yes = new_asset_id_yes
+        self.asset_id_no = new_asset_id_no
+        self.daily_reward_rate = float(new_daily_reward_rate)
+        self.rewards_max_spread = float(new_rewards_max_spread_cents)
+        self.rewards_min_size = float(new_rewards_min_size)
+        if new_competing_score is not None:
+            self.competing_score_override = float(new_competing_score)
+        if new_quote_size is not None:
+            self.quote_size = float(new_quote_size)
+        if new_spread_offset_cents is not None:
+            self.spread_offset_cents = float(new_spread_offset_cents)
+
+        # Re-initialize books, impacts, and matchers
+        self.book_yes = SyntheticOrderBook(asset_id=new_asset_id_yes)
+        self.book_no = SyntheticOrderBook(asset_id=new_asset_id_no)
+        self.impact_yes = MarketImpactEngine(book=self.book_yes)
+        self.impact_no = MarketImpactEngine(book=self.book_no)
+        self.matcher = OrderMatcherBridge(condition_id=self.condition_id)
+        self.microstructure_yes = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
+        self.microstructure_no = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
+        self.active_quotes.clear()
+        self._rolling_price_ticks.clear()
+        self._volatility_cooldown_until = 0.0
+        self._trigger_instant_scan = False
+        self._last_cooldown_log_time = 0.0
+
+        # Update governor tracking for migration
+        self.governor.market_entry_times[new_condition_id] = ts
+        init_reserve_pct = getattr(self.governor.allocator, "reserve_pct", 0.25)
+        self.governor.current_allocations[new_condition_id] = self.portfolio.cash * (1.0 - init_reserve_pct)
+        self.governor.current_allocations.pop(old_cid, None)
+        self.governor.market_entry_times.pop(old_cid, None)
+
+        # Record event
+        delta_y = self.latest_hurdle_decision.delta_yield_daily_usd if self.latest_hurdle_decision else 0.0
+        cost_val = self.latest_switching_cost.total_switching_cost_usd if self.latest_switching_cost else 0.0
+        net_alpha = self.latest_hurdle_decision.net_alpha_holding_usd if self.latest_hurdle_decision else 0.0
+        reason_str = reason or (self.latest_hurdle_decision.reason if self.latest_hurdle_decision else "Clean market migration")
+
+        evt = {
+            "timestamp": ts,
+            "from_condition_id": old_cid,
+            "to_condition_id": new_condition_id,
+            "delta_yield_daily": delta_y,
+            "switching_cost": cost_val,
+            "net_alpha_holding": net_alpha,
+            "unlocked_cash": unlocked_cash,
+            "reason": reason_str,
+        }
+        self.migration_history.append(evt)
+
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO market_migrations (
+                timestamp, from_condition_id, to_condition_id, delta_yield_daily,
+                switching_cost, net_alpha_holding, unlocked_cash, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                old_cid,
+                new_condition_id,
+                delta_y,
+                cost_val,
+                net_alpha,
+                unlocked_cash,
+                reason_str,
+            ),
+        )
+        self._conn.commit()
+        self.flush_ledger()
+
+        log.info(
+            f"[MARKET MIGRATION] Executed migration: {old_cid[:12]} -> {new_condition_id[:12]} | "
+            f"Unlocked: ${unlocked_cash:.2f} USDC | {reason_str}"
+        )
+        return evt
+
+    # -------------------------------------------------------------------------
     # Polymarket Quadratic Rewards 1-Minute Epoch Scoring
     # -------------------------------------------------------------------------
 
@@ -1094,6 +1615,33 @@ class NativePaperTradingEngine:
             f"| Total Rewards: ${self.total_rewards_credited:.4f}"
         )
 
+        # ---------------------------------------------------------------------
+        # Continuous Optimization Governor: Dynamic Quote Size Compounding
+        # ---------------------------------------------------------------------
+        cand = {
+            "condition_id": self.condition_id,
+            "question": f"Market {self.condition_id[:12]}",
+            "daily_pool": self.daily_reward_rate,
+            "competing_score": max(1.0, competing_score),
+            "max_spread": self.rewards_max_spread,
+            "min_size": self.rewards_min_size,
+            "mid_yes": self.book_yes.mid_price or 0.50,
+            "real_mid": self.book_yes.mid_price or 0.50,
+        }
+        gov_actions = self.governor.evaluate_governor_cycle(
+            current_active_markets=[self.condition_id],
+            live_bankroll_usd=self.portfolio.cash,
+            scanned_universe=[cand],
+            current_time=ts,
+        )
+        for act in gov_actions:
+            if act.action_type == "RESIZE_QUOTE" and act.condition_id == self.condition_id:
+                log.info(
+                    f"ContinuousOptimizationGovernor recommended RESIZE_QUOTE for {self.condition_id[:12]}: "
+                    f"New target size={act.target_quote_size:.1f} shares. Compounding into resting quotes."
+                )
+                self.update_quote_size(act.target_quote_size, timestamp=ts)
+
         return {
             "epoch_index": self.epoch_index,
             "timestamp": ts,
@@ -1104,6 +1652,8 @@ class NativePaperTradingEngine:
             "projected_daily_usd": round(projected_daily_usd, 2),
             "floor_met": floor_met,
             "total_rewards_usd": round(self.total_rewards_credited, 4),
+            "quote_size": self.quote_size,
+            "governor_actions": [act.action_type for act in gov_actions],
         }
 
     # -------------------------------------------------------------------------
@@ -1167,7 +1717,7 @@ class NativePaperTradingEngine:
         )
         self._conn.commit()
 
-        # Write JSON ledger
+        # Write JSON ledger atomically
         ledger_data = {
             "updated_at": time.time(),
             "condition_id": self.condition_id,
@@ -1178,12 +1728,46 @@ class NativePaperTradingEngine:
             "recent_fills": [f.to_dict() for f in self.fills_history[-10:]],
             "recent_merges": [m.to_dict() for m in self.merges_history[-10:]],
         }
+        self._save_ledger(ledger_data)
 
+    def _save_ledger(self, ledger_data: Optional[dict[str, Any]] = None) -> None:
+        """Atomically persist ledger data to JSON file via temporary file replacement.
+
+        Writes to a temporary file (<path>.tmp) and atomically renames it to <path>
+        using os.replace to guarantee zero file corruption if the process is killed
+        or interrupted mid-write.
+        """
+        if ledger_data is None:
+            marks = {
+                self.condition_id: (
+                    self.book_yes.mid_price or 0.5,
+                    self.book_no.mid_price or 0.5,
+                )
+            }
+            state = self.portfolio.get_state(marks)
+            ledger_data = {
+                "updated_at": time.time(),
+                "condition_id": self.condition_id,
+                "portfolio": state,
+                "active_quotes": list(self.active_quotes.values()),
+                "last_deskew": asdict(self.latest_deskew_decision) if self.latest_deskew_decision else None,
+                "epoch_index": self.epoch_index,
+                "recent_fills": [f.to_dict() for f in self.fills_history[-10:]],
+                "recent_merges": [m.to_dict() for m in self.merges_history[-10:]],
+            }
+
+        tmp_path = Path(f"{self.ledger_path}.tmp")
         try:
-            with open(self.ledger_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(ledger_data, f, indent=2)
+            os.replace(tmp_path, self.ledger_path)
         except Exception as e:
-            log.warning(f"Failed to write JSON ledger: {e}")
+            log.warning(f"Failed to write JSON ledger atomically: {e}")
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
 
     def get_telemetry(self) -> dict[str, Any]:
         """Comprehensive real-time telemetry dictionary for dashboards and CLI runners."""
@@ -1199,6 +1783,16 @@ class NativePaperTradingEngine:
         mid_yes = self.book_yes.mid_price or 0.50
         bb_yes = self.book_yes.best_bid_real or 0.0
         ba_yes = self.book_yes.best_ask_real or 1.0
+
+        v_queue_total = self.compute_resting_queue_value()
+        equity_val = max(1e-4, port_state["equity"])
+        cash_val = port_state["cash"]
+        reserve_ratio_pct = (cash_val / equity_val) * 100.0
+        daily_yield = self.get_current_daily_yield()
+        init_cash = max(1.0, self.portfolio.initial_cash)
+        nominal_apr = (daily_yield / init_cash) * 365.25 * 100.0
+        r_daily = max(0.0, daily_yield / init_cash)
+        compounding_apr = (math.pow(1.0 + r_daily, 365.25) - 1.0) * 100.0 if r_daily > 0 else 0.0
 
         return {
             "timestamp": time.time(),
@@ -1227,11 +1821,34 @@ class NativePaperTradingEngine:
             "total_splits": port_state["total_splits_count"],
             "total_volume_usd": port_state["total_volume_traded_usd"],
             "fills_count": len(self.fills_history),
+            "resting_queue_value_usd": v_queue_total,
+            "reserve_cash_usd": round(cash_val, 2),
+            "reserve_ratio_pct": round(reserve_ratio_pct, 1),
+            "daily_yield_usd": round(daily_yield, 2),
+            "nominal_apr_pct": round(nominal_apr, 1),
+            "compounding_apr_pct": round(compounding_apr, 1),
+            "migration_count": len(self.migration_history),
+            "latest_hurdle_decision": asdict(self.latest_hurdle_decision) if self.latest_hurdle_decision else None,
+            "latest_switching_cost": self.latest_switching_cost.to_dict() if self.latest_switching_cost else None,
         }
 
-    def close(self) -> None:
-        """Close SQLite database connection and release file locks."""
+    def flush_wal(self) -> None:
+        """Checkpoint SQLite WAL journal into main database file."""
         if hasattr(self, "_conn") and self._conn:
+            try:
+                cur = self._conn.cursor()
+                cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                self._conn.commit()
+            except Exception as e:
+                log.warning(f"Error checkpointing WAL journal: {e}")
+
+    def close(self) -> None:
+        """Flush WAL journal, close SQLite database connection and release file locks."""
+        if hasattr(self, "_conn") and self._conn:
+            try:
+                self.flush_wal()
+            except Exception:
+                pass
             try:
                 self._conn.close()
             except Exception:

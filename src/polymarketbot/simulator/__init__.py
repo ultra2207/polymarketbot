@@ -38,7 +38,10 @@ from polymarketbot.simulator.engine import (
     OrderMatcherBridge,
 )
 from polymarketbot.simulator.optimizer import (
+    calculate_dynamic_cycles_budget,
+    calibrate_cycles_budget,
     derive_quote_size,
+    estimate_market_trade_frequency,
     optimize_spread_offset,
 )
 
@@ -90,6 +93,9 @@ __all__ = [
     "OrderBookSnapshot",
     "FillEvent",
     "SimulationOrderMatcher",
+    "calculate_dynamic_cycles_budget",
+    "calibrate_cycles_budget",
     "derive_quote_size",
+    "estimate_market_trade_frequency",
     "optimize_spread_offset",
 ]

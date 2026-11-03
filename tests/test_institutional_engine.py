@@ -247,3 +247,130 @@ def test_microstructure_integration_and_deskew_sizing(tmp_path):
     assert abs(state_toxic.ofi_10_events) > 850.0
 
 
+def test_dynamic_threshold_initialization_defaults():
+    """Verify JaneStreetMarketMaker defaults to dynamic threshold calculators when params are None."""
+    from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+    from polymarketbot.rewards.microstructure import (
+        compute_dynamic_drift_threshold_cents,
+        compute_dynamic_ofi_threshold,
+    )
+    from polymarketbot.trading.ctf import estimate_merge_cost_usd
+
+    mm = JaneStreetMarketMaker(
+        condition_id="0xdyn_init",
+        initial_cash=200.0,
+        quote_size=50.0,
+    )
+
+    # 1. Dynamic gas fee
+    assert mm._dynamic_gas_fee is True
+    assert mm.gas_fee_merge == pytest.approx(estimate_merge_cost_usd(), 1e-6)
+    assert mm.portfolio.gas_fee_merge == mm.gas_fee_merge
+
+    # 2. Dynamic threshold calculator instantiated
+    assert isinstance(mm.threshold_calculator, DynamicThresholdCalculator)
+    assert mm._dynamic_q_hard is True
+    assert mm._dynamic_auto_merge is True
+    assert mm.q_hard > 0.0
+    assert mm.auto_merge_threshold > 0.0
+
+    # 3. Dynamic OFI threshold
+    assert mm._dynamic_ofi is True
+    expected_ofi = compute_dynamic_ofi_threshold(100.0, 100.0)
+    assert mm.ofi_thresh == pytest.approx(expected_ofi, 1e-4)
+
+    # 4. Dynamic drift threshold
+    assert mm._dynamic_drift is True
+    expected_drift = compute_dynamic_drift_threshold_cents(0.50, 1.0)
+    assert mm.drift_thresh_cents == pytest.approx(expected_drift, 1e-4)
+
+
+def test_dynamic_threshold_updates_on_depth_and_mid_price_changes():
+    """Verify thresholds update dynamically when depth or mid-price changes in generate_institutional_quotes."""
+    from polymarketbot.rewards.microstructure import (
+        compute_dynamic_drift_threshold_cents,
+        compute_dynamic_ofi_threshold,
+    )
+
+    mm = JaneStreetMarketMaker(
+        condition_id="0xdyn_updates",
+        initial_cash=200.0,
+        quote_size=50.0,
+    )
+
+    # Initial quote call with depth 100/100 and mid 0.50
+    mm.generate_institutional_quotes(
+        best_bid_yes=0.495,
+        best_ask_yes=0.505,
+        depth_bid_yes=100.0,
+        depth_ask_yes=100.0,
+    )
+    init_ofi = mm.ofi_thresh
+    init_drift = mm.drift_thresh_cents
+    init_q_hard = mm.q_hard
+
+    # 1. Change order book depth: increase to 2000.0/2000.0
+    mm.generate_institutional_quotes(
+        best_bid_yes=0.495,
+        best_ask_yes=0.505,
+        depth_bid_yes=2000.0,
+        depth_ask_yes=2000.0,
+    )
+    expected_deep_ofi = compute_dynamic_ofi_threshold(2000.0, 2000.0)
+    assert mm.ofi_thresh == pytest.approx(expected_deep_ofi, 1e-4)
+    assert mm.ofi_thresh > init_ofi  # OFI capacity increases with deep book
+
+    # 2. Change mid-price and spread: shift to 0.85/0.88 (mid 0.865, spread 3.0c)
+    mm.generate_institutional_quotes(
+        best_bid_yes=0.85,
+        best_ask_yes=0.88,
+        depth_bid_yes=2000.0,
+        depth_ask_yes=2000.0,
+    )
+    expected_new_drift = compute_dynamic_drift_threshold_cents(0.865, 3.0)
+    assert mm.drift_thresh_cents == pytest.approx(expected_new_drift, 1e-4)
+    assert mm.drift_thresh_cents != init_drift
+
+
+def test_explicit_threshold_overrides_preserved():
+    """Verify that explicitly provided thresholds are preserved and not overwritten dynamically."""
+    mm = JaneStreetMarketMaker(
+        condition_id="0xexplicit",
+        initial_cash=150.0,
+        quote_size=40.0,
+        auto_merge_threshold=33.0,
+        q_hard_threshold=111.0,
+        gas_fee_merge=0.025,
+        ofi_toxicity_threshold=950.0,
+        drift_toxicity_cents=2.2,
+    )
+
+    assert mm._dynamic_gas_fee is False
+    assert mm._dynamic_q_hard is False
+    assert mm._dynamic_auto_merge is False
+    assert mm._dynamic_ofi is False
+    assert mm._dynamic_drift is False
+
+    assert mm.gas_fee_merge == 0.025
+    assert mm.q_hard == 111.0
+    assert mm.auto_merge_threshold == 33.0
+    assert mm.ofi_thresh == 950.0
+    assert mm.drift_thresh_cents == 2.2
+
+    # Call generate_institutional_quotes with varied depth and mid-price
+    mm.generate_institutional_quotes(
+        best_bid_yes=0.80,
+        best_ask_yes=0.85,
+        depth_bid_yes=5000.0,
+        depth_ask_yes=5000.0,
+    )
+
+    # Values must remain unchanged
+    assert mm.gas_fee_merge == 0.025
+    assert mm.q_hard == 111.0
+    assert mm.auto_merge_threshold == 33.0
+    assert mm.ofi_thresh == 950.0
+    assert mm.drift_thresh_cents == 2.2
+
+
+

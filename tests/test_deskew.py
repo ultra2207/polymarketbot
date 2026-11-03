@@ -93,3 +93,139 @@ def test_toxicity_sentinel_triggers_active_liquidation():
     # Must immediately trigger active liquidation, bypassing passive skew
     assert decision.pathway in (DeSkewPathway.SYNTHETIC_MERGE, DeSkewPathway.DIRECT_CROSS)
     assert decision.order_type == "MARKET_TAKER"
+
+
+def test_neutral_inventory_with_toxic_buying_ofi_triggers_passive_fade():
+    """Neutral inventory with toxic OFI (+900) triggers passive fade rather than hold stable."""
+    optimizer = DynamicDeSkewOptimizer(
+        q_soft_threshold=15.0,
+        ofi_toxicity_threshold=850.0,
+    )
+    # Neutral inventory: net_q = 0 shares (< q_soft = 15.0)
+    # But toxic buying OFI = +900 > 850
+    decision = optimizer.evaluate_skew(
+        shares_yes=10.0,
+        shares_no=10.0,
+        best_bid_yes=0.49,
+        best_ask_yes=0.51,
+        best_bid_no=0.49,
+        best_ask_no=0.51,
+        rolling_ofi=900.0,
+    )
+    assert decision.pathway == DeSkewPathway.PASSIVE_FADE
+    assert decision.urgency_level == "HIGH"
+    assert decision.target_token == "YES"
+    assert decision.action_side == "SELL"
+    assert decision.order_type == "LIMIT_MAKER"
+    assert decision.reason == "Neutral inventory toxicity detected: fading threatened quote"
+
+
+def test_neutral_inventory_with_toxic_selling_ofi_triggers_passive_fade():
+    """Neutral inventory with toxic OFI (-900) triggers passive fade on bid side."""
+    optimizer = DynamicDeSkewOptimizer(
+        q_soft_threshold=15.0,
+        ofi_toxicity_threshold=850.0,
+    )
+    # Neutral inventory: net_q = 0 shares (< q_soft = 15.0)
+    # But toxic selling OFI = -900 < -850
+    decision = optimizer.evaluate_skew(
+        shares_yes=10.0,
+        shares_no=10.0,
+        best_bid_yes=0.49,
+        best_ask_yes=0.51,
+        best_bid_no=0.49,
+        best_ask_no=0.51,
+        rolling_ofi=-900.0,
+    )
+    assert decision.pathway == DeSkewPathway.PASSIVE_FADE
+    assert decision.urgency_level == "HIGH"
+    assert decision.target_token == "YES"
+    assert decision.action_side == "BUY"
+    assert decision.order_type == "LIMIT_MAKER"
+    assert decision.reason == "Neutral inventory toxicity detected: fading threatened quote"
+
+
+def test_neutral_inventory_with_drift_triggers_passive_fade():
+    """Neutral inventory with toxic micro-price drift triggers passive fade in correct direction."""
+    optimizer = DynamicDeSkewOptimizer(
+        q_soft_threshold=15.0,
+        drift_toxicity_cents=1.5,
+    )
+    # Upward drift > 1.5c threatens asks -> SELL
+    decision_up = optimizer.evaluate_skew(
+        shares_yes=5.0,
+        shares_no=5.0,
+        best_bid_yes=0.49,
+        best_ask_yes=0.51,
+        best_bid_no=0.49,
+        best_ask_no=0.51,
+        rolling_ofi=0.0,
+        micro_price_drift_cents=2.0,
+    )
+    assert decision_up.pathway == DeSkewPathway.PASSIVE_FADE
+    assert decision_up.urgency_level == "HIGH"
+    assert decision_up.action_side == "SELL"
+
+    # Downward drift < -1.5c threatens bids -> BUY
+    decision_down = optimizer.evaluate_skew(
+        shares_yes=5.0,
+        shares_no=5.0,
+        best_bid_yes=0.49,
+        best_ask_yes=0.51,
+        best_bid_no=0.49,
+        best_ask_no=0.51,
+        rolling_ofi=0.0,
+        micro_price_drift_cents=-2.0,
+    )
+    assert decision_down.pathway == DeSkewPathway.PASSIVE_FADE
+    assert decision_down.urgency_level == "HIGH"
+    assert decision_down.action_side == "BUY"
+
+
+class TestDynamicThresholdCalculator:
+    """Tests for DynamicThresholdCalculator across capital tiers and market regimes."""
+
+    def test_starter_portfolio_thresholds(self):
+        from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+
+        # $70 starter, quote 20 shares, $17.50 reserve
+        calib = DynamicThresholdCalculator.calibrate_all(
+            quote_size=20.0,
+            bankroll=70.0,
+            cash_reserve=17.50,
+            mid_price=0.50,
+            time_to_resolution_days=7.0,
+        )
+        assert calib.q_soft >= 15.0
+        assert calib.q_hard >= 35.0
+        assert calib.q_hard > calib.q_soft
+        assert calib.auto_merge_threshold >= 10.0
+
+    def test_whale_portfolio_thresholds(self):
+        from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+
+        # $10,000 whale, quote 400 shares, $2,500 reserve
+        calib = DynamicThresholdCalculator.calibrate_all(
+            quote_size=400.0,
+            bankroll=10_000.0,
+            cash_reserve=2500.0,
+            mid_price=0.50,
+            time_to_resolution_days=7.0,
+        )
+        assert calib.q_soft >= 350.0
+        assert calib.q_hard >= 1000.0
+        assert calib.auto_merge_threshold >= 100.0
+
+    def test_holding_time_expiry_adaptation(self):
+        from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+
+        # 5-minute market (300s remaining): holding time must be tightly bounded
+        t_5m = DynamicThresholdCalculator.compute_holding_time(time_to_expiry_seconds=300.0)
+        assert t_5m <= 50.0
+        assert t_5m >= 15.0
+
+        # 90-day election (7.7m seconds): holding time allows healthy patient fill
+        t_90d = DynamicThresholdCalculator.compute_holding_time(time_to_expiry_seconds=7_776_000.0)
+        assert t_90d >= 300.0
+
+

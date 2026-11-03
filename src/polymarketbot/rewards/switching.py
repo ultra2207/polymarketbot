@@ -42,8 +42,8 @@ class SwitchingConfig:
     scan_interval_seconds: float = 300.0  # 5 minutes periodic re-scan
     switch_hurdle_pct: float = 0.20  # M_B must provide >= 20% higher net yield
     amortization_horizon_hours: float = 4.0  # 4-hour amortization window
-    unquote_gas_usd: float = 0.005  # Estimated unquote / order cancel overhead
-    merge_gas_usd: float = 0.015  # Polygon CTF complete-set merge gas fee
+    unquote_gas_usd: float = 0.0  # Off-chain EIP-712 unquote / cancel on Polygon PoS costs 0 gas
+    merge_gas_usd: Optional[float] = None  # Polygon CTF complete-set merge gas fee (dynamic if None)
     crossing_spread_friction_pct: float = 0.0025  # Friction / half-spread crossing into M_B
     amortize_costs: bool = True
 
@@ -82,16 +82,25 @@ class SwitchEvent:
 
 def calculate_switching_cost(
     allocated_capital: float,
-    unquote_gas_usd: float = 0.005,
-    merge_gas_usd: float = 0.015,
+    unquote_gas_usd: float = 0.0,
+    merge_gas_usd: Optional[float] = None,
     crossing_spread_friction_pct: float = 0.0025,
 ) -> float:
     """Calculate the total switching cost:
 
-    Switching Cost = Gas to unquote M_A + CTF merge gas + crossing spread friction to enter M_B.
+    Switching Cost = Gas to unquote M_A (0.0 for off-chain EIP-712 cancel) + CTF merge gas + crossing spread friction to enter M_B.
     """
+    if merge_gas_usd is None:
+        try:
+            from polymarketbot.trading.ctf import estimate_merge_cost_usd
+            m_gas = float(estimate_merge_cost_usd())
+        except Exception:
+            m_gas = 0.015
+    else:
+        m_gas = float(merge_gas_usd)
+
     crossing_cost = allocated_capital * crossing_spread_friction_pct
-    return unquote_gas_usd + merge_gas_usd + crossing_cost
+    return float(unquote_gas_usd) + m_gas + crossing_cost
 
 
 def evaluate_switching_hurdle(

@@ -10,7 +10,9 @@ Implements:
 
 from __future__ import annotations
 
+import copy
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -31,6 +33,58 @@ from polymarketbot.rewards.scoring import (
 logger = get_logger("rewards_scanner")
 
 CLOB_REST_URL = "https://clob.polymarket.com"
+
+
+@dataclass
+class ScannerTelemetry:
+    """Telemetry, hit rates, and error tracking for the opportunity scanner."""
+
+    total_scans: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    http_429_errors: int = 0
+    network_errors: int = 0
+    total_book_queries: int = 0
+    last_scan_timestamp: float = 0.0
+    last_error_time: float = 0.0
+    last_error_message: str = ""
+    cached_candidates_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        hit_ratio = (self.cache_hits / (self.total_scans or 1)) * 100.0
+        return {
+            "total_scans": self.total_scans,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_ratio_pct": round(hit_ratio, 1),
+            "http_429_errors": self.http_429_errors,
+            "network_errors": self.network_errors,
+            "total_book_queries": self.total_book_queries,
+            "last_scan_timestamp": self.last_scan_timestamp,
+            "last_error_time": self.last_error_time,
+            "last_error_message": self.last_error_message,
+            "cached_candidates_count": self.cached_candidates_count,
+        }
+
+
+GLOBAL_SCANNER_TELEMETRY = ScannerTelemetry()
+_SCANNER_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_BOOK_CACHE: dict[str, tuple[float, tuple[float, float, float]]] = {}
+SCANNER_CACHE_TTL_SECONDS: float = 5.0
+
+
+def get_scanner_telemetry() -> ScannerTelemetry:
+    """Return the global scanner telemetry instance."""
+    return GLOBAL_SCANNER_TELEMETRY
+
+
+def reset_scanner_telemetry() -> None:
+    """Reset scanner telemetry and caches (useful for test isolation)."""
+    global GLOBAL_SCANNER_TELEMETRY, _SCANNER_CACHE, _BOOK_CACHE
+    GLOBAL_SCANNER_TELEMETRY = ScannerTelemetry()
+    _SCANNER_CACHE.clear()
+    _BOOK_CACHE.clear()
+
 
 
 @dataclass
@@ -117,8 +171,8 @@ def calculate_expected_yield(
     competing_depth: float = 3000.0,
     competing_score: Optional[float] = None,
     category: str = "default",
-    merge_threshold: float = 30.0,
-    gas_fee_per_merge: float = 0.015,
+    merge_threshold: Optional[float] = None,
+    gas_fee_per_merge: Optional[float] = None,
 ) -> dict[str, Any]:
     """Calculate the Net Expected Marginal Yield for an allocated bankroll:
 
@@ -189,10 +243,28 @@ def calculate_expected_yield(
     jump_loss_cents = max(0.0, regime["jump_mean_cents"] - s) * regime["decay_300s_ratio"]
     adverse_selection = jumps_per_day * quote_size * (jump_loss_cents / 100.0) * fill_share * rate_scale
 
-    # 5. Expected Gas Fees
+    # 5. Expected Gas Fees (dynamic merge cost and optimal threshold)
+    if gas_fee_per_merge is None or gas_fee_per_merge == 0.015:
+        try:
+            from polymarketbot.trading.ctf import estimate_merge_cost_usd
+            eff_gas_fee = float(estimate_merge_cost_usd())
+        except Exception:
+            eff_gas_fee = 0.015
+    else:
+        eff_gas_fee = float(gas_fee_per_merge)
+
+    if merge_threshold is None:
+        try:
+            from polymarketbot.trading.ctf import calculate_optimal_merge_threshold
+            eff_merge_threshold = float(calculate_optimal_merge_threshold(gas_cost_usd=eff_gas_fee))
+        except Exception:
+            eff_merge_threshold = 30.0
+    else:
+        eff_merge_threshold = float(merge_threshold)
+
     filled_shares_daily = daily_fills * min(quote_size, 50.0) * 0.5
-    expected_merges = filled_shares_daily / max(10.0, merge_threshold)
-    gas_fees = expected_merges * gas_fee_per_merge
+    expected_merges = filled_shares_daily / max(1.0, eff_merge_threshold)
+    gas_fees = expected_merges * eff_gas_fee
 
     # Net Yield
     net_yield = daily_reward_payout + spread_capture - adverse_selection - gas_fees
@@ -348,16 +420,37 @@ def get_real_l2_score(
     Returns:
         (competing_score, total_qualifying_shares, current_mid_price)
     """
+    now = time.time()
+    # Check 5-second in-memory book cache
+    if token_id in _BOOK_CACHE:
+        cached_ts, cached_res = _BOOK_CACHE[token_id]
+        if (now - cached_ts) < SCANNER_CACHE_TTL_SECONDS:
+            return cached_res
+
+    GLOBAL_SCANNER_TELEMETRY.total_book_queries += 1
     url = f"{CLOB_REST_URL}/book"
     try:
         r = session.get(url, params={"token_id": token_id}, timeout=timeout)
-        if r.status_code != 200:
+        if r.status_code == 429:
+            GLOBAL_SCANNER_TELEMETRY.http_429_errors += 1
+            GLOBAL_SCANNER_TELEMETRY.last_error_time = now
+            GLOBAL_SCANNER_TELEMETRY.last_error_message = (
+                f"HTTP 429 Too Many Requests on /book for token {token_id[:14]}"
+            )
+            logger.warning(f"[L2 BOOK 429 RATE LIMIT] Rate limited on /book for token {token_id[:14]}")
+            if token_id in _BOOK_CACHE:
+                return _BOOK_CACHE[token_id][1]
             return 0.0, 0.0, 0.50
+        elif r.status_code != 200:
+            return 0.0, 0.0, 0.50
+
         data = r.json()
         bids = data.get("bids", [])
         asks = data.get("asks", [])
         if not bids and not asks:
-            return 0.0, 0.0, 0.50
+            res = (0.0, 0.0, 0.50)
+            _BOOK_CACHE[token_id] = (now, res)
+            return res
 
         best_bid = max(float(b.get("price", 0.0)) for b in bids) if bids else 0.0
         best_ask = min(float(a.get("price", 1.0)) for a in asks) if asks else 1.0
@@ -387,7 +480,17 @@ def get_real_l2_score(
                 comp_score += quadratic_order_score(max_spread_cents, spread_c, sz)
                 total_qual_shares += sz
 
-        return comp_score, total_qual_shares, mid
+        res = (comp_score, total_qual_shares, mid)
+        _BOOK_CACHE[token_id] = (now, res)
+        return res
+    except requests.exceptions.RequestException as e:
+        GLOBAL_SCANNER_TELEMETRY.network_errors += 1
+        GLOBAL_SCANNER_TELEMETRY.last_error_time = now
+        GLOBAL_SCANNER_TELEMETRY.last_error_message = f"Network error on /book for {token_id[:14]}: {e}"
+        logger.debug(f"Network error fetching order book for {token_id[:14]}: {e}")
+        if token_id in _BOOK_CACHE:
+            return _BOOK_CACHE[token_id][1]
+        return 0.0, 0.0, 0.50
     except Exception as e:
         logger.debug(f"Error fetching order book for {token_id[:14]}: {e}")
         return 0.0, 0.0, 0.50
@@ -402,6 +505,24 @@ def find_optimal_lp_markets(
     limit_output: int = 15,
 ) -> list[dict[str, Any]]:
     """Scan all reward pools and rank by Net Daily ROI (%) on deployed capital."""
+    GLOBAL_SCANNER_TELEMETRY.total_scans += 1
+    now = time.time()
+    cache_key = f"{round(bankroll_usd, 2)}_{min_days_to_expiry}_{min_mid_price}_{max_mid_price}_{max_candidates}_{limit_output}"
+
+    # 1. 5-Second TTL In-Memory Opportunity Cache Check
+    if cache_key in _SCANNER_CACHE:
+        cached_ts, cached_markets = _SCANNER_CACHE[cache_key]
+        cache_age = now - cached_ts
+        if cache_age < SCANNER_CACHE_TTL_SECONDS:
+            GLOBAL_SCANNER_TELEMETRY.cache_hits += 1
+            logger.info(
+                f"[SCANNER CACHE HIT] Served {len(cached_markets)} candidate markets from 5s TTL cache "
+                f"(Age: {cache_age:.2f}s < {SCANNER_CACHE_TTL_SECONDS:.1f}s | "
+                f"Hits: {GLOBAL_SCANNER_TELEMETRY.cache_hits}/{GLOBAL_SCANNER_TELEMETRY.total_scans})"
+            )
+            return [dict(m) for m in cached_markets]
+
+    GLOBAL_SCANNER_TELEMETRY.cache_misses += 1
     session = requests.Session()
     session.headers.update({"User-Agent": "polymarketbot/optimal-selector"})
 
@@ -411,10 +532,30 @@ def find_optimal_lp_markets(
     logger.info(f"Querying top {max_candidates} reward pools from Polymarket CLOB...")
     try:
         resp = session.get(url, params=params, timeout=15.0)
+        if resp.status_code == 429:
+            GLOBAL_SCANNER_TELEMETRY.http_429_errors += 1
+            GLOBAL_SCANNER_TELEMETRY.last_error_time = now
+            GLOBAL_SCANNER_TELEMETRY.last_error_message = "HTTP 429 Too Many Requests on /rewards/markets/multi"
+            logger.error("[SCANNER HTTP 429] Rate limit reached on CLOB multi-rewards endpoint.")
+            if cache_key in _SCANNER_CACHE:
+                logger.warning("[SCANNER STALE CACHE FALLBACK] Returning stale cached candidates due to HTTP 429.")
+                return [dict(m) for m in _SCANNER_CACHE[cache_key][1]]
+            return []
         resp.raise_for_status()
         raw_markets = resp.json().get("data", [])
+    except requests.exceptions.RequestException as e:
+        GLOBAL_SCANNER_TELEMETRY.network_errors += 1
+        GLOBAL_SCANNER_TELEMETRY.last_error_time = now
+        GLOBAL_SCANNER_TELEMETRY.last_error_message = f"Network error on /rewards/markets/multi: {e}"
+        logger.error(f"[SCANNER NETWORK ERROR] Failed to fetch reward pools from CLOB: {e}")
+        if cache_key in _SCANNER_CACHE:
+            logger.warning("[SCANNER STALE CACHE FALLBACK] Returning stale cached candidates due to network error.")
+            return [dict(m) for m in _SCANNER_CACHE[cache_key][1]]
+        return []
     except Exception as e:
         logger.error(f"Failed to fetch reward pools from CLOB: {e}")
+        if cache_key in _SCANNER_CACHE:
+            return [dict(m) for m in _SCANNER_CACHE[cache_key][1]]
         return []
 
     logger.info(f"Received {len(raw_markets)} markets. Applying risk & viability filters...")
@@ -499,14 +640,31 @@ def find_optimal_lp_markets(
     def audit_market(cand: dict[str, Any]) -> dict[str, Any]:
         s = requests.Session()
         s.headers.update({"User-Agent": "polymarketbot/optimal-selector"})
-        comp_score, qual_shares, real_mid = get_real_l2_score(
+        score_yes, qual_yes, real_mid_yes = get_real_l2_score(
             session=s,
             token_id=cand["yes_token"],
             max_spread_cents=cand["max_spread"],
         )
+        score_no, qual_no = 0.0, 0.0
+        if cand.get("no_token"):
+            score_no, qual_no, _ = get_real_l2_score(
+                session=s,
+                token_id=cand["no_token"],
+                max_spread_cents=cand["max_spread"],
+            )
+
+        # Polymarket rewards score combines qualifying depth across both tokens
+        comp_score = score_yes + score_no
+        qual_shares = qual_yes + qual_no
+
+        # Realistic competing depth floor: prevent 0.0 singularities
+        # where the solver assumes a tiny quote captures 100% of the pool due to momentary order book flicker
+        min_depth_floor = max(100.0, float(cand.get("min_size", 20.0)) * 5.0)
+        comp_score = max(comp_score, min_depth_floor)
+
         cand["competing_score"] = comp_score
         cand["qualifying_shares"] = qual_shares
-        cand["real_mid"] = real_mid
+        cand["real_mid"] = real_mid_yes
 
         total_score = comp_score + cand["our_score"]
         if total_score > 0 and cand["daily_pool"] > 0:
@@ -515,8 +673,8 @@ def find_optimal_lp_markets(
             raw_payout = 0.0
 
         cand["raw_daily_payout"] = raw_payout
-        # Strict enforcement of $1.00 daily payout floor
-        cand["clears_floor"] = raw_payout >= 1.00
+        # Strict enforcement of daily payout floor with safety buffer (>= $1.20)
+        cand["clears_floor"] = raw_payout >= 1.20
         cand["real_daily_payout"] = raw_payout if cand["clears_floor"] else 0.0
         cand["daily_roi_pct"] = (cand["real_daily_payout"] / cand["capital_required"]) * 100.0
         cand["monthly_roi_pct"] = cand["daily_roi_pct"] * 30.0
@@ -537,5 +695,12 @@ def find_optimal_lp_markets(
         reverse=True,
     )
 
-    return scored[:limit_output]
+    final_candidates = scored[:limit_output]
+    # Store in 5-second TTL in-memory cache
+    _SCANNER_CACHE[cache_key] = (now, final_candidates)
+    GLOBAL_SCANNER_TELEMETRY.cached_candidates_count = len(final_candidates)
+    GLOBAL_SCANNER_TELEMETRY.last_scan_timestamp = now
+
+    return final_candidates
+
 

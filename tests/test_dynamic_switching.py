@@ -39,8 +39,10 @@ from polymarketbot.rewards.switching import (
     calculate_switching_cost,
     evaluate_switching_hurdle,
 )
+from polymarketbot.rewards.queue_valuation import CapitalMigrationEngine, LiquidationRoute
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.models import RiskConfig
+from polymarketbot.simulator.engine import NativePaperTradingEngine
 
 
 # =========================================================================
@@ -479,3 +481,203 @@ def test_delta_neutrality_via_synthetic_cross_hedger_and_merge(tmp_path):
     assert abs(net_exposure) <= 20.0
     # Complete set merges were recorded
     assert paper_engine.total_merges_count >= 1
+
+
+# =========================================================================
+# 5. Native Paper Trading Engine & CapitalMigrationEngine Dynamic Switching
+# =========================================================================
+
+def test_native_engine_compute_resting_queue_value(tmp_path):
+    """Verify resting FIFO queue priority value ($V_queue) across virtual maker quotes."""
+    db_file = tmp_path / "test_vq.db"
+    ledger_file = tmp_path / "test_vq_ledger.json"
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xCOND_A",
+        asset_id_yes="tok_A_yes",
+        asset_id_no="tok_A_no",
+        initial_cash=200.0,
+        quote_size=25.0,
+        spread_offset_cents=0.50,
+        daily_reward_rate=30.0,
+        db_path=db_file,
+        ledger_path=ledger_file,
+    )
+
+    # Ingest order book
+    engine.update_orderbook_snapshot("YES", [{"price": "0.49", "size": "150.0"}], [{"price": "0.51", "size": "150.0"}])
+    engine.update_orderbook_snapshot("NO", [{"price": "0.49", "size": "150.0"}], [{"price": "0.51", "size": "150.0"}])
+
+    # Resting quotes should be placed
+    assert len(engine.active_quotes) >= 2
+    v_queue = engine.compute_resting_queue_value()
+    assert v_queue > 0.0
+
+    for q in engine.active_quotes.values():
+        assert "v_queue" in q
+        assert q["v_queue"] >= 0.0
+
+    engine.close()
+
+
+def test_native_engine_switching_cost_decomposition(tmp_path):
+    """Verify compute_switching_cost evaluates queue loss, merge gas, and downtime."""
+    db_file = tmp_path / "test_cost.db"
+    ledger_file = tmp_path / "test_cost_ledger.json"
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xCOND_A",
+        asset_id_yes="tok_A_yes",
+        asset_id_no="tok_A_no",
+        initial_cash=200.0,
+        quote_size=30.0,
+        spread_offset_cents=0.50,
+        daily_reward_rate=24.0,
+        db_path=db_file,
+        ledger_path=ledger_file,
+    )
+    engine.update_orderbook_snapshot("YES", [{"price": "0.49", "size": "100.0"}], [{"price": "0.51", "size": "100.0"}])
+    engine.update_orderbook_snapshot("NO", [{"price": "0.49", "size": "100.0"}], [{"price": "0.51", "size": "100.0"}])
+
+    decomp = engine.compute_switching_cost(daily_yield=24.0, transit_latency_seconds=4.5)
+
+    assert decomp.queue_value_lost_usd > 0.0
+    assert decomp.opportunity_cost_downtime_usd > 0.0
+    assert decomp.total_switching_cost_usd > 0.0
+    assert decomp.total_switching_cost_usd >= decomp.queue_value_lost_usd
+
+    engine.close()
+
+
+def test_native_engine_evaluate_migration_hurdle_positive_alpha_and_migration(tmp_path):
+    """Verify hurdle clears with POSITIVE ALPHA and executes clean market migration."""
+    db_file = tmp_path / "test_mig.db"
+    ledger_file = tmp_path / "test_mig_ledger.json"
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xCOND_A",
+        asset_id_yes="tok_A_yes",
+        asset_id_no="tok_A_no",
+        initial_cash=300.0,
+        quote_size=20.0,
+        spread_offset_cents=0.50,
+        daily_reward_rate=5.0,  # $5/day low yield
+        db_path=db_file,
+        ledger_path=ledger_file,
+    )
+    engine.update_orderbook_snapshot("YES", [{"price": "0.49", "size": "100.0"}], [{"price": "0.51", "size": "100.0"}])
+    engine.update_orderbook_snapshot("NO", [{"price": "0.49", "size": "100.0"}], [{"price": "0.51", "size": "100.0"}])
+
+    # Simulate 15 complete sets on Market A
+    engine.portfolio.split("0xCOND_A", 15.0)
+    pos_a = engine.portfolio.get_position("0xCOND_A")
+    assert pos_a.complete_sets == 15.0
+
+    # Candidate Market B offers $40/day (> $5/day hurdle)
+    should_switch, decision, cost = engine.evaluate_migration_hurdle(
+        candidate_daily_yield=40.0,
+        holding_horizon_hours=4.0,
+        daily_yield_a=5.0,
+    )
+
+    assert should_switch is True
+    assert "POSITIVE ALPHA" in decision.reason
+    assert decision.net_alpha_holding_usd > 0.0
+
+    # Execute clean market migration
+    cash_before = engine.portfolio.cash
+    evt = engine.migrate_to_market(
+        new_condition_id="0xCOND_B",
+        new_asset_id_yes="tok_B_yes",
+        new_asset_id_no="tok_B_no",
+        new_daily_reward_rate=40.0,
+        new_rewards_max_spread_cents=1.5,
+        new_rewards_min_size=25.0,
+        new_competing_score=500.0,
+        reason=decision.reason,
+    )
+
+    # 1. Quotes on M_A cleanly cancelled
+    assert len(engine.active_quotes) == 0
+
+    # 2. Complete sets on M_A merged to unlock cash
+    pos_a_after = engine.portfolio.get_position("0xCOND_A")
+    assert pos_a_after.complete_sets == 0.0
+    assert engine.portfolio.cash > cash_before
+    assert evt["unlocked_cash"] > 0.0
+
+    # 3. M_B registered
+    assert engine.condition_id == "0xCOND_B"
+    assert engine.asset_id_yes == "tok_B_yes"
+    assert engine.asset_id_no == "tok_B_no"
+    assert engine.daily_reward_rate == 40.0
+    assert len(engine.migration_history) == 1
+
+    engine.close()
+
+
+def test_native_engine_evaluate_migration_hurdle_rejected(tmp_path):
+    """Verify hurdle rejects marginal yield improvements and preserves Market A."""
+    db_file = tmp_path / "test_rej.db"
+    ledger_file = tmp_path / "test_rej_ledger.json"
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xCOND_A",
+        asset_id_yes="tok_A_yes",
+        asset_id_no="tok_A_no",
+        initial_cash=200.0,
+        quote_size=20.0,
+        spread_offset_cents=0.50,
+        daily_reward_rate=20.0,
+        db_path=db_file,
+        ledger_path=ledger_file,
+    )
+    engine.update_orderbook_snapshot("YES", [{"price": "0.49", "size": "100.0"}], [{"price": "0.51", "size": "100.0"}])
+    engine.update_orderbook_snapshot("NO", [{"price": "0.49", "size": "100.0"}], [{"price": "0.51", "size": "100.0"}])
+
+    # Candidate Market B offers $20.20/day (insufficient to clear switching cost amortization)
+    should_switch, decision, cost = engine.evaluate_migration_hurdle(
+        candidate_daily_yield=20.20,
+        holding_horizon_hours=4.0,
+        daily_yield_a=20.0,
+    )
+
+    assert should_switch is False
+    assert "HURDLE REJECTED" in decision.reason
+    assert engine.condition_id == "0xCOND_A"
+    assert len(engine.migration_history) == 0
+
+    engine.close()
+
+
+def test_native_engine_inventory_skew_synthetic_merge_liquidation_route(tmp_path):
+    """Verify optimal liquidation friction routing (Synthetic Merge vs Direct Cross) during switching."""
+    db_file = tmp_path / "test_skew.db"
+    ledger_file = tmp_path / "test_skew_ledger.json"
+
+    engine = NativePaperTradingEngine(
+        condition_id="0xCOND_A",
+        asset_id_yes="tok_A_yes",
+        asset_id_no="tok_A_no",
+        initial_cash=200.0,
+        quote_size=20.0,
+        db_path=db_file,
+        ledger_path=ledger_file,
+    )
+
+    # Ingest book depth
+    engine.update_orderbook_snapshot("YES", [{"price": "0.48", "size": "50.0"}], [{"price": "0.52", "size": "50.0"}])
+    engine.update_orderbook_snapshot("NO", [{"price": "0.48", "size": "50.0"}], [{"price": "0.51", "size": "50.0"}])
+
+    # Induce directional inventory skew: +20 YES shares
+    engine.portfolio.process_fill("0xCOND_A", side="BUY", outcome="YES", price=0.50, size=20.0)
+    pos = engine.portfolio.get_position("0xCOND_A")
+    assert pos.shares_yes == 20.0
+    assert pos.shares_no == 0.0
+
+    cost = engine.compute_switching_cost(daily_yield=10.0)
+    assert cost.liquidation_friction_usd > 0.0
+    assert cost.liquidation_route in (LiquidationRoute.SYNTHETIC_MERGE, LiquidationRoute.DIRECT_CROSS)
+
+    engine.close()
+

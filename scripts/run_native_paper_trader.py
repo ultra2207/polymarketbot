@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -26,6 +27,7 @@ import requests
 
 from polymarketbot.logs import get_logger
 from polymarketbot.rewards.deskew import DynamicDeSkewOptimizer
+from polymarketbot.rewards.queue_valuation import CapitalMigrationEngine
 from polymarketbot.simulator.engine import NativePaperTradingEngine
 from polymarketbot.simulator.feed import LivePolymarketFeed
 from polymarketbot.simulator.optimizer import derive_quote_size, optimize_spread_offset
@@ -75,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         default=100.0,
         help="Initial simulated cash balance in USD (default: $100.00).",
     )
+    parser.add_argument(
+        "--bankrolls",
+        type=str,
+        default=None,
+        help="Optional comma-separated list of bankrolls (e.g. '70,500,1000,2000,5000,10000') to run in simultaneous multi-tier mode.",
+    )
+
     parser.add_argument(
         "--quote-size",
         type=float,
@@ -150,6 +159,36 @@ def parse_args() -> argparse.Namespace:
         "--no-clear",
         action="store_true",
         help="Disable ANSI terminal screen clearing for log-friendly streaming.",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        "--switch-interval",
+        dest="scan_interval",
+        type=float,
+        default=20.0,
+        help="Continuous interval in seconds to scan the universe for high-yield opportunities (default: 20.0s).",
+    )
+    parser.add_argument(
+        "--holding-horizon-hours",
+        type=float,
+        default=4.0,
+        help="Economic holding horizon in hours for amortizing switching costs (default: 4.0h).",
+    )
+    parser.add_argument(
+        "--min-residency-seconds",
+        type=float,
+        default=180.0,
+        help="Minimum duration in seconds to quote a market before migrating to prevent churn (default: 180.0s).",
+    )
+    parser.add_argument(
+        "--disable-switching",
+        action="store_true",
+        help="Disable automatic opportunistic market switching.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume starting cash balance and cumulative state from existing ledger.",
     )
     return parser.parse_args()
 
@@ -284,6 +323,7 @@ def render_dashboard(
     market_info: dict[str, Any],
     start_time: float,
     clear_screen: bool = True,
+    migration_state: Optional[dict[str, Any]] = None,
 ) -> None:
     """Render high-density, real-time terminal telemetry dashboard."""
     t = engine.get_telemetry()
@@ -307,6 +347,14 @@ def render_dashboard(
     floor_met = proj_daily >= 1.0
     floor_str = f"{C_GREEN}MET (>= $1.00){C_RESET}" if floor_met else f"{C_YELLOW}UNMET (< $1.00){C_RESET}"
 
+    # Endogenous Reserve & Compounding APR
+    reserve_cash = t.get("reserve_cash_usd", t["cash"])
+    reserve_pct = t.get("reserve_ratio_pct", (t["cash"] / max(1e-4, t["equity"])) * 100.0)
+    nom_apr = t.get("nominal_apr_pct", 0.0)
+    comp_apr = t.get("compounding_apr_pct", 0.0)
+    v_queue = t.get("resting_queue_value_usd", 0.0)
+    mig_count = t.get("migration_count", 0)
+
     lines = []
     if clear_screen:
         lines.append("\033[H\033[J")  # Clear terminal screen
@@ -328,7 +376,7 @@ def render_dashboard(
     lines.append(f"{C_BOLD}[PORTFOLIO] PORTFOLIO LEDGER & CTF ACCOUNTING{C_RESET}")
     lines.append(
         f"  {C_BOLD}Equity:{C_RESET}        {equity_color}${t['equity']:>8.2f}{C_RESET}    "
-        f"{C_BOLD}Cash:{C_RESET}          ${t['cash']:>8.2f}     "
+        f"{C_BOLD}Cash Reserve:{C_RESET}  ${reserve_cash:>8.2f} ({reserve_pct:.1f}% buffer) "
         f"{C_BOLD}Market Val:{C_RESET}    ${t['market_value']:>8.2f}"
     )
     lines.append(
@@ -345,6 +393,11 @@ def render_dashboard(
         f"  {C_BOLD}Net Exposure:{C_RESET}  {q_color}{net_q:>+8.2f}{C_RESET}    "
         f"{C_BOLD}Complete Sets:{C_RESET} {t['complete_sets']:>8.2f}     "
         f"{C_BOLD}TOTAL PnL:{C_RESET}     {equity_color}${t['total_pnl']:>+8.4f}{C_RESET}"
+    )
+    lines.append(
+        f"  {C_BOLD}Compounding APR:{C_RESET} {C_GREEN}+{nom_apr:.1f}% APR{C_RESET} "
+        f"({C_GREEN}+{comp_apr:.1f}% APY compounded{C_RESET}) | "
+        f"{C_BOLD}Resting Queue Value ($V_queue):{C_RESET} {C_CYAN}${v_queue:.4f}{C_RESET}"
     )
     lines.append(f"{C_CYAN}----------------------------------------------------------------------------------------{C_RESET}")
 
@@ -384,11 +437,60 @@ def render_dashboard(
     )
     lines.append(f"{C_CYAN}----------------------------------------------------------------------------------------{C_RESET}")
 
+    # Migration hurdle status
+    hurdle_info = migration_state or {}
+    sec_rem = hurdle_info.get("next_scan_remaining", 300.0)
+    m_a_y = hurdle_info.get("y_net_a", t.get("daily_yield_usd", proj_daily))
+    m_b_y = hurdle_info.get("y_net_b", 0.0)
+    hurdle_st = hurdle_info.get("hurdle_status", "MONITORING")
+    st_color = C_GREEN if hurdle_st == "POSITIVE ALPHA" else (C_YELLOW if hurdle_st == "HURDLE REJECTED" else C_CYAN)
+    cand_q = hurdle_info.get("candidate_question", "None")
+    cost_val = hurdle_info.get("switching_cost", 0.0)
+    reason_txt = hurdle_info.get("decision_reason", "Awaiting initial 300s opportunity scan")
+
+    lines.append(f"{C_BOLD}[MIGRATION] DYNAMIC CAPITAL MIGRATION & HURDLE TELEMETRY{C_RESET}")
+    lines.append(
+        f"  {C_BOLD}Next Scan:{C_RESET}    {sec_rem:>5.1f}s / 300s   "
+        f"{C_BOLD}Total Migrations:{C_RESET} {mig_count:>2d}   "
+        f"{C_BOLD}Hurdle Status:{C_RESET} [{st_color}{hurdle_st}{C_RESET}]"
+    )
+    lines.append(
+        f"  {C_BOLD}Active Yield (M_A):{C_RESET} ${m_a_y:>6.2f}/d   "
+        f"{C_BOLD}Candidate Yield (M_B):{C_RESET} ${m_b_y:>6.2f}/d   "
+        f"{C_BOLD}Switching Cost:{C_RESET} ${cost_val:>6.4f}"
+    )
+    if cand_q and cand_q != "None":
+        lines.append(f"  {C_DIM}Top Candidate:{C_RESET} {cand_q[:72]}")
+    if reason_txt:
+        lines.append(f"  {C_DIM}Hurdle Audit:{C_RESET}  {reason_txt[:72]}")
+
+    # Scanner Cache & Health Telemetry
+    try:
+        from polymarketbot.rewards.scanner import get_scanner_telemetry
+        s_telemetry = get_scanner_telemetry()
+        s_scans = s_telemetry.total_scans
+        s_hits = s_telemetry.cache_hits
+        s_ratio = (s_hits / (s_scans or 1)) * 100.0
+        err_429 = s_telemetry.http_429_errors
+        net_err = s_telemetry.network_errors
+        err_color = C_GREEN if (err_429 == 0 and net_err == 0) else C_RED
+        lines.append(
+            f"  {C_BOLD}Scanner Health:{C_RESET} {s_scans} scans | "
+            f"{C_GREEN}{s_hits} cache hits ({s_ratio:.0f}% 5s TTL){C_RESET} | "
+            f"{err_color}HTTP 429: {err_429}{C_RESET} | "
+            f"{err_color}Net Errs: {net_err}{C_RESET}"
+        )
+    except Exception:
+        pass
+    lines.append(f"{C_CYAN}----------------------------------------------------------------------------------------{C_RESET}")
+
+
     lines.append(f"{C_BOLD}[QUOTES] ACTIVE RESTING VIRTUAL QUOTES (FIFO Queue & Quadratic Scoring){C_RESET}")
-    lines.append(f"  {'Side':<6s} {'Outcome':<8s} {'Price':<8s} {'Size':<8s} {'Queue Ahead':<14s} {'Score S(v,s)':<14s} {'Status'}")
+    lines.append(f"  {'Side':<6s} {'Outcome':<8s} {'Price':<8s} {'Size':<8s} {'Queue Ahead':<14s} {'Score S(v,s)':<14s} {'$V_queue':<10s} {'Status'}")
     if t["active_quotes"]:
         for q in t["active_quotes"]:
             side_color = C_GREEN if q["side"] == "BUY" else C_RED
+            vq_val = q.get("v_queue", 0.0)
             lines.append(
                 f"  {side_color}{q['side']:<6s}{C_RESET} "
                 f"{q.get('token_side', 'YES'):<8s} "
@@ -396,6 +498,7 @@ def render_dashboard(
                 f"{q['size']:<8.1f} "
                 f"{q['queue_ahead']:<14.1f} "
                 f"{q['score']:<14.4f} "
+                f"${vq_val:<9.4f} "
                 f"{C_GREEN}{q.get('status', 'ACTIVE')}{C_RESET}"
             )
     else:
@@ -408,13 +511,26 @@ def render_dashboard(
 
 async def run_paper_trading_async(args: argparse.Namespace) -> int:
     """Async main execution loop for native Polymarket paper trader with live WebSocket and REST streaming."""
+    active_cash = args.initial_cash
+    if getattr(args, "resume", False) and Path(args.ledger_path).exists():
+        try:
+            with open(args.ledger_path, "r", encoding="utf-8") as f:
+                prev_ledger = json.load(f)
+                prev_port = prev_ledger.get("portfolio", {})
+                prev_cash = float(prev_port.get("cash", 0.0))
+                if prev_cash > 0.0:
+                    active_cash = prev_cash
+                    log.info(f"[RESUME ACTIVE SESSION] Resuming from ledger {args.ledger_path} with starting cash: ${active_cash:.2f}")
+        except Exception as e:
+            log.warning(f"Resume ledger load warning: {e}")
+
     feed = LivePolymarketFeed(fallback_poll_interval=2.0)
     market = resolve_market_details(
         feed=feed,
         requested_cid=args.condition_id,
         requested_yes=args.token_yes,
         requested_no=args.token_no,
-        initial_cash=args.initial_cash,
+        initial_cash=active_cash,
     )
 
     daily_rew = args.daily_reward if args.daily_reward is not None else market["daily_reward"]
@@ -428,13 +544,12 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         log.info(f"Using manual quote size override: {quote_sz:.1f} shares")
     else:
         quote_sz = derive_quote_size(
-            initial_cash=args.initial_cash,
+            initial_cash=active_cash,
             mid_price=market["mid_price"],
             min_size=min_sz,
-            reserve_pct=0.25,
         )
         log.info(
-            f"[DYNAMIC SIZING] Derived quote size from ${args.initial_cash:.2f} initial cash: "
+            f"[DYNAMIC SIZING] Derived quote size from ${active_cash:.2f} initial cash: "
             f"{quote_sz:.1f} shares (mid=${market['mid_price']:.3f}, min_size={min_sz:.1f})"
         )
 
@@ -457,11 +572,12 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
             f"Net Utility=${opt_meta.get('net_utility', 0.0):.2f}/d, Proj Rewards=${opt_meta.get('payout_daily', 0.0):.2f}/d"
         )
 
+    migration_engine = CapitalMigrationEngine()
     engine = NativePaperTradingEngine(
         condition_id=market["condition_id"],
         asset_id_yes=market["token_yes"],
         asset_id_no=market["token_no"],
-        initial_cash=args.initial_cash,
+        initial_cash=active_cash,
         quote_size=quote_sz,
         spread_offset_cents=spread_off,
         daily_reward_rate=daily_rew,
@@ -472,11 +588,17 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         ledger_path=args.ledger_path,
         institutional_mode=not args.legacy_mode,
         competing_score_override=comp_score,
+        migration_engine=migration_engine,
     )
 
     # 1. Register live book listener
     def on_book_update(snapshot: Any) -> None:
-        tok_side = "YES" if snapshot.asset_id == market["token_yes"] else "NO"
+        if snapshot.asset_id == engine.asset_id_yes:
+            tok_side = "YES"
+        elif snapshot.asset_id == engine.asset_id_no:
+            tok_side = "NO"
+        else:
+            return
         engine.update_orderbook_snapshot(
             token_side=tok_side,
             bids=snapshot.bids,
@@ -488,7 +610,12 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
 
     # 2. Register live trade listener (drains queue_ahead and executes fills!)
     def on_trade_update(trade: Any) -> None:
-        tok_side = "YES" if trade.asset_id == market["token_yes"] else "NO"
+        if trade.asset_id == engine.asset_id_yes:
+            tok_side = "YES"
+        elif trade.asset_id == engine.asset_id_no:
+            tok_side = "NO"
+        else:
+            return
         fills = engine.process_public_trade(
             token_side=tok_side,
             price=trade.price,
@@ -526,17 +653,37 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
     log.info("Live Polymarket Feed started (WebSocket streaming + trade listener active).")
 
     start_time = time.time()
+    market_entry_time = time.time()
     last_epoch_check = time.time()
     last_l2_audit_time = time.time()
+    last_opportunity_scan_time = time.time()
     last_render_time = 0.0
     running = True
 
-    def handle_sigint(sig: int, frame: Any) -> None:
+    migration_state: dict[str, Any] = {
+        "next_scan_remaining": getattr(args, "scan_interval", 60.0),
+        "hurdle_status": "MONITORING",
+        "y_net_a": 0.0,
+        "y_net_b": 0.0,
+        "switching_cost": 0.0,
+        "candidate_question": "None",
+        "decision_reason": f"Next scan in {getattr(args, 'scan_interval', 60.0):.0f}s",
+    }
+
+    def handle_shutdown_signal(sig: int, frame: Any) -> None:
         nonlocal running
-        log.warning("Interrupt signal received. Shutting down paper trader...")
+        sig_name = "SIGINT" if sig == signal.SIGINT else (
+            "SIGTERM" if hasattr(signal, "SIGTERM") and sig == signal.SIGTERM else str(sig)
+        )
+        log.warning(f"Shutdown signal ({sig_name}) received. Gracefully terminating execution loop...")
         running = False
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, handle_shutdown_signal)
+        except (ValueError, OSError):
+            pass
 
     log.info("Paper trading execution loop engaged.")
     try:
@@ -564,6 +711,149 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
                         log.debug(f"Periodic L2 audit error: {e}")
                     last_l2_audit_time = loop_now
 
+                # Instant Cooldown Scanner Trigger: when market enters hold or volatility cooldown, immediately trigger scan
+                if hasattr(engine, "pop_instant_scan_trigger") and engine.pop_instant_scan_trigger():
+                    log.warning(
+                        "[INSTANT COOLDOWN SCANNER TRIGGERED] Volatility cooldown / hold active on current market. "
+                        "Triggering immediate opportunity rescan for dynamic market rotation..."
+                    )
+                    last_opportunity_scan_time = 0.0
+
+                # Continuous endogenous opportunity scan & market switching evaluation
+                scan_interval = getattr(args, "scan_interval", 20.0)
+                time_since_last_scan = loop_now - last_opportunity_scan_time
+                migration_state["next_scan_remaining"] = max(0.0, scan_interval - time_since_last_scan)
+
+                if not getattr(args, "disable_switching", False) and time_since_last_scan >= scan_interval:
+                    last_opportunity_scan_time = loop_now
+                    try:
+                        from polymarketbot.rewards.scanner import find_optimal_lp_markets
+                        log.info(
+                            f"[CONTINUOUS OPPORTUNITY SCANNER] Scanning universe (Scan Interval: {scan_interval:.0f}s)..."
+                        )
+                        candidates = find_optimal_lp_markets(
+                            bankroll_usd=engine.portfolio.cash,
+                            limit_output=5,
+                        )
+                        other_candidates = [
+                            c for c in candidates
+                            if str(c.get("condition_id", "")).lower() != str(engine.condition_id).lower()
+                        ]
+                        if other_candidates:
+                            top_cand = other_candidates[0]
+                            y_net_b = float(top_cand.get("real_daily_payout", 0.0) or top_cand.get("raw_daily_payout", 0.0))
+                            y_net_a = engine.get_current_daily_yield()
+
+                            # Compute exact switching friction (incorporating real-time V_queue) & evaluate Net Alpha Hurdle
+                            holding_h = getattr(args, "holding_horizon_hours", 4.0)
+                            should_switch, decision, cost = engine.evaluate_migration_hurdle(
+                                candidate_daily_yield=y_net_b,
+                                holding_horizon_hours=holding_h,
+                                daily_yield_a=y_net_a,
+                            )
+
+                            migration_state["y_net_a"] = y_net_a
+                            migration_state["y_net_b"] = y_net_b
+                            migration_state["candidate_question"] = top_cand.get("question", "")
+                            migration_state["switching_cost"] = cost.total_switching_cost_usd
+                            migration_state["hurdle_status"] = "POSITIVE ALPHA" if should_switch else "HURDLE REJECTED"
+                            migration_state["decision_reason"] = decision.reason
+                            # Enforce minimum residency duration before executing migration
+                            time_in_market = loop_now - market_entry_time
+                            min_residency = getattr(args, "min_residency_seconds", 180.0)
+                            if should_switch and time_in_market < min_residency:
+                                is_cooldown = getattr(engine, "is_volatility_cooldown_active", False) or (
+                                    loop_now < getattr(engine, "_volatility_cooldown_until", 0.0)
+                                )
+                                if is_cooldown:
+                                    log.warning(
+                                        f"[RESIDENCY BYPASS ON HOLD] Active market is in volatility cooldown "
+                                        f"({getattr(engine, '_volatility_cooldown_until', 0.0) - loop_now:.1f}s remaining). "
+                                        f"Bypassing minimum residency hold ({time_in_market:.0f}s < {min_residency:.0f}s) to rotate capital!"
+                                    )
+                                else:
+                                    should_switch = False
+                                    migration_state["hurdle_status"] = "RESIDENCY HOLD"
+                                    migration_state["decision_reason"] = (
+                                        f"Minimum residency {time_in_market:.0f}s < {min_residency:.0f}s (Holding to earn rewards)"
+                                    )
+
+
+                            if should_switch:
+                                log.warning(f"[MARKET MIGRATION TRIGGERED] {decision.reason}")
+                                market_entry_time = loop_now
+                                # 1. Unsubscribe old tokens from live feed
+                                feed.unsubscribe([market["token_yes"], market["token_no"]])
+
+                                # 2. Extract new candidate parameters
+                                new_cid = top_cand["condition_id"]
+                                new_yes = top_cand.get("yes_token") or f"{new_cid}_YES"
+                                new_no = top_cand.get("no_token") or f"{new_cid}_NO"
+                                new_daily_reward = float(top_cand.get("daily_pool", 20.0))
+                                new_max_spread = float(top_cand.get("max_spread", 1.0))
+                                new_min_size = float(top_cand.get("min_size", 20.0))
+                                new_comp_score = top_cand.get("competing_score")
+
+                                # Dynamically derive new quote size and spread offset
+                                new_quote_sz = derive_quote_size(
+                                    initial_cash=engine.portfolio.cash,
+                                    mid_price=float(top_cand.get("real_mid", 0.50)),
+                                    min_size=new_min_size,
+                                )
+                                new_spread_off, _ = optimize_spread_offset(
+                                    max_spread_cents=new_max_spread,
+                                    market_spread_cents=1.0,
+                                    tick_size_cents=1.0,
+                                    daily_reward_pool=new_daily_reward,
+                                    quote_size=new_quote_sz,
+                                    category="default",
+                                )
+
+                                # 3. Clean market migration in engine (cancel quotes on M_A, merge complete sets on M_A, register M_B)
+                                engine.migrate_to_market(
+                                    new_condition_id=new_cid,
+                                    new_asset_id_yes=new_yes,
+                                    new_asset_id_no=new_no,
+                                    new_daily_reward_rate=new_daily_reward,
+                                    new_rewards_max_spread_cents=new_max_spread,
+                                    new_rewards_min_size=new_min_size,
+                                    new_competing_score=new_comp_score,
+                                    new_quote_size=new_quote_sz,
+                                    new_spread_offset_cents=new_spread_off,
+                                    reason=decision.reason,
+                                    timestamp=loop_now,
+                                )
+
+                                # 4. Update local market metadata
+                                market["condition_id"] = new_cid
+                                market["question"] = top_cand.get("question", f"Market {new_cid[:14]}")
+                                market["token_yes"] = new_yes
+                                market["token_no"] = new_no
+                                market["daily_reward"] = new_daily_reward
+                                market["max_spread"] = new_max_spread
+                                market["min_size"] = new_min_size
+                                market["mid_price"] = float(top_cand.get("real_mid", 0.50))
+
+                                # 5. Subscribe new tokens and fetch initial order book snapshot
+                                feed.subscribe([new_yes, new_no])
+                                try:
+                                    book_y = feed.get_book_sync(new_yes)
+                                    if book_y and (book_y.bids or book_y.asks):
+                                        engine.update_orderbook_snapshot("YES", book_y.bids, book_y.asks)
+                                    book_n = feed.get_book_sync(new_no)
+                                    if book_n and (book_n.bids or book_n.asks):
+                                        engine.update_orderbook_snapshot("NO", book_n.bids, book_n.asks)
+                                except Exception as e:
+                                    log.warning(f"REST fetch for newly migrated market failed: {e}")
+
+                                # 6. Start quoting M_B
+                                engine.evaluate_quotes(timestamp=loop_now)
+                                log.info(f"[MARKET MIGRATION COMPLETED] Actively quoting new market: {market['question'][:50]}")
+                            else:
+                                log.info(f"[MARKET MIGRATION AUDIT] Hurdle rejected: {decision.reason} | Maintaining M_A.")
+                    except Exception as e:
+                        log.warning(f"Opportunistic market scan error: {e}")
+
                 # Auto complete-set merge check
                 pos = engine.portfolio.get_position(market["condition_id"])
                 if pos.complete_sets >= args.auto_merge_threshold:
@@ -584,6 +874,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
                         market_info=market,
                         start_time=start_time,
                         clear_screen=not args.no_clear,
+                        migration_state=migration_state,
                     )
                     last_render_time = loop_now
 
@@ -594,12 +885,35 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
                 log.error(f"Error in paper trading iteration: {e}")
 
             await asyncio.sleep(args.poll_interval)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.info("Execution loop interrupted. Proceeding with clean shutdown...")
     finally:
-        log.info("Session concluding. Executing mandatory liquidation of all open positions...")
+        log.info("Session concluding. Initiating graceful shutdown sequence...")
+        log.info("Canceling active virtual maker quotes...")
+        engine.cancel_all_virtual_quotes()
+
+        log.info("Executing mandatory liquidation of all open positions...")
         liq = engine.liquidate_all_positions()
-        log.info("Stopping live feed and flushing final ledger...")
+
+        log.info("Stopping live feed...")
         await feed.stop()
+
+        log.info("Flushing atomic ledger...")
         engine.flush_ledger()
+
+        log.info("Flushing SQLite database WAL journal and closing connections...")
+        engine.flush_wal()
+        engine.close()
+
+        # Write final settlement summary to log
+        total_vol = liq.get("total_volume_traded_usd", getattr(engine.portfolio, "total_volume_traded_usd", 0.0))
+        log.info(
+            f"[SESSION FINAL SETTLEMENT] Initial: ${liq['initial_cash']:.2f} | "
+            f"Final Cash: ${liq['final_cash_settlement']:.2f} | "
+            f"Net Realized PnL: ${liq['total_realized_pnl']:+.4f} ({liq['net_return_pct']:+.2f}%) | "
+            f"Total Volume: ${total_vol:.2f} | "
+            f"Fills: {len(engine.fills_history)} | Open Inventory: {liq['final_open_positions_count']} shares"
+        )
 
         # Print final 100% Cash-Settlement Report
         sys.stdout.write("\n" + "=" * 88 + "\n")
@@ -628,7 +942,19 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args()
-    return asyncio.run(run_paper_trading_async(args))
+    if getattr(args, "bankrolls", None):
+        from scripts.run_multi_tier_paper_trader import run_multi_tier_async
+        try:
+            return asyncio.run(run_multi_tier_async(args))
+        except KeyboardInterrupt:
+            log.info("Multi-tier process interrupted by keyboard signal. Exiting cleanly with code 0.")
+            return 0
+    try:
+        return asyncio.run(run_paper_trading_async(args))
+    except KeyboardInterrupt:
+        log.info("Process interrupted by keyboard signal. Exiting cleanly with code 0.")
+        return 0
+
 
 
 if __name__ == "__main__":

@@ -45,6 +45,28 @@ class MarketAllocation:
     competing_depth: float
     mid_price: float
     tokens: list[dict[str, Any]] = field(default_factory=list)
+    yes_token: str = ""
+    no_token: str = ""
+    max_spread: float = 3.0
+    min_size: float = 20.0
+
+    @property
+    def token_yes(self) -> str:
+        if self.yes_token:
+            return self.yes_token
+        for t in self.tokens:
+            if str(t.get("outcome", "")).upper() == "YES":
+                return t.get("token_id", "")
+        return f"{self.condition_id}_YES"
+
+    @property
+    def token_no(self) -> str:
+        if self.no_token:
+            return self.no_token
+        for t in self.tokens:
+            if str(t.get("outcome", "")).upper() == "NO":
+                return t.get("token_id", "")
+        return f"{self.condition_id}_NO"
 
 
 @dataclass
@@ -89,15 +111,21 @@ class LiquidityRewardsAllocator:
         daily_pool: float,
         competing_score: float,
         alpha: float,
+        floor_target: float = 1.35,
     ) -> float:
-        """Calculate the exact closed-form minimum capital required to clear the $1.00 daily floor:
+        """Calculate the exact closed-form minimum capital required to clear the safety-buffered daily floor:
 
-        P * (alpha * c) / (D + alpha * c) >= 1.00
-        <=> c >= D / (alpha * (P - 1.00))
+        P * (alpha * c) / (D + alpha * c) >= floor_target
+        <=> alpha * c * (P - floor_target) >= floor_target * D
+        <=> c >= (floor_target * D) / (alpha * (P - floor_target))
         """
-        if daily_pool <= 1.0 or alpha <= 0.0:
+        target = max(1.00, float(floor_target))
+        if daily_pool <= target or alpha <= 0.0:
             return float("inf")
-        return float(competing_score / (alpha * (daily_pool - 1.0)))
+        excess_pool_ratio = (daily_pool / target) - 1.0
+        if excess_pool_ratio <= 1e-6:
+            return float("inf")
+        return float(competing_score / (alpha * excess_pool_ratio))
 
     def evaluate_market_payout(
         self,
@@ -123,10 +151,22 @@ class LiquidityRewardsAllocator:
         bankroll_usd: float = 150.0,
         max_active_markets: Optional[int] = None,
         spread_offset_cents: Optional[float] = None,
+        floor_target: float = 1.35,
+        use_endogenous_reserve: bool = True,
+        exact_reserve_override: Optional[float] = None,
+        _is_pass2: bool = False,
     ) -> PortfolioAllocationResult:
         """Solve capital allocation using Google OR-Tools SCIP MILP solver with concave piecewise linear secants."""
-        usable_capital = bankroll_usd * (1.0 - self.reserve_pct)
-        cash_reserve = bankroll_usd * self.reserve_pct
+        if exact_reserve_override is not None:
+            cash_reserve = round(exact_reserve_override, 2)
+            usable_capital = max(0.0, round(bankroll_usd - cash_reserve, 2))
+        elif use_endogenous_reserve:
+            init_reserve = round(min(bankroll_usd * 0.35, max(2.5, math.sqrt(bankroll_usd) * 2.5)), 2)
+            usable_capital = max(0.0, bankroll_usd - init_reserve)
+            cash_reserve = init_reserve
+        else:
+            usable_capital = bankroll_usd * (1.0 - self.reserve_pct)
+            cash_reserve = bankroll_usd * self.reserve_pct
 
         if usable_capital <= 0.0 or not candidates:
             return PortfolioAllocationResult(
@@ -156,7 +196,7 @@ class LiquidityRewardsAllocator:
                 continue
 
             alpha = self.calculate_alpha(max_spr, spread_offset_cents)
-            c_floor = self.calculate_min_floor_capital(p, d, alpha)
+            c_floor = self.calculate_min_floor_capital(p, d, alpha, floor_target=floor_target)
 
             # Check if this candidate can possibly clear the floor within usable capital
             c_min = max(min_sz, c_floor)
@@ -175,7 +215,16 @@ class LiquidityRewardsAllocator:
             })
 
         if not parsed_candidates:
-            # No candidates can clear the $1.00 floor or meet minimum capital constraints
+            # If no candidates clear floor_target (e.g. 1.35), gracefully retry with 1.15
+            if floor_target > 1.15:
+                return self.optimize_allocation_milp(
+                    candidates=candidates,
+                    bankroll_usd=bankroll_usd,
+                    max_active_markets=max_active_markets,
+                    spread_offset_cents=spread_offset_cents,
+                    floor_target=1.15,
+                    use_endogenous_reserve=use_endogenous_reserve,
+                )
             return PortfolioAllocationResult(
                 bankroll_usd=bankroll_usd,
                 usable_capital=usable_capital,
@@ -285,6 +334,10 @@ class LiquidityRewardsAllocator:
                         competing_depth=round(m["D"], 1),
                         mid_price=round(m["mid"], 4),
                         tokens=cand_dict.get("raw_market", {}).get("tokens", []),
+                        yes_token=cand_dict.get("yes_token") or cand_dict.get("token_yes") or "",
+                        no_token=cand_dict.get("no_token") or cand_dict.get("token_no") or "",
+                        max_spread=float(cand_dict.get("max_spread", 3.0)),
+                        min_size=float(cand_dict.get("min_size", 20.0)),
                     )
                 )
                 total_allocated += cap
@@ -292,6 +345,29 @@ class LiquidityRewardsAllocator:
 
         # Sort allocations by daily payout descending
         allocations.sort(key=lambda a: a.daily_reward_payout, reverse=True)
+
+        if use_endogenous_reserve and allocations and not _is_pass2:
+            exact_reserve = calculate_endogenous_reserve(
+                allocations=[a.__dict__ for a in allocations],
+                bankroll_usd=bankroll_usd,
+            )
+            # 2-Pass Refinement: Re-solve with the exact portfolio-derived risk reserve
+            if abs(exact_reserve - cash_reserve) >= 1.0:
+                return self.optimize_allocation_milp(
+                    candidates=candidates,
+                    bankroll_usd=bankroll_usd,
+                    max_active_markets=max_active_markets,
+                    spread_offset_cents=spread_offset_cents,
+                    floor_target=floor_target,
+                    use_endogenous_reserve=True,
+                    exact_reserve_override=exact_reserve,
+                    _is_pass2=True,
+                )
+            cash_reserve = round(exact_reserve, 2)
+            usable_capital = round(bankroll_usd - cash_reserve, 2)
+        elif _is_pass2 and exact_reserve_override is not None:
+            cash_reserve = round(exact_reserve_override, 2)
+            usable_capital = round(bankroll_usd - cash_reserve, 2)
 
         daily_roi = (total_payout / total_allocated) * 100.0 if total_allocated > 0 else 0.0
         monthly_roi = daily_roi * 30.0
@@ -359,6 +435,10 @@ class LiquidityRewardsAllocator:
             competing_depth=round(best_cand["D"], 1),
             mid_price=round(best_cand["mid"], 4),
             tokens=cand_dict.get("raw_market", {}).get("tokens", []),
+            yes_token=cand_dict.get("yes_token") or cand_dict.get("token_yes") or "",
+            no_token=cand_dict.get("no_token") or cand_dict.get("token_no") or "",
+            max_spread=float(cand_dict.get("max_spread", 3.0)),
+            min_size=float(cand_dict.get("min_size", 20.0)),
         )
 
         return PortfolioAllocationResult(
@@ -436,41 +516,77 @@ class LiquidityRewardsAllocator:
         self,
         allocations: list[dict[str, Any]],
         bankroll_usd: float,
-        base_gas_buffer_usd: float = 2.0,
+        base_gas_buffer_usd: Optional[float] = None,
+        ctf_client: Optional[Any] = None,
     ) -> float:
-        """Calculate the economically optimal endogenous cash reserve required to absorb
+        """Delegate to module-level calculate_endogenous_reserve."""
+        return calculate_endogenous_reserve(
+            allocations=allocations,
+            bankroll_usd=bankroll_usd,
+            base_gas_buffer_usd=base_gas_buffer_usd,
+            ctf_client=ctf_client,
+        )
 
-        worst-case adverse inventory skew and execute synthetic CTF merges without capital lock.
 
-        Formulation:
-        For each active market i with capital c_i and price p_i:
-            Single-leg synthetic hedging requirement: h_i = c_i * max(p_i, 1.0 - p_i)
-        Portfolio Value-at-Risk for Concurrent Adverse Hedging:
-            Reserve* = sqrt(sum_i h_i^2) * 0.30 + max_i(h_i) * 0.20 + Gas_Buffer
-        """
-        if not allocations:
-            return round(min(bankroll_usd * 0.15, 25.0), 2)
+def calculate_endogenous_reserve(
+    allocations: list[dict[str, Any]],
+    bankroll_usd: float,
+    base_gas_buffer_usd: Optional[float] = None,
+    confidence_quantile: float = 3.090,  # 99.9% non-exhaustion
+    jump_shock_factor: float = 0.20,
+    ctf_client: Optional[Any] = None,
+) -> float:
+    """Calculate the mathematically optimal endogenous cash reserve C_reserve*.
 
-        h_values = []
-        for a in allocations:
-            cap = float(a.get("capital", a.get("allocated_capital", 50.0)))
-            mid = float(a.get("mid", a.get("mid_price", 0.50)))
-            h_i = cap * max(mid, 1.0 - mid)
-            h_values.append(h_i)
+    Models stochastic unmerged inventory via Poisson-Brownian diffusion across K
+    uncorrelated markets with a jump-shock epigraph and dynamic Polygon PoS gas buffer.
+    """
+    if bankroll_usd <= 0.0:
+        return 0.0
 
-        if len(h_values) == 1:
-            # Single-market concentration: reserve 20% to 30% of the single position for partial de-skewing
-            req_reserve = min(bankroll_usd * 0.35, max(10.0, h_values[0] * 0.25 + base_gas_buffer_usd))
-            return round(req_reserve, 2)
+    if base_gas_buffer_usd is not None:
+        dynamic_gas_buffer = float(base_gas_buffer_usd)
+        per_market_buffer = 0.35
+    else:
+        try:
+            if ctf_client is not None and hasattr(ctf_client, "estimate_merge_cost_usd"):
+                gas_cost_merge = ctf_client.estimate_merge_cost_usd()
+            else:
+                from polymarketbot.trading.ctf import estimate_merge_cost_usd
+                gas_cost_merge = estimate_merge_cost_usd()
+        except Exception:
+            gas_cost_merge = 0.015
+        # Dynamic gas buffer: ~100 merge operations base headroom + 25 per-market merge operations
+        dynamic_gas_buffer = max(0.20, round(gas_cost_merge * 100.0, 2))
+        per_market_buffer = max(0.05, round(gas_cost_merge * 25.0, 2))
 
-        # Multi-market portfolio diversification (square-root scaling of uncorrelated jump risk):
-        diversified_hedge_risk = math.sqrt(sum(h**2 for h in h_values)) * 0.30
-        tail_single_sweep = max(h_values) * 0.20
-        optimal_reserve = diversified_hedge_risk + tail_single_sweep + base_gas_buffer_usd
+    if not allocations:
+        return round(dynamic_gas_buffer + bankroll_usd * 0.05, 2)
 
-        # Bound reserve between 10% and 35% of total bankroll
-        bounded_reserve = max(bankroll_usd * 0.10, min(bankroll_usd * 0.35, optimal_reserve))
-        return round(bounded_reserve, 2)
+    h_values = []
+    total_gas_buffer = dynamic_gas_buffer
+
+    for a in allocations:
+        cap = float(a.get("capital", a.get("allocated_capital", 50.0)))
+        mid = float(a.get("mid", a.get("mid_price", 0.50)))
+        h_i = cap * max(mid, 1.0 - mid)
+        h_values.append(h_i)
+        total_gas_buffer += per_market_buffer
+
+    # Unified Portfolio Exposure via Central Limit Theorem:
+    # 1. Stochastic replenishment demand scales as sqrt(sum(h_i^2)) * sigma_fill
+    #    When K=1, sqrt(h_1^2) = h_1 directly.
+    # 2. Jump shock: risk of instantaneous unhedged fill on the largest single market
+    # 3. Polygon CTF merge gas buffer (scales dynamically with K and live gas pricing)
+    diversified_stochastic_demand = math.sqrt(sum(h**2 for h in h_values)) * 0.15
+    tail_single_sweep = max(h_values) * jump_shock_factor
+    optimal_reserve = diversified_stochastic_demand + tail_single_sweep + total_gas_buffer
+
+    # Physical safety bounds:
+    # Floor: minimum gas buffer so smart contract calls never fail
+    # Ceiling: 35% of bankroll to avoid excessive cash drag
+    bounded_reserve = max(total_gas_buffer, min(bankroll_usd * 0.35, optimal_reserve))
+    return round(bounded_reserve, 2)
 
 
 # ---------------------------------------------------------------------------

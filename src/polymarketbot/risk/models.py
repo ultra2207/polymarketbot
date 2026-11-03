@@ -100,12 +100,18 @@ class RiskConfig:
                     self.total_bankroll_usd * self.micro_capital_concentration_pct, 2
                 )
             else:
-                self.max_portfolio_inventory_usd = 200.0
+                self.max_portfolio_inventory_usd = round(self.total_bankroll_usd * 0.60, 2)
+
+        if self.daily_loss_limit_usd is None:
+            self.daily_loss_limit_usd = round(self.total_bankroll_usd * self.daily_loss_limit_pct, 2)
+
+        if self.max_drawdown_usd is None:
+            self.max_drawdown_usd = round(self.total_bankroll_usd * self.max_drawdown_pct, 2)
 
     # 2. Max Drawdown Circuit Breakers
-    daily_loss_limit_usd: float = 15.0  # Stop quoting if daily loss > $15 (5% of $300)
+    daily_loss_limit_usd: Optional[float] = None  # Dynamically derived from daily_loss_limit_pct
     daily_loss_limit_pct: float = 0.05  # 5% daily loss limit
-    max_drawdown_usd: float = 30.0  # Stop engine if cumulative loss > $30 (10% of $300)
+    max_drawdown_usd: Optional[float] = None  # Dynamically derived from max_drawdown_pct
     max_drawdown_pct: float = 0.10  # 10% max drawdown limit
 
     # 3. Price Jump & Volatility Circuit Breaker

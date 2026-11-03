@@ -29,10 +29,16 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
+from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+from polymarketbot.rewards.microstructure import (
+    compute_dynamic_drift_threshold_cents,
+    compute_dynamic_ofi_threshold,
+)
 from polymarketbot.rewards.scoring import quadratic_order_score
 from polymarketbot.simulator.book import PRICE_EPSILON, SyntheticOrderBook, _norm_px
 from polymarketbot.simulator.impact import MarketImpactEngine, QuoteSide
 from polymarketbot.simulator.portfolio import MergeResult, Position, SimulatedPortfolio
+from polymarketbot.trading.ctf import estimate_merge_cost_usd
 
 log = get_logger("institutional.mm")
 
@@ -74,27 +80,73 @@ class JaneStreetMarketMaker:
         gamma: float = 0.02,                   # Risk aversion coefficient
         max_spread_cents: float = 1.0,         # Maximum allowable half-spread
         min_spread_cents: float = 0.5,         # Target tight half-spread (top of book)
-        auto_merge_threshold: float = 25.0,    # Complete sets before batch CTF merge
-        q_hard_threshold: float = 120.0,       # Emergency circuit breaker inventory limit
-        gas_fee_merge: float = 0.015,          # Polygon CTF mergePositions gas fee
-        ofi_toxicity_threshold: float = 850.0, # Cont-Kukanov-Stoikov OFI threshold
-        drift_toxicity_cents: float = 1.25,    # Micro-price drift threshold (cents)
+        auto_merge_threshold: Optional[float] = None,    # Complete sets before batch CTF merge
+        q_hard_threshold: Optional[float] = None,       # Emergency circuit breaker inventory limit
+        gas_fee_merge: Optional[float] = None,          # Polygon CTF mergePositions gas fee
+        ofi_toxicity_threshold: Optional[float] = None, # Cont-Kukanov-Stoikov OFI threshold
+        drift_toxicity_cents: Optional[float] = None,    # Micro-price drift threshold (cents)
     ) -> None:
         self.condition_id = condition_id
+        self.initial_cash = float(initial_cash)
         self.quote_size = float(quote_size)
         self.gamma = float(gamma)
         self.max_spread_cents = float(max_spread_cents)
         self.min_spread_cents = float(min_spread_cents)
-        self.auto_merge_threshold = float(auto_merge_threshold)
-        self.q_hard = float(q_hard_threshold)
-        self.gas_fee_merge = float(gas_fee_merge)
-        self.ofi_thresh = float(ofi_toxicity_threshold)
-        self.drift_thresh_cents = float(drift_toxicity_cents)
+
+        # Dynamic threshold calculator instantiation
+        self.threshold_calculator = DynamicThresholdCalculator()
+
+        # Dynamic evaluation flags
+        self._dynamic_gas_fee = (gas_fee_merge is None)
+        self._dynamic_q_hard = (q_hard_threshold is None)
+        self._dynamic_auto_merge = (auto_merge_threshold is None)
+        self._dynamic_ofi = (ofi_toxicity_threshold is None)
+        self._dynamic_drift = (drift_toxicity_cents is None)
+
+        # 1. Gas fee merge: evaluate dynamically if None
+        if gas_fee_merge is None:
+            self.gas_fee_merge = float(estimate_merge_cost_usd())
+        else:
+            self.gas_fee_merge = float(gas_fee_merge)
+
+        # 2. Dynamic thresholds (q_hard and auto_merge) based on quote_size, initial_cash, and spread
+        init_spread_cents = self.min_spread_cents * 2.0
+        if self._dynamic_q_hard or self._dynamic_auto_merge:
+            calib = self.threshold_calculator.calibrate_all(
+                quote_size=self.quote_size,
+                bankroll=self.initial_cash,
+                cash_reserve=self.initial_cash,
+                gamma=self.gamma,
+                mid_price=0.50,
+                spread_cents=init_spread_cents,
+                gas_cost_usd=self.gas_fee_merge,
+            )
+            self.q_hard = float(q_hard_threshold) if q_hard_threshold is not None else float(calib.q_hard)
+            self.auto_merge_threshold = (
+                float(auto_merge_threshold) if auto_merge_threshold is not None else float(calib.auto_merge_threshold)
+            )
+        else:
+            self.q_hard = float(q_hard_threshold)
+            self.auto_merge_threshold = float(auto_merge_threshold)
+
+        # 3. Dynamic OFI threshold
+        if ofi_toxicity_threshold is None:
+            self.ofi_thresh = float(compute_dynamic_ofi_threshold(bid_size=100.0, ask_size=100.0))
+        else:
+            self.ofi_thresh = float(ofi_toxicity_threshold)
+
+        # 4. Dynamic drift threshold
+        if drift_toxicity_cents is None:
+            self.drift_thresh_cents = float(
+                compute_dynamic_drift_threshold_cents(mid_price=0.50, spread_cents=init_spread_cents)
+            )
+        else:
+            self.drift_thresh_cents = float(drift_toxicity_cents)
 
         # Portfolio Ledger adhering to real-world CTF collateral economics
         self.portfolio = SimulatedPortfolio(
-            initial_cash=initial_cash,
-            gas_fee_merge=gas_fee_merge,
+            initial_cash=self.initial_cash,
+            gas_fee_merge=self.gas_fee_merge,
             taker_fee_bps=0.0,
         )
 
@@ -110,6 +162,12 @@ class JaneStreetMarketMaker:
         self._last_top_ask_yes: float = 0.51
         self._last_top_ask_size_yes: float = 0.0
         self.rolling_ofi: float = 0.0
+
+        # Dynamic update tracking caches
+        self._last_depth_bid_yes: Optional[float] = None
+        self._last_depth_ask_yes: Optional[float] = None
+        self._last_mid_yes: Optional[float] = None
+        self._last_spread_cents: Optional[float] = None
 
         # Active state
         self.last_decision: Optional[DualCashQuotePair] = None
@@ -213,6 +271,64 @@ class JaneStreetMarketMaker:
         abs_q = abs(net_q)
 
         mid_yes = (best_bid_yes + best_ask_yes) / 2.0
+        spread_cents = max(0.01, (best_ask_yes - best_bid_yes) * 100.0)
+
+        # Dynamic Threshold Updates on Order Book Depth or Mid-Price Changes
+        depth_changed = (
+            self._last_depth_bid_yes is None
+            or self._last_depth_ask_yes is None
+            or abs(depth_bid_yes - self._last_depth_bid_yes) > PRICE_EPSILON
+            or abs(depth_ask_yes - self._last_depth_ask_yes) > PRICE_EPSILON
+        )
+        mid_or_spread_changed = (
+            self._last_mid_yes is None
+            or self._last_spread_cents is None
+            or abs(mid_yes - self._last_mid_yes) > 1e-4
+            or abs(spread_cents - self._last_spread_cents) > 1e-4
+        )
+
+        if depth_changed and self._dynamic_ofi:
+            self.ofi_thresh = float(
+                compute_dynamic_ofi_threshold(
+                    bid_size=depth_bid_yes,
+                    ask_size=depth_ask_yes,
+                )
+            )
+
+        if mid_or_spread_changed:
+            if self._dynamic_drift:
+                self.drift_thresh_cents = float(
+                    compute_dynamic_drift_threshold_cents(
+                        mid_price=mid_yes,
+                        spread_cents=spread_cents,
+                    )
+                )
+
+            if self._dynamic_q_hard or self._dynamic_auto_merge:
+                calib = self.threshold_calculator.calibrate_all(
+                    quote_size=self.quote_size,
+                    bankroll=self.initial_cash,
+                    cash_reserve=self.portfolio.cash,
+                    gamma=self.gamma,
+                    mid_price=mid_yes,
+                    time_to_resolution_days=time_to_resolution_days,
+                    spread_cents=spread_cents,
+                    gas_cost_usd=self.gas_fee_merge,
+                )
+                if self._dynamic_q_hard:
+                    self.q_hard = float(calib.q_hard)
+                if self._dynamic_auto_merge:
+                    self.auto_merge_threshold = float(calib.auto_merge_threshold)
+
+            if self._dynamic_gas_fee:
+                self.gas_fee_merge = float(estimate_merge_cost_usd())
+                self.portfolio.gas_fee_merge = self.gas_fee_merge
+
+        self._last_depth_bid_yes = depth_bid_yes
+        self._last_depth_ask_yes = depth_ask_yes
+        self._last_mid_yes = mid_yes
+        self._last_spread_cents = spread_cents
+
         micro_px = self.compute_stoikov_micro_price(
             best_bid=best_bid_yes,
             bid_size=depth_bid_yes,

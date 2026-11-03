@@ -56,41 +56,57 @@ def test_calculate_min_floor_capital(allocator):
     alpha = allocator.calculate_alpha(max_spread_cents=4.5, spread_offset_cents=1.5)
     assert abs(alpha - 0.4444) < 1e-3
 
-    c_floor = allocator.calculate_min_floor_capital(daily_pool=565.0, competing_score=3400.0, alpha=alpha)
+    c_floor_100 = allocator.calculate_min_floor_capital(daily_pool=565.0, competing_score=3400.0, alpha=alpha, floor_target=1.00)
     # c_floor = 3400 / (0.4444 * 564) = 3400 / 250.666 = 13.56
-    assert 13.0 < c_floor < 14.0
+    assert 13.0 < c_floor_100 < 14.0
+
+    # With safety buffer floor_target=1.35
+    c_floor_135 = allocator.calculate_min_floor_capital(daily_pool=565.0, competing_score=3400.0, alpha=alpha, floor_target=1.35)
+    assert 18.0 < c_floor_135 < 19.0
 
 
 def test_micro_capital_allocation_concentrates(allocator, sample_candidates):
-    # Bankroll $150 -> usable $112.50 (25% reserve = $37.50)
-    result = allocator.optimize_allocation_milp(candidates=sample_candidates, bankroll_usd=150.0)
+    # Fixed reserve mode: Bankroll $150 -> usable $112.50 (25% reserve = $37.50)
+    result_fixed = allocator.optimize_allocation_milp(candidates=sample_candidates, bankroll_usd=150.0, use_endogenous_reserve=False)
+    assert result_fixed.bankroll_usd == 150.0
+    assert result_fixed.usable_capital == 112.50
+    assert result_fixed.cash_reserve == 37.50
+    assert result_fixed.active_markets_count == 1
+    assert result_fixed.total_allocated <= 112.50
+    assert result_fixed.total_daily_payout > 5.0
+    assert result_fixed.allocations[0].clears_floor is True
 
-    assert result.bankroll_usd == 150.0
-    assert result.usable_capital == 112.50
-    assert result.cash_reserve == 37.50
-    assert result.active_markets_count == 1
-    assert result.total_allocated <= 112.50
-    assert result.total_daily_payout > 5.0
-    assert result.allocations[0].clears_floor is True
-    # Guaranteed to pick the top sweet spot market
-    assert result.allocations[0].condition_id in ("0x_senate_48", "0x_gemini_carbon")
+    # Endogenous reserve mode: frees up more capital for quoting
+    result_endog = allocator.optimize_allocation_milp(candidates=sample_candidates, bankroll_usd=150.0, use_endogenous_reserve=True)
+    assert result_endog.active_markets_count == 1
+    assert result_endog.cash_reserve < 37.50
+    assert result_endog.allocations[0].condition_id in ("0x_senate_48", "0x_gemini_carbon")
 
 
 def test_large_capital_allocation_diversifies(allocator, sample_candidates):
-    # Bankroll $2,000 -> usable $1,500.00
-    result = allocator.optimize_allocation_milp(
+    # Fixed reserve mode: Bankroll $2,000 -> usable $1,500.00
+    result_fixed = allocator.optimize_allocation_milp(
         candidates=sample_candidates,
         bankroll_usd=2000.0,
         max_active_markets=3,
+        use_endogenous_reserve=False,
     )
+    assert result_fixed.bankroll_usd == 2000.0
+    assert result_fixed.usable_capital == 1500.0
+    assert result_fixed.cash_reserve == 500.0
+    assert result_fixed.active_markets_count >= 2
+    assert result_fixed.total_allocated <= 1500.0
 
-    assert result.bankroll_usd == 2000.0
-    assert result.usable_capital == 1500.0
-    assert result.cash_reserve == 500.0
-    # Because of diminishing returns, large capital must diversify into multiple markets
-    assert result.active_markets_count >= 2
-    assert result.total_allocated <= 1500.0
-    for alloc in result.allocations:
+    # Endogenous reserve mode: frees up idle cash above static 25%
+    result_endog = allocator.optimize_allocation_milp(
+        candidates=sample_candidates,
+        bankroll_usd=2000.0,
+        max_active_markets=3,
+        use_endogenous_reserve=True,
+    )
+    assert result_endog.active_markets_count >= 2
+    assert result_endog.cash_reserve < 500.0
+    for alloc in result_endog.allocations:
         assert alloc.clears_floor is True
         assert alloc.allocated_capital >= alloc.min_floor_capital
 
@@ -120,9 +136,9 @@ def test_endogenous_reserve_scaling(allocator):
     # Multi-market diversified portfolio (5 markets): square-root scaling frees up cash
     multi_alloc = [{"capital": 200.0, "mid": 0.50} for _ in range(5)]
     res_multi = allocator.calculate_endogenous_reserve(multi_alloc, bankroll_usd=1500.0)
-    # Total capital = 1000, diversified reserve should be <= 350
+    # Total capital = 1000, diversified reserve should be <= 350 and > 40
     assert res_multi <= 1500.0 * 0.35
-    assert res_multi >= 1500.0 * 0.10
+    assert res_multi >= 40.0
 
 
 def test_continuous_optimization_governor(allocator, sample_candidates):

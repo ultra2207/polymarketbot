@@ -18,6 +18,10 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
+from polymarketbot.trading.ctf import (
+    calculate_optimal_merge_threshold,
+    estimate_merge_cost_usd,
+)
 
 log = get_logger("simulator.portfolio")
 
@@ -139,12 +143,19 @@ class SimulatedPortfolio:
     def __init__(
         self,
         initial_cash: float = 100.0,
-        gas_fee_merge: float = 0.015,
+        gas_fee_merge: Optional[float] = None,
         taker_fee_bps: float = 0.0,
+        ctf_client: Optional[Any] = None,
     ) -> None:
         self.initial_cash = float(initial_cash)
         self.cash: float = float(initial_cash)
-        self.gas_fee_merge: float = float(gas_fee_merge)
+        self.ctf_client = ctf_client
+        if gas_fee_merge is not None:
+            self.gas_fee_merge: float = float(gas_fee_merge)
+        elif self.ctf_client is not None and hasattr(self.ctf_client, "estimate_merge_cost_usd"):
+            self.gas_fee_merge = float(self.ctf_client.estimate_merge_cost_usd())
+        else:
+            self.gas_fee_merge = float(estimate_merge_cost_usd())
         self.taker_fee_rate: float = float(taker_fee_bps) / 10_000.0
 
         # State storage
@@ -172,7 +183,16 @@ class SimulatedPortfolio:
             realized_pnl=0.0,
             notes=f"Initial paper portfolio funded with ${self.cash:.2f} USDC",
         )
-        log.info(f"SimulatedPortfolio initialized with ${self.cash:.2f} USDC (Merge gas: ${self.gas_fee_merge:.3f})")
+        log.info(f"SimulatedPortfolio initialized with ${self.cash:.2f} USDC (Merge gas: ${self.gas_fee_merge:.4f})")
+
+    def get_optimal_merge_threshold(self, fee_basis_points: float = 0.0) -> float:
+        """Calculate optimal merge threshold using current dynamic gas pricing."""
+        cost = (
+            self.ctf_client.estimate_merge_cost_usd()
+            if self.ctf_client is not None and hasattr(self.ctf_client, "estimate_merge_cost_usd")
+            else self.gas_fee_merge
+        )
+        return calculate_optimal_merge_threshold(gas_cost_usd=cost, fee_basis_points=fee_basis_points)
 
     def _record_tx(
         self,
@@ -264,10 +284,15 @@ class SimulatedPortfolio:
             cash_after=self.cash,
         )
 
-    def merge(self, condition_id: str, amount_sets: Optional[float] = None) -> Optional[MergeResult]:
+    def merge(
+        self,
+        condition_id: str,
+        amount_sets: Optional[float] = None,
+        gas_fee: Optional[float] = None,
+    ) -> Optional[MergeResult]:
         """CTF Merge: Converts min(YES, NO) complete sets back into $1.00 USDC cash.
 
-        Deducts $0.015 Polygon PoS gas fees, resets exposure, and records realized PnL.
+        Deducts dynamic Polygon PoS gas fees, resets exposure, and records realized PnL.
         """
         pos = self.get_position(condition_id)
         available_sets = pos.complete_sets
@@ -281,7 +306,15 @@ class SimulatedPortfolio:
 
         # Gross proceeds: 1 complete set = $1.00 USDC
         usdc_gross = sets_to_merge * 1.00
-        gas_fee = self.gas_fee_merge
+        if gas_fee is not None:
+            actual_gas = float(gas_fee)
+        elif self.ctf_client is not None and hasattr(self.ctf_client, "estimate_merge_cost_usd"):
+            actual_gas = float(self.ctf_client.estimate_merge_cost_usd())
+            self.gas_fee_merge = actual_gas
+        else:
+            actual_gas = self.gas_fee_merge
+
+        gas_fee = actual_gas
         net_cash = usdc_gross - gas_fee
 
         # Deduct shares from inventory

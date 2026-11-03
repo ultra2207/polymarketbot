@@ -288,7 +288,9 @@ class HurdleDecision:
     switching_cost_total_usd: float
     holding_horizon_hours: float
     amortized_cost_daily_usd: float
-    reason: str
+    breakeven_holding_hours: float = 0.0
+    breakeven_holding_seconds: float = 0.0
+    reason: str = ""
 
 
 class CapitalMigrationEngine:
@@ -299,7 +301,7 @@ class CapitalMigrationEngine:
         gas_env: Optional[PolygonPoSEnvironment] = None,
         ctf_profile: Optional[CTFGasProfile] = None,
         queue_model: Optional[QueuePriorityValuationModel] = None,
-        safety_hurdle_pct: float = 0.15,
+        safety_hurdle_pct: float = 0.0,
     ) -> None:
         self.gas_env = gas_env or PolygonPoSEnvironment()
         self.ctf_profile = ctf_profile or CTFGasProfile()
@@ -394,7 +396,8 @@ class CapitalMigrationEngine:
             latency_seconds=transit_latency_seconds,
         )
 
-        total_cost = q_loss + liq.optimal_friction_usd + gas_fees + opp_cost
+        # Baseline switching friction (network transit, order cancel/replacement latency)
+        total_cost = max(0.02, q_loss + liq.optimal_friction_usd + gas_fees + opp_cost)
 
         return SwitchingCostDecomposition(
             queue_value_lost_usd=q_loss,
@@ -422,12 +425,25 @@ class CapitalMigrationEngine:
         net_alpha_holding = (delta_y * tau_days) - switching_cost_usd
         should_switch = delta_y >= required_delta_daily
 
-        status = "POSITIVE ALPHA" if should_switch else "HURDLE REJECTED"
-        reason = (
-            f"{status}: Delta yield ${delta_y:.2f}/d clears hurdle ${required_delta_daily:.2f}/d "
-            f"(Amortized cost: ${amortized_cost_daily:.2f}/d over {holding_horizon_hours:.1f}h). "
-            f"Net holding alpha: ${net_alpha_holding:+.4f}."
-        )
+        if delta_y > 0 and switching_cost_usd >= 0:
+            breakeven_days = switching_cost_usd / delta_y
+            breakeven_hours = breakeven_days * 24.0
+            breakeven_seconds = breakeven_days * 86_400.0
+        else:
+            breakeven_hours = float("inf")
+            breakeven_seconds = float("inf")
+
+        if should_switch:
+            reason = (
+                f"POSITIVE ALPHA: Delta yield +${delta_y:.2f}/d covers switching cost ${switching_cost_usd:.4f} "
+                f"in {breakeven_hours:.2f}h ({breakeven_seconds:.0f}s breakeven). "
+                f"Net holding alpha over {holding_horizon_hours:.1f}h: ${net_alpha_holding:+.4f}."
+            )
+        else:
+            reason = (
+                f"HURDLE REJECTED: Delta yield +${delta_y:.2f}/d requires {breakeven_hours:.2f}h to break even on "
+                f"${switching_cost_usd:.4f} switching cost (hurdle required: +${required_delta_daily:.2f}/d over {holding_horizon_hours:.1f}h)."
+            )
 
         return HurdleDecision(
             should_switch=should_switch,
@@ -437,5 +453,7 @@ class CapitalMigrationEngine:
             switching_cost_total_usd=round(switching_cost_usd, 4),
             holding_horizon_hours=holding_horizon_hours,
             amortized_cost_daily_usd=round(amortized_cost_daily, 4),
+            breakeven_holding_hours=round(breakeven_hours, 4) if breakeven_hours != float("inf") else 9999.0,
+            breakeven_holding_seconds=round(breakeven_seconds, 1) if breakeven_seconds != float("inf") else 999999.0,
             reason=reason,
         )

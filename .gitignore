@@ -15,3 +15,6 @@ Thumbs.db
 
 # secrets (RPC keys etc.)
 .env
+
+# scratch
+scratch/

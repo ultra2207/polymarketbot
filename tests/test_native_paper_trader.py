@@ -1,15 +1,22 @@
 """Unit and Integration Tests for Polymarket Native Paper Trading Simulation Engine."""
 
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 import pytest
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from polymarketbot.rewards.deskew import DeSkewPathway, DynamicDeSkewOptimizer
+from polymarketbot.rewards.queue_valuation import CapitalMigrationEngine
 from polymarketbot.simulator.book import SyntheticOrderBook
 from polymarketbot.simulator.engine import NativePaperTradingEngine
 from polymarketbot.simulator.impact import MarketImpactEngine
+from scripts.run_native_paper_trader import render_dashboard
 from polymarketbot.simulator.portfolio import (
     MergeResult,
     PortfolioTransaction,
@@ -284,3 +291,179 @@ class TestNativePaperTradingEngine:
                 assert eng.active_quotes["BUY_NO"]["price"] <= 0.26
             finally:
                 eng.close()
+
+    def test_enhanced_telemetry_metrics(self, engine):
+        """Verify telemetry returns reserve, APR, resting queue value, and migration status."""
+        bids = [{"price": 0.49, "size": 100.0}]
+        asks = [{"price": 0.51, "size": 100.0}]
+        engine.update_orderbook_snapshot("YES", bids=bids, asks=asks)
+
+        t = engine.get_telemetry()
+        assert "resting_queue_value_usd" in t
+        assert t["resting_queue_value_usd"] >= 0.0
+        assert "reserve_cash_usd" in t
+        assert "reserve_ratio_pct" in t
+        assert "nominal_apr_pct" in t
+        assert "compounding_apr_pct" in t
+        assert "migration_count" in t
+        assert t["migration_count"] == 0
+
+    def test_render_dashboard_telemetry(self, engine, capsys):
+        """Verify render_dashboard outputs enhanced telemetry including compounding APR and migration hurdle."""
+        bids = [{"price": 0.49, "size": 100.0}]
+        asks = [{"price": 0.51, "size": 100.0}]
+        engine.update_orderbook_snapshot("YES", bids=bids, asks=asks)
+
+        market_info = {
+            "question": "Will AI pass the Turing test in 2026?",
+            "token_yes": "TOK_YES_1",
+            "token_no": "TOK_NO_1",
+            "daily_reward": 50.0,
+        }
+
+        mig_state = {
+            "next_scan_remaining": 215.4,
+            "hurdle_status": "MONITORING",
+            "y_net_a": 15.2,
+            "y_net_b": 22.5,
+            "switching_cost": 0.045,
+            "candidate_question": "Fed interest rate decision in December 2026",
+            "decision_reason": "Next scan in 215s",
+        }
+
+        render_dashboard(
+            engine=engine,
+            market_info=market_info,
+            start_time=time.time(),
+            clear_screen=False,
+            migration_state=mig_state,
+        )
+
+        captured = capsys.readouterr().out
+        assert "Compounding APR" in captured
+        assert "Resting Queue Value ($V_queue)" in captured
+        assert "DYNAMIC CAPITAL MIGRATION & HURDLE TELEMETRY" in captured
+        assert "Next Scan" in captured
+        assert "Candidate Yield (M_B)" in captured
+        assert "Fed interest rate" in captured
+
+    def test_engine_market_migration_flow(self, engine):
+        """Verify atomic market migration clears quotes, merges sets, and registers new market."""
+        bids = [{"price": 0.49, "size": 100.0}]
+        asks = [{"price": 0.51, "size": 100.0}]
+        engine.update_orderbook_snapshot("YES", bids=bids, asks=asks)
+
+        # Create complete sets on initial market
+        engine.portfolio.split(engine.condition_id, 20.0)
+        assert engine.portfolio.get_position(engine.condition_id).complete_sets == 20.0
+
+        cash_before = engine.portfolio.cash
+
+        # Evaluate hurdle for candidate market with high yield
+        should_switch, decision, cost = engine.evaluate_migration_hurdle(
+            candidate_daily_yield=45.0,
+            holding_horizon_hours=4.0,
+            daily_yield_a=10.0,
+        )
+        assert should_switch is True
+
+        # Execute migration
+        mig_evt = engine.migrate_to_market(
+            new_condition_id="0xNEW_MARKET_CID",
+            new_asset_id_yes="NEW_TOK_YES",
+            new_asset_id_no="NEW_TOK_NO",
+            new_daily_reward_rate=45.0,
+            new_rewards_max_spread_cents=2.0,
+            new_rewards_min_size=20.0,
+            reason=decision.reason,
+        )
+
+        # Complete sets merged
+        assert engine.portfolio.get_position("0xTEST_COND_ID").complete_sets == 0.0
+        assert engine.portfolio.cash > cash_before
+        assert mig_evt["unlocked_cash"] > 0.0
+
+        # Engine now tracking new market
+        assert engine.condition_id == "0xNEW_MARKET_CID"
+        assert engine.asset_id_yes == "NEW_TOK_YES"
+        assert engine.asset_id_no == "NEW_TOK_NO"
+        assert engine.daily_reward_rate == 45.0
+        assert len(engine.migration_history) == 1
+
+        t = engine.get_telemetry()
+        assert t["migration_count"] == 1
+
+    def test_update_quote_size_safe_updating(self, engine):
+        """Verify update_quote_size threshold (< 5 shares ignores churn, >= 5 shares updates resting quotes)."""
+        bids = [{"price": 0.49, "size": 100.0}]
+        asks = [{"price": 0.51, "size": 100.0}]
+        engine.update_orderbook_snapshot("YES", bids=bids, asks=asks)
+
+        # Baseline quote size is 20.0
+        assert engine.quote_size == 20.0
+        initial_score = engine.active_quotes["BUY_YES"]["score"]
+        assert engine.active_quotes["BUY_YES"]["size"] == 20.0
+
+        # 1. Update by < 5.0 shares (e.g. 20.0 -> 23.0, diff = 3.0)
+        # Should update self.quote_size but return False and NOT churn resting book
+        res = engine.update_quote_size(23.0)
+        assert res is False
+        assert engine.quote_size == 23.0
+        assert engine.active_quotes["BUY_YES"]["size"] == 20.0
+
+        # 2. Update by >= 5.0 shares (e.g. 23.0 -> 35.0, diff = 12.0)
+        # Should return True, update self.quote_size, and re-evaluate resting quotes with new size & score
+        res = engine.update_quote_size(35.0)
+        assert res is True
+        assert engine.quote_size == 35.0
+        assert engine.active_quotes["BUY_YES"]["size"] == 35.0
+        new_score = engine.active_quotes["BUY_YES"]["score"]
+        assert new_score > initial_score
+        assert engine.active_quotes["SELL_YES"]["size"] == 35.0
+
+    def test_continuous_governor_quote_compounding_in_epoch(self, engine):
+        """Verify ContinuousOptimizationGovernor evaluates during epoch and compounds rewards into larger quotes."""
+        bids = [{"price": 0.49, "size": 100.0}]
+        asks = [{"price": 0.51, "size": 100.0}]
+        engine.update_orderbook_snapshot("YES", bids=bids, asks=asks)
+
+        # Initial epoch: stable sizing
+        res1 = engine.process_reward_epoch()
+        assert res1["epoch_index"] == 1
+        assert engine.quote_size == 20.0
+        initial_score = engine.active_quotes["BUY_YES"]["score"]
+
+        # Simulate substantial accumulated rewards compounding into cash bankroll
+        engine.portfolio.credit_reward(150.0, condition_id=engine.condition_id, note="Accumulated rewards pool")
+        assert engine.portfolio.cash >= 250.0
+
+        # Process next epoch: governor evaluates new cash, recommends RESIZE_QUOTE, and compounds quote size
+        res2 = engine.process_reward_epoch()
+        assert res2["epoch_index"] == 2
+        assert "RESIZE_QUOTE" in res2["governor_actions"]
+        assert engine.quote_size > 20.0
+        assert res2["quote_size"] > 20.0
+
+        # Resting virtual quotes should now have compounded size and larger quadratic score
+        compounded_score = engine.active_quotes["BUY_YES"]["score"]
+        assert compounded_score > initial_score
+        assert engine.active_quotes["BUY_YES"]["size"] > 20.0
+
+    def test_endogenous_reserve_quote_sizing_integration(self):
+        """Verify derive_quote_size with dynamic endogenous reserve for single and multi-market portfolios."""
+        from polymarketbot.simulator.optimizer import derive_quote_size
+
+        # 1. Single market dynamic endogenous reserve
+        size_dyn = derive_quote_size(initial_cash=150.0, mid_price=0.74, min_size=20.0, cycles_budget=2.5)
+        assert abs(size_dyn - 44.3) <= 0.2
+
+        # 2. Explicit reserve override
+        size_override = derive_quote_size(initial_cash=150.0, mid_price=0.74, min_size=20.0, reserve_pct=0.25, cycles_budget=2.5)
+        assert size_override == 45.0
+
+        # 3. Multi-market portfolio diversification (5 markets)
+        multi_alloc = [{"capital": 200.0, "mid": 0.50} for _ in range(5)]
+        size_multi = derive_quote_size(initial_cash=1000.0, mid_price=0.50, allocations=multi_alloc)
+        assert size_multi > 0.0
+
+
