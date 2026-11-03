@@ -359,9 +359,14 @@ def get_real_l2_score(
         if not bids and not asks:
             return 0.0, 0.0, 0.50
 
-        best_bid = float(bids[0].get("price", 0.0)) if bids else 0.0
-        best_ask = float(asks[0].get("price", 1.0)) if asks else 1.0
-        mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.50
+        best_bid = max(float(b.get("price", 0.0)) for b in bids) if bids else 0.0
+        best_ask = min(float(a.get("price", 1.0)) for a in asks) if asks else 1.0
+        if best_bid > 0.0 and best_ask < 1.0 and best_bid < best_ask:
+            mid = (best_bid + best_ask) / 2.0
+        elif best_bid > 0.0 and best_ask > best_bid:
+            mid = (best_bid + best_ask) / 2.0
+        else:
+            mid = 0.50
 
         comp_score = 0.0
         total_qual_shares = 0.0
@@ -521,8 +526,8 @@ def find_optimal_lp_markets(
         futures = [executor.submit(audit_market, c) for c in candidates]
         for f in as_completed(futures):
             res = f.result()
-            # Only keep active books with real depth
-            if res["competing_score"] > 0.0:
+            # Enforce active depth and that audited real_mid is within safe probability bounds
+            if res["competing_score"] > 0.0 and (min_mid_price <= res["real_mid"] <= max_mid_price):
                 scored.append(res)
 
     # Sort primarily by floor clearance, then Daily ROI descending
