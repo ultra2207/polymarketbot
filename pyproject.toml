@@ -10,11 +10,13 @@ requires-python = ">=3.14"
 dependencies = [
     "duckdb>=2.0.0",
     "loguru>=0.7.3",
+    "ortools>=9.15.6755",
     "pycryptodome>=4.2.0",
     "pytz>=2026.6",
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
     "rich>=15.0.0",
+    "scipy>=1.18.1",
     "streamlit>=1.66.1",
     "tqdm>=4.70.1",
     "websockets>=17.4",
