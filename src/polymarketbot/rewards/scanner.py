@@ -398,7 +398,7 @@ def find_optimal_lp_markets(
     min_days_to_expiry: float = 7.0,
     min_mid_price: float = 0.12,
     max_mid_price: float = 0.88,
-    max_candidates: int = 100,
+    max_candidates: int = 250,
     limit_output: int = 15,
 ) -> list[dict[str, Any]]:
     """Scan all reward pools and rank by Net Daily ROI (%) on deployed capital."""
@@ -406,7 +406,7 @@ def find_optimal_lp_markets(
     session.headers.update({"User-Agent": "polymarketbot/optimal-selector"})
 
     url = f"{CLOB_REST_URL}/rewards/markets/multi"
-    params = {"order_by": "rate_per_day", "position": "DESC", "page_size": max_candidates}
+    params = {"order_by": "rate_per_day", "position": "DESC", "page_size": min(500, max_candidates)}
 
     logger.info(f"Querying top {max_candidates} reward pools from Polymarket CLOB...")
     try:
@@ -430,7 +430,8 @@ def find_optimal_lp_markets(
         max_spread = float(m.get("rewards_max_spread", 3.0))
         min_size = float(m.get("rewards_min_size", 50.0))
 
-        if daily_pool < 25.0:
+        # Accept all active pools that have at least $1.00 daily budget
+        if daily_pool < 1.0:
             continue
 
         tokens = m.get("tokens", [])
@@ -526,8 +527,8 @@ def find_optimal_lp_markets(
         futures = [executor.submit(audit_market, c) for c in candidates]
         for f in as_completed(futures):
             res = f.result()
-            # Enforce active depth and that audited real_mid is within safe probability bounds
-            if res["competing_score"] > 0.0 and (min_mid_price <= res["real_mid"] <= max_mid_price):
+            # Enforce that audited real_mid is within safe probability bounds (including zero-competition pools)
+            if res["competing_score"] >= 0.0 and (min_mid_price <= res["real_mid"] <= max_mid_price):
                 scored.append(res)
 
     # Sort primarily by floor clearance, then Daily ROI descending
