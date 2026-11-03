@@ -11,7 +11,9 @@ Implements:
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 import requests
@@ -333,3 +335,201 @@ class OpportunityScanner:
             if scored else "No active markets found."
         )
         return scored
+
+
+def get_real_l2_score(
+    session: requests.Session,
+    token_id: str,
+    max_spread_cents: float,
+    timeout: float = 4.0,
+) -> tuple[float, float, float]:
+    """Fetch real L2 order book and calculate true competing score inside qualifying spread.
+
+    Returns:
+        (competing_score, total_qualifying_shares, current_mid_price)
+    """
+    url = f"{CLOB_REST_URL}/book"
+    try:
+        r = session.get(url, params={"token_id": token_id}, timeout=timeout)
+        if r.status_code != 200:
+            return 0.0, 0.0, 0.50
+        data = r.json()
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if not bids and not asks:
+            return 0.0, 0.0, 0.50
+
+        best_bid = float(bids[0].get("price", 0.0)) if bids else 0.0
+        best_ask = float(asks[0].get("price", 1.0)) if asks else 1.0
+        mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else 0.50
+
+        comp_score = 0.0
+        total_qual_shares = 0.0
+
+        for b in bids:
+            p = float(b.get("price", 0.0))
+            sz = float(b.get("size", 0.0))
+            spread_c = (mid - p) * 100.0
+            if 0.0 <= spread_c <= max_spread_cents:
+                comp_score += quadratic_order_score(max_spread_cents, spread_c, sz)
+                total_qual_shares += sz
+
+        for a in asks:
+            p = float(a.get("price", 0.0))
+            sz = float(a.get("size", 0.0))
+            spread_c = (p - mid) * 100.0
+            if 0.0 <= spread_c <= max_spread_cents:
+                comp_score += quadratic_order_score(max_spread_cents, spread_c, sz)
+                total_qual_shares += sz
+
+        return comp_score, total_qual_shares, mid
+    except Exception as e:
+        logger.debug(f"Error fetching order book for {token_id[:14]}: {e}")
+        return 0.0, 0.0, 0.50
+
+
+def find_optimal_lp_markets(
+    bankroll_usd: float = 150.0,
+    min_days_to_expiry: float = 7.0,
+    min_mid_price: float = 0.12,
+    max_mid_price: float = 0.88,
+    max_candidates: int = 100,
+    limit_output: int = 15,
+) -> list[dict[str, Any]]:
+    """Scan all reward pools and rank by Net Daily ROI (%) on deployed capital."""
+    session = requests.Session()
+    session.headers.update({"User-Agent": "polymarketbot/optimal-selector"})
+
+    url = f"{CLOB_REST_URL}/rewards/markets/multi"
+    params = {"order_by": "rate_per_day", "position": "DESC", "page_size": max_candidates}
+
+    logger.info(f"Querying top {max_candidates} reward pools from Polymarket CLOB...")
+    try:
+        resp = session.get(url, params=params, timeout=15.0)
+        resp.raise_for_status()
+        raw_markets = resp.json().get("data", [])
+    except Exception as e:
+        logger.error(f"Failed to fetch reward pools from CLOB: {e}")
+        return []
+
+    logger.info(f"Received {len(raw_markets)} markets. Applying risk & viability filters...")
+
+    candidates = []
+    now_utc = datetime.now(timezone.utc)
+
+    for m in raw_markets:
+        cid = m.get("condition_id")
+        q = m.get("question", "Unknown")
+        rewards_cfg = m.get("rewards_config", [])
+        daily_pool = float(rewards_cfg[0].get("rate_per_day", 0.0)) if rewards_cfg else 0.0
+        max_spread = float(m.get("rewards_max_spread", 3.0))
+        min_size = float(m.get("rewards_min_size", 50.0))
+
+        if daily_pool < 25.0:
+            continue
+
+        tokens = m.get("tokens", [])
+        if len(tokens) < 2:
+            continue
+
+        mid_yes = 0.50
+        yes_token = None
+        no_token = None
+        for t in tokens:
+            outcome = str(t.get("outcome", "")).upper()
+            tid = t.get("token_id")
+            if outcome == "YES":
+                mid_yes = float(t.get("price", 0.50) or 0.50)
+                yes_token = tid
+            elif outcome == "NO":
+                no_token = tid
+
+        # 1. Divergence / Extreme Probability Filter (avoid markets where 1 side has already won)
+        if not (min_mid_price <= mid_yes <= max_mid_price):
+            continue
+
+        # 2. Expiry / Resolution Filter (avoid markets ending soon with settlement jump risk)
+        end_date_str = m.get("end_date_iso")
+        days_left = 999.0
+        if end_date_str:
+            try:
+                dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                days_left = (dt - now_utc).total_seconds() / 86400.0
+                if days_left < min_days_to_expiry:
+                    continue
+            except Exception:
+                pass
+
+        # 3. Capital Sizing Feasibility Check
+        # Deploy 75% for two-sided quoting, retain 25% cash buffer
+        allocated_capital = bankroll_usd * 0.75
+        quote_size = max(min_size, allocated_capital / 1.0)
+        capital_required = quote_size * 1.0  # cost of buying YES + NO
+
+        if capital_required > bankroll_usd * 0.95:
+            # Requires more capital than our bankroll allows
+            continue
+
+        our_score = quadratic_order_score(max_spread, 0.50, quote_size)
+
+        candidates.append({
+            "condition_id": cid,
+            "question": q,
+            "daily_pool": daily_pool,
+            "max_spread": max_spread,
+            "min_size": min_size,
+            "mid_yes": mid_yes,
+            "days_left": days_left,
+            "quote_size": quote_size,
+            "capital_required": capital_required,
+            "our_score": our_score,
+            "yes_token": yes_token,
+            "no_token": no_token,
+            "raw_market": m,
+        })
+
+    logger.info(f"Screened {len(candidates)} high-safety markets. Auditing full L2 depth in parallel...")
+
+    def audit_market(cand: dict[str, Any]) -> dict[str, Any]:
+        s = requests.Session()
+        s.headers.update({"User-Agent": "polymarketbot/optimal-selector"})
+        comp_score, qual_shares, real_mid = get_real_l2_score(
+            session=s,
+            token_id=cand["yes_token"],
+            max_spread_cents=cand["max_spread"],
+        )
+        cand["competing_score"] = comp_score
+        cand["qualifying_shares"] = qual_shares
+        cand["real_mid"] = real_mid
+
+        total_score = comp_score + cand["our_score"]
+        if total_score > 0 and cand["daily_pool"] > 0:
+            raw_payout = cand["daily_pool"] * (cand["our_score"] / total_score)
+        else:
+            raw_payout = 0.0
+
+        cand["raw_daily_payout"] = raw_payout
+        # Strict enforcement of $1.00 daily payout floor
+        cand["clears_floor"] = raw_payout >= 1.00
+        cand["real_daily_payout"] = raw_payout if cand["clears_floor"] else 0.0
+        cand["daily_roi_pct"] = (cand["real_daily_payout"] / cand["capital_required"]) * 100.0
+        cand["monthly_roi_pct"] = cand["daily_roi_pct"] * 30.0
+        return cand
+
+    scored: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(audit_market, c) for c in candidates]
+        for f in as_completed(futures):
+            res = f.result()
+            # Only keep active books with real depth
+            if res["competing_score"] > 0.0:
+                scored.append(res)
+
+    # Sort primarily by floor clearance, then Daily ROI descending
+    scored.sort(
+        key=lambda x: (x["clears_floor"], x["daily_roi_pct"], x["raw_daily_payout"]),
+        reverse=True,
+    )
+
+    return scored[:limit_output]
+

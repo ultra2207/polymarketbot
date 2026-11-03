@@ -149,6 +149,7 @@ class NativePaperTradingEngine:
         gas_fee_merge: float = 0.015,
         institutional_mode: bool = True,
         gamma: float = 0.02,
+        competing_score_override: Optional[float] = None,
         db_path: Union[str, Path] = "data/native_paper_trading.db",
         ledger_path: Union[str, Path] = "data/native_paper_trading_ledger.json",
         deskew_optimizer: Optional[DynamicDeSkewOptimizer] = None,
@@ -165,6 +166,7 @@ class NativePaperTradingEngine:
         self.gas_fee_merge = float(gas_fee_merge)
         self.institutional_mode = bool(institutional_mode)
         self.gamma = float(gamma)
+        self.competing_score_override = float(competing_score_override) if competing_score_override is not None else None
 
         # Paths
         self.db_path = Path(db_path)
@@ -1034,8 +1036,11 @@ class NativePaperTradingEngine:
             if 0 <= spread_c <= self.rewards_max_spread:
                 competing_score += quadratic_order_score(self.rewards_max_spread, spread_c, sz)
 
-        # Baseline floor for competing depth
-        competing_score = max(0.0, competing_score)
+        # Baseline floor for competing depth (override with true L2 depth if provided)
+        if self.competing_score_override is not None and self.competing_score_override > 0.0:
+            competing_score = max(self.competing_score_override, competing_score)
+        else:
+            competing_score = max(0.0, competing_score)
 
         # Pool Share
         total_pool_score = total_user_score + competing_score

@@ -153,6 +153,7 @@ def resolve_market_details(
     requested_cid: Optional[str] = None,
     requested_yes: Optional[str] = None,
     requested_no: Optional[str] = None,
+    initial_cash: float = 150.0,
 ) -> dict[str, Any]:
     """Resolve condition ID, question, tokens, and rewards config from Polymarket CLOB."""
     log.info("Resolving market details from Polymarket CLOB API...")
@@ -168,34 +169,39 @@ def resolve_market_details(
         val = float(m.get("rewards_daily_rate", 0.0) or 0.0)
         return (val / 100.0) if val >= 500.0 else val
 
+    competing_score_override: Optional[float] = None
     if requested_cid:
         for m in markets:
             if m.get("condition_id", "").lower() == requested_cid.lower():
                 target_market = m
                 break
-    elif markets:
-        # Sort markets by daily reward rate descending
+    else:
+        log.info(f"Auto-scanning Polymarket universe for optimal high-ROI sweet spot market for ${initial_cash:.2f}...")
+        try:
+            from polymarketbot.rewards.scanner import find_optimal_lp_markets
+            optimal_markets = find_optimal_lp_markets(bankroll_usd=initial_cash, limit_output=5)
+            if optimal_markets:
+                best_opt = optimal_markets[0]
+                target_market = best_opt.get("raw_market")
+                competing_score_override = best_opt.get("competing_score")
+                log.info(
+                    f"[OPTIMAL SWEET SPOT DETECTED] Auto-selected: '{best_opt['question']}' "
+                    f"(Pool: ${best_opt['daily_pool']:,.2f}/day, Competing Depth: {best_opt['qualifying_shares']:,.0f} sh, "
+                    f"Expected Real Payout: ${best_opt['real_daily_payout']:.2f}/day, ROI: +{best_opt['daily_roi_pct']:.1f}%/day)"
+                )
+        except Exception as e:
+            log.warning(f"Optimal market scan fallback to raw rate sort: {e}")
+
+    if not target_market and markets:
+        # Fallback sorting
         markets_sorted = sorted(markets, key=_get_rate, reverse=True)
-        # Find the highest-yield market that is active, open, and has verified live orderbook liquidity
         for m in markets_sorted:
             if m.get("closed") is True or m.get("active") is False:
                 continue
             tokens = m.get("tokens", [])
-            if len(tokens) < 2:
-                continue
-            t0 = tokens[0].get("token_id")
-            if not t0:
-                continue
-            try:
-                book = feed.get_book_sync(t0)
-                if book and len(book.bids) > 0 and len(book.asks) > 0:
-                    target_market = m
-                    log.info(f"Auto-selected active liquid market: {m.get('question')} (Pool: ${_get_rate(m):,.2f}/day)")
-                    break
-            except Exception:
-                continue
-        if not target_market and markets_sorted:
-            target_market = markets_sorted[0]
+            if len(tokens) >= 2 and tokens[0].get("token_id"):
+                target_market = m
+                break
 
     cid = requested_cid or (target_market.get("condition_id") if target_market else None) or "0x221319cd...demo"
     question = (target_market.get("question") if target_market else None) or f"Market Condition {cid[:14]}..."
@@ -252,6 +258,7 @@ def resolve_market_details(
         "market_spread_cents": market_spread_cents,
         "tick_size_cents": tick_size_cents,
         "category": category,
+        "competing_score_override": competing_score_override,
     }
 
 
@@ -390,6 +397,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         requested_cid=args.condition_id,
         requested_yes=args.token_yes,
         requested_no=args.token_no,
+        initial_cash=args.initial_cash,
     )
 
     daily_rew = args.daily_reward or market["daily_reward"]
@@ -445,6 +453,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         db_path=args.db_path,
         ledger_path=args.ledger_path,
         institutional_mode=not args.legacy_mode,
+        competing_score_override=market.get("competing_score_override"),
     )
 
     # 1. Register live book listener
