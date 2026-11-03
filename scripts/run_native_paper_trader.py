@@ -90,20 +90,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--daily-reward",
         type=float,
-        default=25.0,
-        help="Total daily reward pool in USD (default: $25.00 or fetched from API).",
+        default=None,
+        help="Total daily reward pool in USD (default: fetched from market rewards config).",
     )
     parser.add_argument(
         "--max-spread",
         type=float,
-        default=1.0,
-        help="Qualifying max spread in cents for rewards (default: 1.0c).",
+        default=None,
+        help="Qualifying max spread in cents for rewards (default: fetched from market).",
     )
     parser.add_argument(
         "--min-size",
         type=float,
-        default=20.0,
-        help="Qualifying minimum order size in shares (default: 20.0).",
+        default=None,
+        help="Qualifying minimum order size in shares (default: fetched from market).",
+    )
+    parser.add_argument(
+        "--competing-score",
+        type=float,
+        default=None,
+        help="Hardcoded competing L2 score override (default: audited from live CLOB REST L2 depth).",
     )
     parser.add_argument(
         "--auto-merge-threshold",
@@ -164,12 +170,11 @@ def resolve_market_details(
     def _get_rate(m: dict[str, Any]) -> float:
         cfg = m.get("rewards_config", [])
         if cfg and isinstance(cfg, list) and len(cfg) > 0:
-            val = float(cfg[0].get("rate_per_day", 0.0) or 0.0)
-            return (val / 100.0) if val >= 500.0 else val
-        val = float(m.get("rewards_daily_rate", 0.0) or 0.0)
-        return (val / 100.0) if val >= 500.0 else val
+            return float(cfg[0].get("rate_per_day", 0.0) or 0.0)
+        return float(m.get("rewards_daily_rate", 0.0) or 0.0)
 
     competing_score_override: Optional[float] = None
+    daily_reward_override: Optional[float] = None
     if requested_cid:
         for m in markets:
             if m.get("condition_id", "").lower() == requested_cid.lower():
@@ -184,6 +189,7 @@ def resolve_market_details(
                 best_opt = optimal_markets[0]
                 target_market = best_opt.get("raw_market")
                 competing_score_override = best_opt.get("competing_score")
+                daily_reward_override = best_opt.get("daily_pool")
                 log.info(
                     f"[OPTIMAL SWEET SPOT DETECTED] Auto-selected: '{best_opt['question']}' "
                     f"(Pool: ${best_opt['daily_pool']:,.2f}/day, Competing Depth: {best_opt['qualifying_shares']:,.0f} sh, "
@@ -205,7 +211,7 @@ def resolve_market_details(
 
     cid = requested_cid or (target_market.get("condition_id") if target_market else None) or "0x221319cd...demo"
     question = (target_market.get("question") if target_market else None) or f"Market Condition {cid[:14]}..."
-    daily_reward = _get_rate(target_market) if target_market else 25.0
+    daily_reward = daily_reward_override if daily_reward_override is not None else (_get_rate(target_market) if target_market else 25.0)
     max_spread = float(target_market.get("rewards_max_spread", 1.0)) if target_market else 1.0
     min_size = float(target_market.get("rewards_min_size", 20.0)) if target_market else 20.0
 
@@ -245,6 +251,17 @@ def resolve_market_details(
         category = "sports"
     else:
         category = "default"
+
+    # If competing score override is not yet known, audit live L2 depth directly
+    if competing_score_override is None and tok_yes and max_spread:
+        try:
+            from polymarketbot.rewards.scanner import get_real_l2_score
+            comp_score, _, _ = get_real_l2_score(feed.session, tok_yes, max_spread)
+            if comp_score > 0:
+                competing_score_override = comp_score
+                log.info(f"[L2 DEPTH AUDIT] Audited live L2 competing score for {tok_yes[:14]}: {comp_score:,.1f}")
+        except Exception as e:
+            log.warning(f"L2 audit fallback: {e}")
 
     return {
         "condition_id": cid,
@@ -400,9 +417,10 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         initial_cash=args.initial_cash,
     )
 
-    daily_rew = args.daily_reward or market["daily_reward"]
-    max_spr = args.max_spread or market["max_spread"]
-    min_sz = args.min_size or market["min_size"]
+    daily_rew = args.daily_reward if args.daily_reward is not None else market["daily_reward"]
+    max_spr = args.max_spread if args.max_spread is not None else market["max_spread"]
+    min_sz = args.min_size if args.min_size is not None else market["min_size"]
+    comp_score = args.competing_score if args.competing_score is not None else market.get("competing_score_override")
 
     # 1. Dynamically derive quote size from initial cash if not explicitly passed
     if args.quote_size is not None:
@@ -453,7 +471,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
         db_path=args.db_path,
         ledger_path=args.ledger_path,
         institutional_mode=not args.legacy_mode,
-        competing_score_override=market.get("competing_score_override"),
+        competing_score_override=comp_score,
     )
 
     # 1. Register live book listener
@@ -509,6 +527,7 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
 
     start_time = time.time()
     last_epoch_check = time.time()
+    last_l2_audit_time = time.time()
     last_render_time = 0.0
     running = True
 
@@ -532,6 +551,18 @@ async def run_paper_trading_async(args: argparse.Namespace) -> int:
                 if (loop_now - last_epoch_check) >= 60.0:
                     engine.process_reward_epoch(timestamp=loop_now)
                     last_epoch_check = loop_now
+
+                # Periodic 300-second live L2 depth refresh
+                if (loop_now - last_l2_audit_time) >= 300.0:
+                    try:
+                        from polymarketbot.rewards.scanner import get_real_l2_score
+                        new_comp_score, _, _ = get_real_l2_score(feed.session, market["token_yes"], max_spr)
+                        if new_comp_score > 0:
+                            engine.competing_score_override = new_comp_score
+                            log.info(f"[L2 DEPTH REFRESH] Updated live competing score: {new_comp_score:,.1f}")
+                    except Exception as e:
+                        log.debug(f"Periodic L2 audit error: {e}")
+                    last_l2_audit_time = loop_now
 
                 # Auto complete-set merge check
                 pos = engine.portfolio.get_position(market["condition_id"])
