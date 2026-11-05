@@ -22,7 +22,6 @@ Unified Features:
 from __future__ import annotations
 
 import json
-import math
 import os
 import sqlite3
 import time
@@ -51,9 +50,19 @@ from polymarketbot.rewards.queue_valuation import (
     HurdleDecision,
     SwitchingCostDecomposition,
 )
-from polymarketbot.rewards.scoring import quadratic_order_score
+from polymarketbot.rewards.scoring import (
+    OrderQuote,
+    compute_book_side_scores,
+    compute_minimum_score,
+    quadratic_order_score,
+)
 from polymarketbot.risk.manager import RiskManager
-from polymarketbot.risk.models import CircuitBreakerReason, RiskConfig
+from polymarketbot.risk.models import RiskConfig
+from polymarketbot.trading.pending_settlements import (
+    PENDING_SETTLEMENTS_DDL,
+    PENDING_SETTLEMENTS_INDEX,
+    PENDING_SETTLEMENTS_UNIQUE,
+)
 
 logger = get_logger("trading.base")
 
@@ -171,6 +180,9 @@ class BaseMarketMakingEngine:
             self.governor.market_entry_times[self.condition_id] = time.time()
 
         # Risk Management & Circuit Breakers
+        # Optional in-process hook for the live session recorder. It must never
+        # block or raise: the recorder enqueues and returns immediately.
+        self.event_hook: Optional[Callable[[str, dict[str, Any]], None]] = None
         self.risk_manager = risk_manager or RiskManager(
             RiskConfig(
                 price_jump_window_seconds=60.0,
@@ -195,10 +207,21 @@ class BaseMarketMakingEngine:
         # Quote Registry: quote_id -> dict
         self.active_quotes: Dict[str, dict[str, Any]] = {}
 
+        # Reprice gate: prevents cancel/replace churn that destroys queue priority.
+        # Subclasses with a real market tick override quote_tick_size / round_quote_price.
+        self.quote_tick_size: float = 0.001
+        self.min_reprice_interval_s: float = 2.0
+        self.min_reprice_ticks: int = 1
+        # Real time-to-resolution for the A-S variance term. The live engine replaces
+        # this from the market's end date; the default matches the research model.
+        self.days_to_resolution: float = 7.0
+
         # Epoch & Telemetry State
         self.epoch_index: int = 0
         self.last_epoch_ts: float = time.time()
         self.total_rewards_credited: float = 0.0
+        self._epoch_samples: List[float] = []
+        self._last_reward_epoch: Dict[str, Any] = {}
         self.latest_deskew_decision: Optional[DeSkewDecision] = None
 
         # SQLite Connection
@@ -208,6 +231,16 @@ class BaseMarketMakingEngine:
     # -------------------------------------------------------------------------
     # Database Initialization
     # -------------------------------------------------------------------------
+
+    def _emit_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Best-effort hook for the session recorder; a broken hook is ignored."""
+        hook = self.event_hook
+        if hook is None:
+            return
+        try:
+            hook(kind, payload)
+        except Exception:  # noqa: BLE001 - recording must never affect trading
+            pass
 
     def _init_sqlite(self) -> None:
         """Create high-performance SQLite schema with WAL journal mode."""
@@ -316,6 +349,14 @@ class BaseMarketMakingEngine:
             );
         """)
 
+        # Signed settlement transactions, written before broadcast. The hash is
+        # the identity of a settlement, so a retried send can never become a
+        # second merge. Additive: only the merge guard and the startup replay
+        # read it, both through PendingSettlementStore.
+        cur.execute(PENDING_SETTLEMENTS_DDL)
+        cur.execute(PENDING_SETTLEMENTS_INDEX)
+        cur.execute(PENDING_SETTLEMENTS_UNIQUE)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ctf_merges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,6 +381,10 @@ class BaseMarketMakingEngine:
             );
         """)
 
+        # Measurement-only schema. Anchored here (after ctf_splits) so the
+        # yield-measurement block is independent of settlement-table edits.
+        self._init_yield_measurement_schema(cur)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS market_migrations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,6 +404,209 @@ class BaseMarketMakingEngine:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_positions_cond ON positions(condition_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_migrations_ts ON market_migrations(timestamp);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deskew_ts ON deskew_events(timestamp);")
+        self._conn.commit()
+
+    def _init_yield_measurement_schema(self, cur: sqlite3.Cursor) -> None:
+        """Additive measurement tables: fills, rebalances, reward_payouts.
+
+        Nothing here is read by the execution path; every write is append-only
+        and idempotent on its primary key. An older database may already hold a
+        legacy ``fills`` table (venue-agnostic, keyed by an autoincrement id):
+        the yield columns are added with ``ALTER TABLE`` and the insert helper
+        filters values down to the columns that actually exist, so a legacy
+        database and a fresh one both receive the same rows.
+        """
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fills (
+                fill_key TEXT PRIMARY KEY,
+                ts REAL NOT NULL,
+                condition_id TEXT NOT NULL,
+                token_side TEXT,
+                side TEXT,
+                price REAL,
+                size REAL,
+                is_maker INTEGER,
+                order_id TEXT,
+                fee_usd REAL,
+                mid_at_fill REAL,
+                best_bid_at_fill REAL,
+                best_ask_at_fill REAL,
+                markout_30s REAL,
+                markout_5m REAL,
+                markout_30m REAL,
+                realized_pnl REAL,
+                mode TEXT NOT NULL,
+                note TEXT
+            );
+        """)
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rebalances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                condition_id TEXT NOT NULL,
+                pathway TEXT NOT NULL,
+                crossed_cents REAL,
+                taker_fee_usd REAL,
+                gas_usd REAL,
+                reward_score_lost REAL,
+                inventory_before REAL,
+                inventory_after REAL,
+                note TEXT
+            );
+        """)
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reward_payouts (
+                date TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                usd REAL NOT NULL,
+                source TEXT NOT NULL,
+                observed_ts REAL NOT NULL,
+                PRIMARY KEY (date, condition_id, source)
+            );
+        """)
+
+        # Legacy ``fills`` upgrade: add any yield column the old table lacks.
+        cur.execute("PRAGMA table_info(fills);")
+        existing_columns = {str(row[1]) for row in cur.fetchall()}
+        yield_columns = {
+            "fill_key": "TEXT",
+            "ts": "REAL",
+            "token_side": "TEXT",
+            "side": "TEXT",
+            "price": "REAL",
+            "size": "REAL",
+            "is_maker": "INTEGER",
+            "order_id": "TEXT",
+            "fee_usd": "REAL",
+            "mid_at_fill": "REAL",
+            "best_bid_at_fill": "REAL",
+            "best_ask_at_fill": "REAL",
+            "markout_30s": "REAL",
+            "markout_5m": "REAL",
+            "markout_30m": "REAL",
+            "realized_pnl": "REAL",
+            "mode": "TEXT",
+            "note": "TEXT",
+        }
+        for column, sql_type in yield_columns.items():
+            if column not in existing_columns:
+                cur.execute(f"ALTER TABLE fills ADD COLUMN {column} {sql_type};")
+                existing_columns.add(column)
+        # A legacy table's autoincrement id is its primary key, so idempotency
+        # comes from a unique index on the deterministic fill key instead.
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_fill_key ON fills(fill_key);"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_fills_cond_ts ON fills(condition_id, ts);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rebalances_ts ON rebalances(ts);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rebalances_cond_ts ON rebalances(condition_id, ts);")
+
+        self._fills_table_columns: set[str] = set(existing_columns)
+
+    def _insert_yield_fill_row(self, values: dict[str, Any]) -> None:
+        """Idempotently insert one measured fill, filtered to the live schema."""
+        columns = getattr(self, "_fills_table_columns", None)
+        payload = {
+            key: val for key, val in values.items() if columns is None or key in columns
+        }
+        # A pre-existing (legacy) fills table carries NOT NULL columns that the
+        # yield schema does not need; fill them so the row is not silently
+        # ignored, then drop anything the live table does not have.
+        if columns is not None and "fill_id" in columns:
+            payload.setdefault("fill_id", payload.get("fill_key", ""))
+            payload.setdefault("timestamp", payload.get("ts", time.time()))
+            payload.setdefault(
+                "liquidity_type", "maker" if payload.get("is_maker") else "taker"
+            )
+            payload.setdefault("slippage_cents", 0.0)
+            payload.setdefault("queue_depleted", 0)
+            payload.setdefault("post_fill_drift", 0.0)
+            payload.setdefault("cash_after", 0.0)
+            payload.setdefault("realized_pnl", 0.0)
+            payload.setdefault("notes", payload.get("note"))
+            payload = {key: val for key, val in payload.items() if key in columns}
+        if not payload:
+            return
+        names = ", ".join(payload)
+        placeholders = ", ".join("?" for _ in payload)
+        cur = self._conn.cursor()
+        cur.execute(
+            f"INSERT OR IGNORE INTO fills ({names}) VALUES ({placeholders})",
+            tuple(payload.values()),
+        )
+        self._conn.commit()
+
+    def _insert_rebalance_row(
+        self,
+        *,
+        pathway: str,
+        ts: Optional[float] = None,
+        crossed_cents: float = 0.0,
+        taker_fee_usd: float = 0.0,
+        gas_usd: float = 0.0,
+        reward_score_lost: float = 0.0,
+        inventory_before: Optional[float] = None,
+        inventory_after: Optional[float] = None,
+        note: str = "",
+        condition_id: Optional[str] = None,
+    ) -> None:
+        """Record one inventory-rebalancing cost observation (append-only)."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO rebalances (
+                ts, condition_id, pathway, crossed_cents, taker_fee_usd, gas_usd,
+                reward_score_lost, inventory_before, inventory_after, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                float(ts if ts is not None else time.time()),
+                str(condition_id or self.condition_id),
+                str(pathway),
+                float(crossed_cents),
+                float(taker_fee_usd),
+                float(gas_usd),
+                float(reward_score_lost),
+                None if inventory_before is None else float(inventory_before),
+                None if inventory_after is None else float(inventory_after),
+                note or None,
+            ),
+        )
+        self._conn.commit()
+
+    def _insert_reward_payout(
+        self,
+        *,
+        date: str,
+        condition_id: str,
+        usd: float,
+        source: str,
+        observed_ts: Optional[float] = None,
+    ) -> None:
+        """Idempotently upsert one venue-reported daily reward payout."""
+        if not date or not condition_id or not source:
+            return
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO reward_payouts (
+                date, condition_id, usd, source, observed_ts
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(date),
+                str(condition_id),
+                float(usd),
+                str(source),
+                float(observed_ts if observed_ts is not None else time.time()),
+            ),
+        )
         self._conn.commit()
 
     # -------------------------------------------------------------------------
@@ -399,6 +647,14 @@ class BaseMarketMakingEngine:
     def get_cash(self) -> float:
         """Get available cash balance in USD."""
         raise NotImplementedError
+
+    def get_locked_cash(self) -> float:
+        """Collateral committed to resting BUY orders.
+
+        Replacing those orders releases the collateral, so quote sizing uses
+        ``get_cash() + get_locked_cash()``. Simulation engines return 0.
+        """
+        return 0.0
 
     def get_position(self, condition_id: Optional[str] = None) -> PositionView:
         """Get current position state for target condition ID."""
@@ -500,11 +756,11 @@ class BaseMarketMakingEngine:
             self._last_cooldown_log_time = now
             self.cancel_all_quotes()
             msg = f"Mid-price jump {jump_cents:.2f}c > {dyn_thresh:.2f}c within 60s."
-            self.risk_manager.trip_circuit_breaker(
-                CircuitBreakerReason.PRICE_JUMP_VOLATILITY,
-                msg,
-                condition_id=self.condition_id,
-                asset_id=self.asset_id_yes,
+            # Register a *per-market* cooldown with the risk manager's volatility monitor.
+            # Do NOT trip the global circuit breaker here: `is_halted` has no auto-resume,
+            # so a single 2c print would permanently stop the engine.
+            self.risk_manager.volatility_monitor.cooldowns[self.asset_id_yes] = (
+                self._volatility_cooldown_until
             )
             logger.warning(
                 f"[ASYMMETRIC TOXICITY DEFENSE] Dynamic price jump volatility breaker triggered: {msg} "
@@ -518,6 +774,102 @@ class BaseMarketMakingEngine:
     # -------------------------------------------------------------------------
     # Quoting Logic & 2-Tier De-Skewing Strategy
     # -------------------------------------------------------------------------
+
+    def round_quote_price(self, price: float, token_side: str) -> float:
+        """Round ``price`` to the market tick and clamp it to the tradeable band.
+
+        The base class defaults to a 0.001 tick. Subclasses that trade a real CLOB
+        override both ``quote_tick_size`` and this method with the market's tick.
+        """
+        tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
+        min_price = max(tick, 0.001)
+        max_price = min(1.0 - tick, 0.999)
+        if max_price < min_price:
+            min_price = max_price = 0.5
+        rounded = round(round(price / tick) * tick, 6)
+        return round(min(max(rounded, min_price), max_price), 6)
+
+    def should_reprice(
+        self,
+        existing: Optional[dict],
+        price: float,
+        size: float,
+        ts: float,
+    ) -> bool:
+        """Return True when a resting quote must be cancelled/replaced.
+
+        A missing quote always needs placement. An existing quote is left untouched
+        while it is younger than ``min_reprice_interval_s`` and when neither its
+        price has moved by more than ``min_reprice_ticks`` ticks nor its size has
+        changed materially. This is what stops the cancel/replace storm that
+        destroys FIFO queue priority (the actual source of LP income).
+        """
+        if not existing:
+            return True
+
+        tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
+        last_ts = float(existing.get("timestamp", 0.0) or 0.0)
+        if ts - last_ts < self.min_reprice_interval_s:
+            return False
+
+        existing_price = float(existing.get("price", 0.0) or 0.0)
+        existing_size = float(existing.get("size", 0.0) or 0.0)
+        price_moved = abs(float(price) - existing_price)
+        size_moved = abs(float(size) - existing_size)
+        if price_moved <= self.min_reprice_ticks * tick and size_moved < 1e-6:
+            return False
+        return True
+
+    def compute_quote_scores(self) -> Tuple[float, float, float]:
+        """Return ``(q_min, q_one, q_two)`` for the currently resting quotes.
+
+        Uses the official complementary-book scoring with the live YES/NO mids and
+        the real max spread / minimum size. Every resting quote is treated as having
+        survived the full sampled minute.
+        """
+        b_yes, a_yes = self.get_best_bid_ask("YES")
+        b_no, a_no = self.get_best_bid_ask("NO")
+        mid_yes = (b_yes + a_yes) / 2.0
+        mid_no = (b_no + a_no) / 2.0
+
+        yes_quotes: List[OrderQuote] = []
+        no_quotes: List[OrderQuote] = []
+        for q in self.active_quotes.values():
+            price = float(q.get("price", 0.0) or 0.0)
+            size = float(q.get("size", 0.0) or 0.0)
+            if size <= 0.0 or not (0.0 < price < 1.0):
+                continue
+            quote = OrderQuote(
+                side=str(q.get("side", "BUY")).upper(),
+                outcome=str(q.get("token_side", "YES")).upper(),
+                price=price,
+                size=size,
+                duration_seconds=60.0,
+            )
+            if quote.outcome == "NO":
+                no_quotes.append(quote)
+            else:
+                yes_quotes.append(quote)
+
+        q_one_yes, q_two_yes = compute_book_side_scores(
+            yes_quotes,
+            mid_price_yes=mid_yes,
+            max_spread_cents=self.rewards_max_spread,
+            min_size=self.rewards_min_size,
+        )
+        # Passing ``1 - mid_no`` scores the NO book around its own mid (the scorer
+        # derives mid_no as ``1 - mid_price_yes``) while keeping the Q1/Q2 mapping.
+        q_one_no, q_two_no = compute_book_side_scores(
+            no_quotes,
+            mid_price_yes=1.0 - mid_no,
+            max_spread_cents=self.rewards_max_spread,
+            min_size=self.rewards_min_size,
+        )
+
+        q_one = q_one_yes + q_one_no
+        q_two = q_two_yes + q_two_no
+        q_min = compute_minimum_score(q_one=q_one, q_two=q_two, midpoint=mid_yes)
+        return q_min, q_one, q_two
 
     def evaluate_quotes(self, timestamp: Optional[float] = None) -> None:
         """Run 2-Tier Dynamic De-Skewing Optimizer and generate maker quotes."""
@@ -535,7 +887,7 @@ class BaseMarketMakingEngine:
         equity_val = self.get_equity()
         self.risk_manager.update_portfolio_pnl(
             current_equity=equity_val,
-            realized_pnl=pos.realized_pnl + self.total_rewards_credited,
+            realized_pnl=pos.realized_pnl,
             unrealized_pnl=equity_val - cash_val,
             current_cash=cash_val,
             timestamp=ts,
@@ -569,7 +921,7 @@ class BaseMarketMakingEngine:
             best_ask_no=a_no,
             rolling_ofi=rolling_ofi,
             micro_price_drift_cents=drift_cents,
-            time_to_resolution_days=7.0,
+            time_to_resolution_days=max(1.0 / 24.0, float(self.days_to_resolution)),
         )
         self.latest_deskew_decision = decision
 
@@ -594,6 +946,18 @@ class BaseMarketMakingEngine:
         # Neutral Two-Sided Maker Quoting around Mid
         self._execute_neutral_maker_quoting(mid_yes, b_yes, a_yes, ts)
 
+    def _measure_reward_score(self) -> Optional[float]:
+        """Current official Q_min score, or None when it cannot be computed."""
+        try:
+            q_min, _q_one, _q_two = self.compute_quote_scores()
+        except Exception as e:  # measurement must never break quoting
+            logger.debug(f"Reward score measurement failed: {e}")
+            return None
+        value = float(q_min)
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+
     def _execute_tier1_passive_fade(
         self,
         decision: DeSkewDecision,
@@ -602,31 +966,94 @@ class BaseMarketMakingEngine:
         best_ask_yes: float,
         ts: float,
     ) -> None:
-        """Tier 1: Avellaneda-Stoikov inventory quote fading."""
-        self._record_deskew_event(decision, ts)
+        """Tier 1: Avellaneda-Stoikov inventory quote fading.
 
+        The quote mutation itself is unchanged; the reward score is sampled
+        immediately before and after so the fading cost (Q_min given up) is
+        measured rather than assumed.
+        """
+        self._record_deskew_event(decision, ts)
+        q_min_before = self._measure_reward_score()
+        inventory_before = float(getattr(self, "shares_yes", 0.0)) + float(
+            getattr(self, "shares_no", 0.0)
+        )
+
+        self._apply_tier1_passive_fade(decision, mid_yes, best_bid_yes, best_ask_yes, ts)
+
+        q_min_after = self._measure_reward_score()
+        inventory_after = float(getattr(self, "shares_yes", 0.0)) + float(
+            getattr(self, "shares_no", 0.0)
+        )
+        if q_min_before is not None and q_min_after is not None:
+            reward_score_lost = max(0.0, q_min_before - q_min_after)
+            note = (
+                f"tier1 fade; Q_min {q_min_before:.4f} -> {q_min_after:.4f}"
+            )
+        else:
+            reward_score_lost = 0.0
+            note = "tier1 fade; reward Q_min not measurable"
+        self._insert_rebalance_row(
+            pathway=DeSkewPathway.PASSIVE_FADE.value,
+            ts=ts,
+            reward_score_lost=reward_score_lost,
+            inventory_before=inventory_before,
+            inventory_after=inventory_after,
+            note=note,
+        )
+
+    def _apply_tier1_passive_fade(
+        self,
+        decision: DeSkewDecision,
+        mid_yes: float,
+        best_bid_yes: float,
+        best_ask_yes: float,
+        ts: float,
+    ) -> None:
         if self.institutional_mode:
             pos = self.get_position(self.condition_id)
             net_q = pos.shares_yes - pos.shares_no
             p = max(0.01, min(0.99, mid_yes))
-            variance = (p * (1.0 - p)) / 7.0
+            variance = (p * (1.0 - p)) / max(1.0 / 24.0, float(self.days_to_resolution))
             r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
             offset = self.spread_offset_cents / 100.0
+            tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
+            _, best_ask_no = self.get_best_bid_ask("NO")
+            max_bid_yes = self.round_quote_price(best_ask_yes - tick, "YES")
+            max_bid_no = self.round_quote_price(best_ask_no - tick, "NO")
 
             if net_q > 0:
                 # Long YES -> tighten NO bid to complete sets; fade/widen YES bid
-                target_bid_no = round(min(0.98, max(0.01, 1.00 - max(best_bid_yes + 0.001, decision.target_price))), 3)
-                faded_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, r_yes - offset - 0.01)), 3)
+                target_bid_no = self.round_quote_price(
+                    1.00 - max(best_bid_yes + tick, decision.target_price), "NO"
+                )
+                target_bid_no = min(target_bid_no, max_bid_no)
+                faded_bid_yes = min(
+                    self.round_quote_price(r_yes - offset - 0.01, "YES"), max_bid_yes
+                )
                 deskew_size = max(self.quote_size, net_q)
-                self._set_quote("NO", "BUY", target_bid_no, deskew_size, ts)
-                self._set_quote("YES", "BUY", faded_bid_yes, self.quote_size, ts)
+                if self.should_reprice(self.active_quotes.get("BUY_NO"), target_bid_no, deskew_size, ts):
+                    self._set_quote("NO", "BUY", target_bid_no, deskew_size, ts)
+                if self.should_reprice(
+                    self.active_quotes.get("BUY_YES"), faded_bid_yes, self.quote_size, ts
+                ):
+                    self._set_quote("YES", "BUY", faded_bid_yes, self.quote_size, ts)
             elif net_q < 0:
                 # Long NO -> tighten YES bid to complete sets; fade/widen NO bid
-                target_bid_yes = round(max(0.01, min(best_ask_yes - 0.001, decision.target_price)), 3)
-                faded_bid_no = round(max(0.01, min(0.98, 1.00 - (r_yes + offset + 0.01))), 3)
+                target_bid_yes = min(
+                    self.round_quote_price(decision.target_price, "YES"), max_bid_yes
+                )
+                faded_bid_no = min(
+                    self.round_quote_price(1.00 - (r_yes + offset + 0.01), "NO"), max_bid_no
+                )
                 deskew_size = max(self.quote_size, abs(net_q))
-                self._set_quote("YES", "BUY", target_bid_yes, deskew_size, ts)
-                self._set_quote("NO", "BUY", faded_bid_no, self.quote_size, ts)
+                if self.should_reprice(
+                    self.active_quotes.get("BUY_YES"), target_bid_yes, deskew_size, ts
+                ):
+                    self._set_quote("YES", "BUY", target_bid_yes, deskew_size, ts)
+                if self.should_reprice(
+                    self.active_quotes.get("BUY_NO"), faded_bid_no, self.quote_size, ts
+                ):
+                    self._set_quote("NO", "BUY", faded_bid_no, self.quote_size, ts)
             else:
                 self._execute_neutral_maker_quoting(mid_yes, best_bid_yes, best_ask_yes, ts)
                 return
@@ -636,14 +1063,27 @@ class BaseMarketMakingEngine:
             return
 
         # Legacy Single-Token Mode
+        tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
         if decision.target_token == "YES" and decision.action_side == "SELL":
-            faded_ask = min(best_ask_yes, max(best_bid_yes + 0.001, decision.target_price))
-            self._set_quote("YES", "SELL", faded_ask, self.quote_size, ts)
+            faded_ask = max(
+                self.round_quote_price(decision.target_price, "YES"),
+                self.round_quote_price(best_bid_yes + tick, "YES"),
+            )
+            if self.should_reprice(
+                self.active_quotes.get("SELL_YES"), faded_ask, self.quote_size, ts
+            ):
+                self._set_quote("YES", "SELL", faded_ask, self.quote_size, ts)
             self._cancel_quote("BID_YES")
             self._cancel_quote("BUY_YES")
         elif decision.target_token == "YES" and decision.action_side == "BUY":
-            faded_bid = max(best_bid_yes, min(best_ask_yes - 0.001, decision.target_price))
-            self._set_quote("YES", "BUY", faded_bid, self.quote_size, ts)
+            faded_bid = min(
+                self.round_quote_price(decision.target_price, "YES"),
+                self.round_quote_price(best_ask_yes - tick, "YES"),
+            )
+            if self.should_reprice(
+                self.active_quotes.get("BUY_YES"), faded_bid, self.quote_size, ts
+            ):
+                self._set_quote("YES", "BUY", faded_bid, self.quote_size, ts)
             self._cancel_quote("ASK_YES")
             self._cancel_quote("SELL_YES")
 
@@ -693,48 +1133,78 @@ class BaseMarketMakingEngine:
                 f"[ASYMMETRIC TOXICITY DEFENSE] Widening bid offset by +{action_buy.spread_offset_cents:.2f}c: {action_buy.reason}"
             )
 
-        cash_balance = self.get_cash()
+        # Replacing a resting order releases its locked collateral, so sizing must use
+        # total trading cash (free + locked), never free cash alone.
+        cash_balance = self.get_cash() + self.get_locked_cash()
+        tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
 
         if self.institutional_mode:
             # Jane Street Institutional Dual-Cash Quoting (BUY YES + BUY NO)
             pos = self.get_position(self.condition_id)
             net_q = pos.shares_yes - pos.shares_no
             p = max(0.01, min(0.99, mid_yes))
-            variance = (p * (1.0 - p)) / 7.0
+            variance = (p * (1.0 - p)) / max(1.0 / 24.0, float(self.days_to_resolution))
             r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
 
+            _, best_ask_no = self.get_best_bid_ask("NO")
+            max_bid_yes = self.round_quote_price(best_ask_yes - tick, "YES")
+            max_bid_no = self.round_quote_price(best_ask_no - tick, "NO")
+            min_ask_yes = self.round_quote_price(best_bid_yes + tick, "YES")
+
             skew_adj = net_q * 0.0005
-            target_bid_yes = r_yes - bid_offset - max(0.0, skew_adj)
-            target_ask_yes = r_yes + ask_offset - min(0.0, skew_adj)
+            target_bid_yes = min(
+                self.round_quote_price(r_yes - bid_offset - max(0.0, skew_adj), "YES"),
+                max_bid_yes,
+            )
+            target_ask_yes = max(
+                self.round_quote_price(r_yes + ask_offset - min(0.0, skew_adj), "YES"),
+                min_ask_yes,
+            )
+            # Derive the NO bid from the synthetic YES ask, then never cross the NO book.
+            target_bid_no = min(
+                self.round_quote_price(1.00 - target_ask_yes, "NO"),
+                max_bid_no,
+            )
 
-            target_bid_yes = min(best_ask_yes - 0.001, target_bid_yes)
-            target_ask_yes = max(best_bid_yes + 0.001, target_ask_yes)
-
-            target_bid_yes = round(max(0.01, min(0.98, target_bid_yes)), 3)
-            target_ask_yes = round(max(target_bid_yes + 0.002, min(0.99, target_ask_yes)), 3)
-            target_bid_no = round(1.00 - target_ask_yes, 3)
-
-            # Enforce cash sizing bounds
+            # Enforce the rewards minimum size: a sub-minimum order earns nothing and
+            # only adds fill risk, so suppress quoting entirely instead of emitting it.
             active_price_sum = 0.0
             if not suppress_bid:
                 active_price_sum += target_bid_yes
             if not suppress_ask:
                 active_price_sum += target_bid_no
 
+            eff_size = self.quote_size
             if active_price_sum > 0:
-                req_cash = active_price_sum * self.quote_size
-                eff_size = self.quote_size if cash_balance >= req_cash else max(5.0, math.floor(cash_balance / active_price_sum))
-            else:
-                eff_size = self.quote_size
+                eff_size = min(self.quote_size, cash_balance / active_price_sum)
 
-            # Place quotes or cancel if suppressed
+            if eff_size + 1e-9 < self.rewards_min_size:
+                logger.warning(
+                    f"[REWARDS MIN SIZE] Cash ${cash_balance:.2f} supports only {eff_size:.2f} shares at "
+                    f"combined price {active_price_sum:.3f} < min_size={self.rewards_min_size:.1f} "
+                    f"for {self.condition_id}; suppressing quotes."
+                )
+                self._cancel_quote("BUY_YES")
+                self._cancel_quote("BUY_NO")
+                self._cancel_quote("SELL_YES")
+                self._cancel_quote("SELL_NO")
+                return
+
+            # Place quotes or cancel if suppressed. Leave untouched quotes resting so
+            # queue priority survives book ticks (reprice gate).
             if not suppress_bid:
-                self._set_quote("YES", "BUY", target_bid_yes, eff_size, ts)
+                if self.should_reprice(
+                    self.active_quotes.get("BUY_YES"), target_bid_yes, eff_size, ts
+                ):
+                    self._set_quote("YES", "BUY", target_bid_yes, eff_size, ts)
             else:
                 self._cancel_quote("BUY_YES")
 
             if not suppress_ask:
-                self._set_quote("NO", "BUY", target_bid_no, eff_size, ts)
+                if self.should_reprice(
+                    self.active_quotes.get("BUY_NO"), target_bid_no, eff_size, ts
+                ):
+                    self._set_quote("NO", "BUY", target_bid_no, eff_size, ts)
             else:
                 self._cancel_quote("BUY_NO")
 
@@ -743,21 +1213,37 @@ class BaseMarketMakingEngine:
             return
 
         # Legacy Single-Token Mode (BUY YES + SELL YES)
-        target_bid = round(max(0.01, mid_yes - bid_offset), 3)
-        target_ask = round(min(0.99, mid_yes + ask_offset), 3)
+        if self.quote_size < self.rewards_min_size:
+            logger.warning(
+                f"[REWARDS MIN SIZE] quote_size={self.quote_size:.1f} < min_size="
+                f"{self.rewards_min_size:.1f} for {self.condition_id}; suppressing quotes."
+            )
+            self._cancel_quote("BUY_YES")
+            self._cancel_quote("SELL_YES")
+            return
 
-        if target_bid >= best_ask_yes:
-            target_bid = round(best_ask_yes - 0.001, 3)
-        if target_ask <= best_bid_yes:
-            target_ask = round(best_bid_yes + 0.001, 3)
+        target_bid = min(
+            self.round_quote_price(mid_yes - bid_offset, "YES"),
+            self.round_quote_price(best_ask_yes - tick, "YES"),
+        )
+        target_ask = max(
+            self.round_quote_price(mid_yes + ask_offset, "YES"),
+            self.round_quote_price(best_bid_yes + tick, "YES"),
+        )
 
         if not suppress_bid:
-            self._set_quote("YES", "BUY", target_bid, self.quote_size, ts)
+            if self.should_reprice(
+                self.active_quotes.get("BUY_YES"), target_bid, self.quote_size, ts
+            ):
+                self._set_quote("YES", "BUY", target_bid, self.quote_size, ts)
         else:
             self._cancel_quote("BUY_YES")
 
         if not suppress_ask:
-            self._set_quote("YES", "SELL", target_ask, self.quote_size, ts)
+            if self.should_reprice(
+                self.active_quotes.get("SELL_YES"), target_ask, self.quote_size, ts
+            ):
+                self._set_quote("YES", "SELL", target_ask, self.quote_size, ts)
         else:
             self._cancel_quote("SELL_YES")
 
@@ -815,11 +1301,14 @@ class BaseMarketMakingEngine:
     ) -> dict[str, Any]:
         """Process 1-minute quadratic reward epoch and trigger continuous compounding."""
         ts = timestamp or time.time()
-        self.epoch_index += 1
+        # Align the epoch to the wall clock so indices are comparable across restarts
+        # and do not drift with uptime.
+        self.epoch_index = int(ts // 60) % 1440
         self.last_epoch_ts = ts
 
-        # Total User Score S(v, s)
-        total_user_score = sum(float(q.get("score", 0.0)) for q in self.active_quotes.values())
+        # Official Q_min score (never Q1 + Q2): rewards are paid on the minimum of the
+        # two complementary book sides, with the documented single-sided penalty.
+        total_user_score, _q_one, _q_two = self.compute_quote_scores()
 
         if self.competing_score_override is not None and self.competing_score_override > 0.0:
             competing_score = max(self.competing_score_override, competing_score)
@@ -831,10 +1320,18 @@ class BaseMarketMakingEngine:
 
         epoch_budget_usd = self.daily_reward_rate / 1440.0
         raw_epoch_payout = (total_user_score / total_pool_score) * epoch_budget_usd if total_pool_score > 0 else 0.0
-        projected_daily_usd = raw_epoch_payout * 1440.0
 
-        # $1.00 Daily Payout Floor Rule
-        floor_met = projected_daily_usd >= 1.00
+        # Rolling 24h of completed per-minute samples. The projection is the
+        # current run rate (one minute × 1440); the payout floor is applied to
+        # the *accrued* day instead, because Polymarket pays a maker only when
+        # that maker's earnings in this market reach $1 on the day.
+        self._epoch_samples.append(raw_epoch_payout)
+        if len(self._epoch_samples) > 1440:
+            del self._epoch_samples[:-1440]
+        projected_daily_usd = raw_epoch_payout * 1440.0
+        accrued_daily_usd = sum(self._epoch_samples)
+
+        floor_met = accrued_daily_usd >= 1.00
         actual_epoch_payout = raw_epoch_payout if floor_met else 0.0
 
         if actual_epoch_payout > 0:
@@ -876,7 +1373,7 @@ class BaseMarketMakingEngine:
         pos = self.get_position(self.condition_id)
         risk_status = self.risk_manager.update_portfolio_pnl(
             current_equity=equity_val,
-            realized_pnl=pos.realized_pnl + self.total_rewards_credited,
+            realized_pnl=pos.realized_pnl,
             unrealized_pnl=equity_val - cash_val,
             current_cash=cash_val,
             timestamp=ts,
@@ -909,7 +1406,7 @@ class BaseMarketMakingEngine:
                 )
                 self.update_quote_size(act.target_quote_size, timestamp=ts)
 
-        return {
+        result = {
             "epoch_index": self.epoch_index,
             "timestamp": ts,
             "user_score": round(total_user_score, 4),
@@ -917,11 +1414,14 @@ class BaseMarketMakingEngine:
             "pool_share_pct": round(pool_share_pct, 4),
             "epoch_payout_usd": round(actual_epoch_payout, 6),
             "projected_daily_usd": round(projected_daily_usd, 2),
+            "accrued_daily_usd": round(accrued_daily_usd, 4),
             "floor_met": floor_met,
             "total_rewards_usd": round(self.total_rewards_credited, 4),
             "quote_size": self.quote_size,
             "governor_actions": [act.action_type for act in gov_actions],
         }
+        self._last_reward_epoch = result
+        return result
 
     # -------------------------------------------------------------------------
     # Queue Valuation, Switching Hurdle, and Capital Migration
@@ -950,23 +1450,22 @@ class BaseMarketMakingEngine:
         return round(total_v, 4)
 
     def get_current_daily_yield(self) -> float:
-        """Calculate current daily reward payout ($/day) based on active quote score or expected yield."""
-        user_score = sum(float(q.get("score", 0.0)) for q in self.active_quotes.values())
+        """Calculate current daily reward payout ($/day) from the official Q_min score."""
+        user_score, _, _ = self.compute_quote_scores()
         if user_score <= 0.0 and self.quote_size > 0.0 and self.rewards_max_spread > 0.0:
-            # Expected target quote score for current market
+            # Expected target quote score for current market. Single-sided estimate only:
+            # Q_min already accounts for the complementary side, so do not double it.
             v = self.rewards_max_spread
             s = self.spread_offset_cents
             if s < v:
-                eff_score = ((v - s) / v) ** 2 * self.quote_size
-                # Since dual-cash quotes 2 sides (YES and NO)
-                user_score = eff_score * 2.0
+                user_score = ((v - s) / v) ** 2 * self.quote_size
 
         comp_score = self.competing_score_override if self.competing_score_override is not None else 0.0
         tot = user_score + comp_score
         share_payout = (user_score / tot) * self.daily_reward_rate if tot > 0 else 0.0
-        if self.epoch_index >= 5 and self.total_rewards_credited > 0:
-            proj = (self.total_rewards_credited / self.epoch_index) * 1440.0
-            return max(share_payout, proj)
+        if self._epoch_samples:
+            observed_daily = sum(self._epoch_samples[-1440:])
+            return max(share_payout, observed_daily)
         return share_payout
 
     def compute_switching_cost(
@@ -1040,6 +1539,13 @@ class BaseMarketMakingEngine:
 
     def close(self) -> None:
         """Close SQLite connection and unquote cleanly."""
+        tracker = getattr(self, "_markout_tracker", None)
+        if tracker is not None:
+            try:
+                tracker.stop()
+            except Exception:
+                pass
+            self._markout_tracker = None
         try:
             self.cancel_all_quotes()
         except Exception:

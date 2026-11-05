@@ -105,7 +105,8 @@ class FastOrder:
     nonce: int
     feeRateBps: int = 0
     side: int = 0  # 0: BUY, 1: SELL
-    signatureType: int = 0  # 0: EOA, 1: POLY_PROXY, 2: POLY_GNOSIS_SAFE
+    # 0: EOA, 1: POLY_PROXY, 2: POLY_GNOSIS_SAFE (POLY_1271 is V2-only)
+    signatureType: int = 0
 
 
 # --- Lightweight Secp256k1 Curve & ECDSA Math ---
@@ -291,6 +292,10 @@ class FastEIP712Signer:
 
     def sign_order(self, order: FastOrder) -> str:
         """Compute EIP-712 typed data digest and generate cryptographic signature."""
+        if int(order.signatureType) == POLY_1271_SIGNATURE_TYPE:
+            raise ValueError(
+                "signature type POLY_1271 (Deposit Wallet) is not supported for v1 orders"
+            )
         digest = self.hash_typed_data(order)
         return self.sign_digest(digest)
 
@@ -315,4 +320,268 @@ class FastEIP712Signer:
             "owner": self.address or order.signer,
             "orderType": "GTC",
             "signature": sig,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Polymarket CTF Exchange V2 (CLOB order version 2)
+# ---------------------------------------------------------------------------
+# Reference: https://github.com/Polymarket/ctf-exchange-v2
+#   src/exchange/libraries/Structs.sol  (ORDER_TYPEHASH, struct Order)
+#   src/exchange/mixins/Hashing.sol     (DOMAIN_NAME, DOMAIN_VERSION = "2")
+#   https://docs.polymarket.com/resources/contracts.md (Polygon addresses)
+#
+# The V2 signed struct drops taker/nonce/expiration/feeRateBps and adds
+# timestamp (unix MILLISECONDS), metadata and builder. The order signature is
+# not part of the EIP-712 struct hash.
+
+V2_DOMAIN_VERSION = "2"
+V2_CTF_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+V2_NEG_RISK_CTF_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
+ZERO_BYTES32 = b"\x00" * 32
+
+ORDER_V2_TYPE_STRING = (
+    b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,"
+    b"uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,"
+    b"bytes32 builder)"
+)
+
+# Must equal 0xbb86318a2138f5fa8ae32fbe8e659f8fcf13cc6ae4014a707893055433818589
+ORDER_V2_TYPEHASH: bytes = keccak256(ORDER_V2_TYPE_STRING)
+
+# --- POLY_1271 (Deposit Wallet) order signatures ---------------------------
+# Reference: py-clob-client-v2 order_utils/exchange_order_builder_v2.py
+#   (_build_poly_1271_order_signature) and the Solady ERC-7739 "TypedDataSign"
+#   nested EIP-712 envelope it implements. The Deposit Wallet domain is
+#   name "DepositWallet", version "1", chainId, verifyingContract = the order
+#   `signer` (the Deposit Wallet itself) and a zero salt.
+POLY_1271_SIGNATURE_TYPE = 3
+DEPOSIT_WALLET_DOMAIN_NAME = b"DepositWallet"
+DEPOSIT_WALLET_DOMAIN_VERSION = b"1"
+TYPED_DATA_SIGN_TYPE_STRING = (
+    b"TypedDataSign(Order contents,string name,string version,uint256 chainId,"
+    b"address verifyingContract,bytes32 salt)" + ORDER_V2_TYPE_STRING
+)
+# Must equal 0x6ba028565cb324c2aa02bb714b9816d0bddd557a2f33bb36cf13272a4256bd42
+TYPED_DATA_SIGN_TYPEHASH: bytes = keccak256(TYPED_DATA_SIGN_TYPE_STRING)
+DEPOSIT_WALLET_NAME_HASH: bytes = keccak256(DEPOSIT_WALLET_DOMAIN_NAME)
+DEPOSIT_WALLET_VERSION_HASH: bytes = keccak256(DEPOSIT_WALLET_DOMAIN_VERSION)
+
+
+def compute_domain_separator_v2(
+    chain_id: int = DEFAULT_CHAIN_ID,
+    verifying_contract: str = V2_CTF_EXCHANGE,
+) -> bytes:
+    """Compute the EIP-712 domain separator for a CTF Exchange V2 contract.
+
+    Domain: name "Polymarket CTF Exchange", version "2", chainId, verifyingContract.
+    """
+    return compute_domain_separator(
+        name=DEFAULT_DOMAIN_NAME,
+        version=V2_DOMAIN_VERSION,
+        chain_id=chain_id,
+        verifying_contract=verifying_contract,
+    )
+
+
+def to_bytes32(value: Any) -> bytes:
+    """Normalise a bytes32 value (``bytes`` or 0x-prefixed hex string) to 32 bytes."""
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+    elif isinstance(value, str):
+        text = value.removeprefix("0x").removeprefix("0X")
+        if len(text) != 64:
+            raise ValueError(f"bytes32 hex string must be 32 bytes, got {len(text)} hex chars")
+        raw = bytes.fromhex(text)
+    else:
+        raise TypeError(f"bytes32 value must be bytes or hex string, got {type(value)!r}")
+    if len(raw) != 32:
+        raise ValueError(f"bytes32 value must be exactly 32 bytes, got {len(raw)}")
+    return raw
+
+
+def bytes32_to_hex(value: bytes) -> str:
+    """Render 32 bytes as a 0x-prefixed hex string for the CLOB JSON payload."""
+    return "0x" + to_bytes32(value).hex()
+
+
+@dataclass
+class OrderV2:
+    """Order struct matching the Polymarket CTF Exchange V2 EIP-712 schema."""
+
+    salt: int
+    maker: str
+    signer: str
+    tokenId: int
+    makerAmount: int
+    takerAmount: int
+    timestamp: int  # unix milliseconds
+    side: int = 0  # 0: BUY, 1: SELL
+    # 0: EOA, 1: POLY_PROXY, 2: POLY_GNOSIS_SAFE, 3: POLY_1271 (Deposit Wallet)
+    signatureType: int = 0
+    metadata: bytes = ZERO_BYTES32
+    builder: bytes = ZERO_BYTES32
+
+
+class FastEIP712SignerV2:
+    """EIP-712 signer for CTF Exchange V2 orders (order version 2).
+
+    Same precomputed-domain approach as :class:`FastEIP712Signer`, but the
+    struct is the 11-field V2 order (typehash + 11 words = 384 bytes).
+    """
+
+    def __init__(
+        self,
+        private_key: Optional[str] = None,
+        verifying_contract: str = V2_CTF_EXCHANGE,
+        chain_id: int = DEFAULT_CHAIN_ID,
+        domain_name: str = DEFAULT_DOMAIN_NAME,
+        domain_version: str = V2_DOMAIN_VERSION,
+    ) -> None:
+        self.verifying_contract = verifying_contract
+        self.chain_id = chain_id
+        self.domain_name = domain_name
+        self.domain_version = domain_version
+
+        self.domain_separator = compute_domain_separator(
+            name=domain_name,
+            version=domain_version,
+            chain_id=chain_id,
+            verifying_contract=verifying_contract,
+        )
+        self.order_typehash = ORDER_V2_TYPEHASH
+
+        # 1 typehash + 11 fields = 12 words = 384 bytes
+        self._buffer = bytearray(384)
+        self._buffer[0:32] = self.order_typehash
+
+        self._private_key_bytes: Optional[bytes] = None
+        self.address: Optional[str] = None
+        if private_key:
+            clean_key = private_key.removeprefix("0x").removeprefix("0X")
+            self._private_key_bytes = bytes.fromhex(clean_key)
+            self.address = private_key_to_address(self._private_key_bytes)
+
+    def pack_order(self, order: OrderV2) -> bytes:
+        """Pack the V2 order into 384 bytes (12 x 32-byte words)."""
+        buf = self._buffer
+        buf[32:64] = order.salt.to_bytes(32, "big")
+        buf[64:96] = encode_address(order.maker)
+        buf[96:128] = encode_address(order.signer)
+        buf[128:160] = order.tokenId.to_bytes(32, "big")
+        buf[160:192] = order.makerAmount.to_bytes(32, "big")
+        buf[192:224] = order.takerAmount.to_bytes(32, "big")
+        buf[224:256] = order.side.to_bytes(32, "big")
+        buf[256:288] = order.signatureType.to_bytes(32, "big")
+        buf[288:320] = order.timestamp.to_bytes(32, "big")
+        buf[320:352] = to_bytes32(order.metadata)
+        buf[352:384] = to_bytes32(order.builder)
+        return bytes(buf)
+
+    def hash_order(self, order: OrderV2) -> bytes:
+        """Compute the 32-byte struct hash of a V2 order."""
+        return keccak256(self.pack_order(order))
+
+    def hash_typed_data(self, order: OrderV2) -> bytes:
+        """Compute the EIP-712 signable digest for a V2 order."""
+        struct_hash = self.hash_order(order)
+        return keccak256(b"\x19\x01" + self.domain_separator + struct_hash)
+
+    def sign_digest(self, digest: bytes) -> str:
+        """Sign a 32-byte digest and return the 65-byte hex signature."""
+        if self._private_key_bytes is None:
+            raise RuntimeError("Private key is required to sign orders.")
+        r, s, v = ecdsa_sign_digest(digest, self._private_key_bytes)
+        return "0x" + (r.to_bytes(32, "big") + s.to_bytes(32, "big") + bytes([v])).hex()
+
+    def _poly_1271_parts(self, order: OrderV2) -> tuple[bytes, bytes]:
+        """Return (Order struct hash, POLY_1271 inner digest) for a Deposit Wallet order.
+
+        The Deposit Wallet is an EIP-1271 smart wallet, so the CLOB expects a
+        Solady ERC-7739 envelope: an ECDSA signature by the owner over
+        ``keccak256(0x1901 || appDomainSeparator || TypedDataSignStructHash)``
+        where the nested domain is the Deposit Wallet's own
+        (name "DepositWallet", version "1", verifyingContract = order.signer,
+        salt = 0), and ``appDomainSeparator`` is the CTF Exchange V2 domain.
+        """
+        contents_hash = self.hash_order(order)
+        typed_data_sign_struct_hash = keccak256(
+            TYPED_DATA_SIGN_TYPEHASH
+            + contents_hash
+            + DEPOSIT_WALLET_NAME_HASH
+            + DEPOSIT_WALLET_VERSION_HASH
+            + self.chain_id.to_bytes(32, "big")
+            + encode_address(order.signer)
+            + ZERO_BYTES32
+        )
+        digest = keccak256(
+            b"\x19\x01" + self.domain_separator + typed_data_sign_struct_hash
+        )
+        return contents_hash, digest
+
+    def poly_1271_digest(self, order: OrderV2) -> bytes:
+        """EIP-712 digest the Deposit Wallet owner signs for a POLY_1271 order."""
+        return self._poly_1271_parts(order)[1]
+
+    def sign_poly_1271_order(self, order: OrderV2) -> str:
+        """Sign a POLY_1271 order and return the ERC-7739 wrapped signature.
+
+        Layout: ``innerSignature(65) || appDomainSeparator(32) ||
+        contentsHash(32) || contentsType(utf8) || uint16(contentsType length)``.
+        """
+        if self._private_key_bytes is None:
+            raise RuntimeError("Private key is required to sign orders.")
+        contents_hash, digest = self._poly_1271_parts(order)
+        r, s, v = ecdsa_sign_digest(digest, self._private_key_bytes)
+        inner = r.to_bytes(32, "big") + s.to_bytes(32, "big") + bytes([v])
+        return (
+            "0x"
+            + inner.hex()
+            + self.domain_separator.hex()
+            + contents_hash.hex()
+            + ORDER_V2_TYPE_STRING.hex()
+            + len(ORDER_V2_TYPE_STRING).to_bytes(2, "big").hex()
+        )
+
+    def sign_order(self, order: OrderV2) -> str:
+        """Sign a V2 order and return the EIP-712 (or POLY_1271) signature."""
+        if int(order.signatureType) == POLY_1271_SIGNATURE_TYPE:
+            return self.sign_poly_1271_order(order)
+        return self.sign_digest(self.hash_typed_data(order))
+
+    def build_signed_order_payload(
+        self,
+        order: OrderV2,
+        *,
+        owner: str = "",
+        expiration: int = 0,
+        order_type: str = "GTC",
+        post_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Produce the POST /order body for a V2 order.
+
+        Numeric order fields are strings except ``salt`` and ``signatureType``;
+        ``metadata``/``builder`` are 0x-prefixed bytes32 hex strings.
+        """
+        sig = self.sign_order(order)
+        return {
+            "order": {
+                "salt": order.salt,
+                "maker": order.maker,
+                "signer": order.signer,
+                "tokenId": str(order.tokenId),
+                "makerAmount": str(order.makerAmount),
+                "takerAmount": str(order.takerAmount),
+                "side": "BUY" if order.side == 0 else "SELL",
+                "expiration": str(int(expiration)),
+                "signatureType": order.signatureType,
+                "timestamp": str(order.timestamp),
+                "metadata": bytes32_to_hex(order.metadata),
+                "builder": bytes32_to_hex(order.builder),
+                "signature": sig,
+            },
+            "owner": owner,
+            "orderType": str(order_type),
+            "deferExec": False,
+            "postOnly": bool(post_only),
         }

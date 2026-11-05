@@ -70,7 +70,15 @@ class RiskConfig:
     max_portfolio_inventory_usd: Optional[float] = None  # None = dynamically derived
     max_portfolio_inventory_shares: float = 400.0  # Max total inventory shares
     max_quote_size_shares: float = 50.0  # Max single quote size in shares
+    # Correlated-event cap: the sum of all positions in one Gamma event (e.g.
+    # every outcome of a negRisk election) cannot exceed this. 50% of bankroll
+    # is stricter than the 75% per-market cap, so a multi-outcome event cannot
+    # consume the whole concentrated allocation.
+    max_event_inventory_usd: Optional[float] = None
+    max_event_position_cost_usd: Optional[float] = None
+    event_concentration_pct: float = 0.50
     max_active_markets: int = 5  # Multi-market scaling cap
+    allow_short: bool = True  # Paper engines model covering shorts; the live engine sets False (long-only)
 
     # Micro-capital concentration model (for total_bankroll_usd <= $500)
     concentrated_micro_capital: bool = True
@@ -102,6 +110,16 @@ class RiskConfig:
             else:
                 self.max_portfolio_inventory_usd = round(self.total_bankroll_usd * 0.60, 2)
 
+        if self.max_event_inventory_usd is None:
+            self.max_event_inventory_usd = round(
+                self.total_bankroll_usd * self.event_concentration_pct, 2
+            )
+
+        if self.max_event_position_cost_usd is None:
+            self.max_event_position_cost_usd = round(
+                self.total_bankroll_usd * self.event_concentration_pct, 2
+            )
+
         if self.daily_loss_limit_usd is None:
             self.daily_loss_limit_usd = round(self.total_bankroll_usd * self.daily_loss_limit_pct, 2)
 
@@ -118,6 +136,7 @@ class RiskConfig:
     price_jump_threshold_cents: float = 2.0  # Cancel quotes if mid moves > 2.0c
     price_jump_window_seconds: float = 60.0  # Rolling 60s monitor window
     cooldown_duration_seconds: float = 300.0  # 5 minutes cooldown (300s)
+    max_price_jump_cooldown_seconds: float = 3600.0  # Hard cap so a pathological jump cannot cooldown forever
 
     # 4. Asymmetric Toxicity / Inventory Skew Limiter
     consecutive_fills_threshold: int = 3  # 2-3 consecutive fills in same direction
@@ -128,6 +147,7 @@ class RiskConfig:
 
     # 5. Gas & Complete-Set Merge Manager
     min_merge_threshold_shares: float = 30.0  # Small capital merge threshold (25-50 shares, default 30)
+    min_merge_notional_usd: float = 0.0  # Min captured spread (USD) a merge must unlock; 0 = no gate, live engine sets it
     gas_fee_usd: float = 0.015  # Polygon CTF mergePositions gas fee ($0.015)
     max_gas_spread_pct: float = 0.05  # Gas fee cannot exceed 5% of captured spread
     assumed_spread_cents: float = 1.0  # Baseline 1.0c spread per share for gas viability

@@ -11,8 +11,10 @@ Enforces:
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
@@ -35,25 +37,38 @@ class PriceVolatilityMonitor:
         self.config = config
         self.history: dict[str, deque[tuple[float, float]]] = {}  # asset_id -> deque of (ts, mid)
         self.cooldowns: dict[str, float] = {}  # asset_id -> cooldown_expiry_ts
+        self.last_mid: dict[str, float] = {}  # asset_id -> last recorded mid (dedupe)
 
-    def record_price(
+    def record_mid_price(
         self,
         asset_id: str,
         condition_id: str,
-        mid_price: float,
+        mid: float,
         timestamp: Optional[float] = None,
     ) -> tuple[bool, float]:
-        """Record mid price tick and check for rolling price jump exceeding threshold.
+        """Record a trusted mid-price observation and detect a rolling jump.
+
+        Only distinct mids are appended (|delta| >= 1e-6) and at least two
+        observations are required before a jump may trip, so duplicate prints
+        of the same mid cannot fire the breaker.
 
         Returns:
             (is_jump_detected, max_delta_cents)
         """
         now = timestamp if timestamp is not None else time.time()
+        price = float(mid)
+        if not math.isfinite(price):
+            return False, 0.0
+
+        last = self.last_mid.get(asset_id)
+        if last is not None and abs(price - last) < 1e-6:
+            return False, 0.0
+        self.last_mid[asset_id] = price
+
         if asset_id not in self.history:
             self.history[asset_id] = deque()
-
         queue = self.history[asset_id]
-        queue.append((now, mid_price))
+        queue.append((now, price))
 
         # Evict timestamps older than rolling window
         cutoff = now - self.config.price_jump_window_seconds
@@ -68,22 +83,40 @@ class PriceVolatilityMonitor:
         delta_cents = (max_p - min_p) * 100.0
 
         if delta_cents > self.config.price_jump_threshold_cents:
-            # Enter cooldown
-            self.cooldowns[asset_id] = now + self.config.cooldown_duration_seconds
+            if now < self.cooldowns.get(asset_id, 0.0):
+                # Already cooling down; do not extend the window on every tick.
+                return False, delta_cents
+            cooldown = max(
+                0.0,
+                min(
+                    float(self.config.cooldown_duration_seconds),
+                    float(self.config.max_price_jump_cooldown_seconds),
+                ),
+            )
+            self.cooldowns[asset_id] = now + cooldown
             logger.warning(
                 f"[PRICE JUMP BREAKER] Asset {asset_id} jumped {delta_cents:.2f}c within "
                 f"{self.config.price_jump_window_seconds}s (limit: {self.config.price_jump_threshold_cents}c). "
-                f"Entering {self.config.cooldown_duration_seconds}s cooldown."
+                f"Entering {cooldown:.0f}s cooldown."
             )
             return True, delta_cents
 
         return False, delta_cents
 
+    def record_price(
+        self,
+        asset_id: str,
+        condition_id: str,
+        mid_price: float,
+        timestamp: Optional[float] = None,
+    ) -> tuple[bool, float]:
+        """Backwards-compatible alias for :meth:`record_mid_price`."""
+        return self.record_mid_price(asset_id, condition_id, mid_price, timestamp)
+
     def is_in_cooldown(self, asset_id: str, timestamp: Optional[float] = None) -> bool:
         """Check if market is actively in volatility cooldown."""
         now = timestamp if timestamp is not None else time.time()
-        expiry = self.cooldowns.get(asset_id, 0.0)
-        return now < expiry
+        return now < self.cooldowns.get(asset_id, 0.0)
 
     def get_remaining_cooldown(self, asset_id: str, timestamp: Optional[float] = None) -> float:
         """Get seconds remaining in cooldown."""
@@ -248,6 +281,13 @@ class GasMergeManager:
         if spread_usd <= 0.0:
             return False, "Captured spread is non-positive; merge would incur pure gas drag"
 
+        if spread_usd < self.config.min_merge_notional_usd:
+            return (
+                False,
+                f"Captured spread ${spread_usd:.3f} is below minimum merge notional "
+                f"${self.config.min_merge_notional_usd:.2f}",
+            )
+
         gas_ratio = self.config.gas_fee_usd / spread_usd
         if gas_ratio > self.config.max_gas_spread_pct + 1e-6:
             return (
@@ -294,6 +334,7 @@ class RiskManager:
             current_cash_usd=self.config.total_bankroll_usd,
         )
         self.market_states: dict[str, MarketRiskState] = {}
+        self._day_key: Optional[date] = None
 
         # Specialized sub-managers
         self.volatility_monitor = PriceVolatilityMonitor(self.config)
@@ -319,19 +360,103 @@ class RiskManager:
             except Exception as e:
                 logger.error(f"Error executing unquote callback: {e}")
 
+    def _market_state(self, asset_id: str, condition_id: Optional[str] = None) -> MarketRiskState:
+        """Return (creating if needed) the per-asset risk state."""
+        state = self.market_states.get(asset_id)
+        if state is None:
+            state = MarketRiskState(condition_id=condition_id or "", asset_id=asset_id)
+            self.market_states[asset_id] = state
+        elif condition_id and not state.condition_id:
+            state.condition_id = condition_id
+        return state
+
+    def auto_clear_cooldowns(self, timestamp: Optional[float] = None) -> None:
+        """Drop expired volatility cooldowns and normalise the portfolio status.
+
+        A volatility cooldown never halts the engine; the status is ``COOLDOWN``
+        at trip time and ``WARNING`` while any cooldown is still running. Once
+        every cooldown has expired the status returns to ``HEALTHY`` unless a
+        permanent breaker (halt/kill switch) is active.
+        """
+        now = timestamp if timestamp is not None else time.time()
+        expired = [
+            asset_id
+            for asset_id, expiry in self.volatility_monitor.cooldowns.items()
+            if expiry <= now
+        ]
+        for asset_id in expired:
+            self.volatility_monitor.cooldowns.pop(asset_id, None)
+            state = self.market_states.get(asset_id)
+            if state is not None and state.status == RiskStatus.COOLDOWN:
+                state.status = RiskStatus.HEALTHY
+
+        st = self.portfolio_state
+        if st.kill_switch_active or st.is_halted:
+            return
+        if self.volatility_monitor.cooldowns:
+            if st.status in (RiskStatus.COOLDOWN, RiskStatus.WARNING):
+                st.status = RiskStatus.WARNING
+        elif st.status in (RiskStatus.COOLDOWN, RiskStatus.WARNING):
+            st.status = RiskStatus.HEALTHY
+
+    def is_in_cooldown(self, asset_id: str, timestamp: Optional[float] = None) -> bool:
+        """Check volatility cooldown, clearing expired entries first."""
+        self.auto_clear_cooldowns(timestamp)
+        return self.volatility_monitor.is_in_cooldown(asset_id, timestamp)
+
     def trip_circuit_breaker(
         self,
         reason: CircuitBreakerReason,
         details: str,
         condition_id: Optional[str] = None,
         asset_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
     ) -> None:
-        """Trip a circuit breaker, halt execution, log event, and fast-cancel quotes."""
+        """Trip a circuit breaker.
+
+        ``PRICE_JUMP_VOLATILITY`` enters a bounded per-asset cooldown and
+        cancels that asset's quotes without halting the engine. All other
+        reasons are permanent halts until :meth:`resume` is called.
+        """
+        now = timestamp if timestamp is not None else time.time()
+
+        if reason == CircuitBreakerReason.PRICE_JUMP_VOLATILITY:
+            cooldown = max(
+                0.0,
+                min(
+                    float(self.config.cooldown_duration_seconds),
+                    float(self.config.max_price_jump_cooldown_seconds),
+                ),
+            )
+            if asset_id is not None:
+                if now >= self.volatility_monitor.cooldowns.get(asset_id, 0.0):
+                    self.volatility_monitor.cooldowns[asset_id] = now + cooldown
+                self._market_state(asset_id, condition_id).status = RiskStatus.COOLDOWN
+            st = self.portfolio_state
+            if not st.kill_switch_active and not st.is_halted:
+                st.status = RiskStatus.COOLDOWN if asset_id is not None else RiskStatus.WARNING
+
+            event = CircuitBreakerEvent(
+                timestamp=now,
+                reason=reason,
+                details=details,
+                condition_id=condition_id,
+                asset_id=asset_id,
+                action_taken="COOLDOWN_AND_CANCEL_QUOTES" if asset_id is None else f"CANCEL_QUOTES_{asset_id}",
+            )
+            self.portfolio_state.circuit_breaker_events.append(event)
+            logger.warning(
+                f"[VOLATILITY COOLDOWN] {reason.value}: {details} "
+                f"(cooldown {cooldown:.0f}s, not halted)"
+            )
+            self._trigger_unquote(asset_id, details)
+            return
+
         self.portfolio_state.is_halted = True
         self.portfolio_state.status = RiskStatus.HALTED
 
         event = CircuitBreakerEvent(
-            timestamp=time.time(),
+            timestamp=now,
             reason=reason,
             details=details,
             condition_id=condition_id,
@@ -393,8 +518,9 @@ class RiskManager:
         """
         now = timestamp if timestamp is not None else time.time()
         self.record_heartbeat(now)
+        self.auto_clear_cooldowns(now)
 
-        jump_detected, delta_cents = self.volatility_monitor.record_price(
+        jump_detected, delta_cents = self.volatility_monitor.record_mid_price(
             asset_id, condition_id, mid_price, now
         )
 
@@ -403,17 +529,13 @@ class RiskManager:
                 f"Mid-price moved {delta_cents:.2f}c within "
                 f"{self.config.price_jump_window_seconds}s > threshold {self.config.price_jump_threshold_cents}c"
             )
-            event = CircuitBreakerEvent(
-                timestamp=now,
-                reason=CircuitBreakerReason.PRICE_JUMP_VOLATILITY,
-                details=msg,
+            self.trip_circuit_breaker(
+                CircuitBreakerReason.PRICE_JUMP_VOLATILITY,
+                msg,
                 condition_id=condition_id,
                 asset_id=asset_id,
-                action_taken="COOLDOWN_AND_CANCEL",
+                timestamp=now,
             )
-            self.portfolio_state.circuit_breaker_events.append(event)
-            # Cancel quotes for this volatile asset
-            self._trigger_unquote(asset_id, msg)
             return False, msg
 
         return True, None
@@ -432,6 +554,9 @@ class RiskManager:
         mid_price: Optional[float] = None,
         tick_size: float = 0.01,
         timestamp: Optional[float] = None,
+        event_id: Optional[str] = None,
+        current_event_inventory_usd: Optional[float] = None,
+        current_event_cost: Optional[float] = None,
     ) -> tuple[bool, str, float, float]:
         """Comprehensive pre-trade risk check on a proposed virtual or live quote.
 
@@ -443,11 +568,13 @@ class RiskManager:
         - Per-token share cap (150 shares)
         - Per-market cost cap ($60 notional)
         - Portfolio total inventory cap ($200)
+        - Correlated-event inventory/cost cap (all markets sharing ``event_id``)
 
         Returns:
             (is_allowed, reason, approved_size, approved_price)
         """
         now = timestamp if timestamp is not None else time.time()
+        self.auto_clear_cooldowns(now)
 
         # 1. Engine & breaker state
         if self.portfolio_state.kill_switch_active:
@@ -501,18 +628,51 @@ class RiskManager:
             max_shares_by_inv = inv_headroom / max(1e-4, approved_price)
             candidate_size = min(candidate_size, max_shares_by_inv)
 
+            # Correlated-event caps: summed across every market in the event.
+            # event_id is optional, so single-market callers keep the old caps.
+            if (
+                event_id
+                and self.config.max_event_inventory_usd is not None
+                and current_event_inventory_usd is not None
+            ):
+                event_inv_headroom = max(
+                    0.0,
+                    self.config.max_event_inventory_usd - current_event_inventory_usd,
+                )
+                candidate_size = min(
+                    candidate_size, event_inv_headroom / max(1e-4, approved_price)
+                )
+            if (
+                event_id
+                and self.config.max_event_position_cost_usd is not None
+                and current_event_cost is not None
+            ):
+                event_cost_headroom = max(
+                    0.0,
+                    self.config.max_event_position_cost_usd - current_event_cost,
+                )
+                candidate_size = min(
+                    candidate_size, event_cost_headroom / max(1e-4, approved_price)
+                )
+
             # Cash headroom ($300 bankroll)
             cash_headroom = max(0.0, current_cash_usd)
             max_shares_by_cash = cash_headroom / max(1e-4, approved_price)
             candidate_size = min(candidate_size, max_shares_by_cash)
 
         elif side_norm == "SELL":
-            # For selling: ensure we don't exceed short inventory limits
-            shares_headroom = max(0.0, self.config.max_position_shares_per_token - abs(current_pos_shares))
-            candidate_size = min(candidate_size, shares_headroom)
+            if self.config.allow_short:
+                # Shorting allowed: bound the short by the per-token share cap.
+                shares_headroom = max(0.0, self.config.max_position_shares_per_token - abs(current_pos_shares))
+                candidate_size = min(candidate_size, shares_headroom)
+            else:
+                # Long-only: never sell more than is actually owned.
+                candidate_size = min(candidate_size, max(0.0, current_pos_shares))
 
         if candidate_size <= 1e-4:
-            return False, "Quote size reduced to 0 by position, cost, or capital limits", 0.0, approved_price
+            if side_norm == "SELL" and not self.config.allow_short and max(0.0, current_pos_shares) <= 1e-4:
+                return False, "SELL rejected: no owned shares and shorting is disabled", 0.0, approved_price
+            return False, "Quote size reduced to 0 by position, cost, capital, or event limits", 0.0, approved_price
 
         return True, "Quote approved", round(candidate_size, 4), round(approved_price, 4)
 
@@ -529,6 +689,39 @@ class RiskManager:
         now = timestamp if timestamp is not None else time.time()
         self.record_heartbeat(now)
         self.toxicity_tracker.record_fill(asset_id, side, now)
+
+    def reset_daily_if_needed(self, timestamp: Optional[float] = None) -> bool:
+        """Roll the daily accounting window at the first call after a UTC date change.
+
+        Sets ``day_start_equity_usd`` to the latest marked equity, clears the
+        daily PnL/loss counters and the daily gas spend. Permanent breakers
+        (daily-loss halt, drawdown halt, kill switch) are NOT cleared here;
+        an operator still has to call :meth:`resume`.
+
+        Returns:
+            True when a rollover happened.
+        """
+        now = timestamp if timestamp is not None else time.time()
+        day = datetime.fromtimestamp(now, tz=timezone.utc).date()
+        if self._day_key is None:
+            self._day_key = day
+            return False
+        if day == self._day_key:
+            return False
+
+        st = self.portfolio_state
+        st.day_start_equity_usd = st.current_equity_usd
+        st.daily_loss_usd = 0.0
+        st.daily_realized_pnl = 0.0
+        st.daily_unrealized_pnl = 0.0
+        st.daily_gas_spent_usd = 0.0
+        self.gas_merge_manager.reset_daily()
+        self._day_key = day
+        logger.info(
+            f"[DAILY ROLLOVER] UTC day {day.isoformat()}: day_start_equity reset to "
+            f"${st.day_start_equity_usd:.2f}, daily PnL and gas counters cleared."
+        )
+        return True
 
     def update_portfolio_pnl(
         self,
@@ -547,9 +740,11 @@ class RiskManager:
         """
         now = timestamp if timestamp is not None else time.time()
         self.record_heartbeat(now)
+        self.auto_clear_cooldowns(now)
 
         st = self.portfolio_state
         st.current_equity_usd = current_equity
+        self.reset_daily_if_needed(now)
         st.daily_realized_pnl = realized_pnl
         st.daily_unrealized_pnl = unrealized_pnl
         if current_cash is not None:
@@ -667,6 +862,9 @@ class RiskManager:
         if reset_day_start:
             self.portfolio_state.day_start_equity_usd = self.portfolio_state.current_equity_usd
         self.volatility_monitor.cooldowns.clear()
+        for state in self.market_states.values():
+            if state.status == RiskStatus.COOLDOWN:
+                state.status = RiskStatus.HEALTHY
         self.toxicity_tracker.reset()
         logger.info("[RISK RESUME] Risk manager resumed quoting status: HEALTHY.")
 
