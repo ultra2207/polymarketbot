@@ -42,10 +42,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, "src")
+
+from polymarketbot.logs import IST
 
 import duckdb
 
@@ -129,7 +131,7 @@ def score(con: duckdb.DuckDBPyConnection, dest: Path) -> None:
 
     scored: list[tuple] = []
     for (cid, price, payout, size, cat, ftype, frate, fexp, freb, created) in rows:
-        when = created or datetime.now(timezone.utc).isoformat()
+        when = created or datetime.now(IST).isoformat()
         sched = schedule_at({"category": cat, "fee_type": ftype,
                              "fee_rate": frate, "fee_exponent": fexp,
                              "fee_rebate": freb}, when)
@@ -207,10 +209,10 @@ def main() -> int:
 
     glob = f"{(book_root / '**' / 'books.parquet').as_posix()}"
     con = connect()
-    t0 = datetime.now(timezone.utc)
+    t0 = datetime.now(IST)
     build_entries(con, glob, args.entry_max_hours, args.entry_min_hours)
     n = con.sql("SELECT count(*) FROM entries").fetchall()[0][0]
-    print(f"entry observations: {n:,}  ({datetime.now(timezone.utc)-t0})")
+    print(f"entry observations: {n:,}  ({datetime.now(IST)-t0})")
     if n == 0:
         print("no markets resolved inside the book window - the block is too short "
               "or no market both traded and resolved with a snapshot 6-24 h before "

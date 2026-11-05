@@ -40,6 +40,8 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
+from polymarketbot.logs import IST
+
 import duckdb
 
 OUT = Path("data/processed")
@@ -210,7 +212,7 @@ def main() -> int:
         SELECT event_id, side, m, net, k FROM scored
         WHERE net > {args.min_net} ORDER BY net DESC LIMIT 10
     """).fetchall():
-        ts = datetime.fromtimestamp(m * args.bucket_seconds, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        ts = datetime.fromtimestamp(m * args.bucket_seconds, tz=IST).strftime("%Y-%m-%d %H:%M")
         print(f"  {ts} {side:3} net={net:+.4f} legs={k} {str(ev)[:20]}…")
     return 0
 

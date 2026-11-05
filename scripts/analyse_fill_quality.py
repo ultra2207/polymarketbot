@@ -44,6 +44,8 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
+from polymarketbot.logs import IST
+
 import duckdb
 from rich.console import Console
 from rich.progress import (BarColumn, Progress, SpinnerColumn, TaskProgressColumn,
@@ -125,7 +127,7 @@ def main() -> int:
     with bar:
         task = bar.add_task("fill quality", total=len(months))
         for i, (lo, hi) in enumerate(months, 1):
-            label = datetime.fromtimestamp(lo, tz=timezone.utc).strftime("%Y-%m")
+            label = datetime.fromtimestamp(lo, tz=IST).strftime("%Y-%m")
             bar.update(task, description=f"{label} ({i}/{len(months)})")
             con.execute(f"""
                 INSERT INTO agg

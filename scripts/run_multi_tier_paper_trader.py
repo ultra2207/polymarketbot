@@ -24,11 +24,11 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from polymarketbot.logs import get_logger
+from polymarketbot.logs import IST, get_logger
 from polymarketbot.net import install_doh_fallback
 from polymarketbot.rewards.allocator import (
     LiquidityRewardsAllocator,
@@ -353,7 +353,7 @@ def render_multi_tier_dashboard(
 ) -> None:
     """Render comprehensive comparative terminal dashboard across all simultaneous bankroll tiers."""
     elapsed = time.time() - start_time
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
     lines = []
     if clear_screen:

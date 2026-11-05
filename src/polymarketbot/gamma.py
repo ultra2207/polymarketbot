@@ -33,6 +33,9 @@ from typing import Any, Iterable, Iterator
 import requests
 
 from polymarketbot.fees import FeeSchedule
+from polymarketbot.logs import get_logger
+
+logger = get_logger("gamma")
 
 BASE = "https://gamma-api.polymarket.com"
 MAX_BATCH = 100
@@ -78,6 +81,38 @@ class GammaClient:
     def market(self, condition_id: str) -> dict | None:
         rows = self.markets([condition_id])
         return rows[0] if rows else None
+
+    def market_meta(self, condition_id: str) -> dict | None:
+        """Settlement-relevant fields for one market, keyed by snake_case.
+
+        The Gamma field names are camelCase: ``version``, ``negRisk``,
+        ``negRiskMarketID`` (the neg-risk grouping id), ``positionIds``,
+        ``clobTokenIds`` and ``orderMinSize``. Returns ``None`` when the
+        market itself cannot be found. An absent ``negRiskMarketID`` is
+        logged and returned as ``None``; that is normal for a non-neg-risk
+        market but leaves a neg-risk market unroutable.
+        """
+        row = self.market(condition_id)
+        if not row:
+            logger.warning(f"Gamma returned no market for condition {condition_id}")
+            return None
+
+        neg_risk = bool(row.get("negRisk"))
+        market_id = row.get("negRiskMarketID") or None
+        if neg_risk and not market_id:
+            logger.warning(
+                f"Gamma market {condition_id} is negRisk but has no "
+                "negRiskMarketID; neg-risk settlement cannot be routed"
+            )
+        return {
+            "condition_id": row.get("conditionId") or condition_id,
+            "version": row.get("version"),
+            "neg_risk": neg_risk,
+            "position_ids": self.parse_ids(row.get("positionIds")),
+            "clob_token_ids": self.parse_ids(row.get("clobTokenIds")),
+            "neg_risk_market_id": market_id,
+            "order_min_size": self.min_order_size(row),
+        }
 
     def markets(self, condition_ids: Iterable[str]) -> list[dict]:
         """Batch lookup by condition id. `closed=any` is required for history."""

@@ -16,8 +16,40 @@ from pathlib import Path
 
 from polymarketbot.logs import get_logger
 from polymarketbot.paper_trading import PaperTradingEngine, PolymarketLiveClient
+from polymarketbot.paper_trading.kalshi_signal import (
+    DEFAULT_MAPPING,
+    KalshiBasisMonitor,
+)
+from polymarketbot.paper_trading.orchestrator import (
+    OrchestratorConfig,
+    QuoteOrchestrator,
+)
+from polymarketbot.trading.session_recorder import PaperSessionRecorder
 
 log = get_logger("paper_trading")
+
+
+def _build_orchestrator(args: argparse.Namespace) -> QuoteOrchestrator | None:
+    if not args.orchestrator:
+        return None
+    config = OrchestratorConfig(
+        enabled=True,
+        policy=args.orchestrator_policy,
+        signal=args.orchestrator_signal,
+        gate_action=args.orchestrator_gate_action,
+        min_adverse_queue_ratio=args.orchestrator_min_adverse_ratio,
+        shrink_scale=args.orchestrator_shrink_scale,
+        kalshi_basis_threshold=args.orchestrator_kalshi_threshold,
+    )
+    log.info(
+        f"Orchestrator: policy={config.policy} signal={config.signal} "
+        f"gate_action={config.gate_action} "
+        f"min_adverse_ratio={config.min_adverse_queue_ratio:.2f} "
+        f"shrink_scale={config.shrink_scale:.2f} "
+        f"kalshi_basis_threshold={config.kalshi_basis_threshold:.2f} "
+        f"(not measured; 0 = off)"
+    )
+    return QuoteOrchestrator(config)
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +116,69 @@ def parse_args() -> argparse.Namespace:
         default="data/processed/paper_trading/ledger.json",
         help="File path to persist the state ledger (default: data/processed/paper_trading/ledger.json)",
     )
+    parser.add_argument(
+        "--microstructure-gate",
+        action="store_true",
+        help="Enable the live OFI/micro-price pull-or-widen gate on resting quotes",
+    )
+    parser.add_argument(
+        "--orchestrator",
+        action="store_true",
+        help="Enable the queue-aware quote orchestrator (supersedes --microstructure-gate)",
+    )
+    parser.add_argument(
+        "--orchestrator-policy",
+        choices=("reactionary", "side_selection", "queue_aware", "reward_first"),
+        default="queue_aware",
+        help="Orchestrator policy (default: queue_aware)",
+    )
+    parser.add_argument(
+        "--orchestrator-signal",
+        choices=("ofi", "binance", "kalshi"),
+        default="ofi",
+        help=(
+            "Adverse-flow signal the orchestrator reacts to (default: ofi). "
+            "'kalshi' requires the Kalshi basis monitor attached by this script."
+        ),
+    )
+    parser.add_argument(
+        "--orchestrator-gate-action",
+        choices=("shrink", "pull"),
+        default="shrink",
+        help="Threatened-side action at the back of the queue (default: shrink)",
+    )
+    parser.add_argument(
+        "--orchestrator-min-adverse-ratio",
+        type=float,
+        default=0.60,
+        help="Queue ratio at/below which both sides are kept (default: 0.60)",
+    )
+    parser.add_argument(
+        "--orchestrator-shrink-scale",
+        type=float,
+        default=0.25,
+        help="Size multiplier applied when shrinking a threatened side (default: 0.25)",
+    )
+    parser.add_argument(
+        "--orchestrator-kalshi-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Cross-venue Kalshi basis threshold in logit points that must be "
+            "exceeded before a side is shrunk/pulled. NOT YET MEASURED; the "
+            "kalshi signal is off unless selected, and 0.0 is a no-op floor "
+            "(default: 0.0)"
+        ),
+    )
+    parser.add_argument(
+        "--kalshi-mapping",
+        type=str,
+        default=str(DEFAULT_MAPPING),
+        help=(
+            "Polymarket -> Kalshi mapping parquet used by the basis monitor "
+            f"(default: {DEFAULT_MAPPING})"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -101,6 +196,8 @@ async def async_main(args: argparse.Namespace) -> None:
         max_inventory_shares=args.max_inventory,
         max_skew_cents=args.max_skew,
         ledger_path=args.ledger_path,
+        microstructure_gate=args.microstructure_gate,
+        orchestrator=_build_orchestrator(args),
     )
 
     client = PolymarketLiveClient(
@@ -117,6 +214,22 @@ async def async_main(args: argparse.Namespace) -> None:
         log.error("No qualifying reward markets retrieved. Exiting.")
         return
 
+    # The Kalshi basis monitor exists only when the orchestrator is asked for
+    # that signal. Its polled conditions come from the engine's registrations,
+    # so it is attached after the reward pools have been registered.
+    kalshi_monitor: KalshiBasisMonitor | None = None
+    if (
+        engine.orchestrator is not None
+        and engine.orchestrator.config.signal == "kalshi"
+    ):
+        kalshi_monitor = KalshiBasisMonitor(mapping_path=args.kalshi_mapping)
+        engine.attach_kalshi_monitor(kalshi_monitor)
+        kalshi_monitor.start()
+        log.info(
+            f"Kalshi basis monitor polling {len(kalshi_monitor.mapped_tickers())} "
+            f"mapped tickers from {args.kalshi_mapping}"
+        )
+
     # 2. Fetch initial order books
     client.fetch_initial_order_books()
 
@@ -132,7 +245,31 @@ async def async_main(args: argparse.Namespace) -> None:
     )
 
     # 4. Start live WebSocket streaming and epoch simulation
-    await client.run(duration_seconds=args.duration)
+    recorder = PaperSessionRecorder(
+        engine,
+        engine_params={
+            "markets": args.markets,
+            "filter": args.filter,
+            "quote_size": args.quote_size,
+            "spread_offset_cents": args.spread_offset,
+            "microstructure_gate": args.microstructure_gate,
+            "orchestrator": args.orchestrator,
+            "orchestrator_policy": args.orchestrator_policy,
+            "orchestrator_signal": args.orchestrator_signal,
+            "orchestrator_gate_action": args.orchestrator_gate_action,
+            "orchestrator_min_adverse_ratio": args.orchestrator_min_adverse_ratio,
+            "orchestrator_shrink_scale": args.orchestrator_shrink_scale,
+            "orchestrator_kalshi_threshold": args.orchestrator_kalshi_threshold,
+            "kalshi_mapping": args.kalshi_mapping,
+        },
+    )
+    recorder.start()
+    try:
+        await client.run(duration_seconds=args.duration)
+    finally:
+        if kalshi_monitor is not None:
+            kalshi_monitor.close()
+        recorder.stop("run_complete")
 
 
 def main() -> None:

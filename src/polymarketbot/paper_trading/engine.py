@@ -16,6 +16,7 @@ import math
 import os
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +29,10 @@ from polymarketbot.paper_trading.models import (
     SimulatedFill,
     TokenConfig,
     VirtualQuote,
+)
+from polymarketbot.paper_trading.orchestrator import (
+    QuoteOrchestrator,
+    QueueSnapshot,
 )
 from polymarketbot.paper_trading.rewards import (
     compute_competing_depth_score,
@@ -75,6 +80,11 @@ class PaperTradingEngine:
         merge_gas_fee_usd: float = 0.015,
         ledger_path: str | Path = "data/processed/paper_trading/ledger.json",
         risk_manager: Optional[RiskManager] = None,
+        microstructure_gate: bool = False,
+        microstructure_ofi_threshold: float = 0.0,
+        microstructure_ofi_window_s: float = 60.0,
+        orchestrator: Optional[QuoteOrchestrator] = None,
+        kalshi_monitor: Optional[Any] = None,
     ) -> None:
         self.initial_cash_usd = float(initial_cash_usd)
         self.cash_usd = float(initial_cash_usd)
@@ -87,6 +97,17 @@ class PaperTradingEngine:
         self.ledger_path = Path(ledger_path)
         self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self.risk_manager = risk_manager
+        self.microstructure_gate = bool(microstructure_gate)
+        self.microstructure_ofi_threshold = float(microstructure_ofi_threshold)
+        self.microstructure_ofi_window_s = float(microstructure_ofi_window_s)
+        self.orchestrator = orchestrator
+        self.kalshi_monitor = kalshi_monitor
+        self._kalshi_basis: dict[str, Optional[float]] = {}
+        self._kalshi_missing_logged = False
+        self._ofi_steps: dict[str, deque[tuple[float, int]]] = {}
+        self._prev_top: dict[str, tuple[float, float]] = {}
+        self.last_orchestrator_decision: dict[str, Any] = {}
+        self._level_queue: dict[tuple[str, str], tuple[float, float, float, float]] = {}
         if self.risk_manager:
             self.risk_manager.register_unquote_callback(self._on_risk_unquote)
 
@@ -100,6 +121,7 @@ class PaperTradingEngine:
         self.markets: dict[str, MarketConfig] = {}  # condition_id -> config
         self.asset_to_condition: dict[str, str] = {}  # asset_id -> condition_id
         self.asset_to_outcome: dict[str, str] = {}  # asset_id -> outcome
+        self._condition_yes_asset: dict[str, str] = {}  # condition_id -> YES token
 
         # Live book & quoting state
         self.orderbooks: dict[str, dict[str, Any]] = {}  # asset_id -> book info
@@ -117,6 +139,8 @@ class PaperTradingEngine:
         for tok in config.tokens:
             self.asset_to_condition[tok.token_id] = config.condition_id
             self.asset_to_outcome[tok.token_id] = tok.outcome
+            if str(tok.outcome).strip().upper() == "YES":
+                self._condition_yes_asset[config.condition_id] = tok.token_id
             if tok.token_id not in self.positions:
                 self.positions[tok.token_id] = Position(
                     asset_id=tok.token_id,
@@ -142,6 +166,64 @@ class PaperTradingEngine:
             f"Registered market: {config.question[:45]} (${config.rate_per_day}/d, "
             f"max_spread={config.rewards_max_spread}c, min_sz={config.rewards_min_size})"
         )
+
+    def attach_kalshi_monitor(self, monitor: Optional[Any]) -> None:
+        """Attach the cross-venue monitor and scope it to registered markets.
+
+        The engine owns the condition -> asset mapping: the monitor only polls
+        the conditions this engine quotes, and each condition's YES token gives
+        the Polymarket mid the basis is measured against.
+        """
+        self.kalshi_monitor = monitor
+        if monitor is not None and hasattr(monitor, "set_conditions"):
+            monitor.set_conditions(self.markets.keys())
+        logger.info(
+            "Kalshi basis monitor attached"
+            if monitor is not None
+            else "Kalshi basis monitor detached"
+        )
+
+    def update_kalshi_basis(self, asset_id: str, basis: Optional[float]) -> None:
+        """Store the latest basis for one asset; ``None`` means stale or absent."""
+        self._kalshi_basis[asset_id] = None if basis is None else float(basis)
+
+    def _pm_yes_mid(self, condition_id: str) -> Optional[float]:
+        """Polymarket YES mid for a condition, from its registered YES book."""
+        yes_asset = self._condition_yes_asset.get(condition_id)
+        if yes_asset is not None:
+            book = self.orderbooks.get(yes_asset)
+            if book:
+                return float(book["mid"])
+        # No YES token registered: reconstruct YES from the NO token's mid.
+        for asset_id, cid in self.asset_to_condition.items():
+            if cid != condition_id:
+                continue
+            outcome = str(self.asset_to_outcome.get(asset_id, "")).strip().upper()
+            book = self.orderbooks.get(asset_id)
+            if outcome == "NO" and book:
+                return 1.0 - float(book["mid"])
+        return None
+
+    def _refresh_kalshi_basis(self, asset_id: str, condition_id: str) -> None:
+        """Pull one asset's fresh basis from the attached monitor."""
+        monitor = self.kalshi_monitor
+        if monitor is None:
+            if not self._kalshi_missing_logged:
+                logger.warning(
+                    "Orchestrator signal=kalshi has no Kalshi monitor attached; "
+                    "keeping both sides until one is attached"
+                )
+                self._kalshi_missing_logged = True
+            self.update_kalshi_basis(asset_id, None)
+            return
+        self._kalshi_missing_logged = False
+        basis = monitor.basis(condition_id, self._pm_yes_mid(condition_id))
+        outcome = str(self.asset_to_outcome.get(asset_id, "")).strip().upper()
+        if basis is not None and outcome == "NO":
+            # The condition's YES probability falling lifts this NO token's
+            # price, so the threatened side flips for the NO quote.
+            basis = -basis
+        self.update_kalshi_basis(asset_id, basis)
 
     def _on_risk_unquote(self, asset_id: Optional[str], reason: str) -> None:
         self.cancel_quotes(asset_id)
@@ -227,12 +309,103 @@ class PaperTradingEngine:
             "last_updated": time.time(),
         }
 
+        if self.microstructure_gate or (
+            self.orchestrator is not None and self.orchestrator.config.enabled
+        ):
+            prev = self._prev_top.get(asset_id)
+            if prev is not None:
+                e_bid = 1 if best_bid > prev[0] else (-1 if best_bid < prev[0] else 0)
+                e_ask = 1 if best_ask < prev[1] else (-1 if best_ask > prev[1] else 0)
+                self._ofi_steps.setdefault(asset_id, deque()).append(
+                    (time.time(), e_bid + e_ask)
+                )
+            self._prev_top[asset_id] = (best_bid, best_ask)
+
         # Update position mark-to-market
         if asset_id in self.positions:
             self.positions[asset_id].update_mark(mid)
 
         # Regenerate virtual quotes for this asset
         self.generate_quotes(asset_id)
+
+    def _event_exposure(self, event_id: str | None) -> tuple[float, float]:
+        """Sum market value and cost basis across every market in one event."""
+        if not event_id:
+            return 0.0, 0.0
+        inventory = 0.0
+        cost = 0.0
+        for cid, config in self.markets.items():
+            if config.event_id != event_id:
+                continue
+            for token in config.tokens:
+                position = self.positions.get(token.token_id)
+                if position is None:
+                    continue
+                inventory += abs(position.market_value)
+                cost += abs(position.shares * position.avg_cost)
+        return inventory, cost
+
+    def _queue_snapshot(
+        self,
+        asset_id: str,
+        bid_price: float,
+        ask_price: float,
+    ) -> Optional[QueueSnapshot]:
+        """FIFO state of our quote inside its price level, per ``build_l3_queue``.
+
+        The measured front/back split (``scripts/analyze_queue_positions.py``)
+        is defined on ``queue_ratio = q_ahead / (q_ahead + q_behind)``: a quote
+        joins behind the displayed size at its price (ratio 1.0) and moves toward
+        the front as size arrives behind it, while a decrease consumes the front
+        first. We replay exactly that state for the resting paper quotes, so the
+        calibrated 0.60 threshold applies unchanged.
+        """
+        book = self.orderbooks.get(asset_id)
+        if not book:
+            return None
+        existing = self.virtual_quotes.get(asset_id) or {}
+        bid_ratio, bid_level = self._update_level_queue(
+            asset_id, "bid", bid_price, book.get("bids", []), existing.get("bid")
+        )
+        ask_ratio, ask_level = self._update_level_queue(
+            asset_id, "ask", ask_price, book.get("asks", []), existing.get("ask")
+        )
+        return QueueSnapshot(
+            bid_queue_ratio=bid_ratio,
+            bid_size_at_level=bid_level,
+            ask_queue_ratio=ask_ratio,
+            ask_size_at_level=ask_level,
+        )
+
+    def _update_level_queue(
+        self,
+        asset_id: str,
+        side: str,
+        price: float,
+        levels: list[Any],
+        old_quote: Optional[VirtualQuote],
+    ) -> tuple[float, float]:
+        tol = 1e-9
+        level_size = sum(
+            _parse_size(level)
+            for level in levels
+            if abs(_parse_price(level) - price) <= tol
+        )
+        retained = old_quote is not None and abs(old_quote.price - price) <= tol
+        prev = self._level_queue.get((asset_id, side))
+        if not retained or prev is None or abs(prev[0] - price) > tol:
+            q_ahead, q_behind = level_size, 0.0
+        else:
+            _, q_ahead, q_behind, last_size = prev
+            delta = level_size - last_size
+            if delta > 0.0:
+                q_behind += delta
+            elif delta < 0.0:
+                q_ahead = max(0.0, q_ahead + delta)
+        total = q_ahead + q_behind
+        ratio = q_ahead / total if total > 0.0 else 0.0
+        self._level_queue[(asset_id, side)] = (price, q_ahead, q_behind, level_size)
+        return ratio, level_size
 
     def generate_quotes(self, asset_id: str) -> None:
         """Simulate virtual resting limit orders with queue priority and inventory skewing."""
@@ -271,6 +444,9 @@ class PaperTradingEngine:
         raw_bid_price = mid - (s_bid_target / 100.0)
         raw_ask_price = mid + (s_ask_target / 100.0)
 
+        # Size logic: ensure at least rewards_min_size
+        quote_size = max(mkt.rewards_min_size, self.default_quote_size)
+
         # Round to valid tick size
         bid_price = round(math.floor(raw_bid_price / tick) * tick, 4)
         ask_price = round(math.ceil(raw_ask_price / tick) * tick, 4)
@@ -286,14 +462,72 @@ class PaperTradingEngine:
             ask_price = round(max(best_ask, best_bid + tick), 4)
             post_only_ask = (ask_price > best_bid)
 
-        # Size logic: ensure at least rewards_min_size
-        quote_size = max(mkt.rewards_min_size, self.default_quote_size)
+        # Predictive price-only OFI gate (legacy): the trailing order-flow sign
+        # says which resting side the next trade is about to run over. The L3
+        # A/B (29 asset-hours, 780 fills) flips the net per share positive with
+        # this gate and no look-ahead; the live engine's size-weighted 850/1.5c
+        # thresholds did not.
+        #
+        # The queue-aware orchestrator supersedes that gate when enabled: it
+        # keeps both sides at the front of the queue (ratio < 0.60) and only
+        # shrinks or pulls the threatened side at the back, where the measured
+        # fill markout is -2.01 c/share. Disabled by default.
+        gate_bid_pull = False
+        gate_ask_pull = False
+        bid_scale = 1.0
+        ask_scale = 1.0
+        orchestrator_active = (
+            self.orchestrator is not None and self.orchestrator.config.enabled
+        )
+        if orchestrator_active and self.orchestrator.config.signal == "kalshi":
+            self._refresh_kalshi_basis(asset_id, cid)
+            # No monitor means no basis: keep both sides rather than treat a
+            # missing venue as a zero basis. _refresh logs the warning once.
+            orchestrator_active = self.kalshi_monitor is not None
+        if orchestrator_active:
+            ofi = None
+            steps = self._ofi_steps.get(asset_id)
+            if steps:
+                cutoff = time.time() - self.microstructure_ofi_window_s
+                vals = [step for ts, step in steps if ts >= cutoff]
+                if vals:
+                    ofi = sum(vals) / len(vals)
+            queue_snap = self._queue_snapshot(asset_id, bid_price, ask_price)
+            decision = self.orchestrator.decide(
+                ofi, queue_snap, kalshi_basis=self._kalshi_basis.get(asset_id)
+            )
+            self.last_orchestrator_decision[asset_id] = decision
+            gate_bid_pull = decision.bid.action == "PULL"
+            gate_ask_pull = decision.ask.action == "PULL"
+            bid_scale = 0.0 if gate_bid_pull else decision.bid.size_scale
+            ask_scale = 0.0 if gate_ask_pull else decision.ask.size_scale
+        elif self.microstructure_gate:
+            steps = self._ofi_steps.get(asset_id)
+            if steps:
+                cutoff = time.time() - self.microstructure_ofi_window_s
+                vals = [step for ts, step in steps if ts >= cutoff]
+                if vals:
+                    ofi = sum(vals) / len(vals)
+                    if ofi > self.microstructure_ofi_threshold:
+                        gate_ask_pull = True
+                    elif ofi < -self.microstructure_ofi_threshold:
+                        gate_bid_pull = True
 
         # If inventory is maxed out, pause buying or selling
-        bid_size = quote_size if inv < self.max_inventory_shares else 0.0
-        ask_size = quote_size if inv > -self.max_inventory_shares else 0.0
+        bid_size = quote_size * bid_scale if inv < self.max_inventory_shares else 0.0
+        ask_size = quote_size * ask_scale if inv > -self.max_inventory_shares else 0.0
+        if gate_bid_pull:
+            bid_size = 0.0
+        if gate_ask_pull:
+            ask_size = 0.0
+        # A shrunk side stays at the reward-eligible minimum rather than below it.
+        if 0.0 < bid_size < mkt.rewards_min_size:
+            bid_size = mkt.rewards_min_size
+        if 0.0 < ask_size < mkt.rewards_min_size:
+            ask_size = mkt.rewards_min_size
 
         # Risk validation and asymmetric toxicity adjustments
+        event_inv, event_cost = self._event_exposure(mkt.event_id)
         if self.risk_manager and bid_size > 0:
             pos_cost = abs(inv * pos.avg_cost)
             port_inv = sum(abs(p.market_value) for p in self.positions.values())
@@ -309,6 +543,9 @@ class PaperTradingEngine:
                 current_cash_usd=self.cash_usd,
                 mid_price=mid,
                 tick_size=tick,
+                event_id=mkt.event_id,
+                current_event_inventory_usd=event_inv,
+                current_event_cost=event_cost,
             )
             if not ok:
                 bid_size = 0.0
@@ -334,6 +571,9 @@ class PaperTradingEngine:
                 current_cash_usd=self.cash_usd,
                 mid_price=mid,
                 tick_size=tick,
+                event_id=mkt.event_id,
+                current_event_inventory_usd=event_inv,
+                current_event_cost=event_cost,
             )
             if not ok:
                 ask_size = 0.0
@@ -366,7 +606,12 @@ class PaperTradingEngine:
             if old_bid is not None and abs(old_bid.price - bid_price) < 1e-6:
                 # Same price level: retain queue priority
                 bid_queue_ahead = old_bid.queue_ahead
-                current_bid_size = old_bid.size if 0.0 < old_bid.size < bid_size else bid_size
+                if orchestrator_active:
+                    # The policy sizes both sides explicitly; a released shrink
+                    # must return to full size, a held shrink must stay down.
+                    current_bid_size = bid_size
+                else:
+                    current_bid_size = old_bid.size if 0.0 < old_bid.size < bid_size else bid_size
             else:
                 # Price changed or new quote: reset queue_ahead to competing volume resting at or better than quote price
                 bid_queue_ahead = sum(
@@ -391,7 +636,10 @@ class PaperTradingEngine:
             if old_ask is not None and abs(old_ask.price - ask_price) < 1e-6:
                 # Same price level: retain queue priority
                 ask_queue_ahead = old_ask.queue_ahead
-                current_ask_size = old_ask.size if 0.0 < old_ask.size < ask_size else ask_size
+                if orchestrator_active:
+                    current_ask_size = ask_size
+                else:
+                    current_ask_size = old_ask.size if 0.0 < old_ask.size < ask_size else ask_size
             else:
                 # Price changed or new quote: reset queue_ahead to competing volume resting at or better than quote price
                 ask_queue_ahead = sum(

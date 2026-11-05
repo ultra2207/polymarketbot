@@ -105,8 +105,9 @@ def test_shared_scanner_caching_across_tiers():
                 "rewards_min_size": 20.0,
                 "end_date_iso": "2026-12-31T00:00:00Z",
                 "tokens": [
-                    {"token_id": "tok_y", "outcome": "YES", "price": "0.55"},
-                    {"token_id": "tok_n", "outcome": "NO", "price": "0.45"},
+                    # CLOB token ids must be plain decimal digit strings (scanner validation).
+                    {"token_id": "200000000000000000000000000000000000000000000000000000000000001", "outcome": "YES", "price": "0.55"},
+                    {"token_id": "200000000000000000000000000000000000000000000000000000000000002", "outcome": "NO", "price": "0.45"},
                 ],
             }
         ]

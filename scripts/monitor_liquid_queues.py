@@ -21,13 +21,13 @@ import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from polymarketbot.logs import get_logger
+from polymarketbot.logs import IST, get_logger
 from polymarketbot.net import install_doh_fallback
 from polymarketbot.rewards.scoring import quadratic_order_score
 from polymarketbot.simulator.feed import LivePolymarketFeed, MarketTrade, OrderBookSnapshot
@@ -311,7 +311,7 @@ class LiveQueueMonitor:
         metrics = {
             "elapsed_seconds": round(elapsed, 1),
             "elapsed_minutes": round(elapsed / 60.0, 2),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(IST).isoformat(),
             "markets": {},
         }
 

@@ -11,10 +11,11 @@ Viewer & Analytics Dashboard for the fully autonomous market maker:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+from polymarketbot.logs import IST
 from polymarketbot.paper_trading.autonomous_daemon import AutonomousHarvesterDaemon
 from polymarketbot.paper_trading.polysim_client import PolySimulatorClient
 from polymarketbot.paper_trading.polysim_db import PolySimDatabase
@@ -265,7 +266,7 @@ with tab_brain:
 
     latest_decision = db.get_latest_decision()
     if latest_decision:
-        dec_time = datetime.fromtimestamp(latest_decision["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        dec_time = datetime.fromtimestamp(latest_decision["timestamp"], tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
         st.markdown(
             f"""
             <div class="decision-box">

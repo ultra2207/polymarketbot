@@ -93,6 +93,7 @@ class MarketRewardParameters:
     category: str = "default"
     competing_qualifying_depth: float = 5000.0  # Competing shares in qualifying band
     competing_touch_depth: float = 1000.0  # Competing shares at touch
+    event_id: Optional[str] = None  # Gamma event grouping for correlated-event caps
 
 
 @dataclass
@@ -267,6 +268,9 @@ class LiquidityRewardsBotEngine:
                             current_portfolio_inventory_usd=abs(self.position.net_inventory * mid_price),
                             current_cash_usd=self.position.usdc_cash + self.risk_manager.config.total_bankroll_usd,
                             mid_price=mid_price,
+                            event_id=self.market.event_id,
+                            current_event_inventory_usd=abs(self.position.net_inventory * mid_price),
+                            current_event_cost=self.position.cost_basis_yes,
                         )
                         if not ok:
                             quotes.is_bid_active = False
@@ -286,6 +290,9 @@ class LiquidityRewardsBotEngine:
                             current_portfolio_inventory_usd=abs(self.position.net_inventory * mid_price),
                             current_cash_usd=self.position.usdc_cash + self.risk_manager.config.total_bankroll_usd,
                             mid_price=mid_price,
+                            event_id=self.market.event_id,
+                            current_event_inventory_usd=abs(self.position.net_inventory * mid_price),
+                            current_event_cost=self.position.cost_basis_yes,
                         )
                         if not ok:
                             quotes.is_ask_active = False

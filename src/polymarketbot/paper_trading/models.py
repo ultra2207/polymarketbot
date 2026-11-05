@@ -180,3 +180,4 @@ class MarketConfig:
     rewards_min_size: float
     rewards_max_spread: float  # in cents
     tokens: list[TokenConfig] = field(default_factory=list)
+    event_id: Optional[str] = None  # Gamma event grouping for correlated-event caps

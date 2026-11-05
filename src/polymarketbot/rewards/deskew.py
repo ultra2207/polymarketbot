@@ -406,6 +406,11 @@ class DynamicDeSkewOptimizer:
             is_buying_threat = (rolling_ofi > 0) or (rolling_ofi == 0.0 and micro_price_drift_cents >= 0.0)
             target_side = "SELL" if is_buying_threat else "BUY"
             target_price = round(best_ask_yes, 3) if target_side == "SELL" else round(best_bid_yes, 3)
+            # Signed advantage of resting instead of crossing now: cents per share
+            # earned relative to the price an immediate taker cross would pay.
+            passive_advantage_cents = (
+                (target_price - best_bid_yes) if target_side == "SELL" else (best_ask_yes - target_price)
+            ) * 100.0
 
             return DeSkewDecision(
                 pathway=DeSkewPathway.PASSIVE_FADE,
@@ -416,7 +421,7 @@ class DynamicDeSkewOptimizer:
                 target_price=target_price,
                 target_size=abs_q,
                 expected_cost_bps=0.0,
-                synthetic_savings_cents=0.0,
+                synthetic_savings_cents=round(passive_advantage_cents, 3),
                 reason="Neutral inventory toxicity detected: fading threatened quote",
             )
 
@@ -436,16 +441,18 @@ class DynamicDeSkewOptimizer:
                 # Excess YES shares (Long YES) -> Tighten ask on YES to sell; pull/widen bid on YES
                 skew_offset = (spread_yes_cents * 0.40) * skew_ratio
                 passive_ask = max(best_bid_yes + 0.001, best_ask_yes - (skew_offset / 100.0))
+                target_price = round(passive_ask, 3)
                 return DeSkewDecision(
                     pathway=DeSkewPathway.PASSIVE_FADE,
                     urgency_level="MEDIUM",
                     target_token="YES",
                     action_side="SELL",
                     order_type="LIMIT_MAKER",
-                    target_price=round(passive_ask, 3),
+                    target_price=target_price,
                     target_size=abs_q,
                     expected_cost_bps=0.0,
-                    synthetic_savings_cents=0.0,
+                    # Cents per share the resting ask earns over crossing at the bid now.
+                    synthetic_savings_cents=round((target_price - best_bid_yes) * 100.0, 3),
                     reason=f"Tier 1 Passive Skew: q=+{net_q:.1f} < q_crit({q_crit:.1f}). Fading YES ask to top-of-book.",
                 )
             else:
@@ -454,16 +461,18 @@ class DynamicDeSkewOptimizer:
                 skew_offset = (spread_no_cents * 0.40) * skew_ratio
                 # Tighten YES bid towards mid to organically buy YES and complete the set
                 tight_yes_bid = min(best_ask_yes - 0.001, best_bid_yes + (skew_offset / 100.0))
+                target_price = round(tight_yes_bid, 3)
                 return DeSkewDecision(
                     pathway=DeSkewPathway.PASSIVE_FADE,
                     urgency_level="MEDIUM",
                     target_token="YES",
                     action_side="BUY",
                     order_type="LIMIT_MAKER",
-                    target_price=round(tight_yes_bid, 3),
+                    target_price=target_price,
                     target_size=abs_q,
                     expected_cost_bps=0.0,
-                    synthetic_savings_cents=0.0,
+                    # Cents per share the resting bid saves over crossing at the ask now.
+                    synthetic_savings_cents=round((best_ask_yes - target_price) * 100.0, 3),
                     reason=f"Tier 1 Passive Skew: q={net_q:.1f} (long NO). Pulling NO bid, tightening YES bid to complete pairs.",
                 )
 

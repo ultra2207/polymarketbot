@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -101,6 +103,7 @@ class MarketOpportunity:
     competing_depth: float = 3000.0
     competing_score: float = 0.0
     tokens: list[TokenConfig] = field(default_factory=list)
+    event_id: Optional[str] = None
 
     # Scored yield components
     maker_score: float = 0.0
@@ -122,6 +125,7 @@ class MarketOpportunity:
             rewards_min_size=self.rewards_min_size,
             rewards_max_spread=self.rewards_max_spread,
             tokens=self.tokens,
+            event_id=self.event_id,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +135,7 @@ class MarketOpportunity:
             "rate_per_day": round(self.rate_per_day, 2),
             "rewards_min_size": self.rewards_min_size,
             "rewards_max_spread": self.rewards_max_spread,
+            "event_id": self.event_id,
             "mid_price": round(self.mid_price, 4),
             "category": self.category,
             "gross_reward_payout": round(self.gross_reward_payout, 2),
@@ -143,8 +148,6 @@ class MarketOpportunity:
             "passed_payout_floor": self.passed_payout_floor,
         }
 
-
-import re
 
 def infer_market_category(question: str) -> str:
     """Infer risk regime category from market question."""
@@ -365,6 +368,7 @@ class OpportunityScanner:
             category=category,
             competing_depth=competing_depth,
             tokens=tokens,
+            event_id=str(raw_mkt.get("event_id")) if raw_mkt.get("event_id") is not None else None,
             maker_score=yield_metrics["maker_score"],
             gross_reward_payout=yield_metrics["gross_reward_payout"],
             daily_reward_payout=yield_metrics["daily_reward_payout"],
@@ -427,6 +431,15 @@ def get_real_l2_score(
         if (now - cached_ts) < SCANNER_CACHE_TTL_SECONDS:
             return cached_res
 
+    effective_spread = _coerce_float(max_spread_cents)
+    if effective_spread is None or effective_spread <= 0.0:
+        logger.debug(
+            f"[L2 BOOK INVALID SPREAD] Refusing to score {str(token_id)[:14]} "
+            f"with max_spread_cents={max_spread_cents!r}"
+        )
+        return 0.0, 0.0, 0.50
+    max_spread_cents = effective_spread
+
     GLOBAL_SCANNER_TELEMETRY.total_book_queries += 1
     url = f"{CLOB_REST_URL}/book"
     try:
@@ -454,6 +467,17 @@ def get_real_l2_score(
 
         best_bid = max(float(b.get("price", 0.0)) for b in bids) if bids else 0.0
         best_ask = min(float(a.get("price", 1.0)) for a in asks) if asks else 1.0
+
+        # A crossed book (best_bid >= best_ask) cannot be scored without inventing a midpoint.
+        if bids and asks and best_bid >= best_ask:
+            logger.debug(
+                f"[L2 BOOK CROSSED] bid {best_bid} >= ask {best_ask} for "
+                f"{str(token_id)[:14]}; refusing to score"
+            )
+            if token_id in _BOOK_CACHE:
+                return _BOOK_CACHE[token_id][1]
+            return 0.0, 0.0, 0.50
+
         if best_bid > 0.0 and best_ask < 1.0 and best_bid < best_ask:
             mid = (best_bid + best_ask) / 2.0
         elif best_bid > 0.0 and best_ask > best_bid:
@@ -494,6 +518,305 @@ def get_real_l2_score(
     except Exception as e:
         logger.debug(f"Error fetching order book for {token_id[:14]}: {e}")
         return 0.0, 0.0, 0.50
+
+
+_NUMERIC_TOKEN_ID_PATTERN = re.compile(r"[0-9]+")
+_MIN_REWARD_SPREAD_CENTS = 0.1
+_MAX_REWARD_SPREAD_CENTS = 10.0
+_STATE_BOOLEAN_FIELDS = ("closed", "archived")
+
+
+def _is_numeric_token_id(value: Any) -> bool:
+    """True only for a CLOB token id: a plain decimal digit string."""
+    return isinstance(value, str) and _NUMERIC_TOKEN_ID_PATTERN.fullmatch(value.strip()) is not None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    """Parse a finite float, or return None instead of guessing a value."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _coerce_bool(value: Any) -> Optional[bool]:
+    """Parse a payload boolean flag, or return None when it cannot be interpreted."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value in (0, 1):
+            return bool(value)
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+    return None
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _extract_market_metadata(raw_market: dict[str, Any]) -> dict[str, Any]:
+    """Read the execution metadata the live runner needs from a raw CLOB payload."""
+    tick_size = _coerce_float(_first_present(raw_market, "tick_size", "minimum_tick_size"))
+    if tick_size is None or tick_size <= 0.0:
+        tick_size = 0.01
+    fee_rate = _coerce_float(_first_present(raw_market, "fee_rate_bps", "feeRateBps"))
+    fee_rate_bps = int(round(fee_rate)) if fee_rate is not None and fee_rate >= 0.0 else 0
+    return {
+        "neg_risk": bool(_coerce_bool(_first_present(raw_market, "neg_risk", "negRisk"))),
+        "tick_size": tick_size,
+        "fee_rate_bps": fee_rate_bps,
+        "end_date_iso": raw_market.get("end_date_iso"),
+        "accepting_orders": _coerce_bool(
+            _first_present(raw_market, "accepting_orders", "acceptingOrders")
+        ),
+    }
+
+
+def _extract_market_tokens(
+    raw_market: dict[str, Any],
+) -> tuple[Optional[str], Optional[str], float]:
+    """Return (YES token id, NO token id, YES mid price) without inventing token ids."""
+    yes_token: Optional[str] = None
+    no_token: Optional[str] = None
+    mid_yes = 0.50
+    tokens = raw_market.get("tokens")
+    if not isinstance(tokens, (list, tuple)):
+        return yes_token, no_token, mid_yes
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        outcome = str(token.get("outcome", "")).strip().upper()
+        if outcome == "YES" and yes_token is None:
+            yes_token = token.get("token_id")
+            price = _coerce_float(token.get("price"))
+            if price is not None and 0.0 < price < 1.0:
+                mid_yes = price
+        elif outcome == "NO" and no_token is None:
+            no_token = token.get("token_id")
+    return yes_token, no_token, mid_yes
+
+
+def _extract_daily_pool(raw_market: dict[str, Any]) -> float:
+    rewards_cfg = raw_market.get("rewards_config")
+    if isinstance(rewards_cfg, (list, tuple)) and rewards_cfg:
+        first = rewards_cfg[0]
+        if isinstance(first, dict):
+            rate = _coerce_float(first.get("rate_per_day"))
+            if rate is not None:
+                return rate
+    rate = _coerce_float(raw_market.get("rewards_daily_rate"))
+    return rate if rate is not None else 0.0
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp into an aware UTC datetime, or None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _market_state_rejection(raw_market: dict[str, Any]) -> Optional[str]:
+    """Return a reason when the payload says the market cannot accept orders."""
+    for field_name in _STATE_BOOLEAN_FIELDS:
+        raw_value = raw_market.get(field_name)
+        if raw_value is None:
+            continue
+        flag = _coerce_bool(raw_value)
+        if flag is None:
+            return f"market_state: {field_name} flag is not a boolean ({raw_value!r})"
+        if flag:
+            return f"market_state: market is {field_name}"
+    accepting = _first_present(raw_market, "accepting_orders", "acceptingOrders")
+    if accepting is not None:
+        flag = _coerce_bool(accepting)
+        if flag is None:
+            return f"market_state: accepting_orders is not a boolean ({accepting!r})"
+        if not flag:
+            return "market_state: market is not accepting orders"
+    return None
+
+
+def validate_market_for_live(
+    raw_market: dict[str, Any],
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[bool, str]:
+    """Validate a raw reward-market payload is safe to quote live.
+
+    Checks that both token ids are real numeric CLOB ids, the reward config is
+    usable, the market is open, and its expiry is a real future timestamp.
+
+    Returns:
+        (True, "ok") when the market may be traded, else (False, human-readable reason).
+    """
+    if not isinstance(raw_market, dict):
+        return False, "payload: market payload is not a mapping"
+
+    condition_id = raw_market.get("condition_id")
+    if not isinstance(condition_id, str) or not condition_id.strip():
+        return False, "condition_id: missing condition_id"
+
+    yes_token, no_token, _ = _extract_market_tokens(raw_market)
+    if not _is_numeric_token_id(yes_token):
+        return False, f"token_yes: YES token id is missing or not numeric ({yes_token!r})"
+    if not _is_numeric_token_id(no_token):
+        return False, f"token_no: NO token id is missing or not numeric ({no_token!r})"
+
+    min_size = _coerce_float(raw_market.get("rewards_min_size"))
+    if min_size is None or min_size <= 0.0:
+        return (
+            False,
+            f"rewards_min_size: must be > 0, got {raw_market.get('rewards_min_size')!r}",
+        )
+
+    max_spread = _coerce_float(raw_market.get("rewards_max_spread"))
+    if max_spread is None or not (
+        _MIN_REWARD_SPREAD_CENTS <= max_spread <= _MAX_REWARD_SPREAD_CENTS
+    ):
+        return (
+            False,
+            "rewards_max_spread: must be within "
+            f"[{_MIN_REWARD_SPREAD_CENTS}, {_MAX_REWARD_SPREAD_CENTS}] cents, "
+            f"got {raw_market.get('rewards_max_spread')!r}",
+        )
+
+    state_reason = _market_state_rejection(raw_market)
+    if state_reason is not None:
+        return False, state_reason
+
+    end_date_raw = raw_market.get("end_date_iso")
+    end_date = _parse_iso_datetime(end_date_raw)
+    if end_date is None:
+        return False, f"end_date_iso: missing or unparseable ({end_date_raw!r})"
+    now_utc = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    if end_date <= now_utc:
+        return False, f"end_date_iso: market already ended at {end_date_raw}"
+
+    return True, "ok"
+
+
+def _screen_lp_candidate(
+    raw_market: dict[str, Any],
+    *,
+    now_utc: datetime,
+    min_days_to_expiry: float,
+    min_mid_price: float,
+    max_mid_price: float,
+    bankroll_usd: float,
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Filter one raw reward pool. Returns (candidate, "") or (None, "code: reason")."""
+    condition_id = raw_market.get("condition_id")
+    if not isinstance(condition_id, str) or not condition_id.strip():
+        return None, "condition_id: missing condition_id"
+    question = raw_market.get("question") or "Unknown"
+
+    daily_pool = _extract_daily_pool(raw_market)
+    if daily_pool < 1.0:
+        return None, f"daily_pool: ${daily_pool:.2f}/day is below the $1.00 payout floor"
+
+    state_reason = _market_state_rejection(raw_market)
+    if state_reason is not None:
+        return None, state_reason
+
+    yes_token, no_token, mid_yes = _extract_market_tokens(raw_market)
+    if not _is_numeric_token_id(yes_token):
+        return None, f"token_yes: token id is missing or not numeric ({yes_token!r})"
+    if not _is_numeric_token_id(no_token):
+        return None, f"token_no: token id is missing or not numeric ({no_token!r})"
+
+    min_size = _coerce_float(raw_market.get("rewards_min_size"))
+    if min_size is None or min_size <= 0.0:
+        return None, f"rewards_min_size: must be > 0, got {raw_market.get('rewards_min_size')!r}"
+
+    max_spread = _coerce_float(raw_market.get("rewards_max_spread"))
+    if max_spread is None or not (
+        _MIN_REWARD_SPREAD_CENTS <= max_spread <= _MAX_REWARD_SPREAD_CENTS
+    ):
+        return None, (
+            "rewards_max_spread: must be within "
+            f"[{_MIN_REWARD_SPREAD_CENTS}, {_MAX_REWARD_SPREAD_CENTS}] cents, "
+            f"got {raw_market.get('rewards_max_spread')!r}"
+        )
+
+    # Divergence / extreme probability filter (avoid markets where one side has already won)
+    if not (min_mid_price <= mid_yes <= max_mid_price):
+        return None, (
+            f"mid_price: YES mid {mid_yes:.4f} outside "
+            f"[{min_mid_price}, {max_mid_price}]"
+        )
+
+    # Expiry / resolution filter (avoid markets ending soon with settlement jump risk).
+    # A missing end_date_iso keeps the historical "distant expiry" ranking behaviour;
+    # validate_market_for_live() is the stricter live-trading gate.
+    end_date_raw = raw_market.get("end_date_iso")
+    end_date = _parse_iso_datetime(end_date_raw)
+    if end_date is not None:
+        days_left = (end_date - now_utc).total_seconds() / 86400.0
+        if days_left < min_days_to_expiry:
+            return None, (
+                f"end_date_iso: expires in {days_left:.1f} days "
+                f"(< {min_days_to_expiry:.1f})"
+            )
+    elif end_date_raw:
+        return None, f"end_date_iso: unparseable ({end_date_raw!r})"
+    else:
+        days_left = 999.0
+        logger.debug(
+            f"[SCANNER] {condition_id!r} has no end_date_iso; ranking with distant expiry"
+        )
+
+    # Capital sizing feasibility: deploy 75% for two-sided quoting, retain 25% buffer
+    allocated_capital = bankroll_usd * 0.75
+    quote_size = max(min_size, allocated_capital / 1.0)
+    capital_required = quote_size * 1.0  # cost of buying YES + NO
+    if capital_required > bankroll_usd * 0.95:
+        return None, (
+            f"capital: requires ${capital_required:.2f} "
+            f"> ${bankroll_usd * 0.95:.2f} available"
+        )
+
+    metadata = _extract_market_metadata(raw_market)
+    return {
+        "condition_id": condition_id,
+        "question": question,
+        "daily_pool": daily_pool,
+        "max_spread": max_spread,
+        "min_size": min_size,
+        "mid_yes": mid_yes,
+        "days_left": days_left,
+        "quote_size": quote_size,
+        "capital_required": capital_required,
+        "our_score": quadratic_order_score(max_spread, 0.50, quote_size),
+        "yes_token": yes_token,
+        "no_token": no_token,
+        # Execution metadata required by the live runner; read, never invented.
+        "neg_risk": metadata["neg_risk"],
+        "tick_size": metadata["tick_size"],
+        "fee_rate_bps": metadata["fee_rate_bps"],
+        "end_date_iso": metadata["end_date_iso"],
+        "accepting_orders": metadata["accepting_orders"],
+        "raw_market": raw_market,
+    }, ""
 
 
 def find_optimal_lp_markets(
@@ -560,82 +883,40 @@ def find_optimal_lp_markets(
 
     logger.info(f"Received {len(raw_markets)} markets. Applying risk & viability filters...")
 
-    candidates = []
+    candidates: list[dict[str, Any]] = []
+    rejection_counts: Counter[str] = Counter()
     now_utc = datetime.now(timezone.utc)
 
-    for m in raw_markets:
-        cid = m.get("condition_id")
-        q = m.get("question", "Unknown")
-        rewards_cfg = m.get("rewards_config", [])
-        daily_pool = float(rewards_cfg[0].get("rate_per_day", 0.0)) if rewards_cfg else 0.0
-        max_spread = float(m.get("rewards_max_spread", 3.0))
-        min_size = float(m.get("rewards_min_size", 50.0))
-
-        # Accept all active pools that have at least $1.00 daily budget
-        if daily_pool < 1.0:
+    for raw_market in raw_markets:
+        if not isinstance(raw_market, dict):
+            rejection_counts["payload"] += 1
+            logger.debug(f"[SCANNER REJECT] non-mapping market payload: {raw_market!r}")
             continue
-
-        tokens = m.get("tokens", [])
-        if len(tokens) < 2:
+        candidate, reason = _screen_lp_candidate(
+            raw_market,
+            now_utc=now_utc,
+            min_days_to_expiry=min_days_to_expiry,
+            min_mid_price=min_mid_price,
+            max_mid_price=max_mid_price,
+            bankroll_usd=bankroll_usd,
+        )
+        if candidate is None:
+            rejection_counts[reason.split(":", 1)[0]] += 1
+            logger.debug(
+                f"[SCANNER REJECT] {raw_market.get('condition_id')!r} "
+                f"({str(raw_market.get('question') or 'Unknown')[:60]!r}): {reason}"
+            )
             continue
+        candidates.append(candidate)
 
-        mid_yes = 0.50
-        yes_token = None
-        no_token = None
-        for t in tokens:
-            outcome = str(t.get("outcome", "")).upper()
-            tid = t.get("token_id")
-            if outcome == "YES":
-                mid_yes = float(t.get("price", 0.50) or 0.50)
-                yes_token = tid
-            elif outcome == "NO":
-                no_token = tid
-
-        # 1. Divergence / Extreme Probability Filter (avoid markets where 1 side has already won)
-        if not (min_mid_price <= mid_yes <= max_mid_price):
-            continue
-
-        # 2. Expiry / Resolution Filter (avoid markets ending soon with settlement jump risk)
-        end_date_str = m.get("end_date_iso")
-        days_left = 999.0
-        if end_date_str:
-            try:
-                dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                days_left = (dt - now_utc).total_seconds() / 86400.0
-                if days_left < min_days_to_expiry:
-                    continue
-            except Exception:
-                pass
-
-        # 3. Capital Sizing Feasibility Check
-        # Deploy 75% for two-sided quoting, retain 25% cash buffer
-        allocated_capital = bankroll_usd * 0.75
-        quote_size = max(min_size, allocated_capital / 1.0)
-        capital_required = quote_size * 1.0  # cost of buying YES + NO
-
-        if capital_required > bankroll_usd * 0.95:
-            # Requires more capital than our bankroll allows
-            continue
-
-        our_score = quadratic_order_score(max_spread, 0.50, quote_size)
-
-        candidates.append({
-            "condition_id": cid,
-            "question": q,
-            "daily_pool": daily_pool,
-            "max_spread": max_spread,
-            "min_size": min_size,
-            "mid_yes": mid_yes,
-            "days_left": days_left,
-            "quote_size": quote_size,
-            "capital_required": capital_required,
-            "our_score": our_score,
-            "yes_token": yes_token,
-            "no_token": no_token,
-            "raw_market": m,
-        })
-
-    logger.info(f"Screened {len(candidates)} high-safety markets. Auditing full L2 depth in parallel...")
+    rejected_total = sum(rejection_counts.values())
+    rejection_summary = ", ".join(
+        f"{code}={count}" for code, count in rejection_counts.most_common()
+    ) or "none"
+    logger.info(
+        f"Screened {len(candidates)}/{len(raw_markets)} reward markets "
+        f"(rejected {rejected_total}: {rejection_summary}). Auditing full L2 depth in parallel..."
+    )
 
     def audit_market(cand: dict[str, Any]) -> dict[str, Any]:
         s = requests.Session()
@@ -654,16 +935,18 @@ def find_optimal_lp_markets(
             )
 
         # Polymarket rewards score combines qualifying depth across both tokens
-        comp_score = score_yes + score_no
+        audited_comp_score = score_yes + score_no
         qual_shares = qual_yes + qual_no
 
         # Realistic competing depth floor: prevent 0.0 singularities
-        # where the solver assumes a tiny quote captures 100% of the pool due to momentary order book flicker
+        # where the solver assumes a tiny quote captures 100% of the pool due to momentary order book flicker.
+        # Only the payout model sees this floor; reported depth stays the audited sum.
         min_depth_floor = max(100.0, float(cand.get("min_size", 20.0)) * 5.0)
-        comp_score = max(comp_score, min_depth_floor)
+        comp_score = max(audited_comp_score, min_depth_floor)
 
         cand["competing_score"] = comp_score
         cand["qualifying_shares"] = qual_shares
+        cand["competing_score_floor_applied"] = comp_score > audited_comp_score
         cand["real_mid"] = real_mid_yes
 
         total_score = comp_score + cand["our_score"]

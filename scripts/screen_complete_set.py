@@ -39,6 +39,8 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
+from polymarketbot.logs import IST
+
 import duckdb
 
 from polymarketbot.fees import schedule_at
@@ -204,7 +206,7 @@ def main() -> int:
         FROM scored s LEFT JOIN runs r ON r.condition_id = s.condition_id
         WHERE s.net > {args.min_net} ORDER BY s.net DESC LIMIT 12
     """).fetchall():
-        ts = datetime.fromtimestamp(m * 60, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        ts = datetime.fromtimestamp(m * 60, tz=IST).strftime("%Y-%m-%d %H:%M")
         print(f"  {ts} {cat[:16]:16} net={net:+.4f} run={mins} min  "
               f"usd={usd:>7,.0f}  {cid[:14]}…")
     return 0

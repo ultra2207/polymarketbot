@@ -44,8 +44,8 @@ def test_find_optimal_lp_markets_filters():
                 "rewards_min_size": 20.0,
                 "end_date_iso": "2026-11-04T00:00:00Z",
                 "tokens": [
-                    {"token_id": "tok1", "outcome": "YES", "price": "0.50"},
-                    {"token_id": "tok2", "outcome": "NO", "price": "0.50"},
+                    {"token_id": "100000000000000000000000000000000000000000000000000000000000001", "outcome": "YES", "price": "0.50"},
+                    {"token_id": "100000000000000000000000000000000000000000000000000000000000002", "outcome": "NO", "price": "0.50"},
                 ],
             },
             # 2. Market with extreme odds (diverged to 0.95 / 0.05) -> should be excluded
@@ -57,8 +57,8 @@ def test_find_optimal_lp_markets_filters():
                 "rewards_min_size": 20.0,
                 "end_date_iso": "2026-12-31T00:00:00Z",
                 "tokens": [
-                    {"token_id": "tok3", "outcome": "YES", "price": "0.95"},
-                    {"token_id": "tok4", "outcome": "NO", "price": "0.05"},
+                    {"token_id": "100000000000000000000000000000000000000000000000000000000000003", "outcome": "YES", "price": "0.95"},
+                    {"token_id": "100000000000000000000000000000000000000000000000000000000000004", "outcome": "NO", "price": "0.05"},
                 ],
             },
             # 3. Valid sweet spot market -> should pass and rank high
@@ -70,8 +70,8 @@ def test_find_optimal_lp_markets_filters():
                 "rewards_min_size": 20.0,
                 "end_date_iso": "2026-12-31T00:00:00Z",
                 "tokens": [
-                    {"token_id": "tok5", "outcome": "YES", "price": "0.60"},
-                    {"token_id": "tok6", "outcome": "NO", "price": "0.40"},
+                    {"token_id": "100000000000000000000000000000000000000000000000000000000000005", "outcome": "YES", "price": "0.60"},
+                    {"token_id": "100000000000000000000000000000000000000000000000000000000000006", "outcome": "NO", "price": "0.40"},
                 ],
             },
         ]
@@ -116,8 +116,8 @@ def test_scanner_5s_ttl_caching_and_telemetry():
                 "rewards_min_size": 20.0,
                 "end_date_iso": "2026-12-31T00:00:00Z",
                 "tokens": [
-                    {"token_id": "tok_y", "outcome": "YES", "price": "0.55"},
-                    {"token_id": "tok_n", "outcome": "NO", "price": "0.45"},
+                    {"token_id": "200000000000000000000000000000000000000000000000000000000000001", "outcome": "YES", "price": "0.55"},
+                    {"token_id": "200000000000000000000000000000000000000000000000000000000000002", "outcome": "NO", "price": "0.45"},
                 ],
             }
         ]

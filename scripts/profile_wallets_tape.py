@@ -42,6 +42,8 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
+from polymarketbot.logs import IST
+
 import duckdb
 from rich.console import Console
 from rich.progress import (BarColumn, Progress, SpinnerColumn,
@@ -122,7 +124,7 @@ def main() -> int:
     with bar:
         task = bar.add_task("profiling", total=len(months))
         for i, (m_lo, m_hi) in enumerate(months, 1):
-            label = datetime.fromtimestamp(m_lo, tz=timezone.utc).strftime("%Y-%m")
+            label = datetime.fromtimestamp(m_lo, tz=IST).strftime("%Y-%m")
             bar.update(task, description=f"{label} ({i}/{len(months)})")
             con.execute(f"""
                 INSERT INTO prof
@@ -175,7 +177,7 @@ def main() -> int:
         con.execute("CREATE OR REPLACE TEMP TABLE detail (wallet VARCHAR, markets BIGINT, "
                     "median_notional DOUBLE, active_hours BIGINT)")
         for i, (m_lo, m_hi) in enumerate(months, 1):
-            label = datetime.fromtimestamp(m_lo, tz=timezone.utc).strftime("%Y-%m")
+            label = datetime.fromtimestamp(m_lo, tz=IST).strftime("%Y-%m")
             bar.update(t3, description=f"sketch {label} ({i}/{len(months)})")
             con.execute(f"""
                 INSERT INTO detail
@@ -221,7 +223,7 @@ def main() -> int:
             "median_gap_s DOUBLE, gap_cv DOUBLE, subsec_gaps BIGINT)"
         )
         for i, (m_lo, m_hi) in enumerate(months, 1):
-            label = datetime.fromtimestamp(m_lo, tz=timezone.utc).strftime("%Y-%m")
+            label = datetime.fromtimestamp(m_lo, tz=IST).strftime("%Y-%m")
             bar.update(task2, description=f"gaps {label} ({i}/{len(months)})")
             con.execute(f"""
                 INSERT INTO gaps

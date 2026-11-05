@@ -17,8 +17,10 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import random
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -36,6 +38,14 @@ logger = get_logger("simulator.feed")
 DEFAULT_REST_URL = "https://clob.polymarket.com"
 DEFAULT_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
+# Upper bound on events waiting for listener delivery. A book listener that runs
+# slower than the tape must not make the websocket receive loop grow memory.
+DISPATCH_QUEUE_MAXSIZE = 1024
+
+# Upper bound on the `get_next_event` stream. The live runner never drains it and
+# a multi-day run would otherwise retain every book and trade in RAM.
+EVENT_QUEUE_MAXSIZE = 2048
+
 
 def _parse_float(val: Any, default: float = 0.0) -> float:
     """Safely parse float from arbitrary JSON input."""
@@ -45,6 +55,32 @@ def _parse_float(val: Any, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+def _parse_opt_float(val: Any) -> Optional[float]:
+    """Parse an optional float, preserving the difference between missing and 0."""
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _pick(primary: Any, secondary: Any, *keys: str, default: Any = None) -> Any:
+    """Read the first present, non-None field from primary then secondary.
+
+    Polymarket frames arrive both flat and wrapped in ``payload``; values such as
+    ``size: 0`` are meaningful (level removal) so presence — not truthiness —
+    decides which source wins.
+    """
+    for source in (primary, secondary):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            if key in source and source[key] is not None:
+                return source[key]
+    return default
 
 
 @dataclass(frozen=True)
@@ -190,6 +226,186 @@ def build_book_snapshot(
     )
 
 
+@dataclass
+class _TokenBook:
+    """Maintained L2 depth for one token: rounded price -> aggregate size.
+
+    Polymarket ``price_change`` deltas carry the *new aggregate size* at a price
+    level (0 removes it), so the whole book can be reconstructed by applying
+    them to a ``book`` snapshot. Prices are rounded to six decimals to match
+    ``parse_levels`` and keep float keys stable across message encodings.
+    """
+
+    bids: dict[float, float] = field(default_factory=dict)
+    asks: dict[float, float] = field(default_factory=dict)
+    tick_size: float = 0.01
+    timestamp: float = field(default_factory=time.time)
+    hash: Optional[str] = None
+
+    def apply_change(self, side: str, price: float, size: float) -> None:
+        """Apply one delta level. ``side`` is the ladder side ("bid"/"ask")."""
+        levels = self.bids if side == "bid" else self.asks
+        if size <= 0.0:
+            levels.pop(price, None)
+        else:
+            levels[price] = size
+
+    def apply_top(self, best_bid: Optional[float], best_ask: Optional[float]) -> None:
+        """Move the top of book without touching deeper levels.
+
+        A ``best_bid_ask`` frame asserts the best price but carries no size. The
+        asserted price is kept as a zero-size level (explicitly "size unknown",
+        never a fabricated 100) until a ``price_change`` sizes it; levels on the
+        wrong side of the new top cannot exist and are trimmed.
+        """
+        if best_bid is not None and 0.0 < best_bid < 1.0:
+            best_bid = round(best_bid, 6)
+            for price in [p for p in self.bids if p > best_bid]:
+                del self.bids[price]
+            self.bids.setdefault(best_bid, 0.0)
+        if best_ask is not None and 0.0 < best_ask < 1.0:
+            best_ask = round(best_ask, 6)
+            for price in [p for p in self.asks if p < best_ask]:
+                del self.asks[price]
+            self.asks.setdefault(best_ask, 0.0)
+
+    def to_snapshot(
+        self,
+        asset_id: str,
+        *,
+        timestamp: Optional[float] = None,
+        source: str = "ws",
+    ) -> OrderBookSnapshot:
+        """Build a snapshot of the maintained book.
+
+        Zero-size levels are the ``best_bid_ask`` placeholder described above:
+        they must surface as the best price, but they contribute no depth.
+        """
+        raw_bids = [{"price": p, "size": s} for p, s in self.bids.items()]
+        raw_asks = [{"price": p, "size": s} for p, s in self.asks.items()]
+        snapshot = build_book_snapshot(
+            asset_id=asset_id,
+            raw_bids=raw_bids,
+            raw_asks=raw_asks,
+            tick_size=self.tick_size,
+            book_hash=self.hash,
+            timestamp=timestamp if timestamp is not None else self.timestamp,
+            source=source,
+        )
+
+        top_bid = max(self.bids) if self.bids else None
+        top_ask = min(self.asks) if self.asks else None
+        adjusted = False
+        if top_bid is not None and top_bid > snapshot.best_bid:
+            snapshot.bids.insert(0, OrderBookLevel(price=top_bid, size=0.0))
+            snapshot.best_bid = round(top_bid, 4)
+            adjusted = True
+        if top_ask is not None and top_ask < snapshot.best_ask:
+            snapshot.asks.insert(0, OrderBookLevel(price=top_ask, size=0.0))
+            snapshot.best_ask = round(top_ask, 4)
+            adjusted = True
+
+        if adjusted:
+            best_bid = snapshot.best_bid
+            best_ask = snapshot.best_ask
+            if best_bid > 0.0 and best_ask < 1.0 and best_ask >= best_bid:
+                snapshot.mid = round((best_bid + best_ask) / 2.0, 4)
+                snapshot.spread = round(best_ask - best_bid, 4)
+            elif best_bid > 0.0:
+                snapshot.mid = round(best_bid, 4)
+                snapshot.spread = 0.0
+            elif best_ask < 1.0:
+                snapshot.mid = round(best_ask, 4)
+                snapshot.spread = 0.0
+            else:
+                snapshot.mid = 0.50
+                snapshot.spread = 0.0
+            snapshot.spread_cents = round(snapshot.spread * 100.0, 2)
+
+        return snapshot
+
+
+class _BoundedEventQueue(asyncio.Queue):
+    """Bounded queue of ``("book" | "trade", payload)`` events.
+
+    Producers never block and never grow memory without bound: when the queue
+    is full the oldest queued book is evicted first, and every skipped event is
+    counted in ``dropped``.
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        super().__init__(maxsize=max(1, int(maxsize)))
+        self.dropped: int = 0
+
+    def _evict_oldest_book(self) -> bool:
+        for index, item in enumerate(self._queue):
+            if item[0] == "book":
+                del self._queue[index]
+                self.dropped += 1
+                return True
+        return False
+
+    def _evict_oldest(self) -> bool:
+        if not self._queue:
+            return False
+        self._queue.popleft()
+        self.dropped += 1
+        return True
+
+
+class _DispatchQueue(_BoundedEventQueue):
+    """Bounded listener queue that keeps only the newest queued book per asset.
+
+    Trades are never coalesced. When the queue is full the oldest queued book is
+    evicted to make room; if the queue holds no books the incoming event is
+    dropped (a slow listener must not be fed stale work). Everything skipped —
+    coalesced, evicted, or refused — is counted in ``dropped``.
+    """
+
+    def __init__(self, maxsize: int = DISPATCH_QUEUE_MAXSIZE) -> None:
+        super().__init__(maxsize)
+
+    def _drop_queued_books(self, asset_id: str) -> None:
+        kept = [
+            item
+            for item in self._queue
+            if not (item[0] == "book" and item[1].asset_id == asset_id)
+        ]
+        if len(kept) != len(self._queue):
+            self.dropped += len(self._queue) - len(kept)
+            self._queue = type(self._queue)(kept)
+
+    def offer(self, kind: str, payload: Any) -> bool:
+        """Enqueue an event, coalescing books and enforcing the bound."""
+        if kind == "book":
+            self._drop_queued_books(payload.asset_id)
+        if self.full():
+            if not self._evict_oldest_book():
+                self.dropped += 1
+                return False
+        self.put_nowait((kind, payload))
+        return True
+
+
+class _EventQueue(_BoundedEventQueue):
+    """Bounded ``get_next_event`` stream.
+
+    Book ticks are the overwhelming majority of feed traffic, so they are the
+    first to go under pressure; trades are kept for polling consumers. Only when
+    the queue holds nothing but trades is the oldest trade evicted, which keeps
+    the stream recent instead of stalling the websocket loop.
+    """
+
+    def __init__(self, maxsize: int = EVENT_QUEUE_MAXSIZE) -> None:
+        super().__init__(maxsize)
+
+    def offer(self, kind: str, payload: Any) -> bool:
+        if self.full() and not self._evict_oldest_book():
+            self._evict_oldest()
+        self.put_nowait((kind, payload))
+        return True
+
+
 BookCallback = Callable[[OrderBookSnapshot], Union[None, Awaitable[None]]]
 TradeCallback = Callable[[MarketTrade], Union[None, Awaitable[None]]]
 
@@ -226,7 +442,15 @@ class LivePolymarketFeed:
         # Listeners
         self._book_listeners: list[BookCallback] = []
         self._trade_listeners: list[TradeCallback] = []
-        self._event_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        self._event_queue: _EventQueue = _EventQueue()
+        self._dispatch_queue: _DispatchQueue = _DispatchQueue()
+        self._dispatch_task: Optional[asyncio.Task] = None
+
+        # Maintained L2 books, rebuilt from `book` snapshots and `price_change`
+        # deltas. Guarded by a lock because REST snapshots are refreshed from a
+        # worker thread (asyncio.to_thread) while the event loop applies deltas.
+        self._books: dict[str, _TokenBook] = {}
+        self._book_lock = threading.Lock()
 
         # State tracking
         self._running: bool = False
@@ -255,6 +479,31 @@ class LivePolymarketFeed:
     @property
     def subscribed_tokens(self) -> set[str]:
         return set(self._subscribed_tokens)
+
+    @property
+    def last_message_age_seconds(self) -> Optional[float]:
+        """Seconds since the last WebSocket frame (pings included).
+
+        ``None`` means no frame has ever been received on this connection.
+        """
+        if self._last_ws_message_time <= 0.0:
+            return None
+        return max(0.0, time.time() - self._last_ws_message_time)
+
+    def is_stale(self, max_age: float = 30.0) -> bool:
+        """True when no frame arrived within ``max_age`` seconds (or none ever did)."""
+        age = self.last_message_age_seconds
+        return age is None or age > max_age
+
+    @property
+    def dispatch_dropped_count(self) -> int:
+        """Book updates coalesced/evicted plus events refused by the queue bound."""
+        return self._dispatch_queue.dropped
+
+    @property
+    def event_dropped_count(self) -> int:
+        """Events evicted from the bounded ``get_next_event`` stream."""
+        return self._event_queue.dropped
 
     # -------------------------------------------------------------------------
     # Subscription Management
@@ -338,7 +587,7 @@ class LivePolymarketFeed:
                 resp = session.get(url, params={"token_id": token_id}, timeout=self.request_timeout)
                 if resp.status_code == 200:
                     data = resp.json()
-                    return build_book_snapshot(
+                    snapshot = build_book_snapshot(
                         asset_id=token_id,
                         raw_bids=data.get("bids", []),
                         raw_asks=data.get("asks", []),
@@ -346,6 +595,10 @@ class LivePolymarketFeed:
                         book_hash=data.get("hash"),
                         source="rest",
                     )
+                    # REST snapshots are the reconnect base: deltas that follow
+                    # must apply to this book, not to a pre-outage one.
+                    self._reset_book(token_id, snapshot)
+                    return snapshot
                 elif resp.status_code == 429:
                     logger.warning(f"Rate limited (429) fetching book for {token_id[:12]}, backing off...")
                     time.sleep(1.0 * (attempt + 1))
@@ -457,29 +710,186 @@ class LivePolymarketFeed:
 
 
     # -------------------------------------------------------------------------
+    # Maintained Order Books
+    # -------------------------------------------------------------------------
+    def _reset_book(self, asset_id: str, snapshot: OrderBookSnapshot) -> None:
+        """Replace the maintained book for asset_id with a full snapshot."""
+        book = _TokenBook(
+            bids={level.price: level.size for level in snapshot.bids},
+            asks={level.price: level.size for level in snapshot.asks},
+            tick_size=snapshot.tick_size,
+            timestamp=snapshot.timestamp,
+            hash=snapshot.hash,
+        )
+        with self._book_lock:
+            self._books[asset_id] = book
+
+    def _clear_books(self) -> None:
+        """Drop all maintained depth (used on WebSocket reconnect)."""
+        with self._book_lock:
+            self._books.clear()
+
+    def _book_for(self, asset_id: str) -> _TokenBook:
+        """Return the maintained book for asset_id, creating an empty one if needed."""
+        book = self._books.get(asset_id)
+        if book is None:
+            book = _TokenBook()
+            self._books[asset_id] = book
+        return book
+
+    def _apply_price_changes(
+        self,
+        default_asset_id: Optional[str],
+        changes: list[Any],
+    ) -> dict[str, float]:
+        """Apply ``price_changes`` deltas to the maintained books.
+
+        Returns ``asset_id -> event timestamp`` for every asset that changed so
+        the caller can emit one snapshot per asset per message.
+        """
+        updated: dict[str, float] = {}
+        with self._book_lock:
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                payload = change.get("payload") if isinstance(change.get("payload"), dict) else {}
+                asset_id = _pick(change, payload, "asset_id", "assetId", default=default_asset_id)
+                if not asset_id:
+                    continue
+
+                price = _parse_float(_pick(change, payload, "price"), default=-1.0)
+                size = _parse_float(_pick(change, payload, "size"), default=-1.0)
+                side = str(_pick(change, payload, "side") or "").upper()
+                if not (0.0 < price < 1.0) or size < 0.0:
+                    logger.debug(
+                        f"Ignoring malformed price_change for {str(asset_id)[:12]}: price={price} size={size}"
+                    )
+                    continue
+                # `side` is the ladder side: BUY rows are bids, SELL rows asks.
+                if side == "BUY":
+                    book_side = "bid"
+                elif side == "SELL":
+                    book_side = "ask"
+                else:
+                    logger.debug(f"Ignoring price_change with unknown side {side!r} for {str(asset_id)[:12]}")
+                    continue
+
+                ts_raw = _pick(change, payload, "timestamp")
+                ts = (_parse_float(ts_raw) / 1000.0) if ts_raw else time.time()
+                book = self._book_for(asset_id)
+                book.apply_change(book_side, round(price, 6), size)
+                book.timestamp = ts
+                updated[asset_id] = ts
+        return updated
+
+    def _update_book_top(
+        self,
+        asset_id: str,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+        timestamp: float,
+    ) -> OrderBookSnapshot:
+        """Apply a top-of-book update and return the maintained book snapshot."""
+        with self._book_lock:
+            book = self._book_for(asset_id)
+            book.apply_top(best_bid, best_ask)
+            book.timestamp = timestamp
+            return book.to_snapshot(asset_id, timestamp=timestamp, source="ws")
+
+    def _snapshot_from_book(
+        self,
+        asset_id: str,
+        *,
+        timestamp: Optional[float] = None,
+        source: str = "ws",
+    ) -> OrderBookSnapshot:
+        """Emit the maintained book for asset_id as an OrderBookSnapshot."""
+        with self._book_lock:
+            return self._book_for(asset_id).to_snapshot(
+                asset_id,
+                timestamp=timestamp,
+                source=source,
+            )
+
+    # -------------------------------------------------------------------------
     # Event Dispatching
     # -------------------------------------------------------------------------
-    async def _dispatch_book(self, snapshot: OrderBookSnapshot) -> None:
-        """Send book snapshot to all listeners and event queue."""
-        self._event_queue.put_nowait(("book", snapshot))
-        for cb in self._book_listeners:
+    def _dispatch_started(self) -> bool:
+        return self._dispatch_task is not None
+
+    def _dispatch_running(self) -> bool:
+        return self._dispatch_task is not None and not self._dispatch_task.done()
+
+    def _ensure_dispatch_worker(self) -> None:
+        """Start the single listener-dispatch worker if it is not already running."""
+        if not self._dispatch_running():
+            self._dispatch_task = asyncio.create_task(self._dispatch_worker(), name="CLOB-Dispatch")
+
+    async def _dispatch_worker(self) -> None:
+        """Deliver queued events to listeners one at a time, in order, off-loop."""
+        while True:
+            kind, payload = await self._dispatch_queue.get()
             try:
-                res = cb(snapshot)
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception as e:
-                logger.error(f"Error in book listener callback: {e}")
+                if kind == "book":
+                    await self._deliver_book(payload)
+                else:
+                    await self._deliver_trade(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"Error dispatching {kind} event: {exc}")
+            finally:
+                self._dispatch_queue.task_done()
+
+    @staticmethod
+    async def _call_listener(callback: Callable[[Any], Any], event: Any, kind: str) -> None:
+        """Run one listener callback in a worker thread; await async callbacks after."""
+        try:
+            result = await asyncio.to_thread(callback, event)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            logger.error(f"Error in {kind} listener callback: {e}")
+
+    async def _deliver_book(self, snapshot: OrderBookSnapshot) -> None:
+        for cb in list(self._book_listeners):
+            await self._call_listener(cb, snapshot, "book")
+
+    async def _deliver_trade(self, trade: MarketTrade) -> None:
+        for cb in list(self._trade_listeners):
+            await self._call_listener(cb, trade, "trade")
+
+    async def _dispatch_book(self, snapshot: OrderBookSnapshot) -> None:
+        """Publish a book snapshot to the event queue and queue listener delivery."""
+        self._event_queue.offer("book", snapshot)
+        if not self._dispatch_started():
+            # Feed not started (direct payload processing in tests/scripts):
+            # deliver in order, still off the event loop.
+            await self._deliver_book(snapshot)
+            return
+        if not self._dispatch_running():
+            if not self._running:
+                await self._deliver_book(snapshot)
+                return
+            logger.error("Dispatch worker stopped unexpectedly; restarting it.")
+            self._ensure_dispatch_worker()
+        if not self._dispatch_queue.offer("book", snapshot):
+            logger.debug(f"Dispatch queue full; dropped book for {snapshot.asset_id[:12]}")
 
     async def _dispatch_trade(self, trade: MarketTrade) -> None:
-        """Send trade execution to all listeners and event queue."""
-        self._event_queue.put_nowait(("trade", trade))
-        for cb in self._trade_listeners:
-            try:
-                res = cb(trade)
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception as e:
-                logger.error(f"Error in trade listener callback: {e}")
+        """Publish a trade to the event queue and queue listener delivery."""
+        self._event_queue.offer("trade", trade)
+        if not self._dispatch_started():
+            await self._deliver_trade(trade)
+            return
+        if not self._dispatch_running():
+            if not self._running:
+                await self._deliver_trade(trade)
+                return
+            logger.error("Dispatch worker stopped unexpectedly; restarting it.")
+            self._ensure_dispatch_worker()
+        if not self._dispatch_queue.offer("trade", trade):
+            logger.debug(f"Dispatch queue full; dropped trade {trade.trade_id}")
 
     # -------------------------------------------------------------------------
     # WebSocket Message Handling
@@ -537,9 +947,9 @@ class LivePolymarketFeed:
             if ev_type == "book" and asset_id:
                 bids = p.get("bids") if "bids" in p else item.get("bids", [])
                 asks = p.get("asks") if "asks" in p else item.get("asks", [])
-                tick = _parse_float(p.get("tick_size") or p.get("tickSize") or item.get("tick_size"), 0.01)
-                book_hash = p.get("hash") or item.get("hash")
-                ts_raw = p.get("timestamp") or item.get("timestamp")
+                tick = _parse_float(_pick(p, item, "tick_size", "tickSize"), 0.01)
+                book_hash = _pick(p, item, "hash")
+                ts_raw = _pick(p, item, "timestamp")
                 ts = (_parse_float(ts_raw) / 1000.0) if ts_raw else time.time()
 
                 snapshot = build_book_snapshot(
@@ -551,39 +961,32 @@ class LivePolymarketFeed:
                     timestamp=ts,
                     source="ws",
                 )
+                self._reset_book(asset_id, snapshot)
                 await self._dispatch_book(snapshot)
 
-            # 2. Best bid/ask top of book update
+            # 2. Best bid/ask top of book update (deep levels are preserved)
             elif ev_type == "best_bid_ask" and asset_id:
-                bb = _parse_float(p.get("best_bid") or p.get("bestBid") or item.get("best_bid"), 0.0)
-                ba = _parse_float(p.get("best_ask") or p.get("bestAsk") or item.get("best_ask"), 1.0)
-                raw_bids = [{"price": bb, "size": 100.0}] if bb > 0 else []
-                raw_asks = [{"price": ba, "size": 100.0}] if ba < 1.0 else []
-                snapshot = build_book_snapshot(
-                    asset_id=asset_id,
-                    raw_bids=raw_bids,
-                    raw_asks=raw_asks,
-                    source="ws",
-                )
+                bb = _parse_opt_float(_pick(p, item, "best_bid", "bestBid"))
+                ba = _parse_opt_float(_pick(p, item, "best_ask", "bestAsk"))
+                if bb is None and ba is None:
+                    continue
+                ts_raw = _pick(p, item, "timestamp")
+                ts = (_parse_float(ts_raw) / 1000.0) if ts_raw else time.time()
+                snapshot = self._update_book_top(asset_id, bb, ba, ts)
                 await self._dispatch_book(snapshot)
 
-            # 3. Price change / batch delta
+            # 3. Price change / batch delta: `size` is the new aggregate size at
+            # `price` on the `side` ladder (BUY = bids, SELL = asks); 0 removes it.
+            # The `best_bid`/`best_ask` fields on these rows are stale (see
+            # scripts/reduce_pmxt.py) and are deliberately not used.
             elif ev_type == "price_change":
-                changes = p.get("price_changes") or item.get("price_changes") or p.get("priceChanges") or item.get("priceChanges") or []
-                for ch in changes:
-                    c_aid = ch.get("asset_id") or ch.get("assetId")
-                    if c_aid:
-                        bb = _parse_float(ch.get("best_bid") or ch.get("bestBid"), 0.0)
-                        ba = _parse_float(ch.get("best_ask") or ch.get("bestAsk"), 1.0)
-                        raw_bids = [{"price": bb, "size": 100.0}] if bb > 0 else []
-                        raw_asks = [{"price": ba, "size": 100.0}] if ba < 1.0 else []
-                        snapshot = build_book_snapshot(
-                            asset_id=c_aid,
-                            raw_bids=raw_bids,
-                            raw_asks=raw_asks,
-                            source="ws",
-                        )
-                        await self._dispatch_book(snapshot)
+                changes = _pick(p, item, "price_changes", "priceChanges", default=[])
+                if not isinstance(changes, list):
+                    changes = []
+                updated = self._apply_price_changes(asset_id, changes)
+                for changed_asset, ts in updated.items():
+                    snapshot = self._snapshot_from_book(changed_asset, timestamp=ts, source="ws")
+                    await self._dispatch_book(snapshot)
 
             # 4. Public trade stream
             elif ev_type in ("last_trade_price", "trade") and asset_id:
@@ -626,6 +1029,10 @@ class LivePolymarketFeed:
                     self._ws_connected = True
                     self._last_ws_message_time = time.time()
                     reconnect_delay = self.initial_reconnect_delay
+                    # Deltas received after a gap cannot be applied to depth that
+                    # accumulated before it. Drop the books and let the exchange's
+                    # first `book` frame re-seed them.
+                    self._clear_books()
                     logger.info("Polymarket CLOB WebSocket connected successfully.")
 
                     # Subscribe to all current tokens
@@ -716,6 +1123,7 @@ class LivePolymarketFeed:
         if self._running:
             return
         self._running = True
+        self._ensure_dispatch_worker()
         self._ws_task = asyncio.create_task(self._ws_loop(), name="CLOB-WS-Feed")
         self._fallback_task = asyncio.create_task(self._fallback_poll_loop(), name="CLOB-REST-Fallback")
         logger.info("LivePolymarketFeed started.")
@@ -747,6 +1155,22 @@ class LivePolymarketFeed:
             except (asyncio.CancelledError, Exception):
                 pass
             self._fallback_task = None
+
+        if self._dispatch_task is not None:
+            self._dispatch_task.cancel()
+            try:
+                await self._dispatch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._dispatch_task = None
+
+        # A stopped feed owes no further listener events.
+        while not self._dispatch_queue.empty():
+            try:
+                self._dispatch_queue.get_nowait()
+                self._dispatch_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
 
         if self._sync_session is not None:
             self._sync_session.close()

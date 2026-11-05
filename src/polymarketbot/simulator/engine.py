@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from polymarketbot.fees import taker_fee
 from polymarketbot.logs import get_logger
 from polymarketbot.rewards.allocator import (
     ContinuousOptimizationGovernor,
@@ -47,7 +48,12 @@ from polymarketbot.rewards.queue_valuation import (
     LiquidationRoute,
     SwitchingCostDecomposition,
 )
-from polymarketbot.rewards.scoring import quadratic_order_score
+from polymarketbot.rewards.scoring import (
+    OrderQuote,
+    compute_book_side_scores,
+    compute_minimum_score,
+    quadratic_order_score,
+)
 from polymarketbot.trading.base import BaseMarketMakingEngine
 from polymarketbot.simulator.book import (
     DepthInfo,
@@ -404,6 +410,19 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         """)
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS rebalances (
+                ts REAL NOT NULL,
+                condition_id TEXT NOT NULL,
+                crossed_cents REAL NOT NULL,
+                taker_fee_usd REAL NOT NULL,
+                gas_usd REAL NOT NULL,
+                inventory_before REAL,
+                inventory_after REAL,
+                reason TEXT
+            );
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS market_migrations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp REAL NOT NULL,
@@ -422,6 +441,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         cur.execute("CREATE INDEX IF NOT EXISTS idx_positions_cond ON positions(condition_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_migrations_ts ON market_migrations(timestamp);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deskew_ts ON deskew_events(timestamp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rebalances_ts ON rebalances(ts);")
 
         self._conn.commit()
 
@@ -783,6 +803,10 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         )
 
         try:
+            pos_before = self.portfolio.get_position(self.condition_id)
+            inventory_before = pos_before.shares_yes - pos_before.shares_no
+            crossed_cents = abs(target_price - self._deskew_mid_price(target_token)) * 100.0
+
             # Execute taker fill against portfolio
             tx = self.portfolio.process_fill(
                 condition_id=self.condition_id,
@@ -808,8 +832,21 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             self.fills_history.append(fill_rec)
 
             # If synthetic merge pathway: trigger immediate CTF Merge
+            merge: Optional[MergeResult] = None
             if decision.pathway == DeSkewPathway.SYNTHETIC_MERGE:
-                self.trigger_ctf_merge()
+                merge = self.trigger_ctf_merge()
+
+            pos_after = self.portfolio.get_position(self.condition_id)
+            taker_fee_usd, fee_note = self._taker_fee_usd(target_size, target_price)
+            self._record_rebalance(
+                ts=ts,
+                crossed_cents=crossed_cents,
+                taker_fee_usd=taker_fee_usd,
+                gas_usd=self._merge_gas_usd(merge),
+                inventory_before=inventory_before,
+                inventory_after=pos_after.shares_yes - pos_after.shares_no,
+                reason=f"Tier 2 {decision.pathway.value}: {decision.reason}{fee_note}",
+            )
 
         except Exception as e:
             log.error(f"Failed to execute Tier 2 de-skew taker fill: {e}")
@@ -1075,6 +1112,78 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         )
         self._conn.commit()
 
+    def _record_rebalance(
+        self,
+        *,
+        ts: float,
+        crossed_cents: float,
+        taker_fee_usd: float,
+        gas_usd: float,
+        inventory_before: Optional[float],
+        inventory_after: Optional[float],
+        reason: str,
+    ) -> None:
+        """Persist one inventory-crossing rebalance cost observation (append-only)."""
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO rebalances (
+                ts, condition_id, crossed_cents, taker_fee_usd, gas_usd,
+                inventory_before, inventory_after, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                float(ts),
+                self.condition_id,
+                float(crossed_cents),
+                float(taker_fee_usd),
+                float(gas_usd),
+                None if inventory_before is None else float(inventory_before),
+                None if inventory_after is None else float(inventory_after),
+                reason,
+            ),
+        )
+        self._conn.commit()
+
+    def _deskew_mid_price(self, token_side: str) -> float:
+        """Mid-price of the rebalanced token, using the same fallbacks as evaluate_quotes."""
+        b_yes = self.book_yes.best_bid_real or 0.49
+        a_yes = self.book_yes.best_ask_real or 0.51
+        if str(token_side).upper() == "NO":
+            bid = self.book_no.best_bid_real or (1.0 - a_yes)
+            ask = self.book_no.best_ask_real or (1.0 - b_yes)
+        else:
+            bid, ask = b_yes, a_yes
+        return (float(bid) + float(ask)) / 2.0
+
+    @staticmethod
+    def _merge_gas_usd(merge: Optional[MergeResult]) -> float:
+        """Gas for a merge/split executed as part of the same rebalancing action.
+
+        The portfolio charges the merge estimate captured at engine start-up
+        (``trading.ctf.estimate_merge_cost_usd``); fall back to a fresh estimate
+        only when the merge reported no gas at all.
+        """
+        if merge is None:
+            return 0.0
+        charged = float(getattr(merge, "gas_fee_deducted", 0.0) or 0.0)
+        if charged > 0.0:
+            return charged
+        from polymarketbot.trading.ctf import estimate_merge_cost_usd
+
+        return float(estimate_merge_cost_usd())
+
+    def _taker_fee_usd(self, size: float, price: float) -> Tuple[float, str]:
+        """Taker fee for a crossing fill, plus a reason suffix when unavailable.
+
+        The simulator holds no per-market fee schedule, so it never invents a
+        fee: an absent schedule records 0.0 and says so.
+        """
+        schedule = getattr(self, "fee_schedule", None)
+        if schedule is None:
+            return 0.0, "; fee schedule missing"
+        return float(taker_fee(size, price, schedule)), ""
+
     # -------------------------------------------------------------------------
     # CTF Split and Merge Mechanics
     # -------------------------------------------------------------------------
@@ -1188,6 +1297,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             spread_loss = max(0.0, (mid_ref - avg_sell_px) * shares_to_sell)
             spread_crossing_loss += spread_loss
 
+            inv_before = pos.shares_yes - pos.shares_no
             self.portfolio.process_fill(
                 condition_id=self.condition_id,
                 side="SELL",
@@ -1196,6 +1306,15 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                 size=shares_to_sell,
                 is_maker=False,
                 notes=f"Shutdown Taker Liquidation: Sold {shares_to_sell:.1f} YES @ avg ${avg_sell_px:.3f}",
+            )
+            self._record_rebalance(
+                ts=ts,
+                crossed_cents=abs(mid_ref - avg_sell_px) * 100.0,
+                taker_fee_usd=self._taker_fee_usd(shares_to_sell, avg_sell_px)[0],
+                gas_usd=0.0,
+                inventory_before=inv_before,
+                inventory_after=pos.shares_yes - pos.shares_no,
+                reason="Shutdown Taker Liquidation: sold residual YES",
             )
             fill_rec = FillRecord(
                 fill_id=str(uuid.uuid4())[:8],
@@ -1246,6 +1365,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             spread_loss = max(0.0, (mid_ref - avg_sell_px) * shares_to_sell)
             spread_crossing_loss += spread_loss
 
+            inv_before = pos.shares_yes - pos.shares_no
             self.portfolio.process_fill(
                 condition_id=self.condition_id,
                 side="SELL",
@@ -1254,6 +1374,15 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                 size=shares_to_sell,
                 is_maker=False,
                 notes=f"Shutdown Taker Liquidation: Sold {shares_to_sell:.1f} NO @ avg ${avg_sell_px:.3f}",
+            )
+            self._record_rebalance(
+                ts=ts,
+                crossed_cents=abs(mid_ref - avg_sell_px) * 100.0,
+                taker_fee_usd=self._taker_fee_usd(shares_to_sell, avg_sell_px)[0],
+                gas_usd=0.0,
+                inventory_before=inv_before,
+                inventory_after=pos.shares_yes - pos.shares_no,
+                reason="Shutdown Taker Liquidation: sold residual NO",
             )
             fill_rec = FillRecord(
                 fill_id=str(uuid.uuid4())[:8],
@@ -1530,32 +1659,87 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
     # Polymarket Quadratic Rewards 1-Minute Epoch Scoring
     # -------------------------------------------------------------------------
 
+    def _epoch_maker_quotes(self) -> List[OrderQuote]:
+        """Build official-scoring quotes from currently resting virtual maker quotes.
+
+        Each resting quote contributes exactly once: YES bids / NO asks feed Q_one,
+        YES asks / NO bids feed Q_two (see ``compute_book_side_scores``). Every quote is
+        treated as having rested the full sampled minute (``duration_seconds=60``).
+        """
+        quotes: List[OrderQuote] = []
+        for q in self.active_quotes.values():
+            price = float(q.get("price", 0.0) or 0.0)
+            size = float(q.get("size", 0.0) or 0.0)
+            if size <= 0.0 or not (0.0 < price < 1.0):
+                continue
+            quotes.append(
+                OrderQuote(
+                    side=str(q.get("side", "BUY")).upper(),
+                    outcome=str(q.get("token_side", "YES")).upper(),
+                    price=price,
+                    size=size,
+                    duration_seconds=60.0,
+                )
+            )
+        return quotes
+
+    def _epoch_competitor_quotes(self) -> List[OrderQuote]:
+        """Build official-scoring quotes from real (non-virtual) CLOB depth.
+
+        Both outcome-token books are included so competing liquidity is scored on the
+        same Q_one/Q_two basis as our own quotes instead of being summed across sides.
+        Levels are price-aggregated depth, so the per-order ``min_size`` filter is not
+        applied (``min_size=0`` at the call site), which keeps the competing score
+        conservative.
+        """
+        quotes: List[OrderQuote] = []
+        for book, outcome in ((self.book_yes, "YES"), (self.book_no, "NO")):
+            for px, sz in book._real_bids.items():
+                if sz > 0.0:
+                    quotes.append(
+                        OrderQuote(side="BUY", outcome=outcome, price=float(px), size=float(sz), duration_seconds=60.0)
+                    )
+            for px, sz in book._real_asks.items():
+                if sz > 0.0:
+                    quotes.append(
+                        OrderQuote(side="SELL", outcome=outcome, price=float(px), size=float(sz), duration_seconds=60.0)
+                    )
+        return quotes
+
     def process_reward_epoch(self, timestamp: Optional[float] = None) -> dict[str, Any]:
         """Compute 1-minute reward epoch payout with $1.00 daily payout floor enforcement.
 
         Formula:
             S(v, s) = ((v - s) / v)^2 * size
-            Payout_epoch = (S_user / (S_user + S_competing)) * (R_daily / 1440)
+            Q_one  = YES bids + NO asks scores;  Q_two = YES asks + NO bids scores
+            Q_min  = max(min(Q_one, Q_two), max(Q_one, Q_two)/3)  for mid in [0.10, 0.90]
+                     min(Q_one, Q_two)                            outside [0.10, 0.90]
+            Payout_epoch = (Q_min_user / (Q_min_user + Q_min_competing)) * (R_daily / 1440)
             Enforces: Projected daily payout must be >= $1.00; otherwise payout = $0.00.
         """
         ts = timestamp or time.time()
         self.epoch_index += 1
         self.last_epoch_ts = ts
 
-        # Sum user scores across active resting quotes
-        total_user_score = sum(q.get("score", 0.0) for q in self.active_quotes.values())
+        mid_yes = self.book_yes.mid_price or 0.50
 
-        # Estimate competing depth score from real order book inside qualifying spread
-        competing_score = 0.0
-        mid = self.book_yes.mid_price or 0.50
-        for px, sz in self.book_yes._real_bids.items():
-            spread_c = (mid - px) * 100.0
-            if 0 <= spread_c <= self.rewards_max_spread:
-                competing_score += quadratic_order_score(self.rewards_max_spread, spread_c, sz)
-        for px, sz in self.book_yes._real_asks.items():
-            spread_c = (px - mid) * 100.0
-            if 0 <= spread_c <= self.rewards_max_spread:
-                competing_score += quadratic_order_score(self.rewards_max_spread, spread_c, sz)
+        # Official two-sided scoring for our own resting quotes (never Q1 + Q2)
+        q_one, q_two = compute_book_side_scores(
+            quotes=self._epoch_maker_quotes(),
+            mid_price_yes=mid_yes,
+            max_spread_cents=self.rewards_max_spread,
+            min_size=self.rewards_min_size,
+        )
+        total_user_score = compute_minimum_score(q_one=q_one, q_two=q_two, midpoint=mid_yes)
+
+        # Competing depth scored on the same Q_min basis from the real book
+        comp_q_one, comp_q_two = compute_book_side_scores(
+            quotes=self._epoch_competitor_quotes(),
+            mid_price_yes=mid_yes,
+            max_spread_cents=self.rewards_max_spread,
+            min_size=0.0,
+        )
+        competing_score = compute_minimum_score(q_one=comp_q_one, q_two=comp_q_two, midpoint=mid_yes)
 
         # Baseline floor for competing depth (override with true L2 depth if provided)
         if self.competing_score_override is not None and self.competing_score_override > 0.0:
@@ -1572,7 +1756,9 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         raw_epoch_payout = (total_user_score / total_pool_score) * epoch_budget_usd if total_pool_score > 0 else 0.0
         projected_daily_usd = raw_epoch_payout * 1440.0
 
-        # $1.00 Daily Payout Floor Rule
+        # $1.00 daily floor: Polymarket pays a maker only when that maker's
+        # earnings in this market on that day reach $1; project this epoch across
+        # the day and gate on the maker's share, not on the pool size.
         floor_met = projected_daily_usd >= 1.00
         actual_epoch_payout = raw_epoch_payout if floor_met else 0.0
 
@@ -1610,7 +1796,8 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         self._conn.commit()
 
         log.info(
-            f"Epoch {self.epoch_index} processed: Score={total_user_score:.2f} | Share={pool_share_pct:.3f}% "
+            f"Epoch {self.epoch_index} processed: Q1={q_one:.2f} Q2={q_two:.2f} Q_min={total_user_score:.2f} "
+            f"| Competing Q_min={competing_score:.2f} | Share={pool_share_pct:.3f}% "
             f"| Payout=${actual_epoch_payout:.4f} (Projected Daily: ${projected_daily_usd:.2f}, Floor Met: {floor_met}) "
             f"| Total Rewards: ${self.total_rewards_credited:.4f}"
         )
@@ -1645,6 +1832,9 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         return {
             "epoch_index": self.epoch_index,
             "timestamp": ts,
+            "q_one": round(q_one, 4),
+            "q_two": round(q_two, 4),
+            "q_min": round(total_user_score, 4),
             "user_score": round(total_user_score, 4),
             "competing_score": round(competing_score, 2),
             "pool_share_pct": round(pool_share_pct, 4),

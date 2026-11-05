@@ -407,3 +407,40 @@ def test_batch_merging_and_gas_deduction(tmp_path: Path):
     assert ledger_data["recent_merges"][0]["shares_merged"] == 100.0
     assert ledger_data["recent_merges"][0]["gas_fee_usd"] == 0.015
 
+
+def test_price_only_ofi_gate_pulls_threatened_ask(tmp_path: Path):
+    engine = PaperTradingEngine(
+        initial_cash_usd=10000.0,
+        base_spread_offset_cents=0.75,
+        default_quote_size=100.0,
+        ledger_path=tmp_path / "ledger_gate.json",
+        microstructure_gate=True,
+    )
+    engine.register_market(
+        MarketConfig(
+            condition_id="0xgate",
+            question="Gate test",
+            rate_per_day=2000.0,
+            rewards_min_size=50.0,
+            rewards_max_spread=3.0,
+            tokens=[TokenConfig(token_id="tok_yes", outcome="Yes", price=0.50)],
+        )
+    )
+
+    # First top of book: no previous state, so both sides quote.
+    engine.update_orderbook(
+        "tok_yes", [{"price": "0.48", "size": "100"}], [{"price": "0.52", "size": "100"}], 0.01
+    )
+    first = engine.virtual_quotes["tok_yes"]
+    assert first["bid"] is not None
+    assert first["ask"] is not None
+
+    # Bid rises, ask unchanged: trailing OFI is +1 (buy pressure), so the ask is
+    # the threatened side and is pulled. The bid is safe and stays quoted.
+    engine.update_orderbook(
+        "tok_yes", [{"price": "0.49", "size": "100"}], [{"price": "0.52", "size": "100"}], 0.01
+    )
+    gated = engine.virtual_quotes["tok_yes"]
+    assert gated["bid"] is not None
+    assert gated["ask"] is None
+

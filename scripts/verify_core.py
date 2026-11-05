@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
+
+from polymarketbot.logs import IST
 
 RAW = Path("data/raw")
 TRADES = RAW / "sii/trades.parquet"
@@ -117,8 +119,8 @@ def profile_trades(con: duckdb.DuckDBPyConnection) -> None:
     """).fetchall()[0]
 
     n, first_epoch, last_epoch, nulls, bad_price, nonpos_usd, self_trades, summary = row
-    first_ts = datetime.fromtimestamp(first_epoch, timezone.utc)
-    last_ts = datetime.fromtimestamp(last_epoch, timezone.utc)
+    first_ts = datetime.fromtimestamp(first_epoch, IST)
+    last_ts = datetime.fromtimestamp(last_epoch, IST)
     print(f"  rows                 {n:,}")
     print(f"  first timestamp      {first_ts}")
     print(f"  last timestamp       {last_ts}")

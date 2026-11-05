@@ -19,13 +19,13 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
 
-from polymarketbot.logs import get_logger
+from polymarketbot.logs import IST, get_logger
 from polymarketbot.rewards.deskew import DynamicDeSkewOptimizer
 from polymarketbot.rewards.queue_valuation import CapitalMigrationEngine
 from polymarketbot.simulator.engine import NativePaperTradingEngine
@@ -328,7 +328,7 @@ def render_dashboard(
     """Render high-density, real-time terminal telemetry dashboard."""
     t = engine.get_telemetry()
     elapsed = time.time() - start_time
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
     # Format numbers
     equity_color = C_GREEN if t["total_pnl"] >= 0 else C_RED

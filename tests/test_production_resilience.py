@@ -196,7 +196,7 @@ def test_bot_config_defaults() -> None:
     assert cfg.POLYMARKET_PASSPHRASE == ""
     assert cfg.PRIVATE_KEY == ""
     assert cfg.PROXY_WALLET_ADDRESS == ""
-    assert cfg.POLYGON_RPC_URL == "https://polygon-rpc.com"
+    assert cfg.POLYGON_RPC_URL == ""
     assert cfg.CLOB_API_URL == "https://clob.polymarket.com"
     assert cfg.CLOB_WS_URL == "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -206,7 +206,7 @@ def test_bot_config_defaults() -> None:
     assert cfg.passphrase == ""
     assert cfg.private_key == ""
     assert cfg.proxy_wallet_address == ""
-    assert cfg.polygon_rpc_url == "https://polygon-rpc.com"
+    assert cfg.polygon_rpc_url == ""
     assert cfg.clob_api_url == "https://clob.polymarket.com"
     assert cfg.clob_ws_url == "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -281,7 +281,7 @@ def test_load_config_missing_file_uses_defaults(tmp_path: Path) -> None:
     missing_file = tmp_path / "does_not_exist.env"
     cfg = load_config(env_path=missing_file)
 
-    assert cfg.POLYGON_RPC_URL == "https://polygon-rpc.com"
+    assert cfg.POLYGON_RPC_URL == ""
     assert cfg.CLOB_API_URL == "https://clob.polymarket.com"
     assert cfg.CLOB_WS_URL == "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
