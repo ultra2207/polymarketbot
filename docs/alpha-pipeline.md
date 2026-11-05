@@ -42,7 +42,7 @@ Three facts learned on 2026-11-01 reshape the order:
 | C2 | Base-rate models | labels (done) + weather feeds | **free half run: market wins** |
 | C3 | Wallet identity map | on-chain logs | **partly unblocked** |
 | C4 | Cross-venue vs Kalshi | Kalshi public API | **unblocked** |
-| C5 | News latency | GDELT | **unblocked, rate-limited** |
+| C5 | News latency | RSS/Gamma (GDELT removed) | **blocked: no free real-time wire** |
 | E6 | Perps funding carry / liquidations | Binance funding + Polymarket perps | **unblocked** |
 | E7 | Mechanism transplantation | tape (behaviour) | **unblocked at address level** |
 
@@ -274,7 +274,7 @@ each needs, because that is what decides whether two of them can run at once.
 | C1 | Crypto up/down vs reference | `api.binance.com/api/v3/klines` | 200 |
 | C2f | Weather forecasts | Open-Meteo, api.weather.gov | 200 |
 | C4 | Cross-venue vs Kalshi | `api.elections.kalshi.com` | 200 |
-| C5 | News latency | GDELT | 429, 1 req / 5 s |
+| C5 | News latency | GDELT | 429, 1 req / 5 s — removed 2026-11-05 |
 | E6 | Perps funding carry | `fapi.binance.com/fapi/v1/fundingRate` | 200 |
 | C3 | Wallet identity map | `polygon.drpc.org` logs (10 k-block chunks) | 200 |
 

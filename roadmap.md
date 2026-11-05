@@ -1,9 +1,12 @@
 # Polymarket Research → Forward Test → Live
 
-**Status:** Phase 0–2 complete, Phase 3 (labels + trade normalisation) in progress
-**Last updated:** 2026-11-01
-**Scope:** research and backtesting infrastructure. No live trading until Phase 8 gate passes.
-**Companion docs:** [`plan.md`](plan.md) (research agenda and idea backlog) · [`docs/strategy-reverse-engineering.md`](docs/strategy-reverse-engineering.md) · [`docs/limitations.md`](docs/limitations.md)
+**Status:** Phase 0–2 complete, Phase 3 (labels + trade normalisation) in progress; a
+live reward-quoting runner now exists behind explicit gates (pilot only — §3.2)
+**Last updated:** 2026-11-04
+**Scope:** research and backtesting for directional strategies. Directional live trading
+still requires Gate 8. Reward-only liquidity quoting is a separate strategy class with its
+own evidence rules and pilot gate (§3.2, §7 Phase 8b).
+**Companion docs:** [`plan.md`](plan.md) (research agenda and idea backlog) · [`docs/strategy-reverse-engineering.md`](docs/strategy-reverse-engineering.md) · [`docs/limitations.md`](docs/limitations.md) · [`docs/live-trading-audit.md`](docs/live-trading-audit.md) (live-engine findings and gates)
 
 ---
 
@@ -34,7 +37,7 @@ This is slightly better for you than the original plan, because 2026 data also c
 
 Two parallel truths that shape everything below:
 
-1. **Depth is perishable.** You cannot backfill 2026-08-11 onward. Start a recorder now and you manufacture future history at ~zero cost. This is the only "live" work worth doing before Phase 8.
+1. **Depth is perishable.** You cannot backfill 2026-08-11 onward. Start a recorder now and you manufacture future history at ~zero cost. For the **research** track this is the only live work worth doing before Phase 8. The reward-only quoting pilot (§3.2) is separate: it exists to measure a cost the research stack cannot simulate, and it is capped at minimum size until Gate 8b.
 2. **The 2026 regime is a different game.** Taker fees were effectively zero for most markets in 2023–2025 and are now material (crypto peaks ~1.56 % at 50 ¢). A model tuned on 2023–2025 will systematically overstate edge. Fee overlay is mandatory, not optional.
 
 ---
@@ -263,7 +266,7 @@ Four things are commonly assumed to exist and do not. Three are unavailable by a
 | **Historical comments / sentiment** | Stored off-chain with no bulk export; the read endpoint reflects *current* state, so edits and deletions destroy the as-of record | sentiment features for any period before you start recording | record now; substitute GDELT / news / Reddit for history |
 | **Order book depth after 2026-08-10** | Nobody has recorded it publicly. This one is not impossible — it is unrecorded | any post-Aug-2026 depth, slippage or queue backtest | start the recorder (§8); forward-only |
 
-**Why this matters for strategy choice.** The first two gaps are fatal to market making and to any strategy whose edge comes from passive fills. They are close to irrelevant for strategies that enter as a taker and hold to resolution, because those never depend on queue priority and only need one fill price. That is the technical reason §3 recommends starting with fundamental / event-driven rather than market making — not a preference, a data constraint.
+**Why this matters for strategy choice.** The first two gaps are fatal to **spread-capture** market making and to any strategy whose edge comes from passive fills. They are close to irrelevant for strategies that enter as a taker and hold to resolution, because those never depend on queue priority and only need one fill price. That is the technical reason §3 recommends starting with fundamental / event-driven rather than market making — not a preference, a data constraint. Reward-only liquidity quoting (§3.2) is the partial exception: its revenue is observable, its fill cost is not, so it is run as a bounded live pilot rather than backtested.
 
 ---
 
@@ -294,9 +297,12 @@ Fill realism matters in proportion to turnover. Pick the class deliberately; it 
 | **Fundamental / event-driven** — forecast P(outcome) vs price | days → resolution | **Low**. Entry price + resolution dominate; exit optional | tape + metadata + resolution | ✅ **start here** |
 | **Cross-market / arbitrage** — neg-risk basket mispricing, cross-venue | minutes → hours | Medium. Must fill 2+ legs simultaneously | tape + top-10 depth | ✅ second |
 | **Momentum / short-horizon** | minutes | **High**. Slippage is the strategy | full L2 | ⚠️ only in 2026-04→08 window |
-| **Market making** | seconds | **Extreme**. Queue position, adverse selection, rebates | full L2 + order-level (unavailable) | ❌ not with free data |
+| **Spread-capture / inventory MM** | seconds → minutes | **Extreme**. Queue position, adverse selection | full L2 + order-level (unavailable) | ❌ not with free data |
+| **Reward-only liquidity quoting** | hours (resting) | **Revenue low** — price/size/time from the published book; **cost unobservable** — fills/queue | live book + published pool; no backtest | ⚠️ live pilot only (§3.2) |
 
-**Recommendation:** begin with fundamental/event-driven, where the simulator's fill assumptions are least load-bearing, and where the resolution payoff gives you a clean, unambiguous exit. Add arbitrage once the harness is trusted. Do not attempt market making on free data — you cannot observe queue position.
+**Recommendation:** begin with fundamental/event-driven, where the simulator's fill assumptions are least load-bearing, and where the resolution payoff gives you a clean, unambiguous exit. Add arbitrage once the harness is trusted. Do not attempt **spread-capture** market making on free data — you cannot observe queue position.
+
+Reward-only quoting is the exception, and it is a different claim. Its income is the published liquidity-reward formula applied to *our own* resting orders and the opponent's *aggregate* book — both observable. Its cost is the fills those orders receive, which is not observable or simulatable. So it cannot be backtested, but it can be run as a bounded live experiment whose cost side is measured, not assumed. §3.2 defines that gate.
 
 ### 3.1 Sizing and horizon decide more than the strategy class
 
@@ -356,6 +362,46 @@ Implications:
 - This counts **fills, not orders**. One taker order can be split across many maker fills, so order sizes are larger than these numbers. Treat the table as a lower bound on order size and an upper bound on how unusual a given notional is.
 - The sample is dominated by high-frequency crypto markets, which inflates the count of tiny fills. Politics and long-horizon markets carry larger fills. **Re-measure per category in Phase 3** before finalising the number.
 - Run `uv run scripts/measure_fill_sizes.py 2026 2 500000` to reproduce; change the year/month for other periods.
+
+---
+
+### 3.2 Reward-only liquidity quoting — the live track
+
+This is what `scripts/run_real_money_trader.py` does: rest post-only BUY orders on both
+outcomes within the market's `max_spread`, near the mid, sized above `min_size`, and merge
+complete sets to recycle capital. It is **not** the market making that §3 rejects.
+
+**Why it is a different evidence class.** Polymarket's liquidity-reward score for an order
+is a function of its distance from the mid, its size, and the time it rests inside the
+band. All three are ours or published. The opponent's side of the denominator is the
+**aggregate** book (`/book`), which is public. So the revenue formula is observable and
+verifiable, in the real world, against `GET /rewards/user` after the daily payout.
+
+The cost side is not. Whether a resting order fills, and how much adverse selection it
+absorbs, depends on queue position and the flow that hits it — exactly the data §2 proves
+is unavailable. The paper engines confirm the consequence: across the recorded runs, the
+selected reward markets produced almost no fills (audit A6/A7). A paper "profit" for this
+strategy is therefore a statement about the reward formula, not about trading.
+
+**What this permits, and what it forbids.**
+
+| Claim | Status before a live cycle | Status after one live cycle |
+|---|---|---|
+| Reward revenue per day | **bounded** — published pool × modelled Q_min share | **observed** — `/rewards/user` total at UTC midnight |
+| Fill cost / adverse selection | **assumed** — no simulation is valid | **observed** — reconciled `/data/trades` vs resting price |
+| Net edge | **not established** | established only if net > 0 after fees, gas and inventory marks |
+| Capacity | unknown | measured from actual fill sizes and inventory turnover |
+
+**The pilot gate (Phase 8b).** Do not scale beyond minimum notional until all of:
+
+1. one full UTC day of live quoting with no unconfirmed orders at start or end;
+2. `/rewards/user` pays a non-zero amount that the model predicted within 2×;
+3. every fill reconciles to `/data/trades` and to the local inventory ledger;
+4. net PnL (rewards + spread − adverse selection − fees − gas) is positive on that day;
+5. no risk breaker fired, or every firing is explained by a market event.
+
+Until then the strategy is a **supervised experiment**, not a validated edge. The audit
+and its remediation status are in [`docs/live-trading-audit.md`](docs/live-trading-audit.md).
 
 ---
 
@@ -802,12 +848,36 @@ Each cycle:
 
 If Gate 8 fails, **do not go live**. Return to Phase 7 with the failure recorded.
 
+### Phase 8b — Reward-only quoting pilot (separate gate)
+
+This track does not depend on Gate 8 and is not a directional strategy. It is live,
+bounded, and self-validating: the revenue is checked against the venue's own payout, and
+the cost against the venue's own fill tape.
+
+- [ ] Run `scripts/run_real_money_trader.py --live` with a typed `START LIVE`, on one
+  **non-neg-risk** market, EOA signer, minimum notional, bounded `--duration`
+- [ ] Confirm preflight READY and the venue lists no orders at start and end
+- [ ] Reconcile every fill against `/data/trades` and the local ledger
+- [ ] Compare the next UTC `/rewards/user` payout with the modelled share
+- **Gate 8b (pilot pass):** one full UTC day with (a) no unconfirmed orders at any point,
+  (b) reward payout non-zero and within 2× the model, (c) every fill reconciled,
+  (d) net PnL after fees/gas/inventory marks > 0, (e) every breaker firing explained.
+
+Scale only after Gate 8b passes and the measured fill cost is stable over a second day.
+Before that, the strategy may run at minimum size only. See
+[`docs/live-trading-audit.md`](docs/live-trading-audit.md) for the engine gates (neg-risk,
+proxy settlement, settlement confirmation) and §3.2 for the evidence rules.
+
 ### Phase 9 — Live preparation (only after Gate 8)
 
 - [ ] Paper trading against the live WebSocket using the same code path
 - [ ] Reconcile paper fills against real book for 2 weeks
 - [ ] Live with minimum size, hard daily loss limit, kill switch
 - [ ] Scale only if live slippage tracks the model
+
+The live runner for the reward-only track already exists and shares `trading/base.py`
+quoting/risk code; Phase 9's paper-code-path requirement applies to directional strategies,
+which still have not been validated.
 
 ---
 

@@ -81,9 +81,15 @@ withdrawals around news. It is not enough for:
 
 ### What this rules out
 
-Any strategy whose PnL depends on modelling other participants' order lifecycle. In
-practice: market making, liquidity provision, spoof-detection signals, and "follow the
-maker" strategies.
+Any strategy whose PnL depends on modelling **other participants'** order lifecycle. In
+practice: spread-capture market making, inventory-driven market making, spoof-detection
+signals, and "follow the maker" strategies.
+
+It does **not** rule out reward-only liquidity quoting — the strategy this repository now
+runs live. That strategy's revenue depends on *our own* resting orders (price, size, time
+inside `max_spread`) and on the opponent's **aggregate** book, both of which are published.
+What remains unobservable is the **fill cost** of those resting orders (queue and adverse
+selection), so that half cannot be simulated and must be measured live. See §6.
 
 ---
 
@@ -137,8 +143,14 @@ kill criteria require the edge to survive the pessimistic setting.
 
 ### What this rules out
 
-Passive-only market making, and any "I would have been filled at the touch" assumption.
+Any strategy whose PnL depends on **being filled** passively at the touch: spread capture,
+queue-priority market making, and any "I would have been filled at the touch" assumption.
 Taker entries are unaffected: crossing the spread needs no queue.
+
+Reward-only quoting is unaffected on the revenue side — Polymarket scores a resting order
+by its distance from mid, size and time, not by whether it fills. Its **cost** side is
+affected: fill frequency and adverse selection cannot be simulated here, so a reward-only
+strategy must be sized against measured live fills, not against a paper fill model.
 
 ---
 
@@ -240,10 +252,24 @@ and it is why Phase 3 must not assume redemption events exist.
 | Cross-market / neg-risk arbitrage | low | medium (one leg may be passive) | irrelevant | medium |
 | Momentum, taker entry | irrelevant | irrelevant | low | **blocking** |
 | Momentum, passive entry | medium | **blocking** | low | **blocking** |
-| Market making | **blocking** | **blocking** | irrelevant | **blocking** |
+| Spread-capture / inventory market making | **blocking** | **blocking** | irrelevant | **blocking** |
+| **Reward-only liquidity quoting (this repo)** | irrelevant | **bounded** — revenue observed live, fill cost measured live | irrelevant | irrelevant live; **blocking** for a backtest |
 
 Read this table before writing a hypothesis. If a row has a blocking cell, the strategy
 cannot be validated with the free stack, and no amount of engineering changes that.
+
+Reward-only quoting is the one passive strategy that is not blocked: its **revenue** is a
+function of our own resting orders and the published aggregate book, and it is verifiable
+against `/rewards/user` after the daily payout. Its **cost** is not bounded by a
+simulator — the paper engines show almost no fills on exactly the markets selected for
+rewards (see `docs/live-trading-audit.md`, finding A6/A7). The consequence is a process
+rule, not a data rule:
+
+- the reward leg may be sized from the live book and the published pool;
+- the fill/adverse-selection leg may only be sized from **observed live fills**, over at
+  least one full daily payout cycle, starting at minimum notional;
+- a paper run cannot promote this strategy to larger size, because the paper cannot
+  exercise the cost side.
 
 ---
 
