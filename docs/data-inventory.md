@@ -3,6 +3,13 @@
 What we hold, what we derive, and how to rebuild it. Sizes and row counts are from
 2026-11-01; derived files are reproducible from the raw set.
 
+> **2026-11-05:** `data/tape/` is the current 14-day event-driven tape (not in
+> the 2026-11-01 tables below) and the authoritative source for current
+> microstructure. `positions_old.parquet` and `pos_half.parquet` were moved to
+> `data/archive/2026-11-05/`; the current position build is
+> `data/processed/positions/`. `data/raw/` was not touched. See `data/README.md`
+> for the current-vs-historical layout.
+
 ## Raw inputs (`data/raw/`, gitignored)
 
 | File | Size | Coverage | Notes |
