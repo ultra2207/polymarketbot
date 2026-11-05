@@ -1,5 +1,5 @@
-# data
-data/
+# data (top-level tape only; do not ignore src/polymarketbot/data/)
+/data/
 *.part
 .tmp/
 
@@ -18,3 +18,7 @@ Thumbs.db
 
 # scratch
 scratch/
+
+# local secrets
+key.txt
+secrets/

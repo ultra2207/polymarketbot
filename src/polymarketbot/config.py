@@ -25,7 +25,9 @@ class BotConfig:
     POLYMARKET_PASSPHRASE: str = ""
     PRIVATE_KEY: str = ""
     PROXY_WALLET_ADDRESS: str = ""
-    POLYGON_RPC_URL: str = "https://polygon-rpc.com"
+    POLYMARKET_RELAYER_API_KEY: str = ""
+    POLYMARKET_RELAYER_API_KEY_ADDRESS: str = ""
+    POLYGON_RPC_URL: str = ""
     CLOB_API_URL: str = "https://clob.polymarket.com"
     CLOB_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -49,6 +51,14 @@ class BotConfig:
     @property
     def proxy_wallet_address(self) -> str:
         return self.PROXY_WALLET_ADDRESS
+
+    @property
+    def relayer_api_key(self) -> str:
+        return self.POLYMARKET_RELAYER_API_KEY
+
+    @property
+    def relayer_api_key_address(self) -> str:
+        return self.POLYMARKET_RELAYER_API_KEY_ADDRESS
 
     @property
     def polygon_rpc_url(self) -> str:
@@ -82,6 +92,7 @@ class BotConfig:
                 "POLYMARKET_API_KEY",
                 "POLYMARKET_SECRET",
                 "POLYMARKET_PASSPHRASE",
+                "POLYMARKET_RELAYER_API_KEY",
                 "PRIVATE_KEY",
             }
             for k in secret_keys:
@@ -139,12 +150,13 @@ def load_config(env_path: Union[str, Path] = ".env") -> BotConfig:
     file_vars: Dict[str, str] = {}
 
     if path.is_file():
-        # Try loading via python-dotenv if available
+        # Read the file without mutating os.environ. `load_dotenv` writes new
+        # keys into the process environment even with override=False, which made
+        # a later load_config() in the same process inherit a previous file's
+        # values and broke the documented "os.environ wins" precedence.
         try:
-            from dotenv import dotenv_values, load_dotenv
+            from dotenv import dotenv_values
 
-            load_dotenv(dotenv_path=path, override=True)
-            # Also read values directly from file
             file_values = dotenv_values(dotenv_path=path)
             file_vars.update({k: v for k, v in file_values.items() if v is not None})
         except ImportError:
@@ -177,7 +189,11 @@ def load_config(env_path: Union[str, Path] = ".env") -> BotConfig:
         POLYMARKET_PASSPHRASE=_get_val("POLYMARKET_PASSPHRASE", ""),
         PRIVATE_KEY=_get_val("PRIVATE_KEY", ""),
         PROXY_WALLET_ADDRESS=_get_val("PROXY_WALLET_ADDRESS", ""),
-        POLYGON_RPC_URL=_get_val("POLYGON_RPC_URL", "https://polygon-rpc.com"),
+        POLYMARKET_RELAYER_API_KEY=_get_val("POLYMARKET_RELAYER_API_KEY", ""),
+        POLYMARKET_RELAYER_API_KEY_ADDRESS=_get_val(
+            "POLYMARKET_RELAYER_API_KEY_ADDRESS", ""
+        ),
+        POLYGON_RPC_URL=_get_val("POLYGON_RPC_URL", ""),
         CLOB_API_URL=_get_val("CLOB_API_URL", "https://clob.polymarket.com"),
         CLOB_WS_URL=_get_val("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
     )

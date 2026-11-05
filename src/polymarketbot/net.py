@@ -58,6 +58,21 @@ def _doh_query(name: str, rtype: str = "A") -> list[dict]:
     raise RuntimeError(f"DoH lookup failed for {name}: {last}")
 
 
+def _tcp_reachable(ip: str, port: int = 443, timeout: float = 2.0) -> bool:
+    """Return True if a TCP handshake to ``ip:port`` succeeds.
+
+    CloudFront answers rotate across edge IPs; a single edge can be refused by
+    the local firewall (WinError 10013) while its siblings work. Probing the
+    candidate before caching stops a bad edge from being pinned for the whole
+    cache TTL.
+    """
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def resolve_ipv4(host: str, depth: int = 0) -> str:
     """Resolve a host to an IPv4 address, following CNAME chains."""
     if host in _CACHE:
@@ -73,13 +88,23 @@ def resolve_ipv4(host: str, depth: int = 0) -> str:
     RESILIENT_CF_FALLBACK = "104.18.35.205"
 
     answers = _doh_query(host, "A")
+    candidates: list[str] = []
     for a in answers:
         if a.get("type") == 1:
             ip = a["data"]
             if ip in BLOCKED_IPS:
                 ip = RESILIENT_CF_FALLBACK
+            if ip not in candidates:
+                candidates.append(ip)
+    for ip in candidates:
+        if _tcp_reachable(ip):
             _CACHE[host] = (time.time() + 300, ip)
             return ip
+    if candidates:
+        # Every edge refused the probe: cache the first anyway so callers get a
+        # fast, explicit failure instead of re-running DoH on every connection.
+        _CACHE[host] = (time.time() + 300, candidates[0])
+        return candidates[0]
 
     for a in answers:
         if a.get("type") == 5:

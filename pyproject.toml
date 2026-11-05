@@ -8,16 +8,20 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "cryptography>=50.0.2",
     "duckdb>=2.0.0",
     "loguru>=0.7.3",
+    "orjson>=3.13.0",
     "ortools>=9.15.6755",
-    "pycryptodome>=4.2.0",
+    "pyarrow>=26.0.0",
+    "pycryptodome>=3.24.1,<4",
     "pytz>=2026.6",
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
     "rich>=15.0.0",
     "scipy>=1.18.1",
     "streamlit>=1.66.1",
+    "synpath",
     "tqdm>=4.70.1",
     "websockets>=17.4",
 ]
