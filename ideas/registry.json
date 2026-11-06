@@ -198,8 +198,9 @@
    "module": "ideas.micro-qmin-equalisation.module",
    "metric": "Paired per-condition rewards_usd against reactionary at unchanged fill_notional, with the distribution of Q1/Q2 per update and the fraction of updates outside [0.8, 1.25] reported; the deciding number is the paired reward delta per condition. Caveat the run must respect: paper_trading/rewards.compute_epoch_payout sums per-token bid+ask scores with no Q_min and no c factor, so rewards_usd on today's engine cannot express this claim; the run needs the Q1/Q2 proxy from the per-token epoch snapshots or a scoring patch in rewards.py before this metric can falsify anything.",
    "kill": "Kill if Q1/Q2 stays inside [0.8, 1.25] in 90 % or more of updates (nothing to equalise), or if the paired reward gain is under 3 % on both slices, or if fill_notional rises by more than 5 %.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "killed",
+   "author": "IdeaGenMicro",
+   "kill_reason": "Refuted by the venue formula we now implement: Q_norm = Q_two + min(Q_one, Q_two)/3. When both sides rest, Q_one = 0 and Q_norm = Q_two = the plain sum, so unequal side sizes are NOT penalised. The idea assumed Q_min caps the smaller side inside a two-sided book, which the published rule does not do."
   },
   {
    "slug": "micro-queue-erosion-velocity",
@@ -304,8 +305,9 @@
    "module": "ideas.micro-time-vs-size.module",
    "metric": "Two numbers, both required: (a) reward_usd / fill_notional at min size versus at full size, which is the invariance check, and (b) paired per-condition net against reactionary, the deciding number. A violation of (a) beyond 10 % means the model is wrong, not that the strategy is good.",
    "kill": "Kill if reward_usd / fill_notional changes by more than 25 % between min and full size (the linearity assumption is false and every reward-sizing idea here needs rebasing), or if paired net is not positive on both slices, or if fills fall below the 200-fill / 50-condition gate.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "killed",
+   "author": "IdeaGenMicro",
+   "kill_reason": "Refuted by the capital sweep on the frozen slice: net rises from $35.19 to $88.76 as the per-market multiplier goes 0.10 to 1.00. Minimum size with full presence is the losing side of that trade-off here."
   },
   {
    "slug": "micro-two-sided-coupling",
@@ -416,10 +418,11 @@
    "module": "Act only when `kalshi_age_ms <= 6000` and `kalshi_conf >= 0.6`. basis > +3 -> SHRINK the YES ask to 0.25 and keep the bid; basis < -3 -> mirror; |basis| > 8 -> PULL. The mapping direction is applied before the sign is read: for a `yes_no` row the basis is...",
    "metric": "Paired per-condition net and markout over the 53 reward-universe mapped conditions, versus `queue_aware_ofi` on the same slice.",
    "kill": "Kill if paired net <= 0 or t < 2 on two slices, or the basis-conditioned markout gain is < 0.5 c/share, or the 5 s deciles stay non-monotone on a >= 7 day sample (the slope then belongs to one family with < 10 pairs and cannot be quoted).",
-   "status": "done",
+   "status": "blocked",
    "author": "IdeaGenCross",
    "verdict": "inert",
-   "result": "data/derived/replay/20261106T0615_30m_o0_cross-kalshi-basis-side-pull"
+   "result": "data/derived/replay/20261106T0629_30m_o0_cross-kalshi-basis-side-pull",
+   "blocked_reason": "PM mid is 255 s stale at the median (p90 2,634 s) and the basis never exceeds 1.72 logit points, so the spec's +/-3 threshold is unreachable. The mapping targets reward-tail markets: median 2 book events per condition over 6 hours, 47 of 107 with zero."
   },
   {
    "slug": "cross-kalshi-trade-lead-gate",
@@ -636,6 +639,21 @@
    "kill": "Kill if the AUC gain over the PM OFI gate is < 0.03, or paired net <= 0, or if the AUC gain vanishes under a one-tick quote (the signal then only matters where the spread is wide), or if one condition carries > 50 % of the effect.",
    "status": "proposed",
    "author": "IdeaGenCross"
+  },
+  {
+   "slug": "micro-adaptive-exit",
+   "title": "Withdraw from a market that has stopped paying for itself",
+   "claim": "A market whose own realised P&L per fill is negative after at least 8 fills is not paying for the reward it earns; withdrawing improves paired net on the withdrawn subset without hurting the kept one.",
+   "mechanism": "Reward is payment for resting, adverse selection is the price; which dominates is market-specific and only visible in our own fills, so the rule is adaptive and per market.",
+   "data": "DecisionContext: realized_pnl, fills_count, rate_per_day",
+   "module": "After MIN_FILLS=8, PULL both sides while realized_pnl < 0; re-evaluate every 60 decisions.",
+   "metric": "Paired per-condition net on the withdrawn subset and on the kept subset, reported separately.",
+   "kill": "Kill if fewer than 20 conditions are withdrawn, or if the kept subset loses more than the withdrawn subset gains.",
+   "status": "blocked",
+   "author": "Main",
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0625_10m_o0_micro-adaptive-exit",
+   "blocked_reason": "Needs >=8 fills per market; a 10-minute slice produces ~1.2 fills per market across 500 markets. Re-run on a multi-hour slice."
   }
  ]
 }

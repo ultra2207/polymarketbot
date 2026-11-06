@@ -193,6 +193,33 @@ The next real test is therefore not another sizing rule. It is either a
 **cross-venue** rule with its signal materialised. Both are now unblocked by the
 harness; neither has been measured.
 
+## Where to quote: the spread sweep
+
+Baseline (`reactionary`), frozen slice 05:55Z, 500 markets, 10 minutes:
+
+| offset from mid | fills | rewards | net | median markout |
+|---|---|---|---|---|
+| **0.75c** | 59 | \$12.11 | **−\$8.18** | +222 bps |
+| 1.50c | 43 | \$10.06 | −\$9.14 | +375 bps |
+| 3.00c | 31 | \$5.17 | −\$10.84 | +600 bps |
+| 5.00c | 22 | \$0.64 | −\$13.39 | +1132 bps |
+
+Wider quotes are hit less and their fills are less adverse — and it does not
+matter, because the reward score falls faster than the markout improves. The
+tightest offset the tick allows wins on every slice where it has been run, which
+is why the production default is already 0.75c. Net is negative on this slice at
+every width; that is a property of the slice, not of the offset.
+
+## Two ideas the data refutes outright
+
+| idea | why it dies |
+|---|---|
+| `micro-qmin-equalisation` | The venue pays `Q_norm = Q_two + min(Q_one, Q_two)/3`. With both sides resting `Q_one = 0`, so `Q_norm` is the plain sum and unequal sizes are **not** penalised. The idea assumed the opposite. |
+| `micro-time-vs-size` | Refuted by the capital sweep: net rises \$35.19 → \$88.76 as the multiplier goes 0.10 → 1.00. Minimum size is the losing side. |
+
+Both are marked `killed` in the registry with the measurement attached, so a
+later agent cannot resurrect them without new evidence.
+
 ## Why the cross-venue family is blocked: the mapped markets are silent
 
 The first cross-venue idea (`cross-kalshi-basis-side-pull`) was implemented end
@@ -205,6 +232,9 @@ the verdict is `inert`. The reason is data, not code:
 | mapped conditions in the reward set | 53 of 107 |
 | assets with any book event in a two-hour window | 28 |
 | book events per minute across the whole mapped set | **1–3** |
+| book events per mapped condition over 6 hours | median **2**, 47 of 107 with **zero**, 6 with ≥500 |
+| PM-mid staleness in the basis join | median **255 s**, p90 **2,634 s** |
+| maximum \|basis\| observed | **1.72** logit points (the spec's ±3 is unreachable) |
 | fills in a 30-minute slice on 53 mapped markets | **0** |
 
 The Kalshi mapping targets reward-tail markets: they carry the pool, but almost

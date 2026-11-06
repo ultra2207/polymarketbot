@@ -267,6 +267,7 @@ def run_strategy(
         engine = PaperTradingEngine(
             initial_cash_usd=float(args.flat if args.flat > 0 else max(10.0, args.pool_multiplier * float(m.get("daily_pool") or 0.0))),
             default_quote_size=shares,
+            base_spread_offset_cents=float(args.spread_offset),
             max_inventory_shares=max(min_size, shares * 3.0),
             ledger_path=tag_dir / "ledgers" / f"{m['condition_id'][:18]}.json",
             strategy=load_strategy(strategy_name),
@@ -577,6 +578,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--notional-min", type=float, default=10.0)
     parser.add_argument("--notional-max", type=float, default=500.0)
     parser.add_argument("--flat", type=float, default=0.0, help="flat notional per market; 0 = pool-scaled")
+    parser.add_argument(
+        "--spread-offset",
+        type=float,
+        default=0.75,
+        help="cents from the mid at which the baseline rests (the where-to-quote lever)",
+    )
     parser.add_argument("--max-markets", type=int, default=0)
     parser.add_argument("--order-by", default="liquidity", choices=("pool", "liquidity", "volume"))
     parser.add_argument(
@@ -584,6 +591,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="restrict the universe to the conditions in the Kalshi mapping, where the "
         "cross-venue signals exist",
+    )
+    parser.add_argument(
+        "--mapping",
+        type=Path,
+        default=REPO_ROOT / "data" / "derived" / "kalshi_mapping_v2.parquet",
+        help="mapping used by --mapped (the active subset is kalshi_mapping_active.parquet)",
     )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--tag", default=None)
@@ -593,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     universe_path = args.universe or latest_universe(DEFAULT_UNIVERSE)
     markets = load_universe(universe_path, min_pool=args.min_pool, order_by=args.order_by)
     if args.mapped:
-        mapped = pd.read_parquet(REPO_ROOT / "data" / "derived" / "kalshi_mapping_v2.parquet")
+        mapped = pd.read_parquet(args.mapping)
         keep = set(mapped["polymarket_condition_id"].astype(str))
         markets = [m for m in markets if str(m["condition_id"]) in keep]
         log.info(f"mapped-only universe: {len(markets)} of {len(keep)} mapped conditions are in the reward set")
