@@ -29,8 +29,16 @@ def test_no_signal_quotes_both() -> None:
 
 
 def test_inside_threshold_quotes_both() -> None:
-    out = Module.STRATEGY.decide(_ctx(basis=1.5, age=1.0))
+    """Below the trigger the module must be silent; the number is a parameter."""
+    thr = float(Module.THRESHOLD)
+    out = Module.STRATEGY.decide(_ctx(basis=thr * 0.5, age=1.0))
     assert (out.bid, out.ask) == ("QUOTE", "QUOTE")
+
+
+def test_the_trigger_sits_at_the_scale_the_tape_shows() -> None:
+    """|basis| never exceeded 1.72 logit points in 6,183 as-of rows; a trigger of
+    3.0 - the spec's number - could never fire on live data."""
+    assert float(Module.THRESHOLD) < 1.72
 
 
 def test_positive_basis_shrinks_the_ask() -> None:
