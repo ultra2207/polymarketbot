@@ -364,6 +364,14 @@ def run_strategy(
         log.info(f"[{strategy_name}] no prepared signals; context.signals stays empty")
     else:
         log.info(f"[{strategy_name}] prepared signals for {len(signals._series)} assets")
+    fee_schedule: dict[str, tuple[float, float, bool]] = {}
+    for m in markets:
+        fee_schedule[str(m["condition_id"])] = (
+            float(m.get("fee_rate") or 0.0),
+            float(m.get("fee_rebate") or 0.0),
+            bool(m.get("fees_enabled")),
+        )
+
     for m in markets:
         tokens = [str(t) for t in m["clob_tokens"][:2]]
         min_size = float(m.get("min_size") or 0.0)
@@ -443,6 +451,7 @@ def run_strategy(
     )
 
     fills: list[dict[str, Any]] = []
+    cond_rebate: dict[str, float] = {}
     last_step = math.floor(start)
     last_epoch = math.floor(start)
     started = time.perf_counter()
@@ -539,6 +548,14 @@ def run_strategy(
             row["condition_id"] = owner
             row["strategy"] = strategy_name
             row["fill_ts"] = fill_t
+            rate_f, rebate_f, fees_on = fee_schedule.get(str(owner), (0.0, 0.0, False))
+            px_f = float(row.get("fill_price") or 0.0)
+            if fees_on and rate_f > 0.0 and rebate_f > 0.0:
+                taker_fee = rate_f * min(px_f, 1.0 - px_f) * float(row.get("fill_size") or 0.0)
+                row["rebate_usd"] = rebate_f * taker_fee
+                cond_rebate[str(owner)] = cond_rebate.get(str(owner), 0.0) + row["rebate_usd"]
+            else:
+                row["rebate_usd"] = 0.0
             row["markout_5m"] = None  # filled after the series is complete
             fills.append(row)
 
@@ -593,14 +610,21 @@ def run_strategy(
                 # figure on a synthetic-print replay is dominated by the mid the
                 # print stream moves, so this is the only comparable currency.
                 "markout_tape_bps_mean": _mean(cond_marks.get(str(cond), [])),
+                "rebate_usd": round(cond_rebate.get(str(cond), 0.0), 6),
                 "tape_net": round(
-                    float(engine.total_rewards_earned_usd) + cond_tape_pnl.get(str(cond), 0.0), 6
+                    float(engine.total_rewards_earned_usd)
+                    + cond_rebate.get(str(cond), 0.0)
+                    + cond_tape_pnl.get(str(cond), 0.0),
+                    6,
                 ),
                 "fills": sum(p.fills_count for p in engine.positions.values()),
                 "cash": float(engine.cash_usd),
                 "inventory_mtm": float(inventory),
                 "rewards_usd": float(engine.total_rewards_earned_usd),
-                "net": float(engine.cash_usd - engine.initial_cash_usd + inventory + engine.total_rewards_earned_usd),
+                "net": float(
+                    engine.cash_usd - engine.initial_cash_usd + inventory
+                    + engine.total_rewards_earned_usd + cond_rebate.get(str(cond), 0.0)
+                ),
                 "epochs": int(engine.epoch_count),
                 "competition_observed": bool(
                     any(engine.asset_to_condition.get(a) == cond for a in observed)
@@ -863,6 +887,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "net": round(float(frame["net"].sum()), 4),
             "rewards_usd": round(float(frame["rewards_usd"].sum()), 4),
+            "rebate_usd": round(float(frame.get("rebate_usd", pd.Series(dtype=float)).sum()), 4),
             "inventory_mtm": round(float(frame["inventory_mtm"].sum()), 4),
             "markets_with_fills": int((frame["fills"] > 0).sum()),
             "markout_5m_bps": round(float(sum(marks) / len(marks)), 2) if marks else None,

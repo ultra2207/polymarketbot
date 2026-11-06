@@ -99,14 +99,32 @@ def market_metadata(conditions: list[str]) -> dict[str, dict[str, Any]]:
     placeholders = ",".join("?" for _ in conditions)
     query = f"""
         select conditionId, slug, question, clobTokenIds, rewardsMinSize,
-               rewardsMaxSpread, rewards_daily_rate, volume, liquidity, active, closed
+               rewardsMaxSpread, rewards_daily_rate, volume, liquidity, active, closed,
+               feesEnabled, feeType
         from '{GAMMA.as_posix()}'
         where conditionId in ({placeholders})
     """
     out: dict[str, dict[str, Any]] = {}
-    for cid, slug, question, tokens, min_size, max_spread, rate, vol, liq, active, closed in (
-        con.execute(query, conditions).fetchall()
-    ):
+    # The Gamma snapshot names the fee schedule but not its numbers; the numbers
+    # live in the reward-universe snapshot. Learn rate/rebate per fee type from
+    # the markets where both are known rather than guessing a rate.
+    schedule: dict[str, tuple[float, float]] = {}
+    universe_dir = TAPE / "universe"
+    snaps = sorted(
+        (p for p in universe_dir.glob("*.json") if p.stem[:8].isdigit()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if snaps:
+        for m in json.loads(snaps[-1].read_text(encoding="utf-8")).get("markets") or []:
+            ftype = str(m.get("fee_type") or "")
+            if ftype and ftype != "None" and m.get("fee_rate"):
+                schedule.setdefault(ftype, (float(m["fee_rate"]), float(m.get("fee_rebate") or 0.0)))
+
+    for (
+        cid, slug, question, tokens, min_size, max_spread, rate, vol, liq,
+        active, closed, fees_on, fee_type,
+    ) in con.execute(query, conditions).fetchall():
+        fee_rate, fee_rebate = schedule.get(str(fee_type or ""), (0.0, 0.0))
         if not tokens:
             continue
         try:
@@ -128,6 +146,12 @@ def market_metadata(conditions: list[str]) -> dict[str, dict[str, Any]]:
             "liquidity": float(liq or 0.0),
             "active": bool(active),
             "closed": bool(closed),
+            # The maker earns a share of the taker fee on fee-enabled markets.
+            # A market missing from the snapshot keeps fees off: an unknown fee
+            # must never be invented as revenue.
+            "fees_enabled": bool(fees_on) and fee_rate > 0.0,
+            "fee_rate": float(fee_rate),
+            "fee_rebate": float(fee_rebate),
         }
     return out
 
@@ -194,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 "clob_tokens": fallback[cid], "min_size": DEFAULT_MIN_SIZE,
                 "max_spread": DEFAULT_MAX_SPREAD, "daily_pool": 0.0,
                 "volume": 0.0, "liquidity": 0.0, "active": True, "closed": False,
+                "fees_enabled": False, "fee_rate": 0.0, "fee_rebate": 0.0,
             }
         if m is None:
             dropped += 1
