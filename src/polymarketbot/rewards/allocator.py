@@ -555,7 +555,7 @@ def calculate_endogenous_reserve(
                 from polymarketbot.trading.ctf import estimate_merge_cost_usd
                 gas_cost_merge = estimate_merge_cost_usd()
         except Exception:
-            gas_cost_merge = 0.015
+            gas_cost_merge = 0.0016
         # Dynamic gas buffer: ~100 merge operations base headroom + 25 per-market merge operations
         dynamic_gas_buffer = max(0.20, round(gas_cost_merge * 100.0, 2))
         per_market_buffer = max(0.05, round(gas_cost_merge * 25.0, 2))

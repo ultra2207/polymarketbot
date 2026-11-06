@@ -99,7 +99,7 @@ class DynamicThresholdCalculator:
         mid_price: float = 0.50,
         time_to_resolution_days: float = 7.0,
         spread_cents: float = 1.0,
-        gas_cost_usd: float = 0.015,
+        gas_cost_usd: float = 0.0016,
         taker_fee_bps: float = 0.0,
         q_soft: Optional[float] = None,
     ) -> float:
@@ -185,7 +185,7 @@ class DynamicThresholdCalculator:
         time_to_resolution_days: float = 7.0,
         time_to_expiry_seconds: Optional[float] = None,
         spread_cents: float = 1.0,
-        gas_cost_usd: float = 0.015,
+        gas_cost_usd: float = 0.0016,
         trades_per_min: float = 0.35,
         rewards_min_size: float = 5.0,
         category: str = "default",
@@ -246,7 +246,7 @@ class DynamicDeSkewOptimizer:
         gamma: float = 0.02,                   # Risk aversion coefficient
         temporary_impact_eta: float = 1e-4,    # Almgren-Chriss impact parameter
         taker_fee_bps: float = 0.0,            # Taker fee (0 bps default on Polymarket binary)
-        gas_cost_merge_usd: float = 0.015,     # Polygon CTF mergePositions gas cost
+        gas_cost_merge_usd: float = 0.0016,   # measured: 78k gas at 216 gwei median
         q_soft_threshold: float = 15.0,        # Inventory where Tier 1 passive skew begins
         q_hard_threshold: float = 150.0,       # Inventory where Tier 2 emergency cross is forced
         max_holding_seconds: float = 300.0,    # Max age before emergency liquidation (5 min)

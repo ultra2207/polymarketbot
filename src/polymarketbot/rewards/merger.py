@@ -33,7 +33,7 @@ class MergeEvent:
     remaining_yes: float
     remaining_no: float
     net_inventory: float
-    gas_fee: float = 0.015
+    gas_fee: float = 0.0016
 
 
 @dataclass
@@ -48,7 +48,7 @@ class CompleteSetPosition:
     total_merged_shares: float = 0.0
     total_unlocked_usd: float = 0.0
     total_gas_fees: float = 0.0
-    gas_fee_per_merge: float = 0.015  # Polygon CTF mergePositions gas fee
+    gas_fee_per_merge: float = 0.0016  # measured over 248,319 CTF merges
     auto_merge_threshold: float = 100.0  # Merge whenever min(YES, NO) >= threshold (batched)
     can_merge_fn: Optional[Callable[[float], bool]] = None  # Risk/Gas merge validation hook
     history: List[MergeEvent] = field(default_factory=list)

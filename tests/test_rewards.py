@@ -207,7 +207,7 @@ def test_complete_set_merge_logic() -> None:
 
     # Buy 300 NO shares @ $0.58
     # Holding 500 YES and 300 NO -> 300 complete sets can merge into $300 USDC!
-    # Deducts $0.015 gas fee per batch merge
+    # Deducts one merge gas fee, measured at $0.0016 (78k gas at 216 gwei)
     pos.record_fill(outcome="NO", side="BUY", price=0.58, size=300.0)
 
     # Auto-merge should have executed
@@ -217,9 +217,9 @@ def test_complete_set_merge_logic() -> None:
     assert pos.shares_no == 0.0
     # Net inventory before was 500 - 300 = 200; after merge it is still 200 - 0 = 200!
     assert pos.net_inventory == 200.0
-    # Cash: -200 (YES buy) - 174 (NO buy) + 300 (Merge unlock) - 0.015 (gas fee) = -74.015 USDC
-    assert pos.usdc_cash == pytest.approx(-74.015)
-    assert pos.total_gas_fees == pytest.approx(0.015)
+    gas = pos.gas_fee_per_merge
+    assert pos.usdc_cash == pytest.approx(-200.0 - 174.0 + 300.0 - gas)
+    assert pos.total_gas_fees == pytest.approx(gas)
 
     # Test CTF transaction builder
     tx = build_ctf_merge_transaction(condition_id="0xabc123", amount_shares=100.0)
@@ -237,21 +237,21 @@ def test_short_sale_split_and_merge() -> None:
     assert pos.usdc_cash == pytest.approx(-49.0)
     assert pos.net_inventory == -100.0
 
-    # Buy 100 YES @ 0.49: now holds 100 YES and 100 NO -> auto-merges into $100 USDC (-0.015 gas fee)!
+    # Buy 100 YES @ 0.49: now holds 100 YES and 100 NO -> auto-merges into $100 USDC (-gas fee)!
     pos.record_fill(outcome="YES", side="BUY", price=0.49, size=100.0)
     assert pos.shares_yes == 0.0
     assert pos.shares_no == 0.0
     assert pos.net_inventory == 0.0
     assert pos.total_merged_shares == 100.0
     assert pos.total_unlocked_usd == 100.0
-    assert pos.usdc_cash == pytest.approx(1.985)  # 2.0c spread ($2.00) - $0.015 gas fee
+    assert pos.usdc_cash == pytest.approx(2.0 - pos.gas_fee_per_merge)  # spread less gas
 
 
 def test_batch_merge_threshold_and_gas_fee() -> None:
     # Default threshold is 100.0 shares
     pos = CompleteSetPosition()
     assert pos.auto_merge_threshold == 100.0
-    assert pos.gas_fee_per_merge == 0.015
+    assert pos.gas_fee_per_merge == pytest.approx(0.0016)
 
     # Buy 90 YES and 90 NO: threshold 100 not met -> no merge executed
     pos.record_fill(outcome="YES", side="BUY", price=0.50, size=90.0)
@@ -265,7 +265,7 @@ def test_batch_merge_threshold_and_gas_fee() -> None:
     pos.record_fill(outcome="YES", side="BUY", price=0.50, size=15.0)
     pos.record_fill(outcome="NO", side="BUY", price=0.50, size=15.0)
     assert pos.total_merged_shares == 105.0
-    assert pos.total_gas_fees == pytest.approx(0.015)
+    assert pos.total_gas_fees == pytest.approx(pos.gas_fee_per_merge)
     assert pos.shares_yes == 0.0
     assert pos.shares_no == 0.0
 

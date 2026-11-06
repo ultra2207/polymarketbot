@@ -80,7 +80,7 @@ class PaperTradingEngine:
         max_inventory_shares: float = 1000.0,
         max_skew_cents: float = 0.5,
         auto_merge_threshold: float = 100.0,
-        merge_gas_fee_usd: float = 0.015,
+        merge_gas_fee_usd: float = 0.0016,
         ledger_path: str | Path = "data/processed/paper_trading/ledger.json",
         risk_manager: Optional[RiskManager] = None,
         microstructure_gate: bool = False,
