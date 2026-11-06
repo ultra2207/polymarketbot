@@ -16,7 +16,7 @@ minute at a random offset. Two things follow that the current decision stack ign
    of the band is worth less than its displayed snapshot, and a market whose band depth
    is spiky is worth *more* than a market with the same average depth and a flat book
    (Jensen). The engine's `competing_score` is an instantaneous snapshot recomputed on
-   every book update (`src/polymarketbot/paper_trading/engine.py:311-313`, surfaced as
+   every book update (`src/polymarketbot/paper_trading/engine.py:307-319`, surfaced as
    `BookContext.competing_score`, `src/polymarketbot/strategy/base.py:79`), so a rule
    built directly on it is measuring the wrong moment.
 2. **Presence is a per-minute Bernoulli, so reacting to an instantaneous spike is
@@ -45,10 +45,19 @@ share_avg = S * A / T                          # venue-consistent expected share
 share_now = S / (S + C)
 ```
 
-Decision: `QUOTE` both sides while `share_avg` is above the market's entry bar. Do **not**
-pull on `share_now < share_avg / 2` unless the low-share state has occupied more than
-50 % of the trailing 60 s (tracked as `frac_dwell`). Because `A` and `T` are
-event-timestamped, the integral is independent of how often the tape updates the book.
+Decision: a protective `PULL` is permitted only when the crowd is *durable*, i.e. when the
+integral itself has fallen:
+
+```
+share_ref = time-weighted share over the first 10 min (the market's reference)
+pull_ok   = share_avg <= 0.8 * share_ref      # the minute average moved, not just a print
+never pull on share_now alone                 # a spike that may not be sampled is not news
+```
+
+`frac_dwell` (time in the last 60 s with `share_now < 0.5 * share_ref`) is logged as the
+mechanism check, not used as the trigger. Because `A` and `T` are event-timestamped, the
+integral is independent of how often the tape updates the book, so a slow market and a fast
+market are scored on the same scale.
 
 The market-level companion (a `prepare.sql` alternative, if the in-module buffer proves
 too noisy) is a per-(asset, second) `C` series with columns
@@ -57,7 +66,7 @@ last `book` snapshot — the same reconstruction the harness already performs wi
 `Ladder` (`scripts/replay_all_markets.py:213-233`).
 
 **Already implemented:** nothing of this. The engine stores a snapshot only
-(`engine.py:311-313`); the reward sample reads that snapshot once per minute
+(`engine.py:307-319`); the reward sample reads that snapshot once per minute
 (`engine.py:1240-1262`). No code averages `C` over time, and no sampler randomises the
 offset. The 3.5 s minimum-rest rule (`src/polymarketbot/rewards/scoring.py:73,105`) is
 *not* enforced by the replay's scoring path at all (`engine.py:710-711` calls

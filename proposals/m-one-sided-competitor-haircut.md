@@ -17,7 +17,7 @@ with us; a competitor who rests on both contributes all of it.
 Our measure of competition does not know this. `compute_competing_depth_score` sums every
 qualifying bid and every qualifying ask into one number
 (`src/polymarketbot/paper_trading/rewards.py:38-92`), and the engine stores that single value
-as `orderbooks[asset]["competing_score"]` (`src/polymarketbot/paper_trading/engine.py:311-313`),
+as `orderbooks[asset]["competing_score"]` (`src/polymarketbot/paper_trading/engine.py:307-319`),
 which is what every rule reads as `BookContext.competing_score` (`base.py:79`). So a market
 whose band is one walled side is scored as if the wall were three times its venue weight.
 Our true share there is `S/(S + C/3)`, not `S/(S + C)`.
@@ -32,11 +32,20 @@ the ledger, which no existing idea does.
 `prepare.sql` emits, per (asset, second), the band score split by side:
 
 ```
-C_bid = sum over levels with 0 <= (mid - p)*100 <= v of ((v - s)/v)^2 * size
-C_ask = sum over levels with 0 <= (p - mid)*100 <= v of ((v - s)/v)^2 * size
-C_eff = (C_bid + C_ask)                       if C_bid > eps and C_ask > eps
-        max(C_bid, C_ask) / 3.0               otherwise
+s_b   = (mid - p) * 100      # bid distance, cents
+C_bid = sum over bids with 0 <= s_b <= v of ((v - s_b)/v)^2 * size
+s_a   = (p - mid) * 100      # ask distance, cents
+C_ask = sum over asks with 0 <= s_a <= v of ((v - s_a)/v)^2 * size
+C_eff = C_bid + C_ask                     if C_bid >= eps and C_ask >= eps
+        max(C_bid, C_ask) / 3.0           otherwise
+# eps = the smallest qualifying score, i.e. ((v - v)/v)^2 is 0, so use one
+# minimum-size order at the tightest legal distance: ((v - s_min)/v)^2 * min_size
 ```
+
+This is an approximation of a per-maker quantity from aggregate book data: one maker resting
+both sides and two makers resting one side each look the same in the tape. It is the
+conservative direction only when depth is balanced; where the two sides differ by more than
+2:1 the approximation is exact enough, because the dominant side is what sets the score.
 
 In `decide(ctx)` use `signals["C_eff"]` in place of `ctx.book.competing_score` wherever the
 rule prices competition (entry rank, presence, or any share estimate). Layout per

@@ -41,11 +41,23 @@ conclusion about merging, gas or capital recycling in the existing results is va
 ## Rule
 
 Engine/portfolio rule: set the merge threshold to the smallest economically meaningful
-pair, `auto_merge_threshold = max(1.0, 1.0 * min_size)` — a single fill pair — and merge
-on the *first* call after `min(yes, no) >= 1`. Gas break-even per merge is
-`N* = gas / (1 - mid_YES - mid_NO)`; with a touch spread of ~1c and `v >= 1c`,
-`1 - mid sum <= 0.005`, so `N* <= 3` shares. Above three shares gas is already repaid by
-the mark improvement alone, and the capacity benefit is additional.
+pair, `auto_merge_threshold = max(1.0, 1.0 * min_size)` — a single fill pair — and merge on
+the *first* call after `min(yes, no) >= 1`.
+
+Be honest about the break-even, because it is a time budget, not a share count. With the two
+books consistent the pair's mids sum to 1, so the merge is MTM-neutral and the only return is
+the restored side. That side earns, per minute,
+
+```
+(rate_per_day / 1440) * share * w * quote_size
+```
+
+which at `rate_per_day = $7.5` (a $30 pool at the 0.25 multiplier), `share = 0.2`,
+`w = ((1c - 0.75c)/1c)^2 = 0.06` and `quote_size = 20` is about **$0.00125/min**. Gas of
+$0.015 is therefore repaid by roughly **12 minutes of restored two-sided quoting**. Two
+consequences: a 10-minute slice cannot show the benefit (it should not), and the test must be
+run at `--pool-multiplier 1.0` (fact 7's rule) or with `--minutes 60`, where the same quote
+earns 4x and the break-even is ~3 minutes.
 
 Module-expressible companion, for the half a module *can* control: when
 `abs(ctx.inventory_shares) / ctx.max_inventory_shares > 0.5` (`base.py:99-100`) and the

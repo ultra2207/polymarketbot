@@ -1,0 +1,46 @@
+{
+ "strategy": "micro-burst-decay-reentry",
+ "slices": [
+  {
+   "strategy": "micro-burst-decay-reentry",
+   "stats": {
+    "fills": 65,
+    "fills_recorded": 65,
+    "net": -112.2047,
+    "rewards_usd": 0.3469,
+    "inventory_mtm": 202.6374,
+    "markets_with_fills": 22,
+    "markout_5m_bps": -330.71,
+    "markout_5m_bps_n": 61,
+    "markout_5m_bps_median": 211.27,
+    "markout_tape_bps_median": 75.76,
+    "markout_tape_bps_mean": 805.84,
+    "rewards_observed": 0.0,
+    "rewards_unobserved_competition": 0.3469,
+    "markets_competition_observed": 0,
+    "events": 5718,
+    "elapsed_s": 49.06
+   },
+   "paired": {
+    "conditions": 70,
+    "mean_diff": 277.20333,
+    "t": 1.294,
+    "total_diff": 19404.2328,
+    "concentration": 0.772
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793933400.0,
+    1793934600.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T08:05:54.455596+00:00"
+}

@@ -44,8 +44,8 @@ priced by the maker who fills us, and pulling there would forfeit the pool for n
 
 **Already implemented:** event identity is carried end to end — `MarketConfig.event_id`
 (`src/polymarketbot/paper_trading/models.py`) and `_event_exposure`
-(`src/polymarketbot/paper_trading/engine.py:370-378`) aggregate market value and cost across
-every condition in one event, feeding `validate_quote` (`engine.py:645-700`). **But the replay
+(`src/polymarketbot/paper_trading/engine.py:360-377`) aggregate market value and cost across
+every condition in one event, feeding `validate_quote` (`engine.py:651-699`). **But the replay
 attaches no risk manager** (`scripts/replay_all_markets.py:363-368`), so event limits never
 bind in any measured result. **Not implemented:** the overround as a signal, and any leg-count
 or leg-rank rule.

@@ -24,10 +24,10 @@ maker actually took, and the quadratic pays more for the same order:
 share, for free. When `delta < 0` the credit is negative. The maker should therefore stand on
 the token with the favourable basis, and the basis is directly observable because one module
 instance sees both books of the condition (`scripts/replay_all_markets.py:387-401`; the
-engine calls `decide` once per asset, `engine.py:571-576`).
+engine calls `decide` once per asset, `engine.py:570-572`).
 
 The replay cannot see any of this: each token's spread is computed from that token's own mid
-(`engine.py:700-711`) and its competition from that token's own band (`engine.py:311-313`).
+(`engine.py:700-711`) and its competition from that token's own band (`engine.py:307-319`).
 So the basis is an unmodelled incentive, and the first question is its size. The sibling
 observation that the cross-token mid sum deviates from 1 by ~2.5c in a live hour (measured on
 188 conditions; `proposals/micro-complement-staleness.md`) says the basis is not a rounding
@@ -46,7 +46,7 @@ else:                            QUOTE both sides of YES; PULL both sides of NO
 
 Re-evaluate at most every 60 s of `ctx.seconds_elapsed` (`base.py:98`) — a basis that flips
 faster than that is stale-data noise, and switching costs queue position
-(`engine.py:723-733`).
+(`engine.py:732-737`).
 
 This is *not* `micro-complement-staleness`: that idea uses the gap as a **markout** signal
 (the lagging token is adversely selected) and pulls. This one uses the gap as a **score**

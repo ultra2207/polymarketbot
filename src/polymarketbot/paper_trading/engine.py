@@ -407,6 +407,9 @@ class PaperTradingEngine:
             bid_size_at_level=float(queue.bid_size_at_level) if queue is not None else 0.0,
             ask_size_at_level=float(queue.ask_size_at_level) if queue is not None else 0.0,
             ofi=ofi,
+            realized_pnl=float(sum(p.realized_pnl for p in self.positions.values() if self.asset_to_condition.get(p.asset_id) == cid)),
+            fills_count=int(sum(p.fills_count for p in self.positions.values() if self.asset_to_condition.get(p.asset_id) == cid)),
+            quote_size=float(self.default_quote_size),
             bid_score=float(getattr(self.virtual_quotes.get(asset_id, {}).get("bid"), "score", 0.0) or 0.0),
             ask_score=float(getattr(self.virtual_quotes.get(asset_id, {}).get("ask"), "score", 0.0) or 0.0),
             rate_per_day=float(self.markets[self.asset_to_condition[asset_id]].rate_per_day),
@@ -1235,26 +1238,35 @@ class PaperTradingEngine:
         new_snapshots: list[EpochSnapshot] = []
 
         for cid, mkt in self.markets.items():
+            # A market's daily pool is one pot that every qualifying order on
+            # either token competes for. Paying it per token would double the
+            # income of a market maker who quotes both sides of both tokens,
+            # which is exactly the shape of every strategy this harness scores.
+            token_rows: list[tuple[Any, float, float, float]] = []
+            market_score = 0.0
+            market_comp = 0.0
             for tok in mkt.tokens:
                 asset_id = tok.token_id
                 quotes = self.virtual_quotes.get(asset_id, {})
                 v_bid = quotes.get("bid")
                 v_ask = quotes.get("ask")
                 book = self.orderbooks.get(asset_id, {})
-
                 mid = book.get("mid", 0.50)
                 comp_score = book.get("competing_score", 0.0)
-
                 bid_score = v_bid.score if (v_bid and v_bid.post_only_valid) else 0.0
                 ask_score = v_ask.score if (v_ask and v_ask.post_only_valid) else 0.0
                 v_score = normalise_two_sided(bid_score, ask_score)
+                market_score += v_score
+                market_comp += comp_score
+                token_rows.append((tok, mid, v_score, comp_score))
 
-                # Polymarket splits the daily market reward proportionally
-                share_pct, epoch_payout, projected_daily = compute_epoch_payout(
-                    v_score, comp_score, mkt.rate_per_day
-                )
+            share_pct, epoch_payout, projected_daily = compute_epoch_payout(
+                market_score, market_comp, mkt.rate_per_day
+            )
+            self.total_rewards_earned_usd += epoch_payout
 
-                self.total_rewards_earned_usd += epoch_payout
+            for tok, mid, v_score, comp_score in token_rows:
+                asset_id = tok.token_id
 
                 snap = EpochSnapshot(
                     epoch_index=self.epoch_count,

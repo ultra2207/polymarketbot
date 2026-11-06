@@ -25,7 +25,7 @@ of the same fair value, so one band is often crowded while the other is empty; t
 distance also differs by the tick rounding of each mid. The module already sees both books,
 because `replay_all_markets.py` binds one strategy instance per condition
 (`scripts/replay_all_markets.py:387-401`) and the engine calls `decide` once per asset
-(`src/polymarketbot/paper_trading/engine.py:571-576`; documented in
+(`src/polymarketbot/paper_trading/engine.py:570-572`; documented in
 `micro-cross-token-substitution`).
 
 **The replay must not be trusted for this comparison as written.** `run_epoch_sample`
@@ -52,7 +52,7 @@ at most once per 30 minutes of `ctx.seconds_elapsed` (`base.py:98`) and only if 
 `value` is within 20 % of the winner's — otherwise latch and stop paying attention.
 
 Note the two caveats that apply to the winner's ask side: the venue requires inventory to
-sell, while the replay permits naked shorts (`engine.py:997-1000` treats a sell from a flat
+sell, while the replay permits naked shorts (`engine.py:992-1000` treats a sell from a flat
 position as opening a short). On the real venue the ask side is funded by splitting
 collateral (1 pUSD -> 1 YES + 1 NO, `docs/polymarket-mechanics.md` §7), which is a capital
 cost the replay does not charge.

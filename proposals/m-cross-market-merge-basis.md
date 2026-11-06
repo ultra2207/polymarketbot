@@ -9,7 +9,7 @@ markets the answer is structural and no test is needed.
 
 A complete set is defined by a `conditionId`. `execute_merge` reads the two tokens of *one*
 condition through `_get_yes_no_positions` (`src/polymarketbot/paper_trading/engine.py:1064-1081`)
-and burns `min(yes, no)` of that same condition (`engine.py:1170-1180`); the on-chain call
+and burns `min(yes, no)` of that same condition (`engine.py:1175-1180`); the on-chain call
 is `mergePositions` for that single condition (`src/polymarketbot/rewards/merger.py:167-198`).
 YES in market A and NO in market B are different ERC-1155 ids with different payout vectors,
 so there is no operation that nets them. **Cross-market merging does not exist, at any gas
@@ -52,8 +52,8 @@ convert_gate = (event_overround >= 0.01)
 `signals["event_overround"]` and `signals["event_leg_count"]` in `decide` and, while the
 gate is false, does not attempt to hold a leg purely to convert it (it quotes normally).
 The event-level risk half is already implemented but dormant: `_event_exposure`
-(`engine.py:370-378`) feeds `validate_quote`, which only runs when a risk manager is
-attached (`engine.py:645-700`) — and the replay attaches none
+(`engine.py:360-377`) feeds `validate_quote`, which only runs when a risk manager is
+attached (`engine.py:651-699`) — and the replay attaches none
 (`scripts/replay_all_markets.py:363-368`).
 
 **Already implemented:** same-condition merging (`engine.py:1137,1162`), gas accounting,

@@ -15,8 +15,8 @@ FIFO position at the level. Two costs, one of which the replay models and one it
 
 1. Queue priority: modelled. When our price differs from the previous quote the engine resets
    `queue_ahead` to the whole displayed level
-   (`src/polymarketbot/paper_trading/engine.py:723-733` for the bid, `:745-756` for the ask);
-   when the price is unchanged it retains the old `queue_ahead` (`engine.py:715-722`).
+   (`src/polymarketbot/paper_trading/engine.py:732-737` for the bid, `:761-769` for the ask);
+   when the price is unchanged it retains the old `queue_ahead` (`engine.py:723-731`).
    So a frozen price is a strictly better queue position.
 2. Eligibility: not modelled. The replay's scoring path calls
    `compute_quadratic_score(v, actual_bid_spread, bid_size)`
@@ -28,7 +28,7 @@ So the measured benefit of a reprice budget is a *lower bound*: the queue-priori
 real in the replay, and the eligibility gain is real but invisible. Freezing the price cannot
 be worse on either model, because a frozen quote still rests at the last chosen price and the
 engine's post-only clamp is re-evaluated against the current book every update
-(`engine.py:540-548`).
+(`engine.py:535-543`).
 
 ## Rule
 
@@ -38,15 +38,15 @@ would use from `ctx.book.mid`, `ctx.book.tick_size` and the offset, then:
 
 ```
 if ctx.seconds_elapsed - last_change_t[side] < 3.5:
-        return SideActions(bid_price=last_price[side], ask_price=last_price[side], ...)
+        return SideActions(bid_price=last_bid, ask_price=last_ask, ...)
 else:
         return the rule's own price, and record the change
 ```
 
 The price override is the documented mechanism for this: `SideActions.bid_price` /
 `ask_price` (`base.py:37-38`) are applied verbatim (tick-rounded, then post-only clamped) at
-`engine.py:583-596`. Resting the same price is what preserves `queue_ahead`
-(`engine.py:715-722`).
+`engine.py:583-592`. Resting the same price is what preserves `queue_ahead`
+(`engine.py:723-731`).
 
 Do **not** combine this with a re-quote-every-update policy: the budget only makes sense if
 the underlying rule would otherwise churn. Compose it as a wrapper around any price-producing

@@ -223,6 +223,20 @@ consumes at least half the level it hit - scale-free, unlike the absolute
 The sign is consistent across all three; the 70-market slice is the honest one
 and it does not clear `t >= 2`. Status: promising, not proven.
 
+Three participation rules, all judged the same way on 02:10 (70 markets):
+
+| rule | what it stands down for | tape_net diff | t |
+|---|---|---|---|
+| `micro-burst-decay-reentry` | 4x the duration of a >=4-print burst | **+$107.44** | 1.65 |
+| `micro-print-sweep-detector` | a print eating half its level | **+$73.36** | 1.52 |
+| `micro-absorbed-flow` | a level that only ever shrinks | **+$62.21** | 1.02 |
+
+and on 02:50: burst-decay **+$277.20** (t=1.29), absorbed-flow **+$226.47**
+(t=1.13). Every variant is positive on every slice; none reaches `t >= 2`
+alone. The reading that fits is a family effect - **reducing participation when
+the touch is hostile pays about 1-1.5 % of baseline on liquid markets** - rather
+than any one of these rules being the edge.
+
 `micro-adaptive-exit` was killed on the same machinery: -$3.25, t=-1.28 over
 1,048 fills. Withdrawing from markets whose own realised P&L is negative
 forfeits more than it saves.
@@ -287,6 +301,19 @@ cross-kalshi-basis-side-pull: verdict=inert: no shrink headroom
 
 Test size-based ideas with `--pool-multiplier 1.0` or larger so the quote has
 range above the venue minimum.
+
+## A scoring defect the review found: the pool was paid twice
+
+`run_epoch_sample` looped over a market's two tokens and paid
+`rate_per_day * our_share` **per token**, so a maker quoting both YES and NO
+collected twice the pool the venue actually pays. Every reward figure in this
+document before this fix is therefore about 2x too high, and the paired
+differences are unaffected in sign but scaled. The payout is now computed once
+per market from the sum of both tokens' scores.
+
+The same review claimed the engine adds `bid + ask` scores instead of the venue's
+`Q_norm`; that is **false** - `normalise_two_sided(bid_score, ask_score)` is what
+feeds `compute_epoch_payout`. Checked before adopting, as with every agent claim.
 
 ## Why the cross-venue family is blocked: the mapped markets are silent
 

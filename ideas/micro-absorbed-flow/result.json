@@ -1,0 +1,46 @@
+{
+ "strategy": "micro-absorbed-flow",
+ "slices": [
+  {
+   "strategy": "micro-absorbed-flow",
+   "stats": {
+    "fills": 917,
+    "fills_recorded": 917,
+    "net": 2722.8809,
+    "rewards_usd": 0.1116,
+    "inventory_mtm": 1333.7428,
+    "markets_with_fills": 20,
+    "markout_5m_bps": 1029.5,
+    "markout_5m_bps_n": 869,
+    "markout_5m_bps_median": 454.55,
+    "markout_tape_bps_median": -204.92,
+    "markout_tape_bps_mean": -1175.47,
+    "rewards_observed": 0.0,
+    "rewards_unobserved_competition": 0.1116,
+    "markets_competition_observed": 0,
+    "events": 5718,
+    "elapsed_s": 45.32
+   },
+   "paired": {
+    "conditions": 70,
+    "mean_diff": 226.47023,
+    "t": 1.127,
+    "total_diff": 15852.9159,
+    "concentration": 0.885
+   },
+   "gates": {
+    "fills_and_conditions": true,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793933400.0,
+    1793934600.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T08:06:40.798224+00:00"
+}

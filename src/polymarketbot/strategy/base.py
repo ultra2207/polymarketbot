@@ -103,6 +103,11 @@ class DecisionContext:
     bid_size_at_level: float
     ask_size_at_level: float
     ofi: Optional[float] = None
+    #: This market's own trading result so far: a selection rule needs to know
+    #: whether quoting here has been paying, not just what the book looks like.
+    realized_pnl: float = 0.0
+    fills_count: int = 0
+    quote_size: float = 0.0
     bid_score: float = 0.0
     ask_score: float = 0.0
     rate_per_day: float = 0.0

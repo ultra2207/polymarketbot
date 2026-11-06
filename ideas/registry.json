@@ -659,6 +659,22 @@
    "result": "data/derived/replay/20261106T0754_20m_o0_micro-adaptive-exit",
    "blocked_reason": "Needs >=8 fills per market; a 10-minute slice produces ~1.2 fills per market across 500 markets. Re-run on a multi-hour slice.",
    "kill_reason": "Judged on tape_net at last: -$3.25, t=-1.28 over 1,048 fills on the liquid universe. Withdrawing from markets whose own realised P&L is negative forfeits more reward and presence than it saves in adverse selection."
+  },
+  {
+   "slug": "micro-burst-decay-reentry",
+   "title": "Arrival bursts are parent orders being sliced; the calm after them is not",
+   "status": "promising",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0804_20m_o0_micro-burst-decay-reentry",
+   "evidence": "tape_net vs reactionary, liquid universe, --flat 200: 70 mkts 02:10 +$107.44 (t=1.65); 70 mkts 02:50 +$277.20 (t=1.29). Same sign, below t>=2 on each slice alone."
+  },
+  {
+   "slug": "micro-absorbed-flow",
+   "title": "Depth that refills is absorbed flow; depth that empties is informed flow",
+   "status": "promising",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0804_20m_o0_micro-absorbed-flow",
+   "evidence": "tape_net vs reactionary, liquid universe, --flat 200: 70 mkts 02:10 +$62.21 (t=1.02); 70 mkts 02:50 +$226.47 (t=1.13). Same sign, below t>=2."
   }
  ]
 }
