@@ -1,231 +1,253 @@
-# Plan
+# Plan — automated strategy search on the full reward universe
 
-The research agenda. `roadmap.md` is *how we build the machine*; this is *what we point it at*.
+The machine exists: a 45 GB tape of every book change and print across the
+reward universe, a paper engine that simulates FIFO queues and 1-minute reward
+epochs, and a measured fill model. This plan turns that machine into a loop that
+tests hundreds of ideas without a human in the loop.
 
-Two tracks run in parallel once the data layer exists:
-
-- **Track A — understand the competition.** Reverse-engineer what profitable wallets
-  actually do, and classify which parts are replicable. Detail:
-  [`docs/strategy-reverse-engineering.md`](docs/strategy-reverse-engineering.md).
-- **Track B — find the whitespace.** Score segments on edge × capacity × novelty against
-  cost × competition, and only then write a strategy.
-
-The output of A is mostly *negative*: a list of segments and behaviours to avoid. That is
-valuable, because it removes most of the search space before any modelling.
+`roadmap.md` is how the infrastructure is built. `docs/two-week-data-plan.md` is
+the data spec. This file is the **experiment factory**.
 
 ---
 
-## 0. Thesis
+## 0. Constraints that shape every decision
 
-Three claims this plan is built on:
+| constraint | consequence |
+|---|---|
+| **One CPU** | Replays run **serially** in one scheduler. Parallel agents write code and search for ideas; they never run a replay at the same time. |
+| **Tape only** | Every test replays recorded `clob_events` + `clob_trades`. No live WS in the loop, so a test is reproducible and a strategy cannot peek ahead. |
+| **Rewards are paid on resting quotes, not fills** | A market with no events still pays if our quote is eligible. Performance has **two components**: reward yield (share of pool) and trading P&L (adverse selection). Both are measured; they are not the same number. |
+| **10 minutes is a regime, not a day** | A 10-minute slice over ~500 active conditions gives thousands of fills, but they are correlated within a condition and within one market regime. Rankings use **paired per-condition diffs**, never raw totals. |
+| **The universe is live, the manifest is stale** | The collector currently covers 2,152 markets and ~500 show book events per hour. The Nov-1 `manifest_locked_1028.json` overlaps only 266 of them. Tests use the **current** universe snapshot. |
+| **Book tape records changes** | A market with no competitor activity has no rows. Those markets are modelled from the universe metadata (price, pool, min size, max spread) and are exactly where reward yield is highest and adverse selection is lowest. |
 
-1. **Copying fails** for four reasons — latency, information asymmetry, size dependence,
-   and exit-into-copy-flow. So the unit of analysis is the *behavioural archetype*, not the
-   individual wallet.
-2. **Absence of large traders is ambiguous.** It can mean neglect (opportunity) or
-   uninhabitability (no exit, no depth, ambiguous resolution). Every candidate segment must
-   pass an exit-depth and capacity check before it is called whitespace.
-3. **Edges here are capacity-constrained.** A prediction-market edge that survives at
-   \$500/order may vanish at \$10k. The honest deliverable is a capacity curve, not a Sharpe
-   ratio. Small books can compound these; large books cannot. Say so early.
+## 1. Architecture
 
-What "winning" means for this phase: **2–3 validated, uncrowded, capacity-checked edges**,
-not one impressive backtest.
-
----
-
-## 1. Idea backlog
-
-Tiered by what data they need. Every row has an explicit kill condition, because the point
-of a backlog is to delete things cheaply.
-
-### Tier 1 — testable with trade tape + metadata + resolution
-
-| # | Idea | Why the edge might exist | First test | Kill if |
-|---|---|---|---|---|
-| 1 | **Longshot / favourite bias** | Betting markets systematically overprice longshots and underprice favourites. Prediction markets are not immune | Calibration by price bucket over 2024–2026; PnL of "sell < 0.05, buy > 0.90, hold to resolution" | Edge < 2× fees, or disappears after 2026 fee overlay |
-| 2 | **Coherence arbitrage in neg-risk baskets** | Mutually exclusive outcomes should sum to 1. Legs are priced independently and can drift out of line | For each neg-risk event, compute Σ mid across legs; count and size violations beyond fees | Violations < fees, or only in markets with no depth |
-| 3 | **Ladder monotonicity violations** | "BTC above 100k / 110k / 120k" must be monotone in strike. Independent pricing breaks it | Detect inversions across threshold ladders; measure persistence and executable size | Inversions are tiny, transient, or only at 1-share size |
-| 4 | **Lifecycle-stage inefficiency** | New markets have thin attention. Price discovery takes time; early prices may be stale or anchored | Calibration error as a function of market age (first hour / day / week) | Error is uniform across age → no lifecycle edge |
-| 5 | **Term-structure drift** | Probability paths to resolution may be systematically biased (e.g. favourites drift up too slowly) | Bin by (price, time-to-resolution); measure drift to terminal | No monotone pattern, or within spread |
-| 6 | **Resolution-risk premium** | Ambiguous rules and UMA dispute risk are hard to price; most traders ignore them | Dispute rate by category; compare entry price vs realised payout conditional on dispute | No measurable discount, or too few disputes to trade |
-| 7 | **Skilled-wallet consensus flow** | Aggregate net flow of *ranked* wallets may predict drift even when copying any single one fails | Build a lagged flow feature from top-decile wallets; test against matched control | No incremental predictive power over price |
-| 8 | **Cross-market lead-lag** | Related markets (nomination → general, crypto → updown) may propagate information at different speeds | Lead-lag correlation with lagged returns; test tradability after costs | Lead is < cost, or explained by the reference asset |
-| 9 | **Base-rate models for recurring markets** | Temperature ranges, sports totals, and similar markets recur with stable distributions | Fit historical base rates; compare Brier to market price | Model does not beat market Brier by a usable margin |
-| 10 | **Crypto up/down vs reference price** | 5-min/15-min markets should track a Chainlink TWAP; short-horizon mispricing may exist away from expiry | Compare implied probability to a model from Binance/Chainlink history; measure error by seconds-to-close | Error is inside spread, or only exploitable with sub-second latency |
-| 11 | **Fee-aware category selection** | Identical gross edge nets very differently: geopolitical markets are fee-free, crypto peaks at 1.56 % | Re-score all candidate strategies under per-category fee schedules | Ranking is unchanged by fees (then this is not an edge source) |
-| 12 | **Time-of-day / weekend effects** | Attention and maker presence vary; mispricing may cluster when the book is thin | Calibration error by hour-of-day and weekday | Effect is a proxy for liquidity only, with no residual edge |
-
-### Tier 2 — need the L2 window (2026-04-13 → 2026-08-10)
-
-| # | Idea | Why the edge might exist | First test | Kill if |
-|---|---|---|---|---|
-| 13 | **Book imbalance predicts short-horizon returns** | Standard microstructure effect; untested on Polymarket | Imbalance at t → return over t+1m/5m/1h | No effect after spread |
-| 14 | **Signed taker flow / price impact** | Aggressor imbalance may persist | Regress returns on signed volume | Effect only at sizes we can't trade |
-| 15 | **Stale-quote pickoff** | Resolved and near-resolved markets keep resting orders; ~23 % of resolved markets had zero book in the final hour | Detect fills against stale levels; net of fees | Stale fills are rare or immediately arbitraged |
-| 16 | **Execution scheduling** | Large orders should be sliced relative to depth, not time | Compare TWAP-by-time vs TWAP-by-depth on the same signal | Depth-aware scheduling does not reduce slippage |
-| 17 | **Cancellation-pressure proxy** | Book delta minus fills gives net adds/cancels; extreme cancel pressure may signal withdrawal | Build the residual series; test predictive power | Residual is noise |
-
-### Tier 3 — need external data or forward recording
-
-| # | Idea | Why the edge might exist | First test | Kill if |
-|---|---|---|---|---|
-| 18 | **News-latency strategy** | Prices may react to public news with a delay | GDELT / RSS event timestamps vs price jumps; measure lag | Lag < cost, or only for machine-readable feeds everyone has |
-| 19 | **Cross-venue arbitrage vs Kalshi** | Same event, two venues, different clienteles | Match events semantically; compare prices net of fees and transfer friction | Spreads are inside combined costs |
-| 20 | **Attention proxies** | Wikipedia pageviews / search trends may lead price | Correlate lagged attention with returns | Attention is contemporaneous, not leading |
-| 21 | **Comment sentiment** | Crowd discussion may contain signal | Requires forward recording (§ `docs/limitations.md`) | Parked until the recorder has ≥ 3 months |
-
-### Parked — structurally unavailable, do not revisit
-
-| # | Idea | Why it is parked |
-|---|---|---|
-| 22 | Market making | Needs queue position (unobtainable) |
-| 23 | Order-flow toxicity / spoof detection | Needs individual order events (unobtainable) |
-| 24 | Single-wallet copy trading | Latency + impact + exit-into-copy; fails by construction |
-
-### New from the docs (2026-11-01)
-
-The mirrored documentation revealed data surfaces the original backlog assumed were
-unavailable. These four ideas are only testable because of that:
-
-| # | Idea | Why the edge might exist | First test | Kill if |
-|---|---|---|---|---|
-| 25 | **Scalar-market anchoring** | Range markets ("what will the price of X be on date?") pay a *fraction* between 0 and 1, but traders may price them like binaries or anchor at 0.5 | 64 resolved binary conditions pay non-0/1; compare price to realised payout fraction; check calibration by price bucket | Too few markets to size, or calibration beats price by < 2× fees |
-| 26 | **Resolution-timing premium** | A market stops trading at resolution, but UMA takes ~2 h undisputed and 4–6 days if disputed. Capital is locked, and dispute risk is hard to price | Use `/v2/resolutions` `resolved_at`/`was_disputed` + tape; measure price drift between `end_date` and resolution. **First 400-market sample (2026-05+): sports resolve +4.1 h median (p90 +5.8 h) after `end_date`; crypto ~0 h; 0 disputes.** So the locked-capital story holds for sports only | No measurable discount, or no tradable window (trading may already be closed) |
-| 27 | **Conversion-bounded neg-risk arbitrage** | Docs confirm 1 NO converts into 1 YES in every other outcome. Ignoring conversion overstates arbitrage; including it creates tighter, executable bounds | Recompute neg-risk basket violations with conversion cost + fees included | Violations inside conversion + fee cost |
-| 28 | **Leaderboard-cohort flow** | `/v2/leaderboard` and `/v2/biggest-winners` give ranked wallets cheaply, so a cohort can be defined without reconstructing every wallet | Aggregate net flow of leaderboard wallets; test against matched control | No incremental predictive power over price (same kill as #7, cheaper test) |
-
----
-
-## 2. What I would run first, and why
-
-If only five things get investigated, these:
-
-1. **Coherence and ladder arbitrage (#2, #3).** The only ideas here that need *no*
-   information edge — just arithmetic on prices that must obey constraints. Objective,
-   cheap to test, and the failure mode is clean (either violations exceed fees or they
-   don't). Capacity is limited, which is exactly the "where big traders aren't" thesis.
-2. **Longshot bias (#1).** The most robust prior in betting markets. Pure tape + resolution,
-   no depth needed, testable immediately. The catch is tail risk: selling longshots has a
-   fat left tail, so size it as a portfolio, not a trade.
-3. **Lifecycle-stage inefficiency (#4).** Directly targets neglect rather than competition.
-   If new markets are mispriced for the first few hours, that is a repeatable, uncrowded
-   window that does not require being faster than anyone.
-4. **Objective-data markets (#9).** Weather, econ releases, sports totals. Public data, low
-   crowding, clear base rates. Small capacity, but a genuine information edge that isn't a
-   race.
-5. **Skilled-wallet consensus flow (#7).** The correct way to use the reverse-engineering
-   output: not "follow wallet X" but "aggregate the net flow of wallets that have survived
-   walk-forward ranking". Uses the Track A work without inheriting its latency problem.
-
-Everything else is a candidate, not a commitment.
-
----
-
-## 3. Sequencing
-
-```
-                    ┌──────────────── critical path (decided 2026-11-01) ────────────────┐
-Phase 3 (labels, unified fills, PnL) ──► Phase 4 (book replayer) ──► Phase 5 (fill engine,
-                                                                     all five exit policies)
-                    │                                                        │
-                    ▼                                                        ▼
-        gross-effect screen (tape only)                        exit-policy comparison on
-        may DELETE an idea, never graduate it                  2026-04-13 → 2026-08-10
-                    │                                                        │
-                    └──────────────► Phase 6b (landscape) ──► Phase 7 loops ◄─┘
-                                                                     │
-                                                                     ▼
-                                                             Phase 8 forward test
+```mermaid
+flowchart TB
+  GEN[idea generators] -->|spec.md + registry entry| REG[(ideas/registry.json)]
+  REG -->|status=implemented| Q[run queue]
+  Q --> SCHED[serial scheduler<br/>one replay at a time]
+  TAPE[(clob_events + clob_trades)] --> SCHED
+  UNI[(universe snapshot)] --> SCHED
+  SCHED -->|strategy module| MOD[ideas/slug/module.py]
+  MOD --> ENG[paper engine per market<br/>FIFO queue + 1-min epochs]
+  ENG --> RES[(data/derived/replay/slug/*.parquet)]
+  RES --> EVAL[paired eval + gates]
+  EVAL -->|promote / kill| REG
+  EVAL -->|survivors| COMBO[combination test]
 ```
 
-**Two decisions recorded 2026-11-01 change this sequence.**
+Four components, each replaceable:
 
-1. **Exits are chosen by the system, not fixed.** "Hold to resolution" is a candidate action,
-   not the plan's assumption. Evaluating any exit honestly needs book state across the whole
-   holding period, and full L2 exists only for **2026-04-13 → 2026-08-10**. That makes the
-   book replayer (Phase 4) and fill engine (Phase 5) the critical path rather than a later
-   refinement, and it makes the recorder the only way to lengthen the observable window.
-2. **Capital should be as small as possible** so research and live testing start early
-   (working assumption: `$2,000` bankroll, `$250` max order — `configs/windows.yaml`). This
-   is an advantage, not a compromise: at `$250` against a p10 ask depth of ~`$1,500` an order
-   is a fraction of one price level, so fills are tractable and an edge that survives at
-   small size is a real edge rather than a backtest artefact.
+1. **`scripts/replay_all_markets.py`** — the harness. Universe → slice → one
+   paper engine per market → per-market and aggregate metrics. Deterministic
+   for a given slice and strategy.
+2. **`src/polymarketbot/strategy/`** — the module protocol and the built-ins
+   (`reactionary`, `queue_aware_ofi`). A module is pure: it sees a context
+   object and returns per-side actions. No I/O, no network, no clock.
+3. **`ideas/<slug>/`** — one directory per idea: `spec.md` (hypothesis, data,
+   kill condition), `module.py` (the strategy), optional `prepare.sql`,
+   `result.json`. **Nobody edits another idea's files.**
+4. **`scripts/run_idea_queue.py`** — reads the registry, runs the next batch
+   serially, writes results, flips statuses.
 
-**Consequence for screening.** Screening splits into two stages, because they have different
-evidence requirements:
+## 2. The all-markets harness
 
-| Stage | Needs | Can do | Cannot do |
+**Universe.** `--universe data/tape/universe/<latest>.json`, filtered by
+`--min-pool` (default `15`). Every market registers both tokens.
+
+**Capital and sizing.** Per market:
+
+```
+capital_i   = clamp(pool_multiplier * daily_pool_i, notional_min, notional_max)
+shares_i    = max(rewards_min_size_i, capital_i / mid_i)
+inventory_i = 3 * shares_i
+```
+
+Defaults `pool_multiplier=0.25`, `notional_min=10`, `notional_max=500`, so a
+\$25/day market quotes ~\$10 and a \$3,000/day market quotes \$500. `--flat 500`
+overrides the scaling for the "\\$500 on every market" configuration.
+
+**Slice.** `--start-utc` + `--minutes`, default the last 10 minutes of the most
+recent sealed hour. Books are replayed by applying `price_change` levels to a
+per-asset ladder; `update_orderbook` is called when the top moves or every
+`--requote-seconds` (default 1). Prints go to `on_trade`, which is the FIFO
+queue simulation. `run_epoch_sample` is called once per simulated minute, so a
+10-minute slice is 10 reward epochs.
+
+**Outputs.** `data/derived/replay/<tag>/metrics.parquet` (one row per
+strategy × condition), `fills.parquet` (every fill with its markout), and
+`summary.json`. Ledgers per market under the same tag.
+
+**Metrics, per market and aggregate**
+
+| metric | definition |
+|---|---|
+| `fills`, `fill_notional` | FIFO-simulated fills and their notional |
+| `cash_pnl` | realised P&L from the engine ledger |
+| `inventory_mtm` | open inventory x final mid |
+| `rewards_usd` | sum of 1-minute epoch payouts |
+| `net` | `cash_pnl + inventory_mtm + rewards_usd` |
+| `markout_5m_bps` | signed mid move 5 min after each fill, in bps of fill price |
+| `time_quoted_frac` | fraction of seconds with at least one side resting |
+| `score_share` | mean `S_ours / (S_ours + S_competitors)` per epoch |
+
+**Budget.** ~1,028 markets x 2 tokens x 600 s ≈ 1.2 M book updates ≈ 40–150 s
+per strategy at the measured 8–30 k updates/s. A first run of any new harness
+gets 300 s; a slice that exceeds it is cut, not waited on.
+
+## 3. Strategy module protocol
+
+```python
+class StrategyModule(Protocol):
+    name: str
+    def setup(self, market: MarketView) -> None: ...
+    def on_book(self, ctx: BookContext) -> None: ...
+    def on_trade(self, ctx: TradeContext) -> None: ...
+    def decide(self, ctx: DecisionContext) -> SideActions: ...
+```
+
+`SideActions` is `(bid_action, ask_action)` with action in `QUOTE`, `SHRINK`,
+`PULL` and a `size_scale` in `[0, 1]`. `decide` is called after every book
+update, exactly where `QuoteOrchestrator.decide` sits today; the built-in
+`queue_aware_ofi` module *is* the current orchestrator wrapped in the protocol,
+so the harness can reproduce known numbers before it tests anything new.
+
+Rules for modules:
+
+- Read only the context (book, queue ratio, own inventory, measured signals).
+  Never read the tape ahead, never use wall-clock time.
+- Return actions; the engine owns sizing floors, post-only clamping and risk.
+- Any state is per market and reset by `setup`.
+- A module that needs new data ships a `prepare.sql` that materialises it into
+  `data/derived/ideas/<slug>/`, built from the tape in a separate step.
+
+## 4. Idea pipeline
+
+**Generator.** One agent (a second when the backlog drops below 5) that writes
+ideas until the quota is met. Quota, not infinity: **80 specs**, then it
+consolidates and dedupes. Each spec is 15 lines: claim, mechanism, data needed,
+module sketch, kill condition, what result would change our mind. Sources must
+be cited (paper, venue docs, observed pattern in our data).
+
+**Dedupe.** An idea is a duplicate if its `mechanism` field matches an existing
+one at the level of "what moves the price and why we get paid". Different
+parameter values are not new ideas.
+
+**Status machine**
+
+```
+proposed → data_ready → implemented → queued → running → done
+                                    ↘ killed (with reason)
+```
+
+`killed` is a first-class outcome. An experiment factory whose ideas never die
+is measuring nothing.
+
+**Spec template** (`ideas/_template/spec.md`)
+
+```
+# <title>
+claim:      <one sentence, falsifiable>
+mechanism:  <why the counterparty loses / why the pool underpays us>
+data:       <tables, fields, window>
+module:     <what decide() does, in one paragraph>
+metric:     <the number that decides it>
+kill:       <the result that ends this line of work>
+```
+
+## 5. Agent swarm protocol
+
+| role | count | writes | never touches |
 |---|---|---|---|
-| **Gross effect** | tape + labels + `schedule_at` fees | **delete** an idea whose effect is absent or inside 2× costs | claim an edge is tradable |
-| **Graduation** | all five exit policies on reconstructed books | rank strategies, score capacity | — |
+| idea generator | 1–3 | `ideas/<new>/spec.md`, registry `proposed` | code, tape, other ideas |
+| implementer | 1 per idea | `ideas/<slug>/module.py`, `prepare.sql` | other slugs, shared engine |
+| scheduler | 1 (script) | `data/derived/replay/*`, registry status | code |
+| integrator | 1 | `src/polymarketbot/strategy/`, harness fixes | idea internals |
 
-A gross-effect screen is still worth running early: it is the cheapest possible way to
-delete most of the backlog, and deletion is the point. But nothing "survives screening" in a
-tradable sense until it has been through the exit comparison. An idea that only works if you
-hold to resolution is not an edge — it is an assumption about the exit.
+Rules:
 
+- **One compute job at a time.** The scheduler owns the CPU; agents may run
+  unit tests (seconds), never a replay.
+- **Interface first.** The registry entry names the module path and the metric;
+  the harness never imports anything outside `ideas/`.
+- **Every idea gets its own slice hash.** Two ideas compared on different
+  slices are not compared; the harness refuses mismatched slices unless
+  `--allow-unpaired`.
+- **An agent may not promote its own idea.** Promotion is a gate statistic, not
+  an opinion.
 
-Screening is deliberately cheap: for each idea, answer three questions before writing a
-model —
+## 6. Experiment design and statistics
 
-1. **Does the effect exist at all?** Raw frequency × size of the violation/mispricing.
-2. **Does it survive costs?** Fees + half-spread + modelled impact.
-3. **Is there capacity?** Depth at target notional in the relevant window.
+- **Paired, per condition.** For every condition, compute the strategy's net and
+  the baseline's net on the *same* slice; test the mean of the differences with
+  a t-stat that uses the condition as the unit. Sign tests as a cross-check
+  (robust to fat tails).
+- **Two baselines.** `reactionary` (quote both, no gate) and
+  `queue_aware_ofi` (the current production candidate). Beating reactionary is
+  necessary; beating queue_aware is what earns a promotion.
+- **Both P&L components reported separately.** Never present `net` without
+  `rewards_usd` and `marks` next to it.
+- **Regime split.** Each slice is labelled by hour bucket and by whether the
+  condition's book was active; a strategy that only wins in one bucket is
+  reported as such.
+- **Promotion gates.**
+  1. ≥ 200 fills across ≥ 50 conditions, or ≥ 50 conditions and a reward-only
+     claim with `time_quoted_frac > 0.9`.
+  2. Paired mean net > 0 with t ≥ 2.0 on the condition unit, on **two
+     non-overlapping slices**.
+  3. `markout_5m_bps` not worse than the baseline by more than its standard
+     error.
+  4. No single condition contributes > 25 % of the total (concentration check).
+- **Combination test.** Survivors are stacked in priority order (a module can
+  veto or scale, never increase). Report leave-one-out contribution per module
+  on the same slice; a combination must beat its best member, else the members
+  are redundant and stay separate.
 
-An idea that fails (1) is deleted. One that fails (2) is re-tested under the no-fee regime to
-confirm it was a fee artifact. One that fails (3) is logged as "real but untradeable" —
-which is still useful, because it explains why the segment is uncrowded.
+## 7. Autonomy loop
 
----
+One cycle, repeated:
 
-## 4. How ideas die
+1. Generator tops the backlog up to its quota.
+2. Scheduler runs every `implemented` idea on slice *A* (10 min), serially.
+3. Evaluator writes the paired table; ideas that fail gate 2 on *A* are killed
+   or flagged `needs_data`.
+4. Survivors run on slice *B* (a different hour, same day) and on a longer
+   60-minute slice.
+5. Survivors and the two baselines run as a combination.
+6. Registry, `docs/results-log.md`, and the replay tag are committed with the
+   numbers, so a later agent can audit every claim.
 
-Pre-registered, before any modelling:
+Budget per cycle: ≤ 40 idea-minutes of replay (each run 1–3 min), so a cycle is
+~2 hours of wall clock on this machine.
 
-| Gate | Question | Fail action |
+## 8. Milestones
+
+| # | deliverable | done when |
 |---|---|---|
-| **Prior** | Why would this mispricing survive? | If there is no mechanism, stop |
-| **Data** | Can it be measured with data we hold? | If no, park it — don't approximate silently |
-| **Effect** | Is the raw effect larger than 2× round-trip cost? | Delete |
-| **Capacity** | Is depth at target notional ≥ 3× our size? | Log as untradeable |
-| **Robustness** | Does it survive 2× impact and the 2026 fee overlay? | Delete |
-| **Crowding** | Is top-10 wallet share < 60 %, or is our edge structurally different? | Delete or re-scope |
-| **Stability** | Does it hold out-of-sample across two periods? | Delete |
+| 1 | all-markets harness | reproduces `reactionary` and `queue_aware_ofi` numbers on a 10-min slice, one command, ≤ 300 s |
+| 2 | strategy protocol + built-ins | `--strategy` selects any module in `ideas/`; engine untouched for a new idea |
+| 3 | idea registry + 20 specs | generated, deduped, each with a kill condition |
+| 4 | first wave of 5 ideas | implemented and queued, each with its own result row |
+| 5 | paired evaluation report | `docs/replay-results.md` with the two baselines and the wave |
+| 6 | combination test | leave-one-out table over the survivors |
+| 7 | promotion to the live gate shortlist | gate 8 checklist updated with the winning module |
 
-Anything that survives all seven graduates to a full backtest. Most will not.
+## 9. Risks and kill criteria
 
----
-
-## 5. Structural bets worth revisiting later
-
-Not in the backlog yet, but worth keeping on the radar:
-
-- **Resolution-risk as a product, not a trade.** If UMA disputes are systematically
-  mispriced, the edge may be in *providing* certainty (selling insurance) rather than
-  taking a directional view.
-- **Cross-venue market making.** If Kalshi and Polymarket quote the same event, the
-  spread between them is a structural edge that does not require prediction — but it does
-  require capital on both venues and transfer friction modelling.
-- **Event-calendar specialisation.** A calendar of scheduled information (elections, CPI,
-  Fed, fixtures, weather releases) lets you be *present* exactly when mispricing is created,
-  instead of scanning continuously. Cheap to build; free sources.
-- **Decay monitoring as a first-class product.** Any edge found should ship with a monitor
-  that tells you when it has been competed away. Without it, you find out via PnL.
-- **Portfolio construction for correlated legs.** Neg-risk baskets are anti-correlated
-  positions, not independent bets. A proper event-level risk model may be worth more than
-  another signal.
-
----
-
-## 6. What would make me abandon this whole plan
-
-Stated up front so it isn't rationalised later:
-
-- If **Track A** finds that essentially all durable PnL comes from latency, market making, or
-  private information, then there is no replicable directional edge for us, and the project
-  should pivot to infrastructure/data rather than trading.
-- If **Tier 1 screening** finds no effect exceeding 2× costs in any segment, the market is
-  efficient enough at our size and horizon, and we should stop rather than lower the bar.
-- If everything that survives is capacity-constrained below the capital we need, the honest
-  answer is that this is a research asset, not a trading business.
+- **Slice overfitting.** Ten minutes of one hour is one regime. Gate 2 (two
+  slices) exists for this; a strategy that cannot survive it is killed, not
+  tuned.
+- **Reward model approximation.** `compute_epoch_payout` uses the observed
+  competing score from the tape. Where the book tape is silent, competition is
+  unknown, not zero: those markets are flagged `unobserved_competition` and
+  their reward numbers are reported separately, never mixed into the aggregate.
+- **Tape gaps.** A condition with no `book` snapshot inside the slice starts
+  from the first `price_change` top; if that is absent too, the market is
+  skipped and counted, not silently filled with a default price.
+- **Agent drift.** Any module that reads outside its context, or a result whose
+  slice hash does not match the recorded one, is rejected by the harness.
+- **The endpoint.** After the quota of ideas, the deliverable is a ranked list
+  of capacity-checked strategies with their measured numbers — not a single
+  backtest and not a promise.

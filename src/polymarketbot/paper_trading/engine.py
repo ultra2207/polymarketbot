@@ -85,6 +85,7 @@ class PaperTradingEngine:
         microstructure_ofi_window_s: float = 60.0,
         orchestrator: Optional[QuoteOrchestrator] = None,
         kalshi_monitor: Optional[Any] = None,
+        strategy: Optional[Any] = None,
     ) -> None:
         self.initial_cash_usd = float(initial_cash_usd)
         self.cash_usd = float(initial_cash_usd)
@@ -102,6 +103,11 @@ class PaperTradingEngine:
         self.microstructure_ofi_window_s = float(microstructure_ofi_window_s)
         self.orchestrator = orchestrator
         self.kalshi_monitor = kalshi_monitor
+        # A pluggable ``StrategyModule`` (see polymarketbot.strategy). When set it
+        # replaces the orchestrator block; the engine still owns sizing floors,
+        # post-only clamping and risk.
+        self.strategy = strategy
+        self._strategy_started = time.time()
         self._kalshi_basis: dict[str, Optional[float]] = {}
         self._kalshi_missing_logged = False
         self._ofi_steps: dict[str, deque[tuple[float, int]]] = {}
@@ -321,6 +327,22 @@ class PaperTradingEngine:
                 )
             self._prev_top[asset_id] = (best_bid, best_ask)
 
+        if self.strategy is not None:
+            from polymarketbot.strategy.base import BookContext
+
+            self.strategy.on_book(
+                BookContext(
+                    condition_id=cid,
+                    asset_id=asset_id,
+                    outcome=str(self.asset_to_outcome.get(asset_id, "")),
+                    mid=mid,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    tick_size=tick_size,
+                    spread_cents=spread * 100.0,
+                )
+            )
+
         # Update position mark-to-market
         if asset_id in self.positions:
             self.positions[asset_id].update_mark(mid)
@@ -344,6 +366,40 @@ class PaperTradingEngine:
                 inventory += abs(position.market_value)
                 cost += abs(position.shares * position.avg_cost)
         return inventory, cost
+
+    def _strategy_context(
+        self,
+        asset_id: str,
+        book: dict[str, Any],
+        queue: Optional[Any],
+        ofi: Optional[float],
+    ) -> Any:
+        """Build the pure ``DecisionContext`` a module sees; no engine internals leak."""
+        from polymarketbot.strategy.base import BookContext, DecisionContext
+
+        cid = self.asset_to_condition[asset_id]
+        ctx = BookContext(
+            condition_id=cid,
+            asset_id=asset_id,
+            outcome=str(self.asset_to_outcome.get(asset_id, "")),
+            mid=float(book["mid"]),
+            best_bid=float(book["best_bid"]),
+            best_ask=float(book["best_ask"]),
+            tick_size=float(book.get("tick_size", 0.01)),
+            spread_cents=float(book.get("spread_cents", 0.0)),
+        )
+        pos = self.positions.get(asset_id)
+        return DecisionContext(
+            book=ctx,
+            seconds_elapsed=time.time() - self._strategy_started,
+            inventory_shares=float(pos.shares) if pos is not None else 0.0,
+            max_inventory_shares=float(self.max_inventory_shares),
+            bid_queue_ratio=float(queue.ratio("bid")) if queue is not None else 0.0,
+            ask_queue_ratio=float(queue.ratio("ask")) if queue is not None else 0.0,
+            bid_size_at_level=float(queue.bid_size_at_level) if queue is not None else 0.0,
+            ask_size_at_level=float(queue.ask_size_at_level) if queue is not None else 0.0,
+            ofi=ofi,
+        )
 
     def _queue_snapshot(
         self,
@@ -476,8 +532,28 @@ class PaperTradingEngine:
         gate_ask_pull = False
         bid_scale = 1.0
         ask_scale = 1.0
+        if self.strategy is not None:
+            ofi = None
+            steps = self._ofi_steps.get(asset_id)
+            if steps:
+                cutoff = time.time() - self.microstructure_ofi_window_s
+                vals = [step for ts, step in steps if ts >= cutoff]
+                if vals:
+                    ofi = sum(vals) / len(vals)
+            queue_snap = self._queue_snapshot(asset_id, bid_price, ask_price)
+            decision = self.strategy.decide(
+                self._strategy_context(asset_id, book, queue_snap, ofi)
+            )
+            self.last_orchestrator_decision[asset_id] = decision
+            gate_bid_pull = decision.bid == "PULL"
+            gate_ask_pull = decision.ask == "PULL"
+            bid_scale = 0.0 if gate_bid_pull else float(decision.bid_scale)
+            ask_scale = 0.0 if gate_ask_pull else float(decision.ask_scale)
+
         orchestrator_active = (
-            self.orchestrator is not None and self.orchestrator.config.enabled
+            self.strategy is None
+            and self.orchestrator is not None
+            and self.orchestrator.config.enabled
         )
         if orchestrator_active and self.orchestrator.config.signal == "kalshi":
             self._refresh_kalshi_basis(asset_id, cid)
@@ -679,6 +755,19 @@ class PaperTradingEngine:
         """
         if asset_id not in self.asset_to_condition:
             return None
+
+        if self.strategy is not None:
+            from polymarketbot.strategy.base import TradeContext
+
+            self.strategy.on_trade(
+                TradeContext(
+                    asset_id=asset_id,
+                    price=float(trade_price),
+                    size=float(trade_size),
+                    side=str(trade_side),
+                    seconds_elapsed=time.time() - self._strategy_started,
+                )
+            )
 
         quotes = self.virtual_quotes.get(asset_id, {})
         v_bid = quotes.get("bid")
