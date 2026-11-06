@@ -193,6 +193,30 @@ The next real test is therefore not another sizing rule. It is either a
 **cross-venue** rule with its signal materialised. Both are now unblocked by the
 harness; neither has been measured.
 
+## Removed: the implementation of every rejected rule
+
+The modules for rules that were measured and rejected are deleted; their specs,
+kill reasons and measurements stay in `ideas/registry.json` and this document, so
+the evidence survives without the code that no longer has a use:
+
+| removed | why it cannot be restored |
+|---|---|
+| `micro-adaptive-exit` | -$3.25, t=-1.28 over 1,048 fills |
+| `micro-print-sweep-detector` | exposure effect; per-fill markout t=0.54 |
+| `micro-burst-decay-reentry` | same family, same verdict |
+| `micro-absorbed-flow` | same family, same verdict |
+| `micro-participation-gate` | the union of the three, labelled `exposure-only` by the harness |
+| `micro-complement-staleness` | per-fill signs [+54, -42, +257], not robust |
+| `micro-maker-vacancy` | +$0.036, t=1.05 over 1,500 condition-slices |
+
+`micro-random-participation-control` is **kept**: it is the instrument that
+distinguishes a timing rule from less exposure, and every future participation
+idea needs it.
+
+Regenerable analysis caches (558 MB of news mid series, 196 MB of on-chain mid
+caches, the whale and comment extracts) were deleted; their findings are in
+`docs/signal-audit.md` and the scripts that rebuild them live with the analyses.
+
 ## Validation of the synthetic print path: not yet trustworthy
 
 The same slice, same universe, real trade prints against prints rebuilt from
