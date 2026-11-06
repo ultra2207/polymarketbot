@@ -1006,6 +1006,17 @@ class PaperSessionRecorder:
             )
             self._written[name] = self._written.get(name, 0) + len(stamped)
 
+    def snapshot(self) -> None:
+        """Write the current state now.
+
+        A paper session that is killed - by a timeout, a crash, or a terminal
+        that goes away - loses everything if the only write is in ``stop()``.
+        The runner calls this on an interval so a kill costs one snapshot.
+        """
+        if self._stopped_ns is not None:
+            return
+        self._snapshot()
+
     def stop(self, reason: str = "stopped") -> None:
         if self._stopped_ns is not None:
             return

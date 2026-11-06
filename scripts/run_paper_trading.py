@@ -105,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         help="Run duration in seconds (default: continuous until interrupted)",
     )
     parser.add_argument(
+        "--snapshot-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between paper session snapshots (default: 60)",
+    )
+    parser.add_argument(
         "--epoch-interval",
         type=float,
         default=60.0,
@@ -264,11 +270,23 @@ async def async_main(args: argparse.Namespace) -> None:
         },
     )
     recorder.start()
+
+    async def _snapshot_loop(stop_after: float | None) -> None:
+        """Persist state as the session runs, so a kill loses one interval."""
+        while True:
+            await asyncio.sleep(min(60.0, args.snapshot_interval))
+            try:
+                recorder.snapshot()
+            except Exception as exc:  # noqa: BLE001 - never kill the session
+                log.warning(f"periodic snapshot failed: {exc}")
+
+    snapshot_task = asyncio.create_task(_snapshot_loop(args.duration))
     try:
         await client.run(duration_seconds=args.duration)
     finally:
         if kalshi_monitor is not None:
             kalshi_monitor.close()
+        snapshot_task.cancel()
         recorder.stop("run_complete")
 
 
