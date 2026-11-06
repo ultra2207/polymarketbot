@@ -394,6 +394,7 @@ class PaperTradingEngine:
             best_ask=float(book["best_ask"]),
             tick_size=float(book.get("tick_size", 0.01)),
             spread_cents=float(book.get("spread_cents", 0.0)),
+            competing_score=float(book.get("competing_score", 0.0)),
         )
         pos = self.positions.get(asset_id)
         return DecisionContext(
@@ -406,6 +407,9 @@ class PaperTradingEngine:
             bid_size_at_level=float(queue.bid_size_at_level) if queue is not None else 0.0,
             ask_size_at_level=float(queue.ask_size_at_level) if queue is not None else 0.0,
             ofi=ofi,
+            bid_score=float(getattr(self.virtual_quotes.get(asset_id, {}).get("bid"), "score", 0.0) or 0.0),
+            ask_score=float(getattr(self.virtual_quotes.get(asset_id, {}).get("ask"), "score", 0.0) or 0.0),
+            rate_per_day=float(self.markets[self.asset_to_condition[asset_id]].rate_per_day),
             signals=self._signals_for(asset_id),
         )
 
