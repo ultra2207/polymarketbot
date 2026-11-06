@@ -85,7 +85,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0550_10m_micro-inventory-skew-size"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-inventory-skew-size"
   },
   {
    "slug": "micro-join-vs-lead",
@@ -111,7 +111,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0538_10m_micro-jump-withdrawal"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-jump-withdrawal"
   },
   {
    "slug": "micro-net-complement-inventory",
@@ -137,7 +137,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0547_10m_micro-oscillation-vs-trend"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-oscillation-vs-trend"
   },
   {
    "slug": "micro-payout-floor",
@@ -163,7 +163,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0546_10m_micro-post-fill-defence"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-post-fill-defence"
   },
   {
    "slug": "micro-print-sweep-detector",
@@ -201,7 +201,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0538_10m_micro-queue-erosion-velocity"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-queue-erosion-velocity"
   },
   {
    "slug": "micro-reward-priced-pull",
@@ -212,8 +212,10 @@
    "module": "ideas.micro-reward-priced-pull.module",
    "metric": "Paired per-condition net with rewards_usd, fills and time_quoted_frac reported together; deciding number is net at equal-or-lower fills versus queue_aware_ofi, with the 0.90 time_quoted_frac gate applied.",
    "kill": "Kill if priced and unpriced gates land within $0.001/share on both slices, or if the priced gate needs time_quoted_frac below 0.90 to show its gain, or if the markout prior's error on the calibration hour exceeds 50 % (the conversion would be meaningless).",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-reward-priced-pull"
   },
   {
    "slug": "micro-score-density-split",
@@ -248,8 +250,10 @@
    "module": "ideas.micro-spread-widening-retreat.module",
    "metric": "Paired per-condition net with the post-widening versus quiet markout gap as the mechanism check, and time_quoted_frac as the reward cost; the deciding number is the paired net delta per share.",
    "kill": "Kill if the post-widening markout gap is below 0.3 c/share, or if widening episodes occur in fewer than 2 % of updates, or if reward forfeiture exceeds the markout saving on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-spread-widening-retreat"
   },
   {
    "slug": "micro-tail-price-bps",
@@ -275,7 +279,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0538_10m_micro-thin-level-sweep"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-thin-level-sweep"
   },
   {
    "slug": "micro-time-vs-size",
@@ -313,7 +317,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0547_10m_micro-vol-scaled-size"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-vol-scaled-size"
   },
   {
    "slug": "cross-binance-microprice-lead",

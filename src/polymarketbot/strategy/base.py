@@ -73,6 +73,10 @@ class BookContext:
     best_ask: float
     tick_size: float
     spread_cents: float
+    #: Reward-relevant state of the book: competitors' band score and the score
+    #: our own resting quotes currently earn. A reward-priced rule needs both to
+    #: compare the dollar value of quoting against the markout it risks.
+    competing_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,9 @@ class DecisionContext:
     bid_size_at_level: float
     ask_size_at_level: float
     ofi: Optional[float] = None
+    bid_score: float = 0.0
+    ask_score: float = 0.0
+    rate_per_day: float = 0.0
     signals: dict[str, float] = field(default_factory=dict)
 
 
@@ -138,4 +145,17 @@ def load_strategy(name: str) -> StrategyModule:
         raise StrategyError(f"ideas.{slug}.module has no STRATEGY instance")
     if not isinstance(strategy, StrategyModule):
         raise StrategyError(f"ideas.{slug}.module.STRATEGY does not implement the protocol")
-    return strategy
+    return _fresh(strategy)
+
+
+def _fresh(strategy: StrategyModule) -> StrategyModule:
+    """A per-market instance, so one module's buffer never spans two markets.
+
+    Modules ship a module-level ``STRATEGY`` for discovery. A replay runs one
+    engine per market, and sharing that one instance would mix their state; the
+    factory is called per market and must be stateless at construction.
+    """
+    try:
+        return type(strategy)()
+    except Exception:  # noqa: BLE001 - a module that needs constructor args keeps its instance
+        return strategy

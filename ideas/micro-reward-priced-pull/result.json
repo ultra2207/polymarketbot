@@ -1,0 +1,44 @@
+{
+ "strategy": "micro-reward-priced-pull",
+ "slices": [
+  {
+   "strategy": "micro-reward-priced-pull",
+   "stats": {
+    "fills": 83,
+    "fills_recorded": 83,
+    "net": 59.4435,
+    "rewards_usd": 37.0375,
+    "inventory_mtm": 42.3244,
+    "markets_with_fills": 34,
+    "markout_5m_bps": -52.91,
+    "markout_5m_bps_n": 83,
+    "markout_5m_bps_median": 231.34,
+    "rewards_observed": 32.5167,
+    "rewards_unobserved_competition": 4.5208,
+    "markets_competition_observed": 369,
+    "events": 2155,
+    "elapsed_s": 7.8
+   },
+   "paired": {
+    "conditions": 500,
+    "mean_diff": 0.0,
+    "t": 0.0,
+    "total_diff": 0.0,
+    "concentration": 1.0
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793943900.0,
+    1793944500.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T05:59:34.647028+00:00"
+}

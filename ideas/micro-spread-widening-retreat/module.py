@@ -107,8 +107,8 @@ class SpreadWideningRetreat:
                 history.append((spread, mid))
                 return _pull(spread, reference, state.cooldown)
             # The spread came back to its median: no reason to stay out early.
+            # The not-widened branch below re-arms, so a later widening is new.
             state.cooldown = 0
-            state.armed = True
 
         if len(history) < MIN_OBSERVATIONS:
             history.append((spread, mid))

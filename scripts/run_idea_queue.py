@@ -58,6 +58,21 @@ def pending(data: dict[str, Any]) -> list[dict[str, Any]]:
     return [i for i in data.get("ideas", []) if i.get("status") == "implemented"]
 
 
+def slice_start(args: argparse.Namespace, offset: int) -> str:
+    """ISO start a given number of seconds before the newest tape timestamp."""
+    import duckdb
+
+    newest = duckdb.connect().execute(
+        "select max(venue_ts_ms) from read_parquet('data/tape/clob_events/**/*.parquet')"
+    ).fetchone()[0]
+    import math
+
+    end = math.floor(float(newest) / 1000.0 / 300.0) * 300.0 - float(offset)
+    from datetime import datetime, UTC
+
+    return datetime.fromtimestamp(end - args.minutes * 60.0, UTC).strftime("%Y-%m-%dT%H:%M")
+
+
 def run_replay(strategy: str, args: argparse.Namespace, tag: str, out: Path) -> dict[str, Any]:
     cmd = [
         sys.executable,
@@ -130,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=280, help="per-replay cap, below the 300 s rule")
     parser.add_argument("--limit", type=int, default=0, help="run at most N pending ideas")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--slice-offsets",
+        default="0",
+        help="comma-separated seconds before the newest data; promotion requires every slice",
+    )
     args = parser.parse_args(argv)
 
     registry = load_registry()
@@ -143,30 +163,61 @@ def main(argv: list[str] | None = None) -> int:
 
     stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M")
     base_dir = DERIVED / f"{stamp}_{args.minutes}m_{args.baseline}"
-    base_summary = run_replay(args.baseline, args, f"{stamp}_{args.minutes}m_{args.baseline}", base_dir)
-    log.info(f"baseline net={base_summary['strategies'][args.baseline]['net']}")
+    offsets = [int(o) for o in str(args.slice_offsets).split(",") if o.strip()]
+    base_dirs: dict[int, Path] = {}
+    base_summaries: dict[int, dict[str, Any]] = {}
+    for offset in offsets:
+        args.start_utc = slice_start(args, offset)
+        base_dir = DERIVED / f"{stamp}_{args.minutes}m_o{offset}_{args.baseline}"
+        base_summaries[offset] = run_replay(
+            args.baseline, args, f"{stamp}_{args.minutes}m_o{offset}_{args.baseline}", base_dir
+        )
+        base_dirs[offset] = base_dir
+        log.info(
+            f"baseline[{offset}] start={args.start_utc} net="
+            f"{base_summaries[offset]['strategies'][args.baseline]['net']}"
+        )
 
     for idea in queue:
         slug = str(idea["slug"])
-        idea_dir = DERIVED / f"{stamp}_{args.minutes}m_{slug}"
+        per_slice: list[dict[str, Any]] = []
+        verdict = "pass"
         try:
-            summary = run_replay(slug, args, f"{stamp}_{args.minutes}m_{slug}", idea_dir)
+            for offset in offsets:
+                args.start_utc = slice_start(args, offset)
+                idea_dir = DERIVED / f"{stamp}_{args.minutes}m_o{offset}_{slug}"
+                summary = run_replay(
+                    slug, args, f"{stamp}_{args.minutes}m_o{offset}_{slug}", idea_dir
+                )
+                pair = paired(idea_dir, base_dirs[offset])
+                result = evaluate(idea_dir, summary, base_summaries[offset], pair)
+                result["slice"] = summary["slice"]
+                result["offset"] = offset
+                per_slice.append(result)
+                if result["verdict"] != "pass":
+                    verdict = "fail"
+                log.info(
+                    f"{slug}[{offset}] net_diff={pair['mean_diff']} t={pair['t']} "
+                    f"({result['verdict']})"
+                )
         except Exception as exc:  # noqa: BLE001 - one broken idea must not stop the queue
             log.warning(f"{slug}: {exc}")
             idea["status"] = "error"
             idea["error"] = str(exc)[:400]
             save_registry(registry)
             continue
-        pair = paired(idea_dir, base_dir)
-        result = evaluate(idea_dir, summary, base_summary, pair)
-        result["slice"] = summary["slice"]
-        result["finished_utc"] = datetime.now(tz=UTC).isoformat()
-        (IDEAS / slug / "result.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+        combined = {
+            "strategy": slug,
+            "slices": per_slice,
+            "verdict": verdict,
+            "finished_utc": datetime.now(tz=UTC).isoformat(),
+        }
+        (IDEAS / slug / "result.json").write_text(json.dumps(combined, indent=1), encoding="utf-8")
         idea["status"] = "done"
-        idea["verdict"] = result["verdict"]
-        idea["result"] = f"data/derived/replay/{idea_dir.name}"
+        idea["verdict"] = verdict
+        idea["result"] = f"data/derived/replay/{stamp}_{args.minutes}m_o{offsets[0]}_{slug}"
         save_registry(registry)
-        log.info(f"{slug}: net_diff={pair['mean_diff']} t={pair['t']} verdict={result['verdict']}")
+        log.info(f"{slug}: verdict={verdict} over {len(per_slice)} slice(s)")
         if args.dry_run:
             break
     return 0
