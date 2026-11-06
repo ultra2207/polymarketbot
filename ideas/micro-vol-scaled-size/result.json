@@ -17,14 +17,14 @@
     "rewards_unobserved_competition": 0.0713,
     "markets_competition_observed": 334,
     "events": 1835,
-    "elapsed_s": 9.62
+    "elapsed_s": 7.6
    },
    "paired": {
     "conditions": 500,
-    "mean_diff": -0.02273,
-    "t": -0.907,
-    "total_diff": -11.3635,
-    "concentration": 0.877
+    "mean_diff": 0.00316,
+    "t": 1.0,
+    "total_diff": 1.578,
+    "concentration": 1.0
    },
    "gates": {
     "fills_and_conditions": false,
@@ -40,5 +40,5 @@
   }
  ],
  "verdict": "fail",
- "finished_utc": "2026-11-06T06:06:27.613261+00:00"
+ "finished_utc": "2026-11-06T06:09:54.275463+00:00"
 }

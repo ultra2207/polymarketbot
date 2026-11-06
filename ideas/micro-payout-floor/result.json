@@ -4,6 +4,43 @@
   {
    "strategy": "micro-payout-floor",
    "stats": {
+    "fills": 88,
+    "fills_recorded": 88,
+    "net": 47.9833,
+    "rewards_usd": 14.3141,
+    "inventory_mtm": -396.7835,
+    "markets_with_fills": 36,
+    "markout_5m_bps": 1597.12,
+    "markout_5m_bps_n": 88,
+    "markout_5m_bps_median": 204.08,
+    "rewards_observed": 14.1716,
+    "rewards_unobserved_competition": 0.1425,
+    "markets_competition_observed": 335,
+    "events": 1427,
+    "elapsed_s": 7.35
+   },
+   "paired": {
+    "conditions": 500,
+    "mean_diff": 0.08309,
+    "t": 0.862,
+    "total_diff": 41.5464,
+    "concentration": 1.121
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793944800.0,
+    1793945400.0
+   ],
+   "offset": 0
+  },
+  {
+   "strategy": "micro-payout-floor",
+   "stats": {
     "fills": 108,
     "fills_recorded": 108,
     "net": 14.2515,
@@ -17,7 +54,7 @@
     "rewards_unobserved_competition": 0.1726,
     "markets_competition_observed": 203,
     "events": 2269,
-    "elapsed_s": 9.36
+    "elapsed_s": 7.46
    },
    "paired": {
     "conditions": 500,
@@ -36,9 +73,9 @@
     1793941200.0,
     1793941800.0
    ],
-   "offset": 0
+   "offset": 3600
   }
  ],
  "verdict": "fail",
- "finished_utc": "2026-11-06T06:08:45.587933+00:00"
+ "finished_utc": "2026-11-06T06:10:46.875903+00:00"
 }

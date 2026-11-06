@@ -158,8 +158,10 @@
    "module": "ideas.micro-payout-floor.module",
    "metric": "Fraction of rewarded conditions projected below the floor, and the paired net difference on that subset; the deciding number is the paired net delta per share on below-floor conditions with the rewards_usd delta printed next to it.",
    "kill": "Kill if fewer than 5 % of rewarded conditions fall below the floor, or if below-floor conditions show reactionary markout >= +0.001 $/share (i.e. they are profitable to quote anyway), or if the projection's error versus realised epoch payouts exceeds 2x on the calibration slice.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0609_10m_o0_micro-payout-floor"
   },
   {
    "slug": "micro-post-fill-defence",
@@ -211,7 +213,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0605_10m_o0_micro-queue-erosion-velocity"
+   "result": "data/derived/replay/20261106T0609_10m_o0_micro-queue-erosion-velocity"
   },
   {
    "slug": "micro-reward-priced-pull",
@@ -288,10 +290,10 @@
    "module": "ideas/micro-thin-level-sweep/module.py",
    "metric": "Paired per-condition net against reactionary, with the markout difference between the bottom and top level-size quartiles reported as the mechanism check; the deciding number is the paired net delta per share.",
    "kill": "Kill if the quartile markout gap is below 0.3 c/share, or if the bottom-quartile fills are not worse than -0.5 c/share, or if the paired net delta is negative on either slice.",
-   "status": "implemented",
+   "status": "done",
    "author": "IdeaGenMicro",
-   "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-thin-level-sweep"
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-thin-level-sweep"
   },
   {
    "slug": "micro-time-vs-size",
@@ -314,8 +316,10 @@
    "module": "ideas.micro-two-sided-coupling.module",
    "metric": "Paired per-condition net and rewards_usd on tail conditions, plus the fraction of conditions where the two Q sides are simultaneously populated (a two-sidedness proxy the harness can compute from the per-token epoch snapshots); deciding number is the paired net difference against queue_aware_ofi. Caveat: paper_trading/rewards.compute_epoch_payout has no Q_min and no c = 3 penalty, so on today's engine a one-sided book is scored additively; the proxy, not rewards_usd, is the falsifying number until that scoring is patched.",
    "kill": "Kill if, on tail conditions, symmetric pull is worse than per-side pull by more than $0.002/share on both slices, or if fewer than 3 % of rewarded conditions sit outside [0.10, 0.90] at any point in the slice.",
-   "status": "implemented",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-two-sided-coupling"
   },
   {
    "slug": "micro-vol-scaled-size",
@@ -326,10 +330,10 @@
    "module": "ideas.micro-vol-scaled-size.module",
    "metric": "Paired per-condition net against reactionary, with the volatility-tercile markout ladder and the distribution of the applied scale reported; the deciding number is the paired net delta per share.",
    "kill": "Kill if the tercile markout ladder is flat (spread below 0.3 c/share), or if the applied scale is 1.0 or the floor for more than 90 % of updates (the signal does not vary), or if paired net is not positive on both slices.",
-   "status": "implemented",
+   "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-vol-scaled-size"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-vol-scaled-size"
   },
   {
    "slug": "cross-binance-microprice-lead",
@@ -412,8 +416,10 @@
    "module": "Act only when `kalshi_age_ms <= 6000` and `kalshi_conf >= 0.6`. basis > +3 -> SHRINK the YES ask to 0.25 and keep the bid; basis < -3 -> mirror; |basis| > 8 -> PULL. The mapping direction is applied before the sign is read: for a `yes_no` row the basis is...",
    "metric": "Paired per-condition net and markout over the 53 reward-universe mapped conditions, versus `queue_aware_ofi` on the same slice.",
    "kill": "Kill if paired net <= 0 or t < 2 on two slices, or the basis-conditioned markout gain is < 0.5 c/share, or the 5 s deciles stay non-monotone on a >= 7 day sample (the slope then belongs to one family with < 10 pairs and cannot be quoted).",
-   "status": "proposed",
-   "author": "IdeaGenCross"
+   "status": "done",
+   "author": "IdeaGenCross",
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0615_30m_o0_cross-kalshi-basis-side-pull"
   },
   {
    "slug": "cross-kalshi-trade-lead-gate",

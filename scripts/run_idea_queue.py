@@ -88,6 +88,8 @@ def run_replay(strategy: str, args: argparse.Namespace, tag: str, out: Path) -> 
         cmd += ["--start-utc", args.start_utc]
     if args.flat:
         cmd += ["--flat", str(args.flat)]
+    if getattr(args, "mapped", False):
+        cmd += ["--mapped"]
     log.info(f"replay {strategy} -> {out}")
     result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=args.timeout, check=False)
     if result.returncode != 0:
@@ -149,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=280, help="per-replay cap, below the 300 s rule")
     parser.add_argument("--limit", type=int, default=0, help="run at most N pending ideas")
     parser.add_argument("--only", default="", help="comma-separated slugs; overrides status filtering")
+    parser.add_argument("--mapped", action="store_true", help="restrict to Kalshi-mapped conditions")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--slice-offsets",

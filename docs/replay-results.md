@@ -193,6 +193,26 @@ The next real test is therefore not another sizing rule. It is either a
 **cross-venue** rule with its signal materialised. Both are now unblocked by the
 harness; neither has been measured.
 
+## Why the cross-venue family is blocked: the mapped markets are silent
+
+The first cross-venue idea (`cross-kalshi-basis-side-pull`) was implemented end
+to end — `prepare.sql` builds 10,240 basis rows, the harness injects them as-of,
+the module shrinks the threatened side and flips the sign for a NO quote — and
+the verdict is `inert`. The reason is data, not code:
+
+| measure | value |
+|---|---|
+| mapped conditions in the reward set | 53 of 107 |
+| assets with any book event in a two-hour window | 28 |
+| book events per minute across the whole mapped set | **1–3** |
+| fills in a 30-minute slice on 53 mapped markets | **0** |
+
+The Kalshi mapping targets reward-tail markets: they carry the pool, but almost
+no Polymarket book activity. A cross-venue rule cannot be calibrated on 1–3
+events per minute, so more `prepare.sql` files would only produce more `inert`
+verdicts. The fix is a mapping audit that prefers *active* Polymarket markets
+over high-pool ones — a research task, not a pipeline task.
+
 ## Capital scaling (500 markets, 10 minutes, `reactionary`)
 
 | pool multiplier | notional range | fills | rewards | net |

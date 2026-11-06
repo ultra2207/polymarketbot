@@ -257,6 +257,8 @@ def run_strategy(
     signals = load_signals(strategy_name)
     if signals is None:
         log.info(f"[{strategy_name}] no prepared signals; context.signals stays empty")
+    else:
+        log.info(f"[{strategy_name}] prepared signals for {len(signals._series)} assets")
     for m in markets:
         tokens = [str(t) for t in m["clob_tokens"][:2]]
         min_size = float(m.get("min_size") or 0.0)
@@ -577,6 +579,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flat", type=float, default=0.0, help="flat notional per market; 0 = pool-scaled")
     parser.add_argument("--max-markets", type=int, default=0)
     parser.add_argument("--order-by", default="liquidity", choices=("pool", "liquidity", "volume"))
+    parser.add_argument(
+        "--mapped",
+        action="store_true",
+        help="restrict the universe to the conditions in the Kalshi mapping, where the "
+        "cross-venue signals exist",
+    )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--tag", default=None)
     parser.add_argument("--tape-root", default=str(TAPE))
@@ -584,6 +592,11 @@ def main(argv: list[str] | None = None) -> int:
 
     universe_path = args.universe or latest_universe(DEFAULT_UNIVERSE)
     markets = load_universe(universe_path, min_pool=args.min_pool, order_by=args.order_by)
+    if args.mapped:
+        mapped = pd.read_parquet(REPO_ROOT / "data" / "derived" / "kalshi_mapping_v2.parquet")
+        keep = set(mapped["polymarket_condition_id"].astype(str))
+        markets = [m for m in markets if str(m["condition_id"]) in keep]
+        log.info(f"mapped-only universe: {len(markets)} of {len(keep)} mapped conditions are in the reward set")
     if args.max_markets:
         markets = markets[: args.max_markets]
     start, end = resolve_slice(args.minutes, args.start_utc, tape=Path(args.tape_root))

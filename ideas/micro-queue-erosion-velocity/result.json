@@ -4,27 +4,27 @@
   {
    "strategy": "micro-queue-erosion-velocity",
    "stats": {
-    "fills": 64,
-    "fills_recorded": 64,
-    "net": 15.6782,
-    "rewards_usd": 11.9099,
-    "inventory_mtm": -312.3472,
-    "markets_with_fills": 22,
-    "markout_5m_bps": 3375.12,
-    "markout_5m_bps_n": 64,
-    "markout_5m_bps_median": 204.08,
-    "rewards_observed": 11.8386,
-    "rewards_unobserved_competition": 0.0713,
-    "markets_competition_observed": 334,
-    "events": 1835,
-    "elapsed_s": 9.28
+    "fills": 84,
+    "fills_recorded": 84,
+    "net": 47.9104,
+    "rewards_usd": 14.3243,
+    "inventory_mtm": -315.5955,
+    "markets_with_fills": 37,
+    "markout_5m_bps": 1818.88,
+    "markout_5m_bps_n": 84,
+    "markout_5m_bps_median": 216.49,
+    "rewards_observed": 14.1818,
+    "rewards_unobserved_competition": 0.1425,
+    "markets_competition_observed": 335,
+    "events": 1427,
+    "elapsed_s": 7.9
    },
    "paired": {
     "conditions": 500,
-    "mean_diff": 0.01848,
-    "t": 0.903,
-    "total_diff": 9.2413,
-    "concentration": 1.105
+    "mean_diff": 0.08295,
+    "t": 0.862,
+    "total_diff": 41.4735,
+    "concentration": 1.123
    },
    "gates": {
     "fills_and_conditions": false,
@@ -33,12 +33,49 @@
    },
    "verdict": "fail",
    "slice": [
-    1793944500.0,
-    1793945100.0
+    1793944800.0,
+    1793945400.0
    ],
    "offset": 0
+  },
+  {
+   "strategy": "micro-queue-erosion-velocity",
+   "stats": {
+    "fills": 83,
+    "fills_recorded": 83,
+    "net": 11.7493,
+    "rewards_usd": 6.6606,
+    "inventory_mtm": -428.4577,
+    "markets_with_fills": 37,
+    "markout_5m_bps": 1591.53,
+    "markout_5m_bps_n": 83,
+    "markout_5m_bps_median": 170.21,
+    "rewards_observed": 6.488,
+    "rewards_unobserved_competition": 0.1726,
+    "markets_competition_observed": 203,
+    "events": 2269,
+    "elapsed_s": 8.39
+   },
+   "paired": {
+    "conditions": 500,
+    "mean_diff": -0.0053,
+    "t": -1.183,
+    "total_diff": -2.6523,
+    "concentration": 0.484
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793941200.0,
+    1793941800.0
+   ],
+   "offset": 3600
   }
  ],
  "verdict": "fail",
- "finished_utc": "2026-11-06T06:08:32.428506+00:00"
+ "finished_utc": "2026-11-06T06:11:13.806692+00:00"
 }

@@ -1,0 +1,44 @@
+{
+ "strategy": "cross-kalshi-basis-side-pull",
+ "slices": [
+  {
+   "strategy": "cross-kalshi-basis-side-pull",
+   "stats": {
+    "fills": 0,
+    "fills_recorded": 0,
+    "net": 0.0327,
+    "rewards_usd": 0.0327,
+    "inventory_mtm": 0.0,
+    "markets_with_fills": 0,
+    "markout_5m_bps": null,
+    "markout_5m_bps_n": 0,
+    "markout_5m_bps_median": null,
+    "rewards_observed": 0.0,
+    "rewards_unobserved_competition": 0.0327,
+    "markets_competition_observed": 0,
+    "events": 16518,
+    "elapsed_s": 3.49
+   },
+   "paired": {
+    "conditions": 53,
+    "mean_diff": 0.0,
+    "t": 0.0,
+    "total_diff": 0.0,
+    "concentration": 1.0
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "inert",
+   "slice": [
+    1793932200.0,
+    1793934000.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "inert",
+ "finished_utc": "2026-11-06T06:15:36.833254+00:00"
+}
