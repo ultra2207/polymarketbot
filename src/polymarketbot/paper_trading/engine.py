@@ -42,6 +42,8 @@ from polymarketbot.paper_trading.rewards import (
 )
 from polymarketbot.risk import RiskConfig, RiskManager
 
+MIN_REST_SECONDS = 3.5
+
 logger = get_logger("paper_trading")
 
 
@@ -745,6 +747,7 @@ class PaperTradingEngine:
                 score=bid_score,
                 post_only_valid=post_only_bid,
                 queue_ahead=round(bid_queue_ahead, 4),
+                timestamp=self.clock(),
             )
 
         # Update ASK quote
@@ -773,6 +776,7 @@ class PaperTradingEngine:
                 score=ask_score,
                 post_only_valid=post_only_ask,
                 queue_ahead=round(ask_queue_ahead, 4),
+                timestamp=self.clock(),
             )
 
         self.virtual_quotes[asset_id] = {"bid": v_bid, "ask": v_ask}
@@ -1253,8 +1257,19 @@ class PaperTradingEngine:
                 book = self.orderbooks.get(asset_id, {})
                 mid = book.get("mid", 0.50)
                 comp_score = book.get("competing_score", 0.0)
-                bid_score = v_bid.score if (v_bid and v_bid.post_only_valid) else 0.0
-                ask_score = v_ask.score if (v_ask and v_ask.post_only_valid) else 0.0
+                # The venue scores an order only if it rested at least 3.5 s in
+                # the sampled minute; a quote replaced more often earns nothing.
+                now_s = self.clock()
+                bid_score = (
+                    v_bid.score
+                    if (v_bid and v_bid.post_only_valid and now_s - v_bid.timestamp >= MIN_REST_SECONDS)
+                    else 0.0
+                )
+                ask_score = (
+                    v_ask.score
+                    if (v_ask and v_ask.post_only_valid and now_s - v_ask.timestamp >= MIN_REST_SECONDS)
+                    else 0.0
+                )
                 v_score = normalise_two_sided(bid_score, ask_score)
                 market_score += v_score
                 market_comp += comp_score

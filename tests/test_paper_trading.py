@@ -187,7 +187,11 @@ def test_epoch_sampling_and_ledger_persistence(tmp_path: Path):
 
     bids = [{"price": "0.49", "size": "200"}]
     asks = [{"price": "0.51", "size": "200"}]
+    clock = [1_000_000.0]
+    engine.clock = lambda: clock[0]
     engine.update_orderbook("tok_yes", bids, asks, tick_size=0.01)
+    # The venue scores an order only after it has rested 3.5 s in the minute.
+    clock[0] += 4.0
 
     # Run epoch sample
     snaps = engine.run_epoch_sample()

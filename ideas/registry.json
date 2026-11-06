@@ -693,6 +693,13 @@
    "status": "done",
    "verdict": "pass",
    "result": "data/derived/replay/20261106T0815_20m_o0_micro-random-participation-control"
+  },
+  {
+   "slug": "micro-complement-staleness",
+   "title": "A stale complement is a free option: pull the lagging token",
+   "status": "done",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0841_20m_o0_micro-complement-staleness"
   }
  ]
 }

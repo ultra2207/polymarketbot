@@ -22,6 +22,7 @@ import argparse
 import bisect
 import json
 import math
+import re
 import sys
 import time
 from collections import defaultdict
@@ -57,7 +58,14 @@ MARKOUT_TAIL_SECONDS = 900.0
 # Universe and slice
 # --------------------------------------------------------------------------- #
 def latest_universe(root: Path) -> Path:
-    files = sorted(root.glob("*.json"))
+    """Newest timestamped snapshot, never a hand-built universe file.
+
+    ``build_highvol_universe.py`` writes ``highvol_latest.json`` into the same
+    directory, and sorting by name put it last - so a plain reward replay
+    silently loaded the liquid universe and found no markets at reward hours.
+    Only ``YYYYMMDDTHHMMSS.json`` files are snapshots of the reward universe.
+    """
+    files = sorted(p for p in root.glob("*.json") if re.fullmatch(r"\d{8}T\d{6}", p.stem))
     if not files:
         raise SystemExit(f"no universe snapshot under {root}")
     return files[-1]

@@ -334,6 +334,14 @@ cross-kalshi-basis-side-pull: verdict=inert: no shrink headroom
 Test size-based ideas with `--pool-multiplier 1.0` or larger so the quote has
 range above the venue minimum.
 
+## Three harness defects found while re-checking
+
+| defect | effect | status |
+|---|---|---|
+| `latest_universe` sorted filenames, so `highvol_latest.json` outranked every timestamped snapshot | a plain reward replay silently loaded the liquid universe and found no markets at reward hours | fixed: only `YYYYMMDDTHHMMSS.json` counts as a snapshot |
+| the venue scores an order only if it rested >= 3.5 s in the sampled minute; the engine scored every quote | rewards overstated; quotes are usually older than 3.5 s, so the correction is small | fixed: quote timestamps come from the engine clock. Reward at 0.75c on the frozen slice: $1.789 -> $1.692 (-5 %) |
+| `capital_for` sizes every market at `mid = 0.5`, before any book exists | shares are over-sized on cheap tokens and under-sized on expensive ones by `0.5/mid`; paired comparisons are unaffected | **documented, not fixed**: the mid is not known until the book arrives, and no mid field exists in the universe snapshot |
+
 ## A scoring defect the review found: the pool was paid twice
 
 `run_epoch_sample` looped over a market's two tokens and paid
