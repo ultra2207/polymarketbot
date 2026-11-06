@@ -140,6 +140,7 @@ def paired(idea: Path, base: Path, metric: str = "net") -> dict[str, Any]:
         "t": round(t, 3),
         "total_diff": round(total, 4),
         "concentration": round(concentration, 3),
+        "diffs": [float(x) for x in diff.tolist()],
     }
 
 
@@ -166,6 +167,76 @@ def evaluate(idea_dir: Path, idea_metrics: dict[str, Any], base_metrics: dict[st
     }
 
 
+def pooled_metric(idea_dirs: list[Path], base_dirs: list[Path], column: str) -> dict[str, Any] | None:
+    """Pool one metric's per-condition differences across slices."""
+    pooled: list[float] = []
+    means: list[float] = []
+    for idea_dir, base_dir in zip(idea_dirs, base_dirs):
+        try:
+            a = pd.read_parquet(idea_dir / "metrics.parquet").set_index("condition_id")
+            b = pd.read_parquet(base_dir / "metrics.parquet").set_index("condition_id")
+        except Exception:  # noqa: BLE001 - a missing slice is not a verdict
+            continue
+        if column not in a or column not in b:
+            continue
+        common = a.index.intersection(b.index)
+        diff = (a.loc[common, column].fillna(0.0) - b.loc[common, column].fillna(0.0)).astype(float)
+        if not len(diff):
+            continue
+        pooled.extend(float(x) for x in diff.tolist())
+        means.append(float(diff.mean()))
+    if not pooled:
+        return None
+    n = len(pooled)
+    mean = sum(pooled) / n
+    sd = (sum((x - mean) ** 2 for x in pooled) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    t = mean / (sd / n**0.5) if sd > 0 and n > 1 else 0.0
+    return {
+        "slices": len(means),
+        "n": n,
+        "mean_diff": round(mean, 4),
+        "t": round(t, 3),
+        "all_positive": all(m > 0 for m in means),
+        "per_slice_means": [round(m, 2) for m in means],
+    }
+
+
+def pool_slices(per_slice: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Combine per-condition diffs across slices into one statistic.
+
+    A single 20-minute slice has ~40-70 conditions and a t of 1-2 on an effect of
+    1 % of baseline, so it can never separate a real rule from noise. Slices are
+    independent draws of the same effect; pooling them is the honest way to buy
+    power, provided the sign holds in each one.
+    """
+    pooled: list[float] = []
+    means: list[float] = []
+    for result in per_slice:
+        diffs = result.get("paired", {}).get("diffs") or []
+        if not diffs:
+            continue
+        pooled.extend(diffs)
+        means.append(float(result["paired"]["mean_diff"]))
+    if not pooled:
+        return None
+    n = len(pooled)
+    mean = sum(pooled) / n
+    if n > 1:
+        var = sum((x - mean) ** 2 for x in pooled) / (n - 1)
+        sd = var**0.5
+    else:
+        sd = 0.0
+    t = mean / (sd / n**0.5) if sd > 0 and n > 1 else 0.0
+    return {
+        "slices": len(means),
+        "per_slice_means": [round(m, 4) for m in means],
+        "n": n,
+        "mean_diff": round(mean, 5),
+        "t": round(t, 3),
+        "all_positive": all(m > 0 for m in means),
+    }
+
+
 def _inert_cause(run_dir: Path) -> str:
     """Say why a strategy produced no difference, when the run can tell us."""
     try:
@@ -188,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--minutes", type=int, default=10)
     parser.add_argument("--start-utc", default=None)
+    parser.add_argument("--starts", default="",
+                        help="comma-separated slice starts; every slice is replayed and the "
+                             "paired diffs are pooled into one statistic")
     parser.add_argument("--order-by", default="liquidity", choices=("pool", "liquidity", "volume"))
     parser.add_argument("--max-markets", type=int, default=500)
     parser.add_argument("--baseline", default="queue_aware_ofi")
@@ -228,13 +302,16 @@ def main(argv: list[str] | None = None) -> int:
 
     stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M")
     base_dir = DERIVED / f"{stamp}_{args.minutes}m_{args.baseline}"
-    frozen = bool(args.start_utc)
+    starts = [x.strip() for x in str(getattr(args, "starts", "") or "").split(",") if x.strip()]
+    frozen = bool(args.start_utc) or bool(starts)
     offsets = [0] if frozen else [int(o) for o in str(args.slice_offsets).split(",") if o.strip()]
+    if starts:
+        offsets = list(range(len(starts)))
     frozen_start = args.start_utc
     base_dirs: dict[int, Path] = {}
     base_summaries: dict[int, dict[str, Any]] = {}
     for offset in offsets:
-        args.start_utc = frozen_start if frozen else slice_start(args, offset)
+        args.start_utc = starts[offset] if starts else (frozen_start if frozen else slice_start(args, offset))
         base_dir = DERIVED / f"{stamp}_{args.minutes}m_o{offset}_{args.baseline}"
         base_summaries[offset] = run_replay(
             args.baseline, args, f"{stamp}_{args.minutes}m_o{offset}_{args.baseline}", base_dir
@@ -248,10 +325,11 @@ def main(argv: list[str] | None = None) -> int:
     for idea in queue:
         slug = str(idea["slug"])
         per_slice: list[dict[str, Any]] = []
+        idea_dirs_seen: list[Path] = []
         verdict = "pass"
         try:
             for offset in offsets:
-                args.start_utc = frozen_start if frozen else slice_start(args, offset)
+                args.start_utc = starts[offset] if starts else (frozen_start if frozen else slice_start(args, offset))
                 idea_dir = DERIVED / f"{stamp}_{args.minutes}m_o{offset}_{slug}"
                 summary = run_replay(
                     slug, args, f"{stamp}_{args.minutes}m_o{offset}_{slug}", idea_dir
@@ -261,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
                 result["slice"] = summary["slice"]
                 result["offset"] = offset
                 per_slice.append(result)
+                idea_dirs_seen.append(idea_dir)
                 if result["verdict"].startswith("inert"):
                     verdict = result["verdict"]
                 elif result["verdict"] != "pass":
@@ -269,6 +348,33 @@ def main(argv: list[str] | None = None) -> int:
                     f"{slug}[{offset}] net_diff={pair['mean_diff']} t={pair['t']} "
                     f"({result['verdict']})"
                 )
+            pooled = pool_slices(per_slice)
+            if pooled is not None:
+                result_pool = pooled
+                # Trading less on a market where every fill loses money improves
+                # P&L without any skill. Per-fill markout is exposure-free, so a
+                # gain that vanishes there is an exposure effect, not a signal.
+                per_fill = pooled_metric(
+                    idea_dirs_seen,
+                    [base_dirs[o] for o in offsets][: len(idea_dirs_seen)],
+                    "markout_tape_bps_mean",
+                )
+                log.info(
+                    f"{slug}: pooled over {result_pool['slices']} slice(s) "
+                    f"n={result_pool['n']} mean={result_pool['mean_diff']} t={result_pool['t']} "
+                    f"sign_consistent={result_pool['all_positive']}"
+                )
+                if verdict.startswith("inert"):
+                    pass
+                elif not (result_pool["t"] >= MIN_T and result_pool["all_positive"]):
+                    verdict = "fail"
+                elif per_fill is not None and (per_fill["t"] < 1.0 or not per_fill["all_positive"]):
+                    verdict = (
+                        "exposure-only: P&L gain does not survive on per-fill markout "
+                        f"(markout t={per_fill['t']}, per-slice {per_fill['per_slice_means']})"
+                    )
+                else:
+                    verdict = "pass"
         except Exception as exc:  # noqa: BLE001 - one broken idea must not stop the queue
             log.warning(f"{slug}: {exc}")
             idea["status"] = "error"

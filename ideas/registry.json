@@ -186,11 +186,12 @@
    "module": "ideas.micro-print-sweep-detector.module",
    "metric": "Paired per-condition net against queue_aware_ofi, with the markout of fills inside sweep windows versus outside as the mechanism check, and the median consumed fraction reported so the 0.5 threshold is auditable.",
    "kill": "Kill if sweep prints are under 5 % of prints, or if the in-window markout gap is below 0.3 c/share, or if the rule repeats the 850/1.5 c failure (paired net at or below baseline on both slices).",
-   "status": "promising",
+   "status": "killed",
    "author": "IdeaGenMicro",
    "verdict": "fail",
    "result": "data/derived/replay/20261106T0759_20m_o0_micro-print-sweep-detector",
-   "evidence": "tape_net vs reactionary on the 70-market liquid universe, --flat 200, synthetic prints: 40 mkts 02:10 +$26.25 (t=2.82); 40 mkts 02:50 +$23.48 (t=2.41); 70 mkts 02:10 +$73.36 (t=1.52). Sign is consistent, significance is not: the 70-market slice is the honest one and it does not clear t>=2."
+   "evidence": "tape_net vs reactionary on the 70-market liquid universe, --flat 200, synthetic prints: 40 mkts 02:10 +$26.25 (t=2.82); 40 mkts 02:50 +$23.48 (t=2.41); 70 mkts 02:10 +$73.36 (t=1.52). Sign is consistent, significance is not: the 70-market slice is the honest one and it does not clear t>=2.",
+   "kill_reason": "Exposure artefact. P&L gain pools to +$154 (t=2.05) but the per-fill markout effect is t=0.54 with signs [-290, +27, +504]: the gain is trading less on markets where every fill loses, not better timing. A random stand-down at a 31% duty cycle captures $65 of it and beats nothing else. Tested on the liquid universe (70 markets, 3x20min, tape-priced P&L)."
   },
   {
    "slug": "micro-qmin-equalisation",
@@ -663,18 +664,35 @@
   {
    "slug": "micro-burst-decay-reentry",
    "title": "Arrival bursts are parent orders being sliced; the calm after them is not",
-   "status": "promising",
+   "status": "killed",
    "verdict": "fail",
    "result": "data/derived/replay/20261106T0804_20m_o0_micro-burst-decay-reentry",
-   "evidence": "tape_net vs reactionary, liquid universe, --flat 200: 70 mkts 02:10 +$107.44 (t=1.65); 70 mkts 02:50 +$277.20 (t=1.29). Same sign, below t>=2 on each slice alone."
+   "evidence": "tape_net vs reactionary, liquid universe, --flat 200: 70 mkts 02:10 +$107.44 (t=1.65); 70 mkts 02:50 +$277.20 (t=1.29). Same sign, below t>=2 on each slice alone.",
+   "kill_reason": "Exposure artefact. P&L gain pools to +$154 (t=2.05) but the per-fill markout effect is t=0.54 with signs [-290, +27, +504]: the gain is trading less on markets where every fill loses, not better timing. A random stand-down at a 31% duty cycle captures $65 of it and beats nothing else. Tested on the liquid universe (70 markets, 3x20min, tape-priced P&L)."
   },
   {
    "slug": "micro-absorbed-flow",
    "title": "Depth that refills is absorbed flow; depth that empties is informed flow",
-   "status": "promising",
+   "status": "killed",
    "verdict": "fail",
    "result": "data/derived/replay/20261106T0804_20m_o0_micro-absorbed-flow",
-   "evidence": "tape_net vs reactionary, liquid universe, --flat 200: 70 mkts 02:10 +$62.21 (t=1.02); 70 mkts 02:50 +$226.47 (t=1.13). Same sign, below t>=2."
+   "evidence": "tape_net vs reactionary, liquid universe, --flat 200: 70 mkts 02:10 +$62.21 (t=1.02); 70 mkts 02:50 +$226.47 (t=1.13). Same sign, below t>=2.",
+   "kill_reason": "Exposure artefact. P&L gain pools to +$154 (t=2.05) but the per-fill markout effect is t=0.54 with signs [-290, +27, +504]: the gain is trading less on markets where every fill loses, not better timing. A random stand-down at a 31% duty cycle captures $65 of it and beats nothing else. Tested on the liquid universe (70 markets, 3x20min, tape-priced P&L)."
+  },
+  {
+   "slug": "micro-participation-gate",
+   "title": "Stand down when the touch is hostile, on the union of three measured conditions",
+   "status": "killed",
+   "verdict": "exposure-only: P&L gain does not survive on per-fill markout (markout t=0.54, per-slice [-290.27, 27.01, 503.71])",
+   "result": "data/derived/replay/20261106T0831_20m_o0_micro-participation-gate",
+   "kill_reason": "Exposure artefact. P&L gain pools to +$154 (t=2.05) but the per-fill markout effect is t=0.54 with signs [-290, +27, +504]: the gain is trading less on markets where every fill loses, not better timing. A random stand-down at a 31% duty cycle captures $65 of it and beats nothing else. Tested on the liquid universe (70 markets, 3x20min, tape-priced P&L)."
+  },
+  {
+   "slug": "micro-random-participation-control",
+   "title": "Control: same duty cycle, no information",
+   "status": "done",
+   "verdict": "pass",
+   "result": "data/derived/replay/20261106T0815_20m_o0_micro-random-participation-control"
   }
  ]
 }

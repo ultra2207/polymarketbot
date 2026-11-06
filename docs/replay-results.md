@@ -223,7 +223,39 @@ consumes at least half the level it hit - scale-free, unlike the absolute
 The sign is consistent across all three; the 70-market slice is the honest one
 and it does not clear `t >= 2`. Status: promising, not proven.
 
-Three participation rules, all judged the same way on 02:10 (70 markets):
+### The participation family is an exposure effect, not a signal
+
+Pooling the three slices into one statistic (n=210 condition-slices) and adding
+the control every participation rule needs - stand down at random for the same
+duty cycle, with no information:
+
+| strategy | pooled P&L vs baseline | t | per-fill markout t | verdict |
+|---|---|---|---|---|
+| `micro-participation-gate` (union of the three) | **+$154.12** | 2.05 | **0.54** | **exposure-only** |
+| `micro-random-participation-control` | **+$64.67** | 2.07 | - | pure exposure |
+| gate vs control (head to head) | **+$102.92** | 2.01 | - | more stand-down, not better stand-down |
+
+Absolute tape-priced P&L on the liquid universe, one slice:
+
+| strategy | fills | tape_net |
+|---|---|---|
+| baseline `reactionary` | 2,054 | **-$7,808.76** |
+| random stand-down (31 % of decisions) | 1,226 | -$5,049.97 |
+| participation gate | 63 | -$126.86 |
+
+Every strategy loses money on liquid markets at a 0.75 c offset: the maker pays
+adverse selection and there is no reward pool to fund it. A rule that trades less
+therefore loses less, and against a baseline that loses money a "positive P&L
+diff" is nothing but less participation. The gate does not survive on per-fill
+markout - signs across slices are `[-290, +27, +504]`, pooled t=0.54 - so it has
+no timing skill at all.
+
+The harness now refuses to call that a pass: a P&L gain whose per-fill markout
+effect is insignificant is reported as `exposure-only`, with the markout t
+attached. This is the rule that keeps a loss-avoidance result from being promoted
+as an edge, and it is the reason `micro-random-participation-control` exists.
+
+### The three rules judged separately on 02:10 (70 markets):
 
 | rule | what it stands down for | tape_net diff | t |
 |---|---|---|---|
