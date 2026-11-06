@@ -1,0 +1,46 @@
+{
+ "strategy": "micro-print-sweep-detector",
+ "slices": [
+  {
+   "strategy": "micro-print-sweep-detector",
+   "stats": {
+    "fills": 1042,
+    "fills_recorded": 1042,
+    "net": 965.2457,
+    "rewards_usd": 0.0638,
+    "inventory_mtm": -1293.9658,
+    "markets_with_fills": 10,
+    "markout_5m_bps": 457.69,
+    "markout_5m_bps_n": 1042,
+    "markout_5m_bps_median": 312.5,
+    "markout_tape_bps_median": 151.52,
+    "markout_tape_bps_mean": -121.89,
+    "rewards_observed": 0.0,
+    "rewards_unobserved_competition": 0.0638,
+    "markets_competition_observed": 0,
+    "events": 5879,
+    "elapsed_s": 43.29
+   },
+   "paired": {
+    "conditions": 40,
+    "mean_diff": 26.25439,
+    "t": 2.82,
+    "total_diff": 1050.1756,
+    "concentration": 0.219
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": true,
+    "not_concentrated": true
+   },
+   "verdict": "fail",
+   "slice": [
+    1793931000.0,
+    1793932200.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T07:56:23.414774+00:00"
+}

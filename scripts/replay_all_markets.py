@@ -167,6 +167,103 @@ def seed_books(
     return {"tops": tops, "ladders": ladders}
 
 
+def iter_synthetic_prints(
+    assets: set[str], start: float, end: float, *, tape: Path = TAPE, batch: int = 200_000
+) -> Iterable[tuple]:
+    """Prints reconstructed from level decreases in ``price_change`` rows.
+
+    The trade feed only covers the markets the collector subscribes to, which are
+    reward markets. The busiest markets pay nothing and therefore have no trade
+    rows at all, so a replay over them can never fill. A book level that shrinks
+    is what a taker leaves behind, so a decrease at price ``p`` on the bid side is
+    a sell of ``prev - size`` at ``p`` and a decrease on the ask side is a buy.
+
+    A cancellation looks identical to a fill. That bias applies equally to every
+    strategy compared on the same slice, which is what the harness measures.
+    """
+    if not assets:
+        return
+    con = duckdb.connect()
+    con.execute("create temp table tok(asset_id varchar)")
+    con.executemany("insert into tok values (?)", [(a,) for a in assets])
+    files = f"'{tape.as_posix()}/clob_events/**/*.parquet'"
+    # Which assets carry incremental rows at all. A market whose feed only sends
+    # full snapshots has no price_change stream to difference, so its prints have
+    # to come from consecutive snapshots instead.
+    con.execute(
+        f"""
+        create temp table incremental as
+        select e.asset_id, count(*) as n
+        from read_parquet({files}) e join tok k using (asset_id)
+        where e.event_type = 'price_change' and e.venue_ts_ms >= ? and e.venue_ts_ms < ?
+        group by 1
+        """,
+        [int(start * 1000), int(end * 1000)],
+    )
+    query = f"""
+        with pc as (
+          select e.asset_id, e.venue_ts_ms, e.price, e.size, e.side,
+                 lag(e.size) over (
+                   partition by e.asset_id, e.price, e.side order by e.venue_ts_ms
+                 ) as prev
+          from read_parquet({files}) e
+          join tok k using (asset_id)
+          join incremental i using (asset_id)
+          where e.event_type = 'price_change' and e.price is not null and e.side is not null
+            and e.venue_ts_ms >= ? and e.venue_ts_ms < ?
+        ),
+        snap_bids as (
+          select e.asset_id, e.venue_ts_ms, lvl.price as price, lvl.size as size
+          from read_parquet({files}) e
+          join tok k using (asset_id)
+          anti join incremental i using (asset_id)
+          cross join unnest(e.bids) as t(lvl)
+          where e.event_type = 'book' and e.bids is not null
+            and e.venue_ts_ms >= ? and e.venue_ts_ms < ?
+        ),
+        snap_asks as (
+          select e.asset_id, e.venue_ts_ms, lvl.price as price, lvl.size as size
+          from read_parquet({files}) e
+          join tok k using (asset_id)
+          anti join incremental i using (asset_id)
+          cross join unnest(e.asks) as t(lvl)
+          where e.event_type = 'book' and e.asks is not null
+            and e.venue_ts_ms >= ? and e.venue_ts_ms < ?
+        ),
+        snap as (
+          select asset_id, venue_ts_ms, price, size, 'BUY' as side from snap_bids
+          union all
+          select asset_id, venue_ts_ms, price, size, 'SELL' as side from snap_asks
+        ),
+        snap_diff as (
+          select asset_id, venue_ts_ms, price, size - lag(size) over (
+                     partition by asset_id, price, side order by venue_ts_ms
+                 ) as traded, side
+          from snap
+        )
+        select asset_id, venue_ts_ms, price, prev - size as traded, side
+        from pc
+        where prev is not null and size < prev and prev - size > 0
+        union all
+        select asset_id, venue_ts_ms, price, -traded, side
+        from snap_diff
+        where traded is not null and traded < 0
+        order by 2
+    """
+    cursor = con.execute(
+        query,
+        [int(start * 1000), int(end * 1000)] * 3,
+    )
+    while True:
+        rows = cursor.fetchmany(batch)
+        if not rows:
+            return
+        for asset_id, ts_ms, price, traded, side in rows:
+            # A shrinking bid level means someone sold into it, and vice versa.
+            taker = "SELL" if str(side).upper() == "BUY" else "BUY"
+            yield str(asset_id), ts_ms, float(price), float(traded), taker
+
+
 def iter_prints(assets: set[str], start: float, end: float, *, tape: Path = TAPE) -> Iterable[tuple]:
     """Prints on the universe tokens, oldest first."""
     if not list((tape / "clob_trades").glob("date=*/hour=*/*.parquet")):
@@ -397,7 +494,12 @@ def run_strategy(
         last_step += 1
 
     _quiet("paper_trading")
-    for asset_id, ts_ms, price, size, side in iter_prints(assets, start, end, tape=tape):
+    print_source = (
+        iter_synthetic_prints(assets, start, end_track, tape=tape)
+        if getattr(args, "synthetic_prints", False)
+        else iter_prints(assets, start, end, tape=tape)
+    )
+    for asset_id, ts_ms, price, size, side in print_source:
         owner = token_owner.get(asset_id)
         if owner is None:
             continue
@@ -428,10 +530,38 @@ def run_strategy(
             row["markout_5m"] = None  # filled after the series is complete
             fills.append(row)
 
+    tape_marks = tape_mid_marks(fills, tape=tape)
+    for row in fills:
+        mark = tape_marks.get((str(row["asset_id"]), int((float(row["fill_ts"]) + 300.0) * 1000)))
+        if mark is None or not row.get("fill_price"):
+            row["markout_5m_tape"] = None
+            continue
+        price = float(row["fill_price"])
+        signed = (mark - price) if str(row.get("side", "")).upper() == "SELL" else (price - mark)
+        row["markout_5m_tape"] = signed / max(price, 1e-9) * 1e4
+
     rows: list[dict[str, Any]] = []
     observed_conditions = {
         engine.asset_to_condition.get(a) for a in observed if a in engine.asset_to_condition
     } if engines else set()
+    cond_marks: dict[str, list[float]] = {}
+    cond_tape_pnl: dict[str, float] = {}
+    for f in fills:
+        mark = f.get("markout_5m_tape")
+        if mark is None:
+            continue
+        cid = str(f.get("condition_id"))
+        cond_marks.setdefault(cid, []).append(float(mark))
+        # Per-fill P&L priced from the untouched tape: size x markout x price.
+        # This is the only currency in which a size rule can be judged on a
+        # market without a trade feed, because the replay's own inventory MTM
+        # is dominated by the mid its print reconstruction moves.
+        cond_tape_pnl[cid] = cond_tape_pnl.get(cid, 0.0) + (
+            float(f.get("fill_size") or 0.0)
+            * (float(mark) / 1e4)
+            * float(f.get("fill_price") or 0.0)
+        )
+
     for cond, engine in engines.items():
         summary = engine.get_portfolio_summary()
         inventory = sum(p.market_value for p in engine.positions.values())
@@ -447,6 +577,13 @@ def run_strategy(
                 # PULL changes anything - record it so an "inert" verdict can be
                 # told apart from "this market has no size to give up".
                 "min_size": float(engine.markets[cond].rewards_min_size),
+                # Mean tape-derived markout for this condition's fills. The net
+                # figure on a synthetic-print replay is dominated by the mid the
+                # print stream moves, so this is the only comparable currency.
+                "markout_tape_bps_mean": _mean(cond_marks.get(str(cond), [])),
+                "tape_net": round(
+                    float(engine.total_rewards_earned_usd) + cond_tape_pnl.get(str(cond), 0.0), 6
+                ),
                 "fills": sum(p.fills_count for p in engine.positions.values()),
                 "cash": float(engine.cash_usd),
                 "inventory_mtm": float(inventory),
@@ -544,6 +681,58 @@ def _quiet(name: str) -> None:
         pass
 
 
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(v) for v in values)
+    return round(ordered[len(ordered) // 2], 2)
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(float(v) for v in values) / len(values), 2)
+
+
+def tape_mid_marks(
+    fills: list[dict[str, Any]], horizon: float = 300.0, *, tape: Path = TAPE
+) -> dict[tuple[str, float], float]:
+    """Mid at ``fill_ts + horizon`` read from the recorded tape, not from the replay.
+
+    The replay's own mid series is built from a ladder that the print stream
+    mutates: every synthetic print removes a level, which moves the mid, which
+    then marks our inventory. On markets whose feed carries no trades at all,
+    that artefact dominates both ``net`` and the ladder-based markout, so the
+    honest markout has to come from the untouched tape.
+    """
+    if not fills:
+        return {}
+    con = duckdb.connect()
+    con.execute("create temp table want(asset_id varchar, ts BIGINT)")
+    con.executemany(
+        "insert into want values (?, ?)",
+        [(str(f["asset_id"]), int((float(f["fill_ts"]) + horizon) * 1000)) for f in fills],
+    )
+    query = f"""
+        select w.asset_id, w.ts, (
+            select (e.best_bid + e.best_ask) / 2.0
+            from read_parquet('{tape.as_posix()}/clob_events/**/*.parquet') e
+            where e.asset_id = w.asset_id
+              and e.venue_ts_ms <= w.ts
+              and e.best_bid is not null and e.best_ask is not null
+              and e.best_bid > 0 and e.best_ask < 1 and e.best_ask > e.best_bid
+            order by e.venue_ts_ms desc
+            limit 1
+        ) as mid
+        from want w
+    """
+    out: dict[tuple[str, float], float] = {}
+    for asset_id, ts, mid in con.execute(query).fetchall():
+        if mid is not None:
+            out[(str(asset_id), float(ts))] = float(mid)
+    return out
+
+
 def _markout(
     series: list[tuple[float, float]], fill_t: float, fill_px: float, *, sell: bool = False
 ) -> Optional[float]:
@@ -577,6 +766,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--universe", type=Path, default=None)
     parser.add_argument("--min-pool", type=float, default=15.0)
+    parser.add_argument(
+        "--synthetic-prints",
+        action="store_true",
+        help="rebuild taker prints from price_change level decreases; required for "
+        "markets outside the collector's trade subscription (all high-volume markets)",
+    )
     parser.add_argument("--minutes", type=int, default=10)
     parser.add_argument("--start-utc", default=None, help="YYYY-MM-DDTHH:MM; default = last sealed slice")
     parser.add_argument("--strategies", default="queue_aware_ofi")
@@ -659,6 +854,14 @@ def main(argv: list[str] | None = None) -> int:
             "markout_5m_bps": round(float(sum(marks) / len(marks)), 2) if marks else None,
             "markout_5m_bps_n": len(marks),
             "markout_5m_bps_median": round(float(sorted(marks)[len(marks) // 2]), 2) if marks else None,
+            "markout_tape_bps_median": _median(
+                [f["markout_5m_tape"] for f in all_fills
+                 if f.get("strategy") == str(name) and f.get("markout_5m_tape") is not None]
+            ),
+            "markout_tape_bps_mean": _mean(
+                [f["markout_5m_tape"] for f in all_fills
+                 if f.get("strategy") == str(name) and f.get("markout_5m_tape") is not None]
+            ),
             "rewards_observed": round(
                 float(frame.loc[frame["competition_observed"], "rewards_usd"].sum()), 4
             ),

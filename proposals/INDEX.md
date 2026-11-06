@@ -1,0 +1,37 @@
+# Microstructure proposals — 12 ideas ranked by expected value
+
+Scope: market microstructure only. Every rule changes **when** we stand, **which market** we stand in, or **whether the sibling book allows us to stand** — never the quote's price, never its size, never one side alone. All twelve are expressible in `decide(ctx) -> SideActions` over fields that already exist on `DecisionContext` / `BookContext` / `TradeContext` / `MarketView`, or over a `prepare.sql` signal joined as-of by `scripts/build_idea_signals.py`. None needs a new data feed: `data/tape/clob_events`, `data/tape/clob_trades`, `data/derived/universe_metadata.parquet` and `data/derived/market_scorecard.parquet` are on disk.
+
+| # | Proposal | Rule in one line | Lever | Scope | Leans on | Why it ranks here |
+|---|---|---|---|---|---|---|
+| 1 | [micro-maker-vacancy](micro-maker-vacancy.md) | Rest only while `ctx.book.competing_score` is in its bottom quartile, re-enter at p25 / leave at p75 | when | all | fact 2 (size is capped) + fact 7 (`SHRINK` is a no-op, so presence is the only remaining lever) | Acts directly on the payout term `S/(S+C)`; zero new data; the reward is linear in share and share is steep only where `C` is small — the largest upside per unit of code |
+| 2 | [micro-complement-staleness](micro-complement-staleness.md) | Pull both sides of the token whose mid is stale against `1 - sibling_mid` while the gap widens | whether | all | fact 3 (markout adverse at every width) | Pure loss avoidance with no reward cost: fires only on a measured 2.55c mean cross-token deviation, and the fill log already carries the markout test |
+| 3 | [micro-print-size-coverage](micro-print-size-coverage.md) | Quote only when `bid_size_at_level * bid_queue_ratio` covers the market's own p90 print size | whether | high-volume | fact 3 + fact 7 (cutting exposure without going below `rewards_min_size` means leaving) | The engine's FIFO model makes queue protection a function of print size, not queue ratio; on liquid books this is the dominant fill-quality driver, and it is unmeasurable on thin ones |
+| 4 | [micro-absorbed-flow](micro-absorbed-flow.md) | Gate on touch `refill/eat` ratio: depth that refills is absorbed flow, depth that empties is informed | whether | high-volume | fact 3 + fact 6's corollary (volume and reward are disjoint, so liquid books must be judged on markout alone) | Distinguishes noise from informed flow using depth dynamics the per-asset OFI cannot see; the strongest signal available in the zero-pool highvol universe |
+| 5 | [micro-volume-imbalance-gate](micro-volume-imbalance-gate.md) | Stand aside when share-weighted taker imbalance is extreme for ≥ 3 consecutive 10 s bins | when | high-volume | fact 3; the engine's own count-OFI A/B (29 asset-hours, 780 fills) is the family's prior | `ctx.ofi` counts quote steps, so it is blind to size; the disagreement fraction is a one-line diagnostic that kills it cheaply if wrong |
+| 6 | [micro-tick-quantum-score](micro-tick-quantum-score.md) | Decline markets where `rewards_max_spread / (tick*100)` leaves a reachable score below a quarter of nominal | which | all | fact 1 (tighter wins) + fact 2 (size is already at the cap) | Free structural screen with no fills at risk; low ceiling on the gain, but no downside and it can be validated from an existing replay's per-market rows |
+| 7 | [micro-spread-instability](micro-spread-instability.md) | Pull while the touch updates ≥ 8 times in 10 s with the mid inside 1.5 ticks | when | all (needs update rate) | fact 3 + fact 1 (the winning width is fixed, so the loss must be attacked in time) | Cheap in-module second-moment gate that the step-mean `ofi` provably cannot see; short episodes mean it needs an hour slice, not ten minutes |
+| 8 | [micro-inventory-velocity](micro-inventory-velocity.md) | Stand down for 2 min when the signed fill rate exceeds a quarter of the inventory cap per minute | when | all | fact 3 + fact 1 (59 fills per 500 markets per 10 min sets the firing rate) | The only *causal* evidence of who is taking from us, but it needs fills to fire, so it is sparse and slow to validate |
+| 9 | [micro-variance-duty-cycle](micro-variance-duty-cycle.md) | Quote only while `R_min ≥ λ·σ·√H·quote_size`, with a 25 % deadband | when | high-volume | fact 1 + fact 3 (the width sweep held volatility fixed; this is the second moment) | Correct economics, but it rests on a cost model with two estimated parameters; more assumptions than 1-8 |
+| 10 | [micro-session-flow-cycle](micro-session-flow-cycle.md) | Quote only in UTC hours whose lagged profile has low signed-flow imbalance | when | high-volume | fact 3 + fact 8 (cohort tells you whether; the hour tells you when) | Strong intuition, but persistence across only three tape days is the binding uncertainty, and that test is a 20-line query |
+| 11 | [micro-event-heat](micro-event-heat.md) | Pull while the event's aggregate trade z-score ≥ 3 or event imbalance ≥ 0.75 | when | high-volume events | fact 8 + fact 6 (cross-*market* inside Polymarket, not cross-venue) | Attacks a real blind spot (per-asset OFI cannot see the family repricing), but depends on `event_id` coverage and sibling activity that the tape may not have |
+| 12 | [micro-burst-decay-reentry](micro-burst-decay-reentry.md) | Cooldown of `4 × burst duration` after an arrival-rate burst; re-enter on decay | when | high-volume | fact 3 | Best mechanistic story (parent-order slicing), thinnest sample: the busiest asset on the tape has 140 prints/hour |
+
+High-volume-only ideas: **#3, #4, #5, #9, #10, #12**, plus #11 on event families. They are meant for `scripts/build_highvol_universe.py`, where `daily_pool = 0` and `net` is spread capture minus adverse selection; on the reward universe their estimators have no sample and they fall back to `QUOTE both`.
+
+## What is deliberately absent
+
+These are excluded by the measured facts, not by taste:
+
+- **Any spread-width rule** — fact 1: the sweep is monotone, 0.75c already wins.
+- **Any quote-size rule** — fact 2: size up to the cap is right; fact 7: `SHRINK` is a no-op where `quote_size == rewards_min_size` (90 % of markets), so any size rule must be evaluated at `--pool-multiplier >= 1.0`.
+- **Any one-sided or unequal-side rule** — fact 4: with both sides resting `Q_one = 0`, so unequal sides are not penalised; and the brief forbids one-vs-two-sided.
+- **Any minimum-size / maximum-time rule** — fact 5.
+- **Anything Kalshi-based** — fact 6: the matched sets are disjoint and the reward markets pay nothing there.
+- **Anything that predicts direction from a single print** — fact 3 says markout is adverse at every width; these rules restrict *participation*, they do not forecast the mid.
+
+## How to read the table
+
+`Lever = when` means the rule stands the market down (both sides) for a state; `whether` means it decides if the book's protection is real; `which` means it removes markets outright. All three compose: #6 screens markets, #1 picks minutes, #3-#5 decide whether the level is worth standing in. A combined strategy is a legitimate follow-up once each gate has been measured alone — do not test them stacked first, or no single mechanism will be identifiable.
+
+Every file states a kill criterion that can be evaluated from an existing replay's per-market rows and fill log (`markout_5m` per fill is already written by `scripts/replay_all_markets.py`), so the first pass of each idea is an analysis, not a new experiment.

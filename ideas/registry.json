@@ -186,8 +186,10 @@
    "module": "ideas.micro-print-sweep-detector.module",
    "metric": "Paired per-condition net against queue_aware_ofi, with the markout of fills inside sweep windows versus outside as the mechanism check, and the median consumed fraction reported so the 0.5 threshold is auditable.",
    "kill": "Kill if sweep prints are under 5 % of prints, or if the in-window markout gap is below 0.3 c/share, or if the rule repeats the 850/1.5 c failure (paired net at or below baseline on both slices).",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0754_20m_o0_micro-print-sweep-detector"
   },
   {
    "slug": "micro-qmin-equalisation",
@@ -650,10 +652,10 @@
    "module": "After MIN_FILLS=8, PULL both sides while realized_pnl < 0; re-evaluate every 60 decisions.",
    "metric": "Paired per-condition net on the withdrawn subset and on the kept subset, reported separately.",
    "kill": "Kill if fewer than 20 conditions are withdrawn, or if the kept subset loses more than the withdrawn subset gains.",
-   "status": "blocked",
+   "status": "done",
    "author": "Main",
-   "verdict": "inert",
-   "result": "data/derived/replay/20261106T0625_10m_o0_micro-adaptive-exit",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0754_20m_o0_micro-adaptive-exit",
    "blocked_reason": "Needs >=8 fills per market; a 10-minute slice produces ~1.2 fills per market across 500 markets. Re-run on a multi-hour slice."
   }
  ]

@@ -93,6 +93,11 @@ def run_replay(strategy: str, args: argparse.Namespace, tag: str, out: Path) -> 
     if getattr(args, "mapping", None):
         cmd += ["--mapping", str(args.mapping)]
     cmd += ["--pool-multiplier", str(getattr(args, "pool_multiplier", 0.25))]
+    if getattr(args, "universe", None):
+        cmd += ["--universe", str(args.universe)]
+    cmd += ["--min-pool", str(getattr(args, "min_pool", 15.0))]
+    if getattr(args, "synthetic_prints", False):
+        cmd += ["--synthetic-prints"]
     log.info(f"replay {strategy} -> {out}")
     result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=args.timeout, check=False)
     if result.returncode != 0:
@@ -100,12 +105,28 @@ def run_replay(strategy: str, args: argparse.Namespace, tag: str, out: Path) -> 
     return json.loads((out / "summary.json").read_text(encoding="utf-8"))
 
 
-def paired(idea: Path, base: Path) -> dict[str, Any]:
-    """Paired per-condition difference against the baseline on the same slice."""
+def paired(idea: Path, base: Path, metric: str = "net") -> dict[str, Any]:
+    """Paired per-condition difference against the baseline on the same slice.
+
+    ``metric="markout"`` compares the tape-derived 5-minute markout instead of
+    ``net``. It exists because a replay that rebuilds prints from book deltas
+    moves the mid every time a level shrinks, and that artefact dominates ``net``
+    on markets that have no trade feed at all.
+    """
     a = pd.read_parquet(idea / "metrics.parquet").set_index("condition_id")
     b = pd.read_parquet(base / "metrics.parquet").set_index("condition_id")
     common = a.index.intersection(b.index)
-    diff = (a.loc[common, "net"] - b.loc[common, "net"]).astype(float)
+    if metric == "tape_net":
+        if "tape_net" not in a or "tape_net" not in b:
+            raise SystemExit("metrics carry no tape_net; rerun the replay")
+        diff = (a.loc[common, "tape_net"].fillna(0.0) - b.loc[common, "tape_net"].fillna(0.0)).astype(float)
+    elif metric == "markout":
+        column = "markout_tape_bps_mean"
+        if column not in a or column not in b:
+            raise SystemExit("metrics carry no tape markout; rerun the replay")
+        diff = (a.loc[common, column].fillna(0.0) - b.loc[common, column].fillna(0.0)).astype(float)
+    else:
+        diff = (a.loc[common, "net"] - b.loc[common, "net"]).astype(float)
     n = len(diff)
     mean = float(diff.mean()) if n else 0.0
     sd = float(diff.std(ddof=1)) if n > 1 else 0.0
@@ -176,6 +197,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default="", help="comma-separated slugs; overrides status filtering")
     parser.add_argument("--mapped", action="store_true", help="restrict to Kalshi-mapped conditions")
     parser.add_argument("--mapping", default=None, help="mapping parquet used by --mapped")
+    parser.add_argument("--min-pool", type=float, default=15.0)
+    parser.add_argument("--metric", choices=("net", "markout", "tape_net"), default="net",
+                        help="currency for the paired comparison; use markout when "
+                             "prints were synthesised from book deltas")
+    parser.add_argument("--universe", default=None, help="universe snapshot (e.g. the high-volume one)")
+    parser.add_argument("--synthetic-prints", action="store_true",
+                        help="rebuild prints from book deltas; needed for markets without a trade feed")
     parser.add_argument("--pool-multiplier", type=float, default=0.25,
                         help="notional = multiplier * daily pool; must exceed 1.0 for shrink rules to have range")
     parser.add_argument("--dry-run", action="store_true")
@@ -228,7 +256,7 @@ def main(argv: list[str] | None = None) -> int:
                 summary = run_replay(
                     slug, args, f"{stamp}_{args.minutes}m_o{offset}_{slug}", idea_dir
                 )
-                pair = paired(idea_dir, base_dirs[offset])
+                pair = paired(idea_dir, base_dirs[offset], getattr(args, "metric", "net"))
                 result = evaluate(idea_dir, summary, base_summaries[offset], pair)
                 result["slice"] = summary["slice"]
                 result["offset"] = offset
