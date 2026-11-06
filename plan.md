@@ -140,7 +140,18 @@ parameter values are not new ideas.
 ```
 proposed → data_ready → implemented → queued → running → done
                                     ↘ killed (with reason)
+                                    ↘ inert  (no decision ever changed)
 ```
+
+`inert` is a verdict, not a pass: a module whose actions never changed the
+baseline's quotes was never tested. The scheduler detects it (identical net on
+every condition) and the fix is a missing signal or a trigger condition that
+cannot hold under inside-spread quoting.
+
+**Frozen slice.** All comparisons in one table must share a slice. The scheduler
+accepts `--start-utc`; a run that silently moves the slice produces numbers that
+cannot be compared with the previous wave, so the slice is recorded in every
+`result.json` and in the results doc.
 
 `killed` is a first-class outcome. An experiment factory whose ideas never die
 is measuring nothing.
@@ -200,10 +211,12 @@ Rules:
   3. `markout_5m_bps` not worse than the baseline by more than its standard
      error.
   4. No single condition contributes > 25 % of the total (concentration check).
-- **Combination test.** Survivors are stacked in priority order (a module can
-  veto or scale, never increase). Report leave-one-out contribution per module
-  on the same slice; a combination must beat its best member, else the members
-  are redundant and stay separate.
+- **Combination test.** Survivors are stacked with `CompositeStrategy`
+  (`src/polymarketbot/strategy/composite.py`): per side the most conservative
+  action wins, the smallest scale survives, and the first explicit price is
+  kept, so a stack can only tighten a quote and never adds exposure. Report
+  leave-one-out contribution per module on the same slice; a combination must
+  beat its best member, else the members are redundant and stay separate.
 
 ## 7. Autonomy loop
 

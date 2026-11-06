@@ -34,8 +34,10 @@
    "module": "ideas.micro-cross-token-substitution.module",
    "metric": "Condition-level paired net versus queue_aware_ofi, plus a condition-level two-sidedness proxy (both Q sides non-zero at the epoch sample, computed from the per-token epoch snapshots); deciding number is the paired net delta with the two-sidedness change printed beside it. Caveat: the engine scores each token additively with no Q1/Q2 min, so the proxy and not rewards_usd is the falsifying number until rewards.compute_epoch_payout is patched.",
    "kill": "Kill if the two-sidedness fraction improves by less than 20 percentage points, or if condition-level inventory variance rises by more than 10 %, or if paired net is not positive on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-cross-token-substitution"
   },
   {
    "slug": "micro-depth-imbalance",
@@ -46,8 +48,10 @@
    "module": "ideas.micro-depth-imbalance.module",
    "metric": "Next-update hit rate of the predicted threatened side (does that side's best price worsen or does its level shrink?) and the paired per-condition net; the deciding number is the paired net delta per share against queue_aware_ofi.",
    "kill": "Kill if the hit rate is below 55 %, or if the resulting markout gap between quoted and shrunk sides is below 0.3 c/share, or if the paired net delta is not positive on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-depth-imbalance"
   },
   {
    "slug": "micro-expiry-flatten",
@@ -85,7 +89,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-inventory-skew-size"
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-inventory-skew-size"
   },
   {
    "slug": "micro-join-vs-lead",
@@ -111,7 +115,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-jump-withdrawal"
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-jump-withdrawal"
   },
   {
    "slug": "micro-net-complement-inventory",
@@ -122,8 +126,10 @@
    "module": "ideas.micro-net-complement-inventory.module",
    "metric": "Pair-completion rate (fraction of conditions where both legs fill within the slice) and the paired per-condition net; the deciding number is the net delta per share against reactionary, with inventory_mtm variance reported as the risk check.",
    "kill": "Kill if pair completion is below 10 % of conditions, or if the realised carry per completed pair is below $0.002/share, or if condition-level inventory variance rises by more than 10 % on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-net-complement-inventory"
   },
   {
    "slug": "micro-oscillation-vs-trend",
@@ -136,8 +142,8 @@
    "kill": "Kill if the tercile markout spread is below 0.3 c/share, or if the high-flip tercile is not the better one, or if the paired net delta is not positive on both slices.",
    "status": "done",
    "author": "IdeaGenMicro",
-   "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-oscillation-vs-trend"
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-oscillation-vs-trend"
   },
   {
    "slug": "micro-payout-floor",
@@ -163,7 +169,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-post-fill-defence"
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-post-fill-defence"
   },
   {
    "slug": "micro-print-sweep-detector",
@@ -201,7 +207,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-queue-erosion-velocity"
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-queue-erosion-velocity"
   },
   {
    "slug": "micro-reward-priced-pull",
@@ -214,8 +220,8 @@
    "kill": "Kill if priced and unpriced gates land within $0.001/share on both slices, or if the priced gate needs time_quoted_frac below 0.90 to show its gain, or if the markout prior's error on the calibration hour exceeds 50 % (the conversion would be meaningless).",
    "status": "done",
    "author": "IdeaGenMicro",
-   "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-reward-priced-pull"
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-reward-priced-pull"
   },
   {
    "slug": "micro-score-density-split",
@@ -253,7 +259,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-spread-widening-retreat"
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-spread-widening-retreat"
   },
   {
    "slug": "micro-tail-price-bps",
@@ -264,8 +270,10 @@
    "module": "ideas.micro-tail-price-bps.module",
    "metric": "Net per committed dollar per condition (net over mean quoted notional), paired against reactionary, with markout_5m_bps and rewards_usd reported separately by price bucket (0.00-0.20, 0.20-0.80, 0.80-1.00); the deciding number is the paired improvement in net per dollar.",
    "kill": "Kill if per-share markout is flat across the three price buckets (spread below 0.3 c/share), or if the paired net-per-dollar improvement is under 5 % on both slices, or if fewer than 50 conditions have a token outside 0.20-0.80.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-tail-price-bps"
   },
   {
    "slug": "micro-thin-level-sweep",
@@ -279,7 +287,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0557_10m_o0_micro-thin-level-sweep"
+   "result": "data/derived/replay/20261106T0602_10m_o0_micro-thin-level-sweep"
   },
   {
    "slug": "micro-time-vs-size",
@@ -302,7 +310,7 @@
    "module": "ideas.micro-two-sided-coupling.module",
    "metric": "Paired per-condition net and rewards_usd on tail conditions, plus the fraction of conditions where the two Q sides are simultaneously populated (a two-sidedness proxy the harness can compute from the per-token epoch snapshots); deciding number is the paired net difference against queue_aware_ofi. Caveat: paper_trading/rewards.compute_epoch_payout has no Q_min and no c = 3 penalty, so on today's engine a one-sided book is scored additively; the proxy, not rewards_usd, is the falsifying number until that scoring is patched.",
    "kill": "Kill if, on tail conditions, symmetric pull is worse than per-side pull by more than $0.002/share on both slices, or if fewer than 3 % of rewarded conditions sit outside [0.10, 0.90] at any point in the slice.",
-   "status": "proposed",
+   "status": "implemented",
    "author": "IdeaGenMicro"
   },
   {
@@ -314,7 +322,7 @@
    "module": "ideas.micro-vol-scaled-size.module",
    "metric": "Paired per-condition net against reactionary, with the volatility-tercile markout ladder and the distribution of the applied scale reported; the deciding number is the paired net delta per share.",
    "kill": "Kill if the tercile markout ladder is flat (spread below 0.3 c/share), or if the applied scale is 1.0 or the floor for more than 90 % of updates (the signal does not vary), or if paired net is not positive on both slices.",
-   "status": "done",
+   "status": "implemented",
    "author": "IdeaGenMicro",
    "verdict": "fail",
    "result": "data/derived/replay/20261106T0557_10m_o0_micro-vol-scaled-size"
