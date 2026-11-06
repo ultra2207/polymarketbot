@@ -31,6 +31,7 @@ from collections.abc import Iterable
 from typing import Any, Optional
 
 import duckdb
+import numpy as np
 import pandas as pd
 from dataclasses import asdict
 
@@ -251,6 +252,10 @@ def run_strategy(
     quote_size: dict[str, float] = {}
     skipped_no_book: set[str] = set()
 
+    now_ts = [float(start)]
+    signals = load_signals(strategy_name)
+    if signals is None:
+        log.info(f"[{strategy_name}] no prepared signals; context.signals stays empty")
     for m in markets:
         tokens = [str(t) for t in m["clob_tokens"][:2]]
         min_size = float(m.get("min_size") or 0.0)
@@ -262,6 +267,8 @@ def run_strategy(
             max_inventory_shares=max(min_size, shares * 3.0),
             ledger_path=tag_dir / "ledgers" / f"{m['condition_id'][:18]}.json",
             strategy=load_strategy(strategy_name),
+            clock=lambda: now_ts[0],
+            signal_provider=signals,
         )
         engine.logger = log
         cfg = MarketConfig(
@@ -331,6 +338,7 @@ def run_strategy(
     def flush(until: float) -> None:
         """Apply pending top changes and step the epoch clock up to ``until``."""
         nonlocal last_epoch
+        now_ts[0] = float(until)
         for asset_id in dirty:
             owner = token_owner.get(asset_id)
             if owner is None:
@@ -451,6 +459,48 @@ def run_strategy(
     frame["elapsed_s"] = round(elapsed, 2)
     frame["skipped_assets"] = len(skipped_no_book)
     return frame, fills
+
+
+class SignalBook:
+    """As-of lookup of one idea's prepared signals, keyed by asset and time.
+
+    A module that needs exogenous data ships ``prepare.sql``; the runner writes
+    ``data/derived/ideas/<slug>/signals.parquet`` with ``asset_id``, ``ts_ms`` and
+    one numeric column per signal. The provider returns the last value at or
+    before the replay clock - no look-ahead, which is the whole point of testing
+    on a tape.
+    """
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        self._series: dict[str, tuple[np.ndarray, dict[str, np.ndarray]]] = {}
+        if frame.empty:
+            return
+        frame = frame.sort_values(["asset_id", "ts_ms"])
+        for asset, group in frame.groupby("asset_id"):
+            times = group["ts_ms"].to_numpy(dtype=float) / 1000.0
+            values = {
+                col: group[col].to_numpy(dtype=float)
+                for col in group.columns
+                if col not in ("asset_id", "ts_ms")
+            }
+            self._series[str(asset)] = (times, values)
+
+    def __call__(self, asset_id: str, ts: float) -> dict[str, float]:
+        entry = self._series.get(str(asset_id))
+        if entry is None:
+            return {}
+        times, values = entry
+        idx = int(np.searchsorted(times, float(ts), side="right")) - 1
+        if idx < 0:
+            return {}
+        return {name: float(vals[idx]) for name, vals in values.items()}
+
+
+def load_signals(slug: str, *, root: Path = REPO_ROOT / "data" / "derived" / "ideas") -> Optional[SignalBook]:
+    path = root / slug / "signals.parquet"
+    if not path.exists():
+        return None
+    return SignalBook(pd.read_parquet(path))
 
 
 def _quiet(name: str) -> None:

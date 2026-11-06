@@ -87,6 +87,8 @@ class PaperTradingEngine:
         orchestrator: Optional[QuoteOrchestrator] = None,
         kalshi_monitor: Optional[Any] = None,
         strategy: Optional[Any] = None,
+        clock: Optional[Any] = None,
+        signal_provider: Optional[Any] = None,
     ) -> None:
         self.initial_cash_usd = float(initial_cash_usd)
         self.cash_usd = float(initial_cash_usd)
@@ -108,7 +110,11 @@ class PaperTradingEngine:
         # replaces the orchestrator block; the engine still owns sizing floors,
         # post-only clamping and risk.
         self.strategy = strategy
-        self._strategy_started = time.time()
+        # Replay needs a simulated clock and an as-of signal lookup; live keeps
+        # the wall clock and no provider. Both are injected, never global.
+        self.clock = clock or time.time
+        self.signal_provider = signal_provider
+        self._strategy_started = self.clock()
         self._kalshi_basis: dict[str, Optional[float]] = {}
         self._kalshi_missing_logged = False
         self._ofi_steps: dict[str, deque[tuple[float, int]]] = {}
@@ -392,7 +398,7 @@ class PaperTradingEngine:
         pos = self.positions.get(asset_id)
         return DecisionContext(
             book=ctx,
-            seconds_elapsed=time.time() - self._strategy_started,
+            seconds_elapsed=self.clock() - self._strategy_started,
             inventory_shares=float(pos.shares) if pos is not None else 0.0,
             max_inventory_shares=float(self.max_inventory_shares),
             bid_queue_ratio=float(queue.ratio("bid")) if queue is not None else 0.0,
@@ -400,7 +406,17 @@ class PaperTradingEngine:
             bid_size_at_level=float(queue.bid_size_at_level) if queue is not None else 0.0,
             ask_size_at_level=float(queue.ask_size_at_level) if queue is not None else 0.0,
             ofi=ofi,
+            signals=self._signals_for(asset_id),
         )
+
+    def _signals_for(self, asset_id: str) -> dict[str, float]:
+        """Named exogenous signals for this asset at the current clock, or empty."""
+        if self.signal_provider is None:
+            return {}
+        try:
+            return dict(self.signal_provider(asset_id, self.clock()) or {})
+        except Exception:  # noqa: BLE001 - a broken signal must not stop quoting
+            return {}
 
     def _queue_snapshot(
         self,
@@ -539,7 +555,7 @@ class PaperTradingEngine:
             ofi = None
             steps = self._ofi_steps.get(asset_id)
             if steps:
-                cutoff = time.time() - self.microstructure_ofi_window_s
+                cutoff = self.clock() - self.microstructure_ofi_window_s
                 vals = [step for ts, step in steps if ts >= cutoff]
                 if vals:
                     ofi = sum(vals) / len(vals)
@@ -582,7 +598,7 @@ class PaperTradingEngine:
             ofi = None
             steps = self._ofi_steps.get(asset_id)
             if steps:
-                cutoff = time.time() - self.microstructure_ofi_window_s
+                cutoff = self.clock() - self.microstructure_ofi_window_s
                 vals = [step for ts, step in steps if ts >= cutoff]
                 if vals:
                     ofi = sum(vals) / len(vals)
@@ -598,7 +614,7 @@ class PaperTradingEngine:
         elif self.microstructure_gate:
             steps = self._ofi_steps.get(asset_id)
             if steps:
-                cutoff = time.time() - self.microstructure_ofi_window_s
+                cutoff = self.clock() - self.microstructure_ofi_window_s
                 vals = [step for ts, step in steps if ts >= cutoff]
                 if vals:
                     ofi = sum(vals) / len(vals)
@@ -783,7 +799,7 @@ class PaperTradingEngine:
                     price=float(trade_price),
                     size=float(trade_size),
                     side=str(trade_side),
-                    seconds_elapsed=time.time() - self._strategy_started,
+                    seconds_elapsed=self.clock() - self._strategy_started,
                 )
             )
 
