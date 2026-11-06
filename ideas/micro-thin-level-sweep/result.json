@@ -1,0 +1,35 @@
+{
+ "strategy": "micro-thin-level-sweep",
+ "stats": {
+  "fills": 102,
+  "fills_recorded": 102,
+  "net": 64.3182,
+  "rewards_usd": 34.9865,
+  "inventory_mtm": -166.1217,
+  "markets_with_fills": 40,
+  "markout_5m_bps": -352.68,
+  "rewards_observed": 30.3692,
+  "rewards_unobserved_competition": 4.6173,
+  "markets_competition_observed": 366,
+  "events": 2720,
+  "elapsed_s": 22.03
+ },
+ "paired": {
+  "conditions": 500,
+  "mean_diff": 0.0,
+  "t": 0.0,
+  "total_diff": 0.0,
+  "concentration": 1.0
+ },
+ "gates": {
+  "fills_and_conditions": false,
+  "beats_baseline": false,
+  "not_concentrated": false
+ },
+ "verdict": "fail",
+ "slice": [
+  1793942700.0,
+  1793943300.0
+ ],
+ "finished_utc": "2026-11-06T05:40:13.520078+00:00"
+}

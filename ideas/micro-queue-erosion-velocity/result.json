@@ -1,0 +1,35 @@
+{
+ "strategy": "micro-queue-erosion-velocity",
+ "stats": {
+  "fills": 22,
+  "fills_recorded": 22,
+  "net": 16.7468,
+  "rewards_usd": 11.2402,
+  "inventory_mtm": -20.772,
+  "markets_with_fills": 11,
+  "markout_5m_bps": 265.9,
+  "rewards_observed": 9.3473,
+  "rewards_unobserved_competition": 1.8929,
+  "markets_competition_observed": 366,
+  "events": 2720,
+  "elapsed_s": 21.46
+ },
+ "paired": {
+  "conditions": 500,
+  "mean_diff": -0.09514,
+  "t": -6.02,
+  "total_diff": -47.5714,
+  "concentration": 0.079
+ },
+ "gates": {
+  "fills_and_conditions": false,
+  "beats_baseline": false,
+  "not_concentrated": true
+ },
+ "verdict": "fail",
+ "slice": [
+  1793942700.0,
+  1793943300.0
+ ],
+ "finished_utc": "2026-11-06T05:39:42.168895+00:00"
+}

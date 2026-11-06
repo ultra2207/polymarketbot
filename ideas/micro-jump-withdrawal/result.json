@@ -1,0 +1,35 @@
+{
+ "strategy": "micro-jump-withdrawal",
+ "stats": {
+  "fills": 21,
+  "fills_recorded": 21,
+  "net": 34.2538,
+  "rewards_usd": 25.9127,
+  "inventory_mtm": -52.0554,
+  "markets_with_fills": 15,
+  "markout_5m_bps": -324.07,
+  "rewards_observed": 21.3918,
+  "rewards_unobserved_competition": 4.5208,
+  "markets_competition_observed": 366,
+  "events": 2720,
+  "elapsed_s": 20.12
+ },
+ "paired": {
+  "conditions": 500,
+  "mean_diff": -0.06013,
+  "t": -4.101,
+  "total_diff": -30.0644,
+  "concentration": 0.128
+ },
+ "gates": {
+  "fills_and_conditions": false,
+  "beats_baseline": false,
+  "not_concentrated": true
+ },
+ "verdict": "fail",
+ "slice": [
+  1793942700.0,
+  1793943300.0
+ ],
+ "finished_utc": "2026-11-06T05:39:10.455610+00:00"
+}

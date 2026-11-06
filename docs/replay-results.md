@@ -95,6 +95,48 @@ events are enough to rank module behaviour on this slice.
    the gates in `plan.md` §6 — 200 fills, 50 conditions, paired t ≥ 2, and no
    single condition above 25 % of the effect.
 
+## Wave 1 — three ideas, three negative results
+
+The first modules written against the protocol, run against `reactionary` on the
+same 500 markets and ten minutes:
+
+| idea | mechanism | net diff per condition | t | verdict |
+|---|---|---|---|---|
+| `micro-jump-withdrawal` | pull both sides for 5 events after a ≥2-tick move | −\$0.060 | −4.10 | fail |
+| `micro-queue-erosion-velocity` | shrink the side whose queue ratio falls ≥0.2 in 10 events | −\$0.095 | −6.02 | fail |
+| `micro-thin-level-sweep` | shrink the side whose touch level is in its own bottom quartile | \$0.000 | 0.00 | fail (never fires) |
+
+The two failing ideas fail for the same reason, and it is a real economic
+reason: **a pull forfeits reward that outweighs the markout it avoids**, on this
+slice. `micro-thin-level-sweep` never fires because every quote rests inside the
+spread, so `size_at_level` is zero on both sides and the "thin level" condition
+can never hold — the idea is only testable under level-joining quotes.
+
+**This forced a scoring fix before the numbers could be trusted.**
+`compute_epoch_payout` summed our two sides additively. The venue normalises:
+
+$$Q_{\text{norm}} = Q_{\text{two}} + \frac{\min(Q_{\text{one}}, Q_{\text{two}})}{3}$$
+
+so a fully one-sided quote earns a third of its raw score. The engine was
+overstating every pulled side by 3×, which flatters exactly the defensive ideas
+above. `normalise_two_sided` now implements the venue rule (tested in
+`tests/test_reward_normalisation.py`); the table above is from the corrected
+model.
+
+## The idea inventory
+
+Two generator agents wrote **50 specs** (25 `micro-*`, 25 `cross-*`) with a
+dedupe check over mechanism text (no pair above 0.22 token Jaccard). Each spec
+has a falsifiable claim, a numeric kill condition, the tape table and columns it
+needs, and a `prepare.sql` when the module cannot run from the context alone.
+Both generators audited their tables against the tape rather than the docs and
+recorded where the two disagree (crypto threshold binaries are sentinels at
+pool 0; `kalshi_books` starts 11-05 19:11; `uma_events` has no disputes).
+
+Three of the 25 `micro-` ideas depend on the venue's official `Q_min`/`c=3`
+rule that the engine now implements; the reward-model change above means none of
+the 50 has been tested against the *old* model.
+
 ## Next
 
 - Two generator agents are writing 50 specs (`micro-*`, `cross-*`), each with a

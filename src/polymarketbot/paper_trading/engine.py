@@ -38,6 +38,7 @@ from polymarketbot.paper_trading.rewards import (
     compute_competing_depth_score,
     compute_epoch_payout,
     compute_quadratic_score,
+    normalise_two_sided,
 )
 from polymarketbot.risk import RiskConfig, RiskManager
 
@@ -1224,11 +1225,9 @@ class PaperTradingEngine:
                 mid = book.get("mid", 0.50)
                 comp_score = book.get("competing_score", 0.0)
 
-                v_score = 0.0
-                if v_bid and v_bid.post_only_valid:
-                    v_score += v_bid.score
-                if v_ask and v_ask.post_only_valid:
-                    v_score += v_ask.score
+                bid_score = v_bid.score if (v_bid and v_bid.post_only_valid) else 0.0
+                ask_score = v_ask.score if (v_ask and v_ask.post_only_valid) else 0.0
+                v_score = normalise_two_sided(bid_score, ask_score)
 
                 # Polymarket splits the daily market reward proportionally
                 share_pct, epoch_payout, projected_daily = compute_epoch_payout(

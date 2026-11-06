@@ -1,0 +1,15 @@
+# Q_min couples the two sides: a one-sided pull is a self-inflicted penalty
+
+claim:      Because Q_min = max(min(Q1,Q2), max(Q1,Q2)/3) inside mid 0.10-0.90 and min(Q1,Q2) outside it, a protective rule that pulls exactly one side loses at least two-thirds of that epoch's score for one side's worth of risk reduction; on tail-price conditions (mid < 0.10 or > 0.90) it loses all of it, so symmetric pull must beat per-side pull by >= $0.002/share net on those conditions.
+
+mechanism:  The venue scores our two book sides and takes the minimum: Q1 = YES bids + NO asks, Q2 = YES asks + NO bids, with a factor c = 3.0 for the single-sided case inside [0.10, 0.90] and a strict minimum outside it (Polymarket docs, eqs. 2-4). So dropping one side does not cost "half" the reward; it costs 2/3 of it in the band and 100 % of it in the tails, while the adverse-selection saving is one side's markout only. The pool underpays a hedged two-sided maker relative to what the maker's risk model assumes, and the mispricing is largest exactly where the engine's own inventory skew is least useful (prices near 0 or 1).
+
+data:       DecisionContext plus MarketView (rate_per_day, rewards_min_size, rewards_max_spread). No derived table; mid and the per-side queue ratios are in the context.
+
+module:     Keep a per-side threat flag (queue ratio >= 0.90 or |OFI| above the baseline threshold). If exactly one side is threatened, do not pull it alone: if 0.10 <= mid <= 0.90, keep both sides at min size (SHRINK with scale 0.01; the engine floors any positive size to rewards_min_size) so Q_min keeps both terms alive; if mid is outside [0.10, 0.90], PULL both, because a single side scores nothing and the surviving side is pure risk. If both sides are threatened, PULL both in either regime.
+
+metric:     Paired per-condition net and rewards_usd on tail conditions, plus the fraction of conditions where the two Q sides are simultaneously populated (a two-sidedness proxy the harness can compute from the per-token epoch snapshots); deciding number is the paired net difference against queue_aware_ofi. Caveat: paper_trading/rewards.compute_epoch_payout has no Q_min and no c = 3 penalty, so on today's engine a one-sided book is scored additively; the proxy, not rewards_usd, is the falsifying number until that scoring is patched.
+
+kill:       Kill if, on tail conditions, symmetric pull is worse than per-side pull by more than $0.002/share on both slices, or if fewer than 3 % of rewarded conditions sit outside [0.10, 0.90] at any point in the slice.
+
+sources:    Polymarket liquidity rewards, minimum-score equations and c = 3.0: https://docs.polymarket.com/programs/liquidity-rewards. Two-sided-depth rationale in the incentive design literature: Multicoin, "Exploring the design space of liquidity mining", https://multicoin.capital/2020/08/13/exploring-the-design-space-of-liquidity-mining. Note: none of this relies on self-trading, the practice Hummingbot's liquidity-mining paper flags as disqualifying (https://hummingbot.org/liquidity-mining.pdf).

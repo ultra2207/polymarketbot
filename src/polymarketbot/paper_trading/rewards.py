@@ -115,3 +115,25 @@ def compute_epoch_payout(
     projected_daily = daily_rate * share
 
     return share * 100.0, epoch_payout, projected_daily
+
+
+# Polymarket normalises a market's score before paying:
+#   Q_two  = sum of scores when both sides rest
+#   Q_one  = sum of scores when only one side rests
+#   Q_min  = min(Q_one, Q_two)
+#   Q_norm = Q_two + Q_min / 3
+# A fully one-sided quote therefore earns a third of its raw score, not all of
+# it. Summing bid+ask (the previous behaviour) overstates every single-sided
+# quote by 3x, which is exactly the regime a "pull the threatened side" strategy
+# creates, so the reward/risk trade-off cannot be measured without this.
+TWO_SIDED_PENALTY = 3.0
+
+
+def normalise_two_sided(bid_score: float, ask_score: float) -> float:
+    """Q_norm for one market bucket from both sides' scores."""
+    bid = max(0.0, float(bid_score))
+    ask = max(0.0, float(ask_score))
+    if bid > 0.0 and ask > 0.0:
+        return bid + ask
+    one_sided = max(bid, ask)
+    return one_sided / TWO_SIDED_PENALTY
