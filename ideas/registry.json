@@ -186,10 +186,11 @@
    "module": "ideas.micro-print-sweep-detector.module",
    "metric": "Paired per-condition net against queue_aware_ofi, with the markout of fills inside sweep windows versus outside as the mechanism check, and the median consumed fraction reported so the 0.5 threshold is auditable.",
    "kill": "Kill if sweep prints are under 5 % of prints, or if the in-window markout gap is below 0.3 c/share, or if the rule repeats the 850/1.5 c failure (paired net at or below baseline on both slices).",
-   "status": "done",
+   "status": "promising",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0754_20m_o0_micro-print-sweep-detector"
+   "result": "data/derived/replay/20261106T0759_20m_o0_micro-print-sweep-detector",
+   "evidence": "tape_net vs reactionary on the 70-market liquid universe, --flat 200, synthetic prints: 40 mkts 02:10 +$26.25 (t=2.82); 40 mkts 02:50 +$23.48 (t=2.41); 70 mkts 02:10 +$73.36 (t=1.52). Sign is consistent, significance is not: the 70-market slice is the honest one and it does not clear t>=2."
   },
   {
    "slug": "micro-qmin-equalisation",
@@ -652,11 +653,12 @@
    "module": "After MIN_FILLS=8, PULL both sides while realized_pnl < 0; re-evaluate every 60 decisions.",
    "metric": "Paired per-condition net on the withdrawn subset and on the kept subset, reported separately.",
    "kill": "Kill if fewer than 20 conditions are withdrawn, or if the kept subset loses more than the withdrawn subset gains.",
-   "status": "done",
+   "status": "killed",
    "author": "Main",
    "verdict": "fail",
    "result": "data/derived/replay/20261106T0754_20m_o0_micro-adaptive-exit",
-   "blocked_reason": "Needs >=8 fills per market; a 10-minute slice produces ~1.2 fills per market across 500 markets. Re-run on a multi-hour slice."
+   "blocked_reason": "Needs >=8 fills per market; a 10-minute slice produces ~1.2 fills per market across 500 markets. Re-run on a multi-hour slice.",
+   "kill_reason": "Judged on tape_net at last: -$3.25, t=-1.28 over 1,048 fills on the liquid universe. Withdrawing from markets whose own realised P&L is negative forfeits more reward and presence than it saves in adverse selection."
   }
  ]
 }

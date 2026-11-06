@@ -193,6 +193,40 @@ The next real test is therefore not another sizing rule. It is either a
 **cross-venue** rule with its signal materialised. Both are now unblocked by the
 harness; neither has been measured.
 
+## The liquid universe: how to test anything on volume
+
+The reward universe and the liquid universe are disjoint, so a strategy that only
+works on volume needs three pieces of infrastructure the harness did not have:
+
+| piece | why |
+|---|---|
+| `scripts/build_highvol_universe.py` | ranks conditions by **all** event types (a `book`-only count measures re-snapshots, not flow), and takes tokens from the tape when a market is newer than the Gamma snapshot |
+| `--synthetic-prints` | the trade feed only covers the collector's subscriptions, so the busiest markets have **zero** print rows and could never fill; prints are rebuilt from level decreases (price_change deltas, or consecutive book snapshots for feeds that only send full books) |
+| `--metric tape_net` | the replay's own ladder is mutated by every synthetic print, which moves the mid and manufactures markout: ladder median **+312 bps** where the tape shows **-361 bps**, and a "profit" of **+$863** that is really adverse selection. Tape-priced P&L (size x markout x price read from the untouched tape) is the only honest currency here |
+
+`--flat 200` is required alongside: on a zero-pool universe the per-market
+notional is otherwise floored at `rewards_min_size`, and every size rule becomes
+a no-op for the reason documented below.
+
+## First result on volume: sweeps, not shares
+
+`micro-print-sweep-detector` shrinks both sides for ten decisions when a print
+consumes at least half the level it hit - scale-free, unlike the absolute
+850-share gate it replaces. Judged on `tape_net`, paired against `reactionary`:
+
+| universe | slice | tape_net diff | t |
+|---|---|---|---|
+| 40 markets | 02:10-02:30Z | **+$26.25** | 2.82 |
+| 40 markets | 02:50-03:10Z | **+$23.48** | 2.41 |
+| 70 markets | 02:10-02:30Z | **+$73.36** | 1.52 |
+
+The sign is consistent across all three; the 70-market slice is the honest one
+and it does not clear `t >= 2`. Status: promising, not proven.
+
+`micro-adaptive-exit` was killed on the same machinery: -$3.25, t=-1.28 over
+1,048 fills. Withdrawing from markets whose own realised P&L is negative
+forfeits more than it saves.
+
 ## Where to quote: the spread sweep
 
 Baseline (`reactionary`), frozen slice 05:55Z, 500 markets, 10 minutes:
