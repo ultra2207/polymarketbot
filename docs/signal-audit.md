@@ -42,6 +42,21 @@ Two numbers here were missing from every earlier result:
 So the honest description of the business is: **reward income plus rebate, minus
 adverse selection with a variance larger than the edge at one day of data.**
 
+## Our own clock is 699 ms off the venue
+
+`clock_offset` measures host time against each stream's server time every few
+minutes. Median offset from the CLOB: **699 ms** with a 193 ms RTT, and it drifts:
+
+| date | median offset | sd |
+|---|---|---|
+| 2026-11-04 | 405 ms | 301 ms |
+| 2026-11-05 | 384 ms | 430 ms |
+| 2026-11-06 | **1,318 ms** | 354 ms |
+
+Every latency number in this repo - including the "13.5 s" on-chain lag - carries
+that error, and it is larger than the 100 ms lead time the original spec assumed
+as its Gate 3. Any speed claim needs NTP discipline before it needs a faster feed.
+
 ## What is left that could pay
 
 In order of cost:
