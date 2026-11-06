@@ -185,6 +185,8 @@ def test_markout_is_signed_and_censored(tmp_path) -> None:
     series = [(0.0, 0.50), (100.0, 0.51), (400.0, 0.52)]
     # Filled at 0.50, mid is 0.52 five minutes later -> +400 bps.
     assert replay._markout(series, 100.0, 0.50) == pytest_approx(0.02 / 0.50 * 1e4)
+    # A sell gains when the mid falls; the sign must flip with the side.
+    assert replay._markout(series, 100.0, 0.50, sell=True) == pytest_approx(-0.02 / 0.50 * 1e4)
     # No mark a minute past the fill -> censored, not invented.
     assert replay._markout([(0.0, 0.50), (110.0, 0.51)], 100.0, 0.50) is None
 

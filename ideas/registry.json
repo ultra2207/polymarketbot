@@ -82,8 +82,10 @@
    "module": "ideas.micro-inventory-skew-size.module",
    "metric": "Paired per-condition net (cash_pnl + inventory_mtm + rewards_usd) against reactionary, with peak |inventory| and inventory_mtm standard deviation reported as the mechanism check, and rewards_usd as the cost.",
    "kill": "Kill if peak |inventory| falls by less than 15 %, or if rewards_usd falls by more than 10 %, or if paired net is not positive on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0550_10m_micro-inventory-skew-size"
   },
   {
    "slug": "micro-join-vs-lead",
@@ -132,8 +134,10 @@
    "module": "ideas.micro-oscillation-vs-trend.module",
    "metric": "Markout ladder across flip_frac terciles (the mechanism check) and the paired per-condition net against queue_aware_ofi; deciding number is the paired net delta per share.",
    "kill": "Kill if the tercile markout spread is below 0.3 c/share, or if the high-flip tercile is not the better one, or if the paired net delta is not positive on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0547_10m_micro-oscillation-vs-trend"
   },
   {
    "slug": "micro-payout-floor",
@@ -156,8 +160,10 @@
    "module": "ideas.micro-post-fill-defence.module",
    "metric": "Paired per-condition net with markout_5m_bps as the primary mechanism number; deciding statistic is the paired markout improvement on post-fill fills, with net required to be positive too.",
    "kill": "Kill if post-fill markout is not worse than pre-fill by 0.3 c/share pooled across conditions, or if the module's fill count falls below 200 on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0546_10m_micro-post-fill-defence"
   },
   {
    "slug": "micro-print-sweep-detector",
@@ -304,8 +310,10 @@
    "module": "ideas.micro-vol-scaled-size.module",
    "metric": "Paired per-condition net against reactionary, with the volatility-tercile markout ladder and the distribution of the applied scale reported; the deciding number is the paired net delta per share.",
    "kill": "Kill if the tercile markout ladder is flat (spread below 0.3 c/share), or if the applied scale is 1.0 or the floor for more than 90 % of updates (the signal does not vary), or if paired net is not positive on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0547_10m_micro-vol-scaled-size"
   },
   {
    "slug": "cross-binance-microprice-lead",

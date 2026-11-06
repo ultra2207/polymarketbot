@@ -123,6 +123,56 @@ above. `normalise_two_sided` now implements the venue rule (tested in
 `tests/test_reward_normalisation.py`); the table above is from the corrected
 model.
 
+## Wave 2 — four more, all negative, and why
+
+| idea | rule | net diff per condition | t | verdict |
+|---|---|---|---|---|
+| `micro-post-fill-defence` | shrink the side just hit, for 5 decisions | −\$0.0016 | −1.96 | fail |
+| `micro-oscillation-vs-trend` | shrink the threatened side when the mid is trending | −\$0.0000 | −1.00 | fail (no-op) |
+| `micro-vol-scaled-size` | size ∝ 1/σ² over a 100-mid window | −\$0.0119 | −3.01 | fail |
+| `micro-inventory-skew-size` | shrink the side that grows inventory | +\$0.0006 | +1.22 | fail (below the t ≥ 2 gate) |
+
+Seven ideas, seven failures, and one common cause: **the reward is linear in
+size and the markout saved by shrinking is smaller than the reward forfeited.**
+Every defensive idea reduces size, so every defensive idea loses on this slice.
+The one positive result (inventory skew) is positive but not significant.
+
+That makes the search direction explicit: **selection and timing beat sizing.**
+The next wave must change *which markets* we quote and *when*, not how much.
+
+## Capital scaling (500 markets, 10 minutes, `reactionary`)
+
+| pool multiplier | notional range | fills | rewards | net |
+|---|---|---|---|---|
+| 0.10 | \$10–200 | 67 | \$33.38 | \$35.19 |
+| 0.25 | \$10–500 | 67 | \$37.52 | \$40.33 |
+| 0.50 | \$10–1000 | 59 | \$42.01 | \$65.54 |
+| 1.00 | \$10–2000 | 59 | \$51.02 | \$88.76 |
+
+Rewards grow with size as the score is linear, but net grows faster than rewards
+because the extra size completes inventory pairs rather than adding exposure.
+This is one slice; it sets a hypothesis (size up to the inventory cap is
+reward-positive), not a rule.
+
+## Markout: three fixes, and one caveat that outranks them
+
+1. **Side sign.** The markout was `(mid − fill)/fill` for both sides; a sell
+   gains when the mid *falls*. Every average before this fix was meaningless.
+2. **Coverage.** A mark was computed at fill time, so a fill whose horizon lay
+   past the last book change was silently censored — 15 of 58 fills were
+   marked. Marks are now computed after the series is complete and terminated at
+   the tracking horizon: **58 of 58**.
+3. **Horizon.** The tracking tail is 900 s so a fill at the end of the slice
+   still has a 5-minute mark.
+
+The caveat: with this fill model a maker's markout on the slice is **positive**
+(mean +188 bps, median +204 bps over 58 fills). A passive maker should show
+*negative* markout (adverse selection). The model fills us at our quote when a
+print trades through it, including when that quote was stale after a jump, and
+the market then reverts. That is conservative in one direction and generous in
+another, so **markout is reported as a mechanism check, never as a promotion
+gate**, until it is reconciled against a fill model that cancels stale quotes.
+
 ## The idea inventory
 
 Two generator agents wrote **50 specs** (25 `micro-*`, 25 `cross-*`) with a

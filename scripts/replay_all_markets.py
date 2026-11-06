@@ -50,6 +50,7 @@ TAPE = REPO_ROOT / "data" / "tape"  # default; --tape-root overrides for tests
 DEFAULT_UNIVERSE = TAPE / "universe"
 DERIVED = REPO_ROOT / "data" / "derived" / "replay"
 MARKOUT_SECONDS = 300.0
+MARKOUT_TAIL_SECONDS = 900.0
 
 
 # --------------------------------------------------------------------------- #
@@ -372,7 +373,7 @@ def run_strategy(
             for engine in engines.values():
                 engine.run_epoch_sample()
 
-    end_track = end + MARKOUT_SECONDS
+    end_track = end + MARKOUT_TAIL_SECONDS
     for cond, asset, etype, ts_ms, bids, asks, price, size, side, *_ in iter_events(
         conditions, start, end_track, tape=tape
     ):
@@ -421,7 +422,7 @@ def run_strategy(
             row["condition_id"] = owner
             row["strategy"] = strategy_name
             row["fill_ts"] = fill_t
-            row["markout_5m"] = _markout(mids[asset_id], fill_t, float(row.get("price") or price))
+            row["markout_5m"] = None  # filled after the series is complete
             fills.append(row)
 
     rows: list[dict[str, Any]] = []
@@ -449,6 +450,27 @@ def run_strategy(
                 "equity": float(summary.get("total_equity", 0.0)),
             }
         )
+    # Marks are computed after the series is complete: a fill's horizon may lie
+    # beyond the last book change, and the terminal point is appended below.
+    # Terminate every series at the end of the tracking window, so a fill that
+    # had no book change afterwards still has a mark at the horizon instead of
+    # being silently censored out of the average.
+    for asset_id, owner in token_owner.items():
+        book = engines[owner].orderbooks.get(asset_id)
+        if book is not None:
+            mids[asset_id].append((end_track, float(book["mid"])))
+
+    for row in fills:
+        row["markout_5m"] = _markout(
+            mids.get(row["asset_id"], []),
+            float(row["fill_ts"]),
+            float(row.get("fill_price") or 0.0),
+            sell=str(row.get("side", "")).upper() == "SELL",
+        )
+
+    marks = [f["markout_5m"] for f in fills if f.get("markout_5m") is not None]
+    if fills:
+        log.info(f"[{strategy_name}] marks {len(marks)}/{len(fills)} fills")
     elapsed = time.perf_counter() - started
     log.info(
         f"[{strategy_name}] {processed:,} book events, {len(fills)} fills, "
@@ -513,8 +535,14 @@ def _quiet(name: str) -> None:
         pass
 
 
-def _markout(series: list[tuple[float, float]], fill_t: float, fill_px: float) -> Optional[float]:
-    """Signed mid move ``MARKOUT_SECONDS`` after the fill, in bps of fill price."""
+def _markout(
+    series: list[tuple[float, float]], fill_t: float, fill_px: float, *, sell: bool = False
+) -> Optional[float]:
+    """Mid move ``MARKOUT_SECONDS`` after the fill, in bps, signed in our favour.
+
+    A buy gains when the mid rises; a sell gains when it falls. Without the side
+    sign the average is meaningless, because a maker's fills are on both sides.
+    """
     if not series or fill_px <= 0:
         return None
     target = fill_t + MARKOUT_SECONDS
@@ -529,7 +557,8 @@ def _markout(series: list[tuple[float, float]], fill_t: float, fill_px: float) -
             return None
     else:
         later = series[idx][1]
-    return (later - fill_px) / fill_px * 1e4
+    move = (later - fill_px) / fill_px * 1e4
+    return -move if sell else move
 
 
 # --------------------------------------------------------------------------- #
@@ -596,6 +625,8 @@ def main(argv: list[str] | None = None) -> int:
             "inventory_mtm": round(float(frame["inventory_mtm"].sum()), 4),
             "markets_with_fills": int((frame["fills"] > 0).sum()),
             "markout_5m_bps": round(float(sum(marks) / len(marks)), 2) if marks else None,
+            "markout_5m_bps_n": len(marks),
+            "markout_5m_bps_median": round(float(sorted(marks)[len(marks) // 2]), 2) if marks else None,
             "rewards_observed": round(
                 float(frame.loc[frame["competition_observed"], "rewards_usd"].sum()), 4
             ),

@@ -1,0 +1,35 @@
+{
+ "strategy": "micro-post-fill-defence",
+ "stats": {
+  "fills": 67,
+  "fills_recorded": 67,
+  "net": 39.5479,
+  "rewards_usd": 37.5238,
+  "inventory_mtm": -301.6675,
+  "markets_with_fills": 31,
+  "markout_5m_bps": -1931.75,
+  "rewards_observed": 33.003,
+  "rewards_unobserved_competition": 4.5208,
+  "markets_competition_observed": 368,
+  "events": 2096,
+  "elapsed_s": 7.91
+ },
+ "paired": {
+  "conditions": 500,
+  "mean_diff": -0.00156,
+  "t": -1.957,
+  "total_diff": -0.7777,
+  "concentration": 0.45
+ },
+ "gates": {
+  "fills_and_conditions": false,
+  "beats_baseline": false,
+  "not_concentrated": false
+ },
+ "verdict": "fail",
+ "slice": [
+  1793943300.0,
+  1793943900.0
+ ],
+ "finished_utc": "2026-11-06T05:47:19.717908+00:00"
+}

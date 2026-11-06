@@ -1,0 +1,35 @@
+{
+ "strategy": "micro-vol-scaled-size",
+ "stats": {
+  "fills": 69,
+  "fills_recorded": 69,
+  "net": 34.4009,
+  "rewards_usd": 32.4561,
+  "inventory_mtm": -274.0661,
+  "markets_with_fills": 31,
+  "markout_5m_bps": -1931.75,
+  "rewards_observed": 28.2565,
+  "rewards_unobserved_competition": 4.1996,
+  "markets_competition_observed": 368,
+  "events": 2096,
+  "elapsed_s": 7.47
+ },
+ "paired": {
+  "conditions": 500,
+  "mean_diff": -0.01185,
+  "t": -3.011,
+  "total_diff": -5.9246,
+  "concentration": 0.203
+ },
+ "gates": {
+  "fills_and_conditions": false,
+  "beats_baseline": false,
+  "not_concentrated": true
+ },
+ "verdict": "fail",
+ "slice": [
+  1793943300.0,
+  1793943900.0
+ ],
+ "finished_utc": "2026-11-06T05:48:09.464500+00:00"
+}
