@@ -193,6 +193,27 @@ The next real test is therefore not another sizing rule. It is either a
 **cross-venue** rule with its signal materialised. Both are now unblocked by the
 harness; neither has been measured.
 
+## Validation of the synthetic print path: not yet trustworthy
+
+The same slice, same universe, real trade prints against prints rebuilt from
+book-level decreases:
+
+| path | fills | rebate | markout median | markout mean | net |
+|---|---|---|---|---|---|
+| `clob_trades` (real) | **59** | $2.32 | -600 bps | +2,381 bps | -$16.45 |
+| synthetic | **2,795** | $428.41 | -341 bps | -571 bps | +$3,591 |
+
+A book level that shrinks is indistinguishable from a cancel, so the synthetic
+path counts cancels as fills: **47x more fills and 185x more rebate** than the
+trade feed produces for the same slice. The sooner it is used, the more it
+inflates; every liquid-universe number in this document inherits that caveat.
+
+Also visible in the same table: the real-path mean markout is **positive**, which
+is not a result. Excluding fills whose markout exceeds 5,000 bps - a fill minutes
+before resolution marks out to the settlement, not to adverse selection - the
+mean becomes **-906.88 bps** against a median of -600. A handful of resolution
+jumps had been carrying the sign of the mean.
+
 ## The liquid universe: how to test anything on volume
 
 The reward universe and the liquid universe are disjoint, so a strategy that only

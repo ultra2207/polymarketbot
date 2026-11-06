@@ -567,7 +567,12 @@ def run_strategy(
             continue
         price = float(row["fill_price"])
         signed = (mark - price) if str(row.get("side", "")).upper() == "SELL" else (price - mark)
-        row["markout_5m_tape"] = signed / max(price, 1e-9) * 1e4
+        bps = signed / max(price, 1e-9) * 1e4
+        row["markout_5m_tape"] = bps
+        # A fill a few minutes before a market resolves has a markout that is
+        # the settlement itself, not adverse selection: |markout| near 10,000 bps
+        # is a binary outcome, and a handful of them dominate a mean.
+        row["markout_tape_clean"] = bps if abs(bps) <= 5_000.0 else None
 
     rows: list[dict[str, Any]] = []
     observed_conditions = {
@@ -576,7 +581,7 @@ def run_strategy(
     cond_marks: dict[str, list[float]] = {}
     cond_tape_pnl: dict[str, float] = {}
     for f in fills:
-        mark = f.get("markout_5m_tape")
+        mark = f.get("markout_tape_clean")
         if mark is None:
             continue
         cid = str(f.get("condition_id"))
@@ -900,6 +905,10 @@ def main(argv: list[str] | None = None) -> int:
             "markout_tape_bps_mean": _mean(
                 [f["markout_5m_tape"] for f in all_fills
                  if f.get("strategy") == str(name) and f.get("markout_5m_tape") is not None]
+            ),
+            "markout_tape_bps_clean_mean": _mean(
+                [f["markout_tape_clean"] for f in all_fills
+                 if f.get("strategy") == str(name) and f.get("markout_tape_clean") is not None]
             ),
             "rewards_observed": round(
                 float(frame.loc[frame["competition_observed"], "rewards_usd"].sum()), 4
