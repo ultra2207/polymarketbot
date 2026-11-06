@@ -53,13 +53,31 @@ minutes.
   `clock_offset`, RTT 193 ms), drifting to 1,318 ms on 11-06 from 384 ms on
   11-05. Any latency claim has to correct for that first.
 
+## The wide run: 40 markets, 15 minutes
+
+`--markets 40` (80 tokens) is the configuration that produces a dataset. Final
+epoch across the 40 markets:
+
+| statistic | value |
+|---|---|
+| competing score, min / median / max | 4,551 / 233,159 / **3,043,284** |
+| spread | **666x** |
+| markets giving us a non-zero share | 17 of 40 in the final minute, 24-48 tokens per epoch out of 80 |
+| our score in the busiest market | 1,058 against 3,043,284 - a 0.069 % share |
+| simulated fills | 1 (SELL 11 @ $0.12) |
+
+The competition is not merely skewed across markets, it moves: the count of
+tokens earning a non-zero share swings between 24 and 48 across fourteen epochs.
+That is the panel a selection rule needs, and it exists nowhere else in the repo.
+
 ## What it is worth doing
 
-Run it **wide, not deep**: `--markets 50 --duration 3600 --snapshot-interval 60`
-produces a competition panel across the reward universe, which is the missing
-input to every market-selection rule (the ones that died on the replay did so for
-lack of exactly this column). Ten minutes on five markets is a smoke test, not a
-dataset.
+Run it **wide, not deep**: `--markets 40-80 --duration 3600 --snapshot-interval 60`
+produces a competition panel across the reward universe. One caveat from the wide
+run: with 40 markets the session took 23 s to rank and subscribe, and the graceful
+shutdown needs headroom - a 900 s session under a 960 s `timeout` was killed mid
+stop, which no longer loses data now that snapshots are periodic, but leaves the
+manifest unfinalised.
 
 ## Defect found and fixed
 
