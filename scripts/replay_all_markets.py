@@ -374,6 +374,10 @@ def run_strategy(
             default_quote_size=shares,
             base_spread_offset_cents=float(args.spread_offset),
             max_inventory_shares=max(min_size, shares * 3.0),
+            # Complete sets are merged into cash once this many shares are held
+            # on both tokens. The default (100) is above the quote size on most
+            # markets, so the channel never fires and the gas model is untested.
+            auto_merge_threshold=float(args.merge_threshold),
             ledger_path=tag_dir / "ledgers" / f"{m['condition_id'][:18]}.json",
             strategy=load_strategy(strategy_name),
             clock=lambda: now_ts[0],
@@ -784,6 +788,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start-utc", default=None, help="YYYY-MM-DDTHH:MM; default = last sealed slice")
     parser.add_argument("--strategies", default="queue_aware_ofi")
     parser.add_argument("--pool-multiplier", type=float, default=0.25)
+    parser.add_argument("--merge-threshold", type=float, default=100.0,
+                        help="shares of a complete YES+NO set required before merging")
     parser.add_argument("--notional-min", type=float, default=10.0)
     parser.add_argument("--notional-max", type=float, default=500.0)
     parser.add_argument("--flat", type=float, default=0.0, help="flat notional per market; 0 = pool-scaled")

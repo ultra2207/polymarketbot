@@ -697,9 +697,18 @@
   {
    "slug": "micro-complement-staleness",
    "title": "A stale complement is a free option: pull the lagging token",
-   "status": "done",
+   "status": "killed",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0841_20m_o0_micro-complement-staleness"
+   "result": "data/derived/replay/20261106T0841_20m_o0_micro-complement-staleness",
+   "kill_reason": "P&L pooled +$133 (t=1.79) but the per-fill markout effect is t=1.62 with signs [+54, -42, +257]. A rule that only sometimes improves the fills it keeps is not a signal."
+  },
+  {
+   "slug": "micro-maker-vacancy",
+   "title": "Quote where the competition is thin, not where the pool is big",
+   "status": "killed",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0857_30m_o0_micro-maker-vacancy",
+   "kill_reason": "Pooled over 3x30-minute reward-universe slices (n=1,500 condition-slices): +$0.036, t=1.05. Gating on the competing-score percentile is directionally right and economically negligible - the payout is dominated by which markets the pool sits in, not by the intraday vacancy of their books."
   }
  ]
 }

@@ -334,6 +334,29 @@ cross-kalshi-basis-side-pull: verdict=inert: no shrink headroom
 Test size-based ideas with `--pool-multiplier 1.0` or larger so the quote has
 range above the venue minimum.
 
+## Two more tested, both rejected
+
+| idea | rule | result | verdict |
+|---|---|---|---|
+| `micro-maker-vacancy` | quote only below the 25th percentile of observed competing score, leave above the 75th | pooled +$0.036 over 1,500 condition-slices, **t=1.05** | directionally right, economically nothing: the payout is dominated by *which* markets hold the pool, not by their intraday vacancy |
+| `micro-complement-staleness` | pull both sides of the token whose mid lags its sibling-implied mid | P&L +$133 (t=1.79), per-fill markout **t=1.62, signs [+54, -42, +257]** | not robust: one slice of three is negative |
+
+## Merge economics: the default threshold is correct
+
+Merging complete YES+NO sets converts inventory to cash, but at these sizes the
+gas exceeds the benefit. Same slice, same strategy, only the threshold moved:
+
+| `auto_merge_threshold` | fills | rewards | net |
+|---|---|---|---|
+| 10 shares | 251 | $18.62 | **-$119.89** |
+| 25 shares | 251 | $18.62 | -$113.72 |
+| 100 (default) | 251 | $18.62 | -$113.72 |
+
+25 and 100 are identical because no market accumulates between them, so the
+channel is inert unless the threshold drops below the quote size - and dropping
+it costs $6.17. The merge path is now exposed as `--merge-threshold` so the claim
+is reproducible rather than assumed.
+
 ## Three harness defects found while re-checking
 
 | defect | effect | status |
