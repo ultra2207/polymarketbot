@@ -4,27 +4,27 @@
   {
    "strategy": "micro-thin-level-sweep",
    "stats": {
-    "fills": 83,
-    "fills_recorded": 83,
-    "net": 59.4435,
-    "rewards_usd": 37.0375,
-    "inventory_mtm": 42.3244,
-    "markets_with_fills": 34,
-    "markout_5m_bps": -52.91,
-    "markout_5m_bps_n": 83,
-    "markout_5m_bps_median": 231.34,
-    "rewards_observed": 32.5167,
-    "rewards_unobserved_competition": 4.5208,
-    "markets_competition_observed": 369,
-    "events": 2155,
-    "elapsed_s": 10.02
+    "fills": 68,
+    "fills_recorded": 68,
+    "net": 6.4369,
+    "rewards_usd": 12.1082,
+    "inventory_mtm": -298.0451,
+    "markets_with_fills": 24,
+    "markout_5m_bps": 3288.08,
+    "markout_5m_bps_n": 68,
+    "markout_5m_bps_median": 206.19,
+    "rewards_observed": 12.0369,
+    "rewards_unobserved_competition": 0.0713,
+    "markets_competition_observed": 334,
+    "events": 1835,
+    "elapsed_s": 8.93
    },
    "paired": {
     "conditions": 500,
-    "mean_diff": 0.0,
-    "t": 0.0,
-    "total_diff": 0.0,
-    "concentration": 1.0
+    "mean_diff": -0.02588,
+    "t": -1.144,
+    "total_diff": -12.9415,
+    "concentration": 0.648
    },
    "gates": {
     "fills_and_conditions": false,
@@ -33,12 +33,12 @@
    },
    "verdict": "fail",
    "slice": [
-    1793943900.0,
-    1793944500.0
+    1793944500.0,
+    1793945100.0
    ],
    "offset": 0
   }
  ],
  "verdict": "fail",
- "finished_utc": "2026-11-06T06:00:04.052113+00:00"
+ "finished_utc": "2026-11-06T06:05:51.262532+00:00"
 }

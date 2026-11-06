@@ -10,8 +10,10 @@
    "module": "ideas.micro-cap-breadth-preserve.module",
    "metric": "Fraction of events with a single-sided book (one side size 0) and the paired per-condition net; the deciding number is the paired net delta per share with the single-sided fraction as the mechanism check.",
    "kill": "Kill if the baseline's single-sided fraction is below 1 % of events (nothing to fix), or if peak |inventory| rises by more than 10 % under the ramp, or if paired net is not positive on both slices.",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-cap-breadth-preserve"
   },
   {
    "slug": "micro-competition-dilution",
@@ -22,8 +24,10 @@
    "module": "ideas.micro-competition-dilution.module",
    "metric": "Paired per-condition net and fill_notional in the top competition tercile, with rewards_usd reported alongside; deciding number is the paired net difference against queue_aware_ofi with the fill reduction as the mechanism check.",
    "kill": "Kill if comp_score varies by less than 5x across the sample (nothing to dilute), or if the reward loss exceeds twice the fill-notional saving on both slices, or if the top tercile contributes more than 25 % of the total (concentration gate).",
-   "status": "proposed",
-   "author": "IdeaGenMicro"
+   "status": "done",
+   "author": "IdeaGenMicro",
+   "verdict": "fail",
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-competition-dilution"
   },
   {
    "slug": "micro-cross-token-substitution",
@@ -37,7 +41,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "inert",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-cross-token-substitution"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-cross-token-substitution"
   },
   {
    "slug": "micro-depth-imbalance",
@@ -51,7 +55,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "inert",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-depth-imbalance"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-depth-imbalance"
   },
   {
    "slug": "micro-expiry-flatten",
@@ -89,7 +93,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-inventory-skew-size"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-inventory-skew-size"
   },
   {
    "slug": "micro-join-vs-lead",
@@ -115,7 +119,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-jump-withdrawal"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-jump-withdrawal"
   },
   {
    "slug": "micro-net-complement-inventory",
@@ -129,7 +133,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "inert",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-net-complement-inventory"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-net-complement-inventory"
   },
   {
    "slug": "micro-oscillation-vs-trend",
@@ -143,7 +147,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "inert",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-oscillation-vs-trend"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-oscillation-vs-trend"
   },
   {
    "slug": "micro-payout-floor",
@@ -169,7 +173,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-post-fill-defence"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-post-fill-defence"
   },
   {
    "slug": "micro-print-sweep-detector",
@@ -207,7 +211,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-queue-erosion-velocity"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-queue-erosion-velocity"
   },
   {
    "slug": "micro-reward-priced-pull",
@@ -221,7 +225,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "inert",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-reward-priced-pull"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-reward-priced-pull"
   },
   {
    "slug": "micro-score-density-split",
@@ -258,8 +262,8 @@
    "kill": "Kill if the post-widening markout gap is below 0.3 c/share, or if widening episodes occur in fewer than 2 % of updates, or if reward forfeiture exceeds the markout saving on both slices.",
    "status": "done",
    "author": "IdeaGenMicro",
-   "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-spread-widening-retreat"
+   "verdict": "inert",
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-spread-widening-retreat"
   },
   {
    "slug": "micro-tail-price-bps",
@@ -273,7 +277,7 @@
    "status": "done",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-tail-price-bps"
+   "result": "data/derived/replay/20261106T0605_10m_o0_micro-tail-price-bps"
   },
   {
    "slug": "micro-thin-level-sweep",
@@ -284,10 +288,10 @@
    "module": "ideas/micro-thin-level-sweep/module.py",
    "metric": "Paired per-condition net against reactionary, with the markout difference between the bottom and top level-size quartiles reported as the mechanism check; the deciding number is the paired net delta per share.",
    "kill": "Kill if the quartile markout gap is below 0.3 c/share, or if the bottom-quartile fills are not worse than -0.5 c/share, or if the paired net delta is negative on either slice.",
-   "status": "done",
+   "status": "implemented",
    "author": "IdeaGenMicro",
    "verdict": "fail",
-   "result": "data/derived/replay/20261106T0602_10m_o0_micro-thin-level-sweep"
+   "result": "data/derived/replay/20261106T0557_10m_o0_micro-thin-level-sweep"
   },
   {
    "slug": "micro-time-vs-size",

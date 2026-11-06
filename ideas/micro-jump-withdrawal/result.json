@@ -4,41 +4,41 @@
   {
    "strategy": "micro-jump-withdrawal",
    "stats": {
-    "fills": 25,
-    "fills_recorded": 25,
-    "net": 31.6443,
-    "rewards_usd": 26.7395,
-    "inventory_mtm": 6.1525,
-    "markets_with_fills": 18,
-    "markout_5m_bps": 319.02,
-    "markout_5m_bps_n": 25,
-    "markout_5m_bps_median": 231.34,
-    "rewards_observed": 22.2187,
-    "rewards_unobserved_competition": 4.5208,
-    "markets_competition_observed": 369,
-    "events": 2155,
-    "elapsed_s": 8.02
+    "fills": 30,
+    "fills_recorded": 30,
+    "net": 3.1527,
+    "rewards_usd": 9.5194,
+    "inventory_mtm": -177.1607,
+    "markets_with_fills": 12,
+    "markout_5m_bps": 2319.28,
+    "markout_5m_bps_n": 30,
+    "markout_5m_bps_median": 333.33,
+    "rewards_observed": 9.4837,
+    "rewards_unobserved_competition": 0.0356,
+    "markets_competition_observed": 334,
+    "events": 1835,
+    "elapsed_s": 8.67
    },
    "paired": {
     "conditions": 500,
-    "mean_diff": -0.0556,
-    "t": -3.759,
-    "total_diff": -27.7992,
-    "concentration": 0.216
+    "mean_diff": -0.00657,
+    "t": -0.728,
+    "total_diff": -3.2842,
+    "concentration": 1.168
    },
    "gates": {
     "fills_and_conditions": false,
     "beats_baseline": false,
-    "not_concentrated": true
+    "not_concentrated": false
    },
    "verdict": "fail",
    "slice": [
-    1793943900.0,
-    1793944500.0
+    1793944500.0,
+    1793945100.0
    ],
    "offset": 0
   }
  ],
  "verdict": "fail",
- "finished_utc": "2026-11-06T05:58:28.154008+00:00"
+ "finished_utc": "2026-11-06T06:07:30.574396+00:00"
 }

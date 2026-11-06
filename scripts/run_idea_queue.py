@@ -125,12 +125,16 @@ def evaluate(idea_dir: Path, idea_metrics: dict[str, Any], base_metrics: dict[st
         "beats_baseline": pair["mean_diff"] > 0 and pair["t"] >= MIN_T,
         "not_concentrated": pair["concentration"] <= MAX_CONCENTRATION,
     }
+    # An idea that changed nothing was not tested, it was inert. Calling that a
+    # "fail" hides a broken trigger behind a statistic.
+    inert = abs(pair["total_diff"]) < 1e-12 and pair["t"] == 0.0
+    verdict = "pass" if all(gates.values()) else ("inert" if inert else "fail")
     return {
         "strategy": name,
         "stats": stats,
         "paired": pair,
         "gates": gates,
-        "verdict": "pass" if all(gates.values()) else "fail",
+        "verdict": verdict,
     }
 
 
@@ -144,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flat", type=float, default=0.0)
     parser.add_argument("--timeout", type=int, default=280, help="per-replay cap, below the 300 s rule")
     parser.add_argument("--limit", type=int, default=0, help="run at most N pending ideas")
+    parser.add_argument("--only", default="", help="comma-separated slugs; overrides status filtering")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--slice-offsets",
@@ -154,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
 
     registry = load_registry()
     queue = pending(registry)
+    if args.only:
+        wanted = {s.strip() for s in args.only.split(",") if s.strip()}
+        queue = [i for i in registry.get("ideas", []) if i.get("slug") in wanted]
     if args.limit:
         queue = queue[: args.limit]
     if not queue:
@@ -163,11 +171,13 @@ def main(argv: list[str] | None = None) -> int:
 
     stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M")
     base_dir = DERIVED / f"{stamp}_{args.minutes}m_{args.baseline}"
-    offsets = [int(o) for o in str(args.slice_offsets).split(",") if o.strip()]
+    frozen = bool(args.start_utc)
+    offsets = [0] if frozen else [int(o) for o in str(args.slice_offsets).split(",") if o.strip()]
+    frozen_start = args.start_utc
     base_dirs: dict[int, Path] = {}
     base_summaries: dict[int, dict[str, Any]] = {}
     for offset in offsets:
-        args.start_utc = slice_start(args, offset)
+        args.start_utc = frozen_start if frozen else slice_start(args, offset)
         base_dir = DERIVED / f"{stamp}_{args.minutes}m_o{offset}_{args.baseline}"
         base_summaries[offset] = run_replay(
             args.baseline, args, f"{stamp}_{args.minutes}m_o{offset}_{args.baseline}", base_dir
@@ -184,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         verdict = "pass"
         try:
             for offset in offsets:
-                args.start_utc = slice_start(args, offset)
+                args.start_utc = frozen_start if frozen else slice_start(args, offset)
                 idea_dir = DERIVED / f"{stamp}_{args.minutes}m_o{offset}_{slug}"
                 summary = run_replay(
                     slug, args, f"{stamp}_{args.minutes}m_o{offset}_{slug}", idea_dir
@@ -194,7 +204,9 @@ def main(argv: list[str] | None = None) -> int:
                 result["slice"] = summary["slice"]
                 result["offset"] = offset
                 per_slice.append(result)
-                if result["verdict"] != "pass":
+                if result["verdict"] == "inert":
+                    verdict = "inert"
+                elif result["verdict"] != "pass":
                     verdict = "fail"
                 log.info(
                     f"{slug}[{offset}] net_diff={pair['mean_diff']} t={pair['t']} "

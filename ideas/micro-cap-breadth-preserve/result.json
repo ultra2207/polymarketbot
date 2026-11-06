@@ -1,0 +1,44 @@
+{
+ "strategy": "micro-cap-breadth-preserve",
+ "slices": [
+  {
+   "strategy": "micro-cap-breadth-preserve",
+   "stats": {
+    "fills": 70,
+    "fills_recorded": 70,
+    "net": 1.0561,
+    "rewards_usd": 12.1082,
+    "inventory_mtm": -321.3654,
+    "markets_with_fills": 24,
+    "markout_5m_bps": 3271.84,
+    "markout_5m_bps_n": 70,
+    "markout_5m_bps_median": 206.19,
+    "rewards_observed": 12.0369,
+    "rewards_unobserved_competition": 0.0713,
+    "markets_competition_observed": 334,
+    "events": 1835,
+    "elapsed_s": 10.02
+   },
+   "paired": {
+    "conditions": 500,
+    "mean_diff": -0.01076,
+    "t": -1.058,
+    "total_diff": -5.3808,
+    "concentration": 0.943
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793944500.0,
+    1793945100.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T06:06:22.455479+00:00"
+}

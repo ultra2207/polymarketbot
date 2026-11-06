@@ -1,0 +1,44 @@
+{
+ "strategy": "micro-payout-floor",
+ "slices": [
+  {
+   "strategy": "micro-payout-floor",
+   "stats": {
+    "fills": 108,
+    "fills_recorded": 108,
+    "net": 14.2515,
+    "rewards_usd": 6.7121,
+    "inventory_mtm": -539.5344,
+    "markets_with_fills": 37,
+    "markout_5m_bps": 929.21,
+    "markout_5m_bps_n": 108,
+    "markout_5m_bps_median": 170.21,
+    "rewards_observed": 6.5395,
+    "rewards_unobserved_competition": 0.1726,
+    "markets_competition_observed": 203,
+    "events": 2269,
+    "elapsed_s": 9.36
+   },
+   "paired": {
+    "conditions": 500,
+    "mean_diff": -0.0003,
+    "t": -1.0,
+    "total_diff": -0.15,
+    "concentration": 1.0
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793941200.0,
+    1793941800.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T06:08:45.587933+00:00"
+}

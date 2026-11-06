@@ -140,6 +140,59 @@ The one positive result (inventory skew) is positive but not significant.
 That makes the search direction explicit: **selection and timing beat sizing.**
 The next wave must change *which markets* we quote and *when*, not how much.
 
+## Wave 3 — sixteen ideas on one frozen slice
+
+Slice `2026-11-06T05:55Z`, 500 markets, 10 minutes, baseline `reactionary`
+(quote both sides inside the spread at pool-scaled size). Paired per condition:
+
+| idea | verdict | net diff/cond | t |
+|---|---|---|---|
+| `micro-queue-erosion-velocity` | fail | +0.01848 | +0.90 |
+| `micro-payout-floor` | fail | −0.00030 | −1.00 |
+| `micro-competition-dilution` | fail | −0.00046 | −0.58 |
+| `micro-jump-withdrawal` | fail | −0.00657 | −0.73 |
+| `micro-inventory-skew-size` | fail | −0.00973 | −1.01 |
+| `micro-post-fill-defence` | fail | −0.00985 | −1.09 |
+| `micro-cap-breadth-preserve` | fail | −0.01076 | −1.06 |
+| `micro-vol-scaled-size` | fail | −0.02273 | −0.91 |
+| `micro-thin-level-sweep` | fail | −0.02588 | −1.14 |
+| `micro-two-sided-coupling` | fail | −0.02605 | −1.16 |
+| `micro-tail-price-bps` | fail | −0.02796 | −1.18 |
+| `micro-cross-token-substitution` | inert | 0 | — |
+| `micro-depth-imbalance` | inert | 0 | — |
+| `micro-net-complement-inventory` | inert | 0 | — |
+| `micro-oscillation-vs-trend` | inert | 0 | — |
+| `micro-reward-priced-pull` | inert | 0 | — |
+
+(`micro-spread-widening-retreat` is also inert and is included in the 16.)
+
+**Zero passes.** The best idea is positive but has t = 0.90, far below the gate
+of 2.0; the rest are at or below zero. Six are `inert`: their trigger needs a
+signal nobody has prepared yet, or a condition that cannot hold while quoting
+inside the spread.
+
+## What 17 negative results mean
+
+They are not noise, and they are not a failed factory — they are a statement
+about the economics of this venue as measured:
+
+1. **Reward dominates.** The reward score is linear in size; a fill's markout is
+   bounded by the spread. Every idea that reduces size forfeits more reward than
+   it saves in markout, and the sign of the paired difference follows the sign
+   of the size change almost everywhere in the table.
+2. **Price choice has one answer here.** Quoting inside the spread (the
+   baseline) beats joining the touch (+\$0.032/condition) because it scores more
+   of the pool and gets filled less.
+3. **`inert` is a bug report, not a result.** Six modules need a signal: the
+   `prepare.sql` pipeline exists (`scripts/build_idea_signals.py`) and one agent
+   is authoring six of them, but the modules that read `sibling_*`,
+   `depth_imbalance` or `threat` cannot be judged until those land.
+
+The next real test is therefore not another sizing rule. It is either a
+**selection** rule (withdraw from a whole market on a market-level feature) or a
+**cross-venue** rule with its signal materialised. Both are now unblocked by the
+harness; neither has been measured.
+
 ## Capital scaling (500 markets, 10 minutes, `reactionary`)
 
 | pool multiplier | notional range | fills | rewards | net |

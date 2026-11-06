@@ -1,0 +1,44 @@
+{
+ "strategy": "micro-two-sided-coupling",
+ "slices": [
+  {
+   "strategy": "micro-two-sided-coupling",
+   "stats": {
+    "fills": 68,
+    "fills_recorded": 68,
+    "net": 6.3519,
+    "rewards_usd": 12.1082,
+    "inventory_mtm": -293.0301,
+    "markets_with_fills": 24,
+    "markout_5m_bps": 3288.08,
+    "markout_5m_bps_n": 68,
+    "markout_5m_bps_median": 206.19,
+    "rewards_observed": 12.0369,
+    "rewards_unobserved_competition": 0.0713,
+    "markets_competition_observed": 334,
+    "events": 1835,
+    "elapsed_s": 10.21
+   },
+   "paired": {
+    "conditions": 500,
+    "mean_diff": -0.02605,
+    "t": -1.158,
+    "total_diff": -13.0265,
+    "concentration": 0.637
+   },
+   "gates": {
+    "fills_and_conditions": false,
+    "beats_baseline": false,
+    "not_concentrated": false
+   },
+   "verdict": "fail",
+   "slice": [
+    1793944500.0,
+    1793945100.0
+   ],
+   "offset": 0
+  }
+ ],
+ "verdict": "fail",
+ "finished_utc": "2026-11-06T06:06:10.059009+00:00"
+}
