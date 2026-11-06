@@ -531,7 +531,11 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = {"tag": tag, "slice": [start, end], "markets": len(markets), "strategies": {}}
     for name, frame in metrics.groupby("strategy"):
-        marks = [f["markout_5m"] for f in all_fills if f.get("condition_id") in set(frame["condition_id"]) and f.get("markout_5m") is not None]
+        marks = [
+            f["markout_5m"]
+            for f in all_fills
+            if f.get("strategy") == str(name) and f.get("markout_5m") is not None
+        ]
         summary["strategies"][str(name)] = {
             "fills": int(frame["fills"].sum()),
             "fills_recorded": len(

@@ -532,6 +532,8 @@ class PaperTradingEngine:
         gate_ask_pull = False
         bid_scale = 1.0
         ask_scale = 1.0
+        strategy_bid_price: Optional[float] = None
+        strategy_ask_price: Optional[float] = None
         if self.strategy is not None:
             ofi = None
             steps = self._ofi_steps.get(asset_id)
@@ -549,6 +551,21 @@ class PaperTradingEngine:
             gate_ask_pull = decision.ask == "PULL"
             bid_scale = 0.0 if gate_bid_pull else float(decision.bid_scale)
             ask_scale = 0.0 if gate_ask_pull else float(decision.ask_scale)
+            strategy_bid_price = getattr(decision, "bid_price", None)
+            strategy_ask_price = getattr(decision, "ask_price", None)
+            # A module may pin its own price (join a level instead of improving
+            # the spread). Tick-round it and re-apply the post-only clamp, so the
+            # price that rests is the price the module chose.
+            if strategy_bid_price is not None:
+                bid_price = round(round(float(strategy_bid_price) / tick) * tick, 4)
+                if bid_price >= best_ask:
+                    bid_price = round(min(best_bid, best_ask - tick), 4)
+                post_only_bid = bid_price < best_ask
+            if strategy_ask_price is not None:
+                ask_price = round(round(float(strategy_ask_price) / tick) * tick, 4)
+                if ask_price <= best_bid:
+                    ask_price = round(max(best_ask, best_bid + tick), 4)
+                post_only_ask = ask_price > best_bid
 
         orchestrator_active = (
             self.strategy is None

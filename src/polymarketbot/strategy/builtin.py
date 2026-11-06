@@ -76,7 +76,40 @@ class QueueAwareOFI:
         )
 
 
+class JoinLevel:
+    """Join the existing best level instead of improving the spread.
+
+    With a quote inside the spread the FIFO queue ahead is zero, so the
+    queue-aware gate has nothing to act on and every policy behaves the same.
+    Joining the level puts size in front of us, which is where the measured
+    front/back split (-2.01 c/share at the back) applies.
+    """
+
+    name = "join_level"
+
+    def setup(self, market: MarketView) -> None:
+        return None
+
+    def on_book(self, ctx: BookContext) -> None:
+        return None
+
+    def on_trade(self, ctx: TradeContext) -> None:
+        return None
+
+    def decide(self, ctx: DecisionContext) -> SideActions:
+        # A one-sided book has a synthetic 0/1 touch; pinning a price to it would
+        # quote at 0c or 100c, which the reward program scores as zero.
+        bid = ctx.book.best_bid if 0.0 < ctx.book.best_bid < 1.0 else None
+        ask = ctx.book.best_ask if 0.0 < ctx.book.best_ask < 1.0 else None
+        return SideActions(
+            bid_price=bid,
+            ask_price=ask,
+            reason="join_level: rest at the touch",
+        )
+
+
 BUILTINS = {
+    "join_level": JoinLevel,
     "reactionary": Reactionary,
     "queue_aware_ofi": QueueAwareOFI,
 }

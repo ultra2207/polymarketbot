@@ -31,6 +31,11 @@ class SideActions:
     bid_scale: float = 1.0
     ask_scale: float = 1.0
     reason: str = ""
+    #: Optional price overrides. A maker's main decision is *where* to stand, so
+    #: a module may join an existing level instead of improving the spread. The
+    #: engine still rounds to the tick, enforces post-only and applies risk.
+    bid_price: Optional[float] = None
+    ask_price: Optional[float] = None
 
     def __post_init__(self) -> None:
         for side, action in (("bid", self.bid), ("ask", self.ask)):
@@ -39,6 +44,9 @@ class SideActions:
         for name, scale in (("bid_scale", self.bid_scale), ("ask_scale", self.ask_scale)):
             if not 0.0 <= float(scale) <= 1.0:
                 raise StrategyError(f"{name}={scale!r} outside [0, 1]")
+        for name, price in (("bid_price", self.bid_price), ("ask_price", self.ask_price)):
+            if price is not None and not 0.0 < float(price) < 1.0:
+                raise StrategyError(f"{name}={price!r} outside (0, 1)")
 
 
 @dataclass(frozen=True)

@@ -53,6 +53,26 @@ Command:
   --strategies reactionary,queue_aware_ofi --tag wave0
 ```
 
+## First strategic result: rest at the touch or stay inside it?
+
+`join_level` (rest at `best_bid`/`best_ask`) versus `queue_aware_ofi` (quote
+inside the spread), same 500 markets, same 10 minutes:
+
+| strategy | fills | rewards | markout 5 min | net |
+|---|---|---|---|---|
+| `join_level` | 129 | \$18.44 | **−201 bps** | \$15.05 |
+| `queue_aware_ofi` | 104 | \$34.48 | **−115 bps** | \$31.97 |
+
+Paired per condition: mean net difference −\$0.032, t = −2.84 over 500
+conditions, in favour of quoting inside the spread. Two effects, both predicted
+by the mechanism: joining the touch gets filled 24 % more often, and those
+fills are 86 bps more adversely selected. Inside the spread also scores more of
+the pool, because the reward score increases with distance from the touch
+penalty curve.
+
+This is one slice of one regime. It is recorded as the direction the first wave
+must beat, not as a promotion.
+
 ## What this slice says, and what it does not
 
 **It says** the harness produces a stable, reproducible, paired measurement on
