@@ -441,6 +441,12 @@ def run_strategy(
                 "condition_id": cond,
                 "rate_per_day": engine.markets[cond].rate_per_day,
                 "quote_shares": round(quote_size[cond], 4),
+                # A shrink rule can only act if the quote sits above the venue
+                # minimum. At a 0.25 pool multiplier most reward markets quote
+                # exactly ``rewards_min_size``, where SHRINK is a no-op and only
+                # PULL changes anything - record it so an "inert" verdict can be
+                # told apart from "this market has no size to give up".
+                "min_size": float(engine.markets[cond].rewards_min_size),
                 "fills": sum(p.fills_count for p in engine.positions.values()),
                 "cash": float(engine.cash_usd),
                 "inventory_mtm": float(inventory),

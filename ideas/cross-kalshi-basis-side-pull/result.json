@@ -4,23 +4,23 @@
   {
    "strategy": "cross-kalshi-basis-side-pull",
    "stats": {
-    "fills": 9,
-    "fills_recorded": 9,
-    "net": -4.7443,
-    "rewards_usd": 0.0,
-    "inventory_mtm": -312.4761,
-    "markets_with_fills": 5,
-    "markout_5m_bps": -2313.28,
-    "markout_5m_bps_n": 9,
-    "markout_5m_bps_median": -133.33,
+    "fills": 3,
+    "fills_recorded": 3,
+    "net": -0.3765,
+    "rewards_usd": 0.5179,
+    "inventory_mtm": -18.3323,
+    "markets_with_fills": 3,
+    "markout_5m_bps": -6769.18,
+    "markout_5m_bps_n": 3,
+    "markout_5m_bps_median": 131.87,
     "rewards_observed": 0.0,
-    "rewards_unobserved_competition": 0.0,
+    "rewards_unobserved_competition": 0.5179,
     "markets_competition_observed": 0,
-    "events": 4687,
-    "elapsed_s": 2.14
+    "events": 4538,
+    "elapsed_s": 1.71
    },
    "paired": {
-    "conditions": 14,
+    "conditions": 10,
     "mean_diff": 0.0,
     "t": 0.0,
     "total_diff": 0.0,
@@ -31,7 +31,7 @@
     "beats_baseline": false,
     "not_concentrated": false
    },
-   "verdict": "inert",
+   "verdict": "inert: no shrink headroom (90% of markets quote at rewards_min_size)",
    "slice": [
     1793934000.0,
     1793935800.0
@@ -39,6 +39,6 @@
    "offset": 0
   }
  ],
- "verdict": "inert",
- "finished_utc": "2026-11-06T06:29:19.031363+00:00"
+ "verdict": "inert: no shrink headroom (90% of markets quote at rewards_min_size)",
+ "finished_utc": "2026-11-06T07:03:57.626136+00:00"
 }

@@ -25,7 +25,7 @@ from (
            cast(b.recv_ts_ns / 1000000 as bigint) as ts_ms,
            b.mid as k_mid
     from read_parquet(['${TAPE}/kalshi_books/date=2026-11-06/hour=02/*.parquet','${TAPE}/kalshi_books/date=2026-11-06/hour=03/*.parquet']) b
-    join read_parquet('data/derived/kalshi_mapping_v2.parquet') m
+    join read_parquet('data/derived/kalshi_mapping_active_v2.parquet') m
       on m.kalshi_ticker = b.ticker
     where b.mid > 0.001 and b.mid < 0.999
 ) k

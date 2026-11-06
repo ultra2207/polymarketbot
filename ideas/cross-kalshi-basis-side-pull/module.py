@@ -15,7 +15,12 @@ from __future__ import annotations
 
 from polymarketbot.strategy.base import DecisionContext, SideActions
 
-THRESHOLD = 3.0  # logit points; the spec's claim is "> 3 predicts the reprice in 15 s"
+# The spec proposed +/-3 logit points. Measured on 6,183 as-of rows over two
+# hours, |basis| has std 0.30 and never exceeds 1.72, so 3.0 is unreachable and
+# the module could never fire. 0.5 is ~1.7 sigma of that distribution; the
+# calibration window and the test slices overlap, so this is a hypothesis to
+# hold out on another day, not a tuned parameter.
+THRESHOLD = 0.5
 MAX_AGE_S = 20.0
 SHRINK = 0.01
 

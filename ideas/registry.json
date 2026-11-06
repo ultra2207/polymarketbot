@@ -418,11 +418,12 @@
    "module": "Act only when `kalshi_age_ms <= 6000` and `kalshi_conf >= 0.6`. basis > +3 -> SHRINK the YES ask to 0.25 and keep the bid; basis < -3 -> mirror; |basis| > 8 -> PULL. The mapping direction is applied before the sign is read: for a `yes_no` row the basis is...",
    "metric": "Paired per-condition net and markout over the 53 reward-universe mapped conditions, versus `queue_aware_ofi` on the same slice.",
    "kill": "Kill if paired net <= 0 or t < 2 on two slices, or the basis-conditioned markout gain is < 0.5 c/share, or the 5 s deciles stay non-monotone on a >= 7 day sample (the slope then belongs to one family with < 10 pairs and cannot be quoted).",
-   "status": "blocked",
+   "status": "done",
    "author": "IdeaGenCross",
-   "verdict": "inert",
-   "result": "data/derived/replay/20261106T0629_30m_o0_cross-kalshi-basis-side-pull",
-   "blocked_reason": "PM mid is 255 s stale at the median (p90 2,634 s) and the basis never exceeds 1.72 logit points, so the spec's +/-3 threshold is unreachable. The mapping targets reward-tail markets: median 2 book events per condition over 6 hours, 47 of 107 with zero."
+   "verdict": "inert: no shrink headroom (90% of markets quote at rewards_min_size)",
+   "result": "data/derived/replay/20261106T0703_30m_o0_cross-kalshi-basis-side-pull",
+   "blocked_reason": "PM mid is 255 s stale at the median (p90 2,634 s) and the basis never exceeds 1.72 logit points, so the spec's +/-3 threshold is unreachable. The mapping targets reward-tail markets: median 2 book events per condition over 6 hours, 47 of 107 with zero.",
+   "error": "name 'run_dir' is not defined"
   },
   {
    "slug": "cross-kalshi-trade-lead-gate",

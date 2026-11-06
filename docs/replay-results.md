@@ -220,6 +220,40 @@ every width; that is a property of the slice, not of the offset.
 Both are marked `killed` in the registry with the measurement attached, so a
 later agent cannot resurrect them without new evidence.
 
+## The intersection of "paid to quote" and "actively traded" is empty
+
+The mapping was rebuilt from the Polymarket side (rank 5,292 conditions with book
+events in six hours, take the top 200, parse each question and match it to a
+Kalshi ticker). It qualifies **13 matches, every one with >= 411 events**, and it
+halves staleness: the PM mid is **39 s** stale at the median against v2's 255 s.
+
+All 13 pay **$0.00/day in liquidity rewards**. Every actively-traded market in
+the matched set is a market people trade because it matters, not one the venue
+pays us to quote. That is the whole reason 25 cross-venue ideas report `inert`:
+
+| set | book events / 6 h | reward pool |
+|---|---|---|
+| reward markets (the replay universe) | median **2** per condition | >= $15/day |
+| matched active markets | median **1,031** per condition | **$0.00/day** |
+
+They are disjoint. A cross-venue signal can only be measured on the second set,
+where `net` is markout and not reward — which the reward harness cannot express.
+
+## Half the universe cannot be shrunk at all
+
+`quote_shares` equals `rewards_min_size` on most markets at the default 0.25 pool
+multiplier (median 20 shares, the floor). A `SHRINK` decision on such a market
+floors straight back to 20 and changes nothing, so every size-reduction idea was
+untested, not failed. The scheduler now says which it is:
+
+```
+cross-kalshi-basis-side-pull: verdict=inert: no shrink headroom
+    (90% of markets quote at rewards_min_size)
+```
+
+Test size-based ideas with `--pool-multiplier 1.0` or larger so the quote has
+range above the venue minimum.
+
 ## Why the cross-venue family is blocked: the mapped markets are silent
 
 The first cross-venue idea (`cross-kalshi-basis-side-pull`) was implemented end

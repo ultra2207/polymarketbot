@@ -92,6 +92,7 @@ def run_replay(strategy: str, args: argparse.Namespace, tag: str, out: Path) -> 
         cmd += ["--mapped"]
     if getattr(args, "mapping", None):
         cmd += ["--mapping", str(args.mapping)]
+    cmd += ["--pool-multiplier", str(getattr(args, "pool_multiplier", 0.25))]
     log.info(f"replay {strategy} -> {out}")
     result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=args.timeout, check=False)
     if result.returncode != 0:
@@ -133,6 +134,8 @@ def evaluate(idea_dir: Path, idea_metrics: dict[str, Any], base_metrics: dict[st
     # "fail" hides a broken trigger behind a statistic.
     inert = abs(pair["total_diff"]) < 1e-12 and pair["t"] == 0.0
     verdict = "pass" if all(gates.values()) else ("inert" if inert else "fail")
+    if verdict == "inert":
+        verdict = _inert_cause(idea_dir)
     return {
         "strategy": name,
         "stats": stats,
@@ -140,6 +143,24 @@ def evaluate(idea_dir: Path, idea_metrics: dict[str, Any], base_metrics: dict[st
         "gates": gates,
         "verdict": verdict,
     }
+
+
+def _inert_cause(run_dir: Path) -> str:
+    """Say why a strategy produced no difference, when the run can tell us."""
+    try:
+        import pandas as pd
+
+        m = pd.read_parquet(run_dir / "metrics.parquet")
+    except Exception:
+        return "inert"
+    if "quote_shares" not in m or "min_size" not in m or m.empty:
+        return "inert"
+    at_floor = (m["quote_shares"] <= m["min_size"] * 1.005).mean()
+    if at_floor >= 0.5:
+        return f"inert: no shrink headroom ({at_floor:.0%} of markets quote at rewards_min_size)"
+    if m["fills"].sum() == 0:
+        return "inert: no fills in the slice"
+    return "inert"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -155,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default="", help="comma-separated slugs; overrides status filtering")
     parser.add_argument("--mapped", action="store_true", help="restrict to Kalshi-mapped conditions")
     parser.add_argument("--mapping", default=None, help="mapping parquet used by --mapped")
+    parser.add_argument("--pool-multiplier", type=float, default=0.25,
+                        help="notional = multiplier * daily pool; must exceed 1.0 for shrink rules to have range")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--slice-offsets",
@@ -210,8 +233,8 @@ def main(argv: list[str] | None = None) -> int:
                 result["slice"] = summary["slice"]
                 result["offset"] = offset
                 per_slice.append(result)
-                if result["verdict"] == "inert":
-                    verdict = "inert"
+                if result["verdict"].startswith("inert"):
+                    verdict = result["verdict"]
                 elif result["verdict"] != "pass":
                     verdict = "fail"
                 log.info(
