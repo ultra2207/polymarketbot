@@ -1,0 +1,52 @@
+{
+  "hours_audited": 4,
+  "total_anomalies": 226,
+  "total_phantom": 90,
+  "total_genuine": 136,
+  "gross_spread_mean": 0.03915929203539824,
+  "gross_spread_median": 0.010000000000000009,
+  "total_taker_fee_mean": 0.014274277876106196,
+  "net_spread_mean": 0.024885014159292052,
+  "net_spread_median": 0.0013441000000000076,
+  "profitable_after_fees_count": 125,
+  "profitable_fraction": 0.5530973451327433,
+  "duration_venue_ms_median": 39.0,
+  "duration_venue_ms_mean": 22884.358407079646,
+  "min_depth_shares_median": 29.66,
+  "dollar_depth_median": 24.8125,
+  "dollar_depth_mean": 115.53429336283185,
+  "hourly_breakdown": [
+    {
+      "hour_dir": "data/tape/clob_events/date=2026-11-04/hour=00",
+      "total_bbo_rows": 255522,
+      "total_anomalies": 141,
+      "phantom_count": 41,
+      "genuine_count": 100,
+      "runtime_s": 14.673460245132446
+    },
+    {
+      "hour_dir": "data/tape/clob_events/date=2026-11-04/hour=12",
+      "total_bbo_rows": 1055769,
+      "total_anomalies": 60,
+      "phantom_count": 45,
+      "genuine_count": 15,
+      "runtime_s": 57.36114764213562
+    },
+    {
+      "hour_dir": "data/tape/clob_events/date=2026-11-05/hour=15",
+      "total_bbo_rows": 0,
+      "total_anomalies": 0,
+      "phantom_count": 0,
+      "genuine_count": 0,
+      "runtime_s": 60.13870716094971
+    },
+    {
+      "hour_dir": "data/tape/clob_events/date=2026-11-06/hour=12",
+      "total_bbo_rows": 143997,
+      "total_anomalies": 25,
+      "phantom_count": 4,
+      "genuine_count": 21,
+      "runtime_s": 30.777788877487183
+    }
+  ]
+}
