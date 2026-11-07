@@ -212,9 +212,15 @@ sudo journalctl -u polymarketbot -f -o cat
 
 ### Selecting Execution Modes
 
-By default, `polymarketbot.service` executes the **Autonomous Liquidity Harvester Daemon**:
+By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across all 4 production pillars ($1,000 each = $4,000 total):
 ```ini
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_autonomous_daemon.py --capital 100
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
+```
+
+### Preflight Health Audit (Run before or after starting daemon):
+```bash
+cd /opt/polymarketbot
+uv run python scripts/preflight_verification.py
 ```
 
 To switch to a different operational mode, run:
@@ -226,13 +232,13 @@ Paste your override in the opened editor:
 ```ini
 [Service]
 ExecStart=
-# --- Option 1: Multi-Market Paper Trader (5 top liquid markets) ---
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_paper_trading.py --markets 5
+# --- Option 1: 4-Strategy Live Paper Soak Daemon ($4,000 virtual capital) ---
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
 
-# --- Option 2: Full Continuous Data Collector (writes L2/L3 tape to Parquet) ---
-# ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_data_collector.py --allow-long --duration 0
+# --- Option 2: Preflight Verification Health Audit ---
+# ExecStart=/opt/polymarketbot/.venv/bin/python scripts/preflight_verification.py
 
-# --- Option 3: Live Real Money Harvester (requires live confirmation & budget) ---
+# --- Option 3: Live Real Money Quoter (BLOCKED until Dec 1st - requires real capital) ---
 # ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_real_money_trader.py --live --yes --budget-pct 0.20
 ```
 

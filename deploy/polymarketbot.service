@@ -22,15 +22,15 @@ Environment=DUCKDB_MEMORY_LIMIT=1GB
 Environment=DUCKDB_THREADS=2
 
 # Execution Command
-# Default: Autonomous paper trading & quadratic rewards harvester
-# Alternate modes (uncomment desired mode or override via systemctl edit polymarketbot):
-#   Paper Trading (multi-market):
-#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_paper_trading.py --markets 5
-#   Background Data Collector:
-#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_data_collector.py --allow-long --duration 0
-#   Real Money Quoting (Requires --live, --yes, and populated credentials):
+# Default (Leading to Dec 1): 24/7 Zero-Capital Live Paper Trading Soak across all 4 production strategies
+#   Allocates $1,000 each to LatencySniper, Domain2ARR, CtfSplitter, and SettlementHarvester.
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
+
+# Alternate modes (override via systemctl edit polymarketbot):
+#   Preflight Verification:
+#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/preflight_verification.py
+#   Real Money Quoting (Blocked until Dec 1st - Requires --live, --yes, and populated credentials):
 #     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_real_money_trader.py --live --yes --budget-pct 0.20
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_autonomous_daemon.py --capital 100
 
 # Reliability & Crash Recovery
 Restart=always
