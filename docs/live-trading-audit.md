@@ -188,3 +188,10 @@ relayer/executor batch is implemented as a builder only, and
 `--allow-no-settlement`; inventory can then only exit by selling.
 
 **Go/no-go:** fit for a small, supervised pilot (EOA, one v1 non-neg-risk market, bounded `--duration`). Not fit for unattended size, and not yet fit for v2 or neg-risk live settlement: the edge is still modelled, not measured, and the non-CTF routes are encoded from verified ABIs but have never carried a real transaction. Acceptance for the pilot: preflight READY; venue reports no open orders at start and end; the first real fill reconciles against `/data/trades`; the `/rewards/user` total at the next UTC midnight matches the modelled direction.
+
+## Production Capital Allocation Gate (Dec 1, 2026 Go-Live)
+
+- **Domain 1 (HFT Passive Quoting + Binance Lead-Lag Alpha):** **ACTIVE** (0% maker fee, low inventory holding risk, calibrated queue priority).
+- **Domain 2 (Settlement Discount Harvesting):** **ACTIVE** (100% dynamic maker queue pricing, Option A/B/C regimes, $0 maker fee, emergency circuit breaker).
+- **Domain 3 (Negative-Risk Arbitrage & CTF Bundle Converter):** **INACTIVE / $0 ALLOCATED**. Hard-gated at zero capital due to empirical audit showing multi-leg taker fees devour 66.5% of gross edge ($16.35 fees on $8.23 profit), 28.4% broken-basket unwinds, and 14× gas friction.
+

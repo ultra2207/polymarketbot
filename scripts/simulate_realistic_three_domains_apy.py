@@ -4,6 +4,8 @@ Simulates $1,000 capital allocated to each of:
 - Domain 1 ($1,000): High-Frequency Passive Maker Quoting & Binance Lead-Lag Alpha.
 - Domain 2 ($1,000): Settlement Discount Harvesting & Global Capital Allocator.
 - Domain 3 ($1,000): Structural Negative Risk Arbitrage & Complement Dual Quoting.
+  NOTE: Domain 3 is hard-gated at $0 capital for Dec 1 live launch due to multi-leg taker fees (66.5% drag)
+  and broken basket risk (28.4% unwind rate).
 - Blended Portfolio ($3,000 Total).
 
 Eliminates all 8 backtest delusions:

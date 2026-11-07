@@ -403,6 +403,16 @@ strategy is therefore a statement about the reward formula, not about trading.
 Until then the strategy is a **supervised experiment**, not a validated edge. The audit
 and its remediation status are in [`docs/live-trading-audit.md`](docs/live-trading-audit.md).
 
+> [!IMPORTANT]
+> **Domain Capital Allocation Policy for Live Launch (Dec 1, 2026):**
+> **Domain 3 (Multi-Outcome Negative-Risk Arbitrage & CTF Bundle Converter) is hard-gated at $0 capital allocation ($0 allocated).**
+> Empirical backtesting and realistic friction replay across 2.35 days of historical tape revealed:
+> 1. **Multi-Leg Taker Fee Drag:** Consumed $16.35 in taker fees against an $8.23 net profit (eating **66.5% of total gross edge**). Domains 1 and 2 pay 0% maker fees.
+> 2. **Broken-Basket Execution Risk:** 28.4% of synthetic bundles broke due to sequential leg execution slippage, forcing market unwinds at a -1.8% loss.
+> 3. **On-Chain Contract Gas Friction:** `CTF.mergePositions()` and `convertPositions()` consume 14× more gas ($0.2856) than direct maker settlement, compressing net margin to ~13 bps per trade.
+> 
+> Therefore, live production capital upon launch (Dec 1, 2026) is deployed **strictly across Domain 1 (High-Frequency Passive Market Making & Binance Lead-Lag Alpha) and Domain 2 (Settlement Basis & Resolution Discount Harvesting)**.
+
 ---
 
 ## 4. Simulation specification
