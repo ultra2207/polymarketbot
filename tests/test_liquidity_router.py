@@ -633,26 +633,35 @@ def test_interdomain_router_meta_integration():
     assert "RewardHarvester" in plan_dict["allocations"]
 
 
-def test_meta_optimizer_marginal_vs_effective_objective():
-    """Test objective='marginal' vs objective='effective' and confirm mathematical superiority of marginal routing."""
+def test_meta_optimizer_equimarginal_optimality_vs_overallocating_high_average_strategy():
+    """Verify that stopping RewardHarvester at the equi-marginal frontier ($1.185M) produces strictly higher profit
+
+    than continuing to allocate to it based on its high historical average APY.
+    """
     optimizer = MetaOptimizerCapitalRouter()
     cap = 10_000_000.0
 
-    plan_marginal = optimizer.optimize(cap, objective="marginal")
-    plan_effective = optimizer.optimize(cap, objective="effective")
+    # 1. Optimal equi-marginal plan
+    optimal_plan = optimizer.optimize(cap)
 
-    # Marginal routing achieves strictly higher annual profit ($73.78M vs $70.22M)
-    assert plan_marginal.total_annual_profit_usd > plan_effective.total_annual_profit_usd
-    diff = plan_marginal.total_annual_profit_usd - plan_effective.total_annual_profit_usd
-    assert diff > 3_000_000.0  # Over $3M/year higher profit
+    # 2. Sub-optimal alternative: forcing RH to its $3M cap, leaving $6M to SH and only $1M to CS
+    models = {m.name: m for m in get_default_strategy_models() if m.is_active}
+    suboptimal_profit = (
+        models["RewardHarvester"].cumulative_annual_profit_usd(3_000_000.0)
+        + models["SettlementHarvester"].cumulative_annual_profit_usd(6_000_000.0)
+        + models["CtfSplitter"].cumulative_annual_profit_usd(1_000_000.0)
+    )
 
-    # Effective objective forces RH up to its hard $3M cap, starving CS
-    assert plan_effective.allocations["RewardHarvester"].allocated_usd == 3_000_000.0
-    assert plan_effective.allocations["CtfSplitter"].allocated_usd == 1_000_000.0
+    # The equi-marginal allocation achieves strictly higher annual profit ($73.78M vs $70.22M)
+    assert optimal_plan.total_annual_profit_usd > suboptimal_profit
+    diff = optimal_plan.total_annual_profit_usd - suboptimal_profit
+    assert diff > 3_000_000.0  # Over $3.55M/year higher profit from pure marginal routing!
 
-    # Marginal objective stops RH at $1.185M (where its marginal return equals CS) and gives CS $2.815M
-    assert plan_marginal.allocations["RewardHarvester"].allocated_usd == 1_185_000.0
-    assert plan_marginal.allocations["CtfSplitter"].allocated_usd == 2_815_000.0
+    # Verify optimal slices at $10M
+    assert optimal_plan.allocations["RewardHarvester"].allocated_usd == 1_185_000.0
+    assert optimal_plan.allocations["SettlementHarvester"].allocated_usd == 6_000_000.0
+    assert optimal_plan.allocations["CtfSplitter"].allocated_usd == 2_815_000.0
+
 
 
 

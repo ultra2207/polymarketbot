@@ -231,14 +231,12 @@ class MetaAllocationPlan:
     compounded_arr_pct: float
     daily_profit_usd: float
     monthly_profit_usd: float
-    objective: str = "marginal"
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert allocation plan to serializable dictionary."""
         return {
             "total_capital_usd": round(self.total_capital_usd, 2),
-            "objective": self.objective,
             "allocations": {
                 k: {
                     "allocated_usd": round(v.allocated_usd, 2),
@@ -362,18 +360,18 @@ class MetaOptimizerCapitalRouter:
         self,
         total_capital_usd: float,
         steps: int = 2000,
-        objective: str = "marginal",
     ) -> MetaAllocationPlan:
-        """Execute greedy water-filling optimization.
+        """Execute greedy equi-marginal water-filling optimization.
+
+        In accordance with the Equi-Marginal Principle:
+        - At each increment, capital is routed to the strategy with the highest marginal compounding APY (#1).
+        - As capital is added, diminishing marginal returns decay that strategy's marginal yield.
+        - The instant its marginal yield decays to match the #2 strategy, the router routes to the new #1
+          (or splits along the equi-marginal frontier), mathematically maximizing total portfolio profit.
 
         Args:
             total_capital_usd: Total portfolio capital to allocate (USD).
             steps: Number of discrete capital increments for numerical water-filling.
-            objective: Optimization metric:
-                - 'marginal' (Default & Mathematically Optimal): Allocates to strategy with highest
-                  marginal APY on the next dollar, maximizing total portfolio profit.
-                - 'effective': Allocates to strategy with highest blended/average APY until
-                  diminishing returns pull average yield down.
 
         Returns:
             MetaAllocationPlan with strategy slices and aggregate portfolio yield.
@@ -402,28 +400,19 @@ class MetaOptimizerCapitalRouter:
                 compounded_arr_pct=0.0,
                 daily_profit_usd=0.0,
                 monthly_profit_usd=0.0,
-                objective=objective,
             )
 
-        # 1. Greedy Incremental Water-Filling
+        # 1. Greedy Incremental Water-Filling along Equi-Marginal Frontier
         allocated: Dict[str, float] = {m.name: 0.0 for m in active_models}
         step_count = max(100, int(steps))
         delta_usd = total_cap / float(step_count)
-        use_effective = objective.lower().strip() == "effective"
 
         for _ in range(step_count):
-            if use_effective:
-                # Rank by effective/average APY on current allocation, capped at max capacity
-                current_yields = {
-                    m.name: (m.effective_apy(allocated[m.name]) if allocated[m.name] < m.max_capacity_usd else 0.0)
-                    for m in active_models
-                }
-            else:
-                # Rank by marginal compounding APY for the next dollar of capital
-                current_yields = {
-                    m.name: m.marginal_apy(allocated[m.name])
-                    for m in active_models
-                }
+            # Compute current marginal compounding APY for the next dollar of capital
+            current_yields = {
+                m.name: m.marginal_apy(allocated[m.name])
+                for m in active_models
+            }
 
             # Find current #1 strategy
             best_strat, best_yield = max(current_yields.items(), key=lambda item: item[1])
@@ -483,7 +472,6 @@ class MetaOptimizerCapitalRouter:
             compounded_arr_pct=round(compounded_arr_pct, 2),
             daily_profit_usd=round(total_profit / 365.0, 2),
             monthly_profit_usd=round(total_profit / 12.0, 2),
-            objective=objective,
         )
 
     def rebalance_delta(
@@ -491,13 +479,12 @@ class MetaOptimizerCapitalRouter:
         current_allocations: Dict[str, float],
         total_equity: float,
         min_rebalance_pct: float = 0.02,
-        objective: str = "marginal",
     ) -> Dict[str, float]:
         """Compute capital adjustment delta per strategy to reach optimal equi-marginal allocation.
 
         Filters out adjustments smaller than min_rebalance_pct * total_equity.
         """
-        plan = self.optimize(total_equity, objective=objective)
+        plan = self.optimize(total_equity)
         threshold_usd = total_equity * min_rebalance_pct
         deltas: Dict[str, float] = {}
 
@@ -964,7 +951,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Meta-Optimizer Capital Router Equi-Marginal Allocator")
     parser.add_argument("--capital", type=float, default=None, help="Specific capital amount (USD) to allocate")
     parser.add_argument("--steps", type=int, default=2000, help="Number of water-filling increments")
-    parser.add_argument("--objective", type=str, default="marginal", choices=["marginal", "effective"], help="Optimization target: 'marginal' (default, optimal) or 'effective'")
     parser.add_argument("--json", action="store_true", help="Output raw JSON plan")
     args = parser.parse_args()
 
@@ -973,12 +959,12 @@ if __name__ == "__main__":
     test_tiers = [1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0] if args.capital is None else [args.capital]
 
     for cap in test_tiers:
-        plan = optimizer.optimize(cap, steps=args.steps, objective=args.objective)
+        plan = optimizer.optimize(cap, steps=args.steps)
         if args.json:
             print(json.dumps(plan.to_dict(), indent=2))
         else:
             print("\n" + "=" * 80)
-            print(f"META-OPTIMIZER ALLOCATION ({plan.objective.upper()}): ${plan.total_capital_usd:,.2f} USD")
+            print(f"META-OPTIMIZER ALLOCATION: ${plan.total_capital_usd:,.2f} USD")
             print("=" * 80)
             print(f"{'Strategy':<22} {'Allocated USD':>14} {'Share':>8} {'Marginal APY':>14} {'Effective APY':>15} {'Annual Profit':>15}")
             print("-" * 80)
