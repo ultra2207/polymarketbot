@@ -16,6 +16,18 @@ from typing import Any, Dict, Optional, Tuple
 
 from Crypto.Hash import keccak
 
+try:
+    import coincurve
+    _HAS_COINCURVE = True
+except ImportError:
+    _HAS_COINCURVE = False
+
+try:
+    from eth_keys import keys as _eth_keys
+    _HAS_ETH_KEYS = True
+except ImportError:
+    _HAS_ETH_KEYS = False
+
 # Universal EIP-712 domain type schema
 EIP712_DOMAIN_TYPE_STRING = (
     b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -172,6 +184,35 @@ def ecdsa_sign_digest(
     if len(private_key_bytes) != 32:
         raise ValueError("Private key must be exactly 32 bytes")
 
+    # Fast path 1: coincurve (libsecp256k1 C library) ~35 microseconds
+    if _HAS_COINCURVE:
+        try:
+            priv = coincurve.PrivateKey(private_key_bytes)
+            sig_bytes = priv.sign_recoverable(digest, hasher=None)
+            r = int.from_bytes(sig_bytes[:32], "big")
+            s = int.from_bytes(sig_bytes[32:64], "big")
+            recid = sig_bytes[64]
+            if s > _SECP256K1_N // 2:
+                s = _SECP256K1_N - s
+                recid ^= 1
+            return (r, s, 27 + recid)
+        except Exception:
+            pass
+
+    # Fast path 2: eth_keys (optimized C/native backend) ~3.2 milliseconds
+    if _HAS_ETH_KEYS:
+        try:
+            pk = _eth_keys.PrivateKey(private_key_bytes)
+            sig = pk.sign_msg_hash(digest)
+            r, s, v = sig.r, sig.s, 27 + sig.v
+            if s > _SECP256K1_N // 2:
+                s = _SECP256K1_N - s
+                v = 28 if v == 27 else 27
+            return (r, s, v)
+        except Exception:
+            pass
+
+    # Fallback path 3: Pure Python RFC 6979 implementation
     priv_int = int.from_bytes(private_key_bytes, "big")
     z = int.from_bytes(digest, "big")
 

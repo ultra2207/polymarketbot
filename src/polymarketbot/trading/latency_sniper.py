@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from polymarketbot.fees import taker_tier, weighted_volume
 from polymarketbot.logs import get_logger
 
 logger = get_logger("trading.latency_sniper")
@@ -102,7 +103,7 @@ class LatencySniperConfig:
 
     min_jump_bps: float = 25.0              # Minimum 0.25% Binance move in trailing 500ms
     max_staleness_ms: float = 1500.0        # Maximum age of Polymarket book snapshot (ms)
-    vip_tier: str = "bronze"                # VIP rebate tier: none, bronze, silver, gold, platinum, diamond, obsidian
+    vip_tier: str = "none"                  # VIP rebate tier: none, bronze, silver, gold, platinum, diamond, obsidian
     min_net_edge_bps: float = 15.0          # Net profit hurdle in bps after taker fee and VIP rebate
     max_single_snipe_usd: float = 250.0     # Maximum notional budget per snipe ticket ($)
     trailing_window_ms: float = 500.0       # Trailing lookback window for Binance velocity (ms)
@@ -181,6 +182,8 @@ class TakerOrder:
     expected_profit_usd: float  # Expected total net profit ($)
     created_at_ms: float        # Timestamp in milliseconds
     order_type: str = "FAK"     # Fill-and-Kill (aggressive taker / IOC)
+    presigned_payload: Optional[Dict[str, Any]] = None
+    raw_json_bytes: Optional[bytes] = None
 
 
 @dataclass
@@ -231,8 +234,13 @@ class BinanceLatencySniperEngine:
     and emits actionable FAK taker orders with full telemetry accounting.
     """
 
-    def __init__(self, config: Optional[LatencySniperConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[LatencySniperConfig] = None,
+        presigned_cache: Optional[Any] = None,
+    ) -> None:
         self.config = config or LatencySniperConfig()
+        self.presigned_cache = presigned_cache
         self.telemetry = SniperTelemetry()
         self._binance_ticks: deque[tuple[float, float]] = deque()  # (timestamp_ms, price)
         self._executed_orders: list[TakerOrder] = []
@@ -260,6 +268,46 @@ class BinanceLatencySniperEngine:
     @property
     def net_latency_pnl(self) -> float:
         return self.telemetry.net_latency_pnl
+
+    def sync_vip_tier_from_account(
+        self,
+        clob_client: Any,
+        lookback_days: int = 30,
+    ) -> str:
+        """Fetch 30-day user trades from Polymarket CLOB API, calculate weighted volume, and set vip_tier."""
+        try:
+            trades = clob_client.get_trades()
+            now_sec = time.time()
+            cutoff_sec = now_sec - (lookback_days * 86400)
+
+            total_wv = 0.0
+            for t in trades:
+                ts = float(t.get("timestamp", 0) or t.get("match_time", 0) or 0)
+                if ts >= cutoff_sec:
+                    price = float(t.get("price", 0.5))
+                    size = float(t.get("size", 0.0))
+                    notional = price * size
+                    cat = str(t.get("category", "other"))
+                    total_wv += weighted_volume(notional, price, cat)
+
+            tier_name, rebate_rate = taker_tier(total_wv)
+            tier_norm = tier_name.strip().lower()
+            if tier_norm in VIP_REBATE_RATES:
+                self.config.vip_tier = tier_norm
+            logger.info(
+                "Synchronized Polymarket account VIP Tier: {} (Rebate: {:.1f}%, 30d Weighted Vol: ${:,.2f})",
+                tier_name,
+                rebate_rate * 100.0,
+                total_wv,
+            )
+            return self.config.vip_tier
+        except Exception as e:
+            logger.warning(
+                "Failed to sync account VIP tier from Polymarket API (falling back to {}): {}",
+                self.config.vip_tier,
+                e,
+            )
+            return self.config.vip_tier
 
     # -------------------------------------------------------------------------
     # Binance Price Feed & Velocity Tracking
@@ -481,7 +529,7 @@ class BinanceLatencySniperEngine:
                 net_edge_bps=net_edge_bps,
             )
 
-        # 8. Construct Executable Taker Order
+        # 8. Construct Executable Taker Order (with PreSignedOrderCache lookup if available)
         notional_usd = round(shares * target_price, 4)
         gross_fee, vip_rebate, net_fee = calculate_taker_fee(
             shares=shares,
@@ -491,6 +539,22 @@ class BinanceLatencySniperEngine:
             vip_tier=self.config.vip_tier,
         )
         expected_profit_usd = round(net_edge * shares, 4)
+
+        presigned_payload = None
+        raw_json_bytes = None
+        if self.presigned_cache is not None:
+            try:
+                presigned = self.presigned_cache.pop_order(
+                    token_id=book.token_id,
+                    side=side,
+                    price=target_price,
+                    size=shares,
+                )
+                if presigned is not None:
+                    presigned_payload = presigned.payload
+                    raw_json_bytes = presigned.raw_json_bytes
+            except Exception as e:
+                logger.debug("Pre-signed cache pop exception: {}", e)
 
         order = TakerOrder(
             order_id=f"snipe_{uuid.uuid4().hex[:8]}",
@@ -509,6 +573,8 @@ class BinanceLatencySniperEngine:
             expected_profit_usd=expected_profit_usd,
             created_at_ms=now_ms,
             order_type="FAK",
+            presigned_payload=presigned_payload,
+            raw_json_bytes=raw_json_bytes,
         )
 
         return SnipeDecision(

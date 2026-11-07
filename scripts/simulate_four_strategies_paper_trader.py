@@ -15,6 +15,7 @@ Calculates:
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
@@ -35,7 +36,11 @@ from polymarketbot.trading.domain2.ortools_allocator import (
     Domain2Candidate,
     Domain2OrtoolsAllocator,
 )
-from polymarketbot.trading.latency_sniper import calculate_taker_fee
+from polymarketbot.trading.latency_sniper import (
+    calculate_taker_fee,
+    get_vip_rebate_rate,
+    VIP_REBATE_RATES,
+)
 
 logger = get_logger("simulate_four_strategies_paper_trader")
 
@@ -280,8 +285,8 @@ def load_simulation_datasets(con: duckdb.DuckDBPyConnection) -> Tuple[pd.DataFra
 # MAIN SIMULATION RUNNER
 # ==============================================================================
 
-def run_four_strategies_paper_trading() -> Dict[str, Any]:
-    logger.info("Starting Paper Trading Simulation across 4 Finalized Strategies ($1,000 each)...")
+def run_four_strategies_paper_trading(vip_tier: str = "none") -> Dict[str, Any]:
+    logger.info("Starting Paper Trading Simulation across 4 Finalized Strategies ($1,000 each) [VIP Tier: {}]...", vip_tier)
     con = duckdb.connect()
     con.execute("SET threads=2;")
 
@@ -579,10 +584,10 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
 
     # ==========================================================================
     # 3. LATENCY SNIPER ($1,000 Initial Bankroll)
-    # Binance CEX-DEX lead-lag jump taker with Bronze VIP taker rebate (3%)
+    # Binance CEX-DEX lead-lag jump taker with configurable VIP taker rebate
     # ONLY snipes when expected net edge after taker fees exceeds hurdle (>15 bps)
     # ==========================================================================
-    logger.info(">>> Running LatencySniper Simulation ($1,000) <<<")
+    logger.info(">>> Running LatencySniper Simulation ($1,000) [VIP Tier: {}] <<<", vip_tier)
     ls_cash = 1000.0
     ls_trades: List[SimulatedTrade] = []
     ls_equity_series: List[float] = []
@@ -590,6 +595,7 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
     # Strict profitability gate: Net edge must exceed 15 bps after fees
     MIN_NET_EDGE_BPS = 15.0
     MIN_NET_EDGE = MIN_NET_EDGE_BPS / 10000.0
+    rebate_rate = get_vip_rebate_rate(vip_tier)
 
     jump_idx = 0
     n_jumps = len(jump_events)
@@ -619,7 +625,7 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
                         p_clamped = max(0.001, min(0.999, px))
                         fee_curve = (p_clamped * (1.0 - p_clamped))
                         gross_fee_per_share = 0.07 * fee_curve
-                        rebate_per_share = gross_fee_per_share * 0.03  # Bronze 3% rebate
+                        rebate_per_share = gross_fee_per_share * rebate_rate
                         net_fee_per_share = gross_fee_per_share - rebate_per_share
 
                         # 2. Expected gross price shift on Polymarket contract:
@@ -637,7 +643,7 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
 
                         # Execute profitable snipe
                         gross_fee, rebate, net_fee = calculate_taker_fee(
-                            shares=shares, price=px, rate=0.07, vip_tier="bronze"
+                            shares=shares, price=px, rate=0.07, vip_tier=vip_tier
                         )
 
                         # Mode A: Fast scalp exit (capital returned in 10-60s)
@@ -696,11 +702,11 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
                 gross_spread = np.random.uniform(0.0065, 0.0140)
                 gross_edge = mint_size_usd * gross_spread
 
-                # Execution: 1 leg taker (VIP Bronze 3% rebate), N-1 legs maker (0% fee + maker rebate)
+                # Execution: 1 leg taker (VIP rebate tier applied), N-1 legs maker (0% fee + maker rebate)
                 # Taker fee on 1 leg (~50c price):
                 taker_shares = (mint_size_usd / 2.0) / 0.50
                 gross_fee, rebate, net_taker_fee = calculate_taker_fee(
-                    shares=taker_shares, price=0.50, rate=0.04, vip_tier="bronze"
+                    shares=taker_shares, price=0.50, rate=0.04, vip_tier=vip_tier
                 )
                 maker_rebate = maker_fee_rebate(0.50, taker_shares, FeeSchedule(rate=0.04, exponent=1.0), maker_rebate_share_pct=0.20)
 
@@ -752,6 +758,8 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
             "duration_days": round(dur_days, 3),
             "total_portfolio_capital_usd": 4000.0,
             "capital_per_strategy_usd": 1000.0,
+            "vip_tier": vip_tier,
+            "vip_rebate_pct": round(get_vip_rebate_rate(vip_tier) * 100.0, 1),
         },
         "performance_metrics": {
             "reward_harvester": asdict(metrics_rh),
@@ -772,8 +780,20 @@ def run_four_strategies_paper_trading() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Production Paper Trader across 4 Strategies ($1,000 each) with Configurable VIP Taker Rebate"
+    )
+    parser.add_argument(
+        "--vip-tier",
+        type=str,
+        default="none",
+        choices=list(VIP_REBATE_RATES.keys()),
+        help="Polymarket VIP taker rebate tier (default: 'none')",
+    )
+    args = parser.parse_args()
+
     t0 = time.time()
-    res = run_four_strategies_paper_trading()
+    res = run_four_strategies_paper_trading(vip_tier=args.vip_tier)
     t_elapsed = time.time() - t0
     print(f"\nExecution finished in {t_elapsed:.2f} seconds.")
     print("=" * 80)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import pytest
 
 from polymarketbot.trading.latency_sniper import (
@@ -21,7 +22,7 @@ class TestLatencySniperConfig:
         cfg = LatencySniperConfig()
         assert cfg.min_jump_bps == 25.0
         assert cfg.max_staleness_ms == 1500.0
-        assert cfg.vip_tier == "bronze"
+        assert cfg.vip_tier == "none"
         assert cfg.min_net_edge_bps == 15.0
         assert cfg.max_single_snipe_usd == 250.0
         assert cfg.min_net_edge == 0.0015
@@ -360,3 +361,47 @@ class TestTelemetryAndMultipleSnipes:
         assert engine.net_latency_pnl == pytest.approx(
             engine.gross_profit - engine.fees_paid + engine.rebates_earned, abs=1e-3
         )
+
+    def test_sync_vip_tier_from_account(self) -> None:
+        engine = BinanceLatencySniperEngine()
+        assert engine.config.vip_tier == "none"
+
+        class MockClobClient:
+            def get_trades(self):
+                # Trades generating >$20,000 weighted volume (qualifying for Silver 8%)
+                return [
+                    {"timestamp": time.time() - 3600, "price": 0.50, "size": 35000.0, "category": "crypto"}
+                ]
+
+        tier = engine.sync_vip_tier_from_account(MockClobClient())
+        assert tier == "silver"
+        assert engine.config.vip_tier == "silver"
+
+    def test_presigned_cache_zero_latency_integration(self) -> None:
+        from polymarketbot.execution.presigned_cache import PreSignedOrderCache
+
+        cache = PreSignedOrderCache(private_key="0x" + "01" * 32)
+        # Sizing: 400 shares at $0.50 ($200 budget)
+        cache.warm_bucket(token_id="1001", side="BUY", price=0.50, size=400.0, count=3)
+
+        engine = BinanceLatencySniperEngine(
+            config=LatencySniperConfig(min_jump_bps=25.0, vip_tier="none", max_single_snipe_usd=200.0),
+            presigned_cache=cache,
+        )
+
+        book = PolymarketTopBook(
+            token_id="1001",
+            best_bid=0.48,
+            best_bid_size=1000.0,
+            best_ask=0.50,
+            best_ask_size=400.0,
+            timestamp_ms=time.time() * 1000.0,
+        )
+
+        decision = engine.evaluate_snipe(book=book, jump_bps=45.0)
+        assert decision.actionable is True
+        assert decision.order is not None
+        assert decision.order.presigned_payload is not None
+        assert decision.order.raw_json_bytes is not None
+        assert len(decision.order.raw_json_bytes) > 0
+        assert decision.order.price == 0.50

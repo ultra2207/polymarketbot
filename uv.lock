@@ -342,6 +342,12 @@ wheels = [
 ]
 
 [[package]]
+name = "coincurve"
+version = "21.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/a2/f2a38eb05b747ed3e54e1be33be339d4a14c1f5cc6a6e2b342b5e8160d51/coincurve-21.0.0.tar.gz", hash = "sha256:8b37ce4265a82bebf0e796e21a769e56fdbf8420411ccbe3fafee4ed75b6a6e5", size = 128986, upload-time = "2025-03-08T15:31:24.266Z" }
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1205,8 +1211,10 @@ name = "polymarketbot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "coincurve", marker = "sys_platform != 'win32'" },
     { name = "cryptography" },
     { name = "duckdb" },
+    { name = "eth-keys" },
     { name = "loguru" },
     { name = "orjson" },
     { name = "ortools" },
@@ -1220,6 +1228,7 @@ dependencies = [
     { name = "streamlit" },
     { name = "synpath" },
     { name = "tqdm" },
+    { name = "uvloop", marker = "sys_platform != 'win32'" },
     { name = "websockets" },
 ]
 
@@ -1230,8 +1239,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "coincurve", marker = "sys_platform != 'win32'", specifier = ">=21.0.0" },
     { name = "cryptography", specifier = ">=50.0.2" },
     { name = "duckdb", specifier = ">=2.0.0" },
+    { name = "eth-keys", specifier = ">=0.8.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "orjson", specifier = ">=3.13.0" },
     { name = "ortools", specifier = ">=9.15.6755" },
@@ -1245,6 +1256,7 @@ requires-dist = [
     { name = "streamlit", specifier = ">=1.66.1" },
     { name = "synpath" },
     { name = "tqdm", specifier = ">=4.70.1" },
+    { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.21.0" },
     { name = "websockets", specifier = ">=17.4" },
 ]
 
