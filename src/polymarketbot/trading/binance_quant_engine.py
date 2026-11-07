@@ -224,15 +224,58 @@ class HighFrequencyVolEstimator:
             return 0.0
         return max(0.0, var_sum / valid_count)
 
+    @staticmethod
+    def yang_zhang_variance(bars: list[KlineBar]) -> float:
+        """Yang-Zhang (2000) multi-period range-based variance (drift & overnight jump independent).
+
+        sigma_YZ^2 = sigma_open^2 + k * sigma_close^2 + (1 - k) * sigma_RS^2
+        where k = 0.34 / (1.34 + (N + 1) / (N - 1))
+        """
+        n = len(bars)
+        if n < 2:
+            return HighFrequencyVolEstimator.rogers_satchell_variance(bars)
+
+        # 1. Open jumps: u_i = ln(O_i / C_{i-1})
+        open_jumps: list[float] = []
+        for i in range(1, n):
+            if bars[i].open > 0 and bars[i - 1].close > 0:
+                open_jumps.append(math.log(bars[i].open / bars[i - 1].close))
+
+        # 2. Close returns: c_i = ln(C_i / O_i)
+        close_returns: list[float] = []
+        for b in bars:
+            if b.open > 0 and b.close > 0:
+                close_returns.append(math.log(b.close / b.open))
+
+        # 3. Rogers-Satchell variance
+        var_rs = HighFrequencyVolEstimator.rogers_satchell_variance(bars)
+
+        if not open_jumps or not close_returns:
+            return var_rs
+
+        # Sample variance of open jumps
+        mean_u = sum(open_jumps) / len(open_jumps)
+        var_o = sum((u - mean_u) ** 2 for u in open_jumps) / max(1, len(open_jumps) - 1)
+
+        # Sample variance of close returns
+        mean_c = sum(close_returns) / len(close_returns)
+        var_c = sum((c - mean_c) ** 2 for c in close_returns) / max(1, len(close_returns) - 1)
+
+        # Weighting constant k
+        k = 0.34 / (1.34 + float(n + 1) / float(n - 1))
+        var_yz = var_o + k * var_c + (1.0 - k) * var_rs
+        return max(0.0, var_yz)
+
     @classmethod
     def annualize_bar_volatility(
         cls,
         bar_variance: float,
         bar_duration_seconds: float = 60.0,
+        fallback_vol: float = 0.55,
     ) -> float:
         """Annualize per-bar variance into annualized volatility sigma_annual."""
         if bar_variance <= 0.0 or bar_duration_seconds <= 0.0:
-            return 0.55  # Baseline crypto fallback
+            return fallback_vol
         bars_per_year = SECONDS_PER_YEAR / bar_duration_seconds
         ann_var = bar_variance * bars_per_year
         ann_vol = math.sqrt(ann_var)
@@ -274,6 +317,91 @@ class HighFrequencyVolEstimator:
         return multiplier
 
 
+class HighFrequencyEWMAVolEstimator:
+    """Online recursive tick-level EWMA volatility estimator with microstructure noise correction.
+
+    Replaces static/fixed volatility assumptions with dynamic high-frequency adaptation.
+    Formulation:
+        r_t = ln(P_t / P_{t-1})
+        dt = max(1e-4, t_t - t_{t-1})
+        v_t = (r_t^2) / (dt / SECONDS_PER_YEAR)
+        lambda_decay = exp(-dt / half_life_seconds)
+        sigma_{raw}^2 = lambda_decay * sigma_{raw, t-1}^2 + (1 - lambda_decay) * v_t
+
+    Microstructure noise adjustment (Bandi-Russell / Hansen-Lunde):
+        Corrects for negative 1st-order autocovariance from bid-ask bouncing.
+        gamma_1 = lambda_decay * gamma_{1, t-1} + (1 - lambda_decay) * (r_t * r_{t-1})
+        noise_adj_var = max(min_var, sigma_{raw}^2 + 2 * (gamma_1 / (dt / SECONDS_PER_YEAR)))
+    """
+
+    def __init__(
+        self,
+        half_life_seconds: float = 60.0,
+        initial_volatility: float = 0.55,
+        min_volatility: float = 0.10,
+        max_volatility: float = 2.50,
+        noise_correction: bool = True,
+    ) -> None:
+        self.half_life_seconds = max(1.0, float(half_life_seconds))
+        self.min_volatility = float(min_volatility)
+        self.max_volatility = float(max_volatility)
+        self.noise_correction = noise_correction
+
+        self.current_var = (max(min_volatility, min(max_volatility, initial_volatility))) ** 2
+        self.last_price: Optional[float] = None
+        self.last_timestamp: Optional[float] = None
+        self.last_return: float = 0.0
+        self.rolling_autocov: float = 0.0
+        self.tick_count: int = 0
+
+    def update_tick(self, price: float, timestamp: Optional[float] = None) -> float:
+        """Update recursive variance with a new price tick and return current annualized volatility."""
+        if price <= 0.0:
+            return self.get_current_volatility()
+        now_ts = timestamp if timestamp is not None else time.time()
+
+        if self.last_price is None or self.last_timestamp is None:
+            self.last_price = float(price)
+            self.last_timestamp = float(now_ts)
+            self.tick_count += 1
+            return self.get_current_volatility()
+
+        dt = max(1e-4, now_ts - self.last_timestamp)
+        if now_ts < self.last_timestamp:
+            return self.get_current_volatility()
+
+        ret = math.log(price / self.last_price)
+        dt_annual = dt / SECONDS_PER_YEAR
+        inst_var = (ret ** 2) / dt_annual
+
+        decay = math.exp(-dt / self.half_life_seconds)
+        self.current_var = decay * self.current_var + (1.0 - decay) * inst_var
+
+        if self.noise_correction and self.tick_count >= 2:
+            prod_r = ret * self.last_return
+            self.rolling_autocov = decay * self.rolling_autocov + (1.0 - decay) * prod_r
+
+        self.last_price = float(price)
+        self.last_timestamp = float(now_ts)
+        self.last_return = ret
+        self.tick_count += 1
+
+        return self.get_current_volatility()
+
+    def get_current_volatility(self) -> float:
+        """Return the current annualized volatility sigma in [min_volatility, max_volatility]."""
+        eff_var = self.current_var
+        if self.noise_correction and self.tick_count >= 3:
+            if self.last_timestamp and self.last_price and self.rolling_autocov < 0.0:
+                dt_avg = max(1e-4, self.half_life_seconds / max(1, self.tick_count))
+                dt_annual = dt_avg / SECONDS_PER_YEAR
+                noise_adj = 2.0 * (self.rolling_autocov / dt_annual)
+                eff_var = max(self.min_volatility ** 2, eff_var + noise_adj)
+
+        vol = math.sqrt(max(0.0, eff_var))
+        return max(self.min_volatility, min(self.max_volatility, vol))
+
+
 # =============================================================================
 # 3. Order Flow Imbalance (OFI) & Short-Term Drift Prediction
 # =============================================================================
@@ -288,13 +416,22 @@ class OFISnapshot:
 
 
 class OrderFlowImbalanceTracker:
-    """Tracks Order Flow Imbalance (Cont, Kukanov, Stoikov 2014) on Binance L1/L2."""
+    """Tracks Order Flow Imbalance (Cont, Kukanov, Stoikov 2014) on Binance L1/L2.
 
-    def __init__(self, history_seconds: float = 60.0) -> None:
+    Eliminates static heuristics by dynamically calibrating the transmission beta
+    between order flow imbalance and price return via online rolling regression.
+    """
+
+    def __init__(self, history_seconds: float = 60.0, beta_decay: float = 0.95) -> None:
         self.history_seconds = history_seconds
+        self.beta_decay = beta_decay
         self._history: deque[OFISnapshot] = deque()
         self._cumulative_ofi: float = 0.0
         self._last_ofi_delta: float = 0.0
+        self._rolling_cov_p_ofi: float = 0.0
+        self._rolling_var_ofi: float = 0.0
+        self._calibrated_beta_ofi: Optional[float] = None
+        self._total_updates: int = 0
 
     def update(
         self,
@@ -333,7 +470,21 @@ class OrderFlowImbalanceTracker:
         ofi_increment = delta_w_b - delta_w_a
         self._last_ofi_delta = ofi_increment
         self._cumulative_ofi += ofi_increment
+
+        # Online dynamic calibration of beta_OFI: Delta P = beta * Delta OFI
+        prev_mid = 0.5 * (prev.bid_price + prev.ask_price)
+        curr_mid = 0.5 * (curr.bid_price + curr.ask_price)
+        if prev_mid > 0.0:
+            delta_p_bps = ((curr_mid - prev_mid) / prev_mid) * 10_000.0
+            d = self.beta_decay
+            self._rolling_cov_p_ofi = d * self._rolling_cov_p_ofi + (1.0 - d) * (delta_p_bps * ofi_increment)
+            self._rolling_var_ofi = d * self._rolling_var_ofi + (1.0 - d) * (ofi_increment ** 2)
+            if self._rolling_var_ofi > 1e-4:
+                ratio = self._rolling_cov_p_ofi / self._rolling_var_ofi
+                self._calibrated_beta_ofi = max(0.000001, min(0.005, ratio))
+
         self._history.append(curr)
+        self._total_updates += 1
 
         # Evict old history
         cutoff = ts - self.history_seconds
@@ -368,17 +519,27 @@ class OrderFlowImbalanceTracker:
     def estimate_drift_mu(
         self,
         lookback_seconds: float = 10.0,
-        beta_ofi: float = 0.00005,  # Empirical coefficient linking OFI/s to bps return
+        beta_ofi: Optional[float] = None,
         velocity_5s_bps: float = 0.0,
+        use_calibrated_beta: bool = True,
     ) -> float:
         """Predicts instantaneous drift mu (annualized) for the binary pricing engine.
 
         mu_annual = (mu_bps_per_sec * 1e-4) * SECONDS_PER_YEAR
         """
         ofi_rate = self.get_ofi_rate(lookback_seconds)
+        
+        # Select dynamically calibrated beta or specified fallback
+        if beta_ofi is not None:
+            eff_beta = beta_ofi
+        elif use_calibrated_beta and self._calibrated_beta_ofi is not None:
+            eff_beta = self._calibrated_beta_ofi
+        else:
+            eff_beta = 0.00005
+
         # Expected return in bps per second
         # Combines order book imbalance flow + short-term trade momentum
-        drift_bps_sec = (beta_ofi * ofi_rate) + (0.05 * (velocity_5s_bps / 5.0))
+        drift_bps_sec = (eff_beta * ofi_rate) + (0.05 * (velocity_5s_bps / 5.0))
         # Bounded between -50 bps/sec and +50 bps/sec to prevent unbounded runaway
         drift_bps_sec = max(-50.0, min(50.0, drift_bps_sec))
 
@@ -386,6 +547,263 @@ class OrderFlowImbalanceTracker:
         mu_annual = mu_per_sec * SECONDS_PER_YEAR
         # Bound annualized drift between [-5.0, +5.0]
         return max(-5.0, min(5.0, mu_annual))
+
+
+class MultiLevelOrderFlowImbalanceTracker:
+    """Multi-Level Order Flow Imbalance tracker across L2 depth (Cont, Kukanov, Stoikov 2014).
+
+    Integrates queue changes across deeper levels k=1..K with distance decay:
+        OFI_{multi} = sum_{k=1}^K exp(-alpha * (k - 1)) * OFI_k
+    """
+
+    def __init__(self, max_levels: int = 5, decay_alpha: float = 0.5, history_seconds: float = 60.0) -> None:
+        self.max_levels = max_levels
+        self.decay_alpha = decay_alpha
+        self.history_seconds = history_seconds
+        self._prev_bids: list[OrderBookLevel] = []
+        self._prev_asks: list[OrderBookLevel] = []
+        self._last_update_ts: float = 0.0
+        self._history: deque[Tuple[float, float]] = deque()  # (ts, multi_ofi_delta)
+
+    def update(
+        self,
+        bids: list[OrderBookLevel],
+        asks: list[OrderBookLevel],
+        timestamp: Optional[float] = None,
+    ) -> float:
+        """Update with a new multi-level book snapshot and return weighted incremental OFI."""
+        now_ts = timestamp if timestamp is not None else time.time()
+        if not self._prev_bids or not self._prev_asks:
+            self._prev_bids = list(bids[:self.max_levels])
+            self._prev_asks = list(asks[:self.max_levels])
+            self._last_update_ts = now_ts
+            self._history.append((now_ts, 0.0))
+            return 0.0
+
+        n_levels = min(len(bids), len(asks), len(self._prev_bids), len(self._prev_asks), self.max_levels)
+        multi_ofi = 0.0
+        total_weight = 0.0
+
+        for k in range(n_levels):
+            w = math.exp(-self.decay_alpha * k)
+            curr_b = bids[k]
+            prev_b = self._prev_bids[k]
+            curr_a = asks[k]
+            prev_a = self._prev_asks[k]
+
+            # Bid side contribution
+            if curr_b.price > prev_b.price:
+                delta_b = curr_b.size
+            elif curr_b.price == prev_b.price:
+                delta_b = curr_b.size - prev_b.size
+            else:
+                delta_b = -prev_b.size
+
+            # Ask side contribution
+            if curr_a.price > prev_a.price:
+                delta_a = -prev_a.size
+            elif curr_a.price == prev_a.price:
+                delta_a = curr_a.size - prev_a.size
+            else:
+                delta_a = curr_a.size
+
+            multi_ofi += w * (delta_b - delta_a)
+            total_weight += w
+
+        normalized_ofi = multi_ofi / max(1e-9, total_weight)
+        self._history.append((now_ts, normalized_ofi))
+        self._prev_bids = list(bids[:self.max_levels])
+        self._prev_asks = list(asks[:self.max_levels])
+        self._last_update_ts = now_ts
+
+        cutoff = now_ts - self.history_seconds
+        while self._history and self._history[0][0] < cutoff:
+            self._history.popleft()
+
+        return normalized_ofi
+
+    def get_multi_ofi_rate(self, lookback_seconds: float = 10.0) -> float:
+        """Returns weighted multi-level OFI per second over lookback window."""
+        if len(self._history) < 2:
+            return 0.0
+        latest_ts = self._history[-1][0]
+        cutoff = latest_ts - lookback_seconds
+        window = [h for h in self._history if h[0] >= cutoff]
+        if len(window) < 2:
+            return 0.0
+        dt = window[-1][0] - window[0][0]
+        if dt <= 0.0:
+            return 0.0
+        total_ofi = sum(h[1] for h in window[1:])
+        return total_ofi / dt
+
+
+@dataclass
+class LeadLagState:
+    """State vector and uncertainty for cross-venue transmission."""
+    beta: float              # Transmission elasticity (dProb / dLnS)
+    alpha: float             # Constant drift/intercept
+    beta_variance: float     # Estimation variance for beta
+    innovation_error: float  # Latest measurement surprise
+    timestamp: float
+
+
+class CrossVenueLeadLagKalmanFilter:
+    """State-Space Kalman Filter for dynamic cross-venue lead-lag estimation.
+
+    Tracks transmission elasticity between Binance spot price changes (d ln S)
+    and Polymarket binary probability changes (d P).
+
+    Observation Equation:
+        y_t = Delta P_{poly, t} = [Delta ln S_{binance, t}, 1.0] * [beta_t, alpha_t]^T + v_t,  v_t ~ N(0, R)
+    State Transition Equation:
+        theta_t = theta_{t-1} + w_t,  w_t ~ N(0, Q)
+    """
+
+    def __init__(
+        self,
+        initial_beta: float = 1.0,
+        initial_alpha: float = 0.0,
+        process_noise_beta: float = 1e-4,
+        process_noise_alpha: float = 1e-6,
+        measurement_noise: float = 1e-6,
+    ) -> None:
+        self.state = [float(initial_beta), float(initial_alpha)]  # [beta, alpha]
+        self.p_cov = [[1.0, 0.0], [0.0, 1e-6]]
+        self.q_cov = [[process_noise_beta, 0.0], [0.0, process_noise_alpha]]
+        self.r_var = measurement_noise
+        self.last_update_ts = time.time()
+        self.last_binance_price: Optional[float] = None
+        self.last_poly_prob: Optional[float] = None
+
+    def update(
+        self,
+        binance_price: float,
+        poly_prob: float,
+        timestamp: Optional[float] = None,
+    ) -> LeadLagState:
+        """Update Kalman Filter with synchronized Binance spot and Polymarket probability."""
+        now_ts = timestamp if timestamp is not None else time.time()
+
+        if self.last_binance_price is None or self.last_poly_prob is None:
+            self.last_binance_price = float(binance_price)
+            self.last_poly_prob = float(poly_prob)
+            self.last_update_ts = now_ts
+            return LeadLagState(
+                beta=self.state[0],
+                alpha=self.state[1],
+                beta_variance=self.p_cov[0][0],
+                innovation_error=0.0,
+                timestamp=now_ts,
+            )
+
+        if self.last_binance_price <= 0.0:
+            d_ln_s = 0.0
+        else:
+            d_ln_s = math.log(binance_price / self.last_binance_price)
+        d_p = poly_prob - self.last_poly_prob
+
+        # Work in basis points for numerical conditioning and balanced regressor scales
+        d_ln_s_bps = d_ln_s * 10_000.0
+        d_p_bps = d_p * 10_000.0
+
+        # 1. Predict
+        p00 = self.p_cov[0][0] + self.q_cov[0][0]
+        p01 = self.p_cov[0][1]
+        p10 = self.p_cov[1][0]
+        p11 = self.p_cov[1][1] + self.q_cov[1][1]
+
+        # 2. Measurement Vector H = [d_ln_s_bps, 1.0]
+        h0 = d_ln_s_bps
+        h1 = 1.0
+
+        # Innovation: e = y - H * x
+        y_pred = h0 * self.state[0] + h1 * self.state[1]
+        e = d_p_bps - y_pred
+
+        # Innovation covariance: S = H * P * H^T + R
+        hp0 = h0 * p00 + h1 * p10
+        hp1 = h0 * p01 + h1 * p11
+        s_cov = hp0 * h0 + hp1 * h1 + self.r_var
+
+        # Kalman Gain: K = P * H^T / S
+        k0 = (p00 * h0 + p01 * h1) / s_cov
+        k1 = (p10 * h0 + p11 * h1) / s_cov
+
+        # 3. Update state
+        self.state[0] += k0 * e
+        self.state[1] += k1 * e
+        self.state[0] = max(0.01, min(100.0, self.state[0]))
+
+        # Update covariance: P = (I - K * H) * P_{pred}
+        self.p_cov[0][0] = (1.0 - k0 * h0) * p00 - (k0 * h1) * p10
+        self.p_cov[0][1] = (1.0 - k0 * h0) * p01 - (k0 * h1) * p11
+        self.p_cov[1][0] = (-k1 * h0) * p00 + (1.0 - k1 * h1) * p10
+        self.p_cov[1][1] = (-k1 * h0) * p01 + (1.0 - k1 * h1) * p11
+
+        self.last_binance_price = float(binance_price)
+        self.last_poly_prob = float(poly_prob)
+        self.last_update_ts = now_ts
+
+        return LeadLagState(
+            beta=self.state[0],
+            alpha=self.state[1],
+            beta_variance=self.p_cov[0][0],
+            innovation_error=e,
+            timestamp=now_ts,
+        )
+
+    @staticmethod
+    def calculate_analytical_elasticity(
+        spot_s: float,
+        strike_k: float,
+        tau_seconds: float,
+        annualized_volatility: float,
+        risk_free_rate: float = 0.0,
+    ) -> float:
+        """Computes analytical binary option transmission elasticity dP / d(ln S).
+
+        Formula:
+            d(P_yes) / d(ln S) = S * (dP / dS) = exp(-r*tau) * N'(d2) / (sigma * sqrt(tau))
+        """
+        if spot_s <= 0.0 or strike_k <= 0.0 or annualized_volatility <= 0.0:
+            return 1.0
+        tau = max(0.1, float(tau_seconds))
+        sig_sec = annualized_volatility / math.sqrt(SECONDS_PER_YEAR)
+        sig_tau = sig_sec * math.sqrt(tau)
+
+        r_sec = risk_free_rate / SECONDS_PER_YEAR
+        log_m = math.log(spot_s / strike_k)
+        d2 = (log_m + (r_sec - 0.5 * sig_sec ** 2) * tau) / sig_tau
+
+        pdf_d2 = norm_pdf(d2)
+        discount = math.exp(-r_sec * tau)
+        elasticity = (discount * pdf_d2) / max(1e-9, sig_tau)
+        return max(0.01, min(5000.0, elasticity))
+
+    @classmethod
+    def calculate_dynamic_surge_threshold_bps(
+        cls,
+        spot_s: float,
+        strike_k: float,
+        tau_seconds: float,
+        annualized_volatility: float,
+        prob_shock_hurdle: float = 0.015,  # 1.5 cents probability move
+        min_threshold_bps: float = 0.10,
+        max_threshold_bps: float = 10.0,
+    ) -> float:
+        """Computes dynamic Binance surge threshold in bps that causes a prob_shock_hurdle move in Polymarket.
+
+        Delta S_bps = (prob_shock_hurdle / elasticity) * 10,000.
+        """
+        elasticity = cls.calculate_analytical_elasticity(
+            spot_s=spot_s,
+            strike_k=strike_k,
+            tau_seconds=tau_seconds,
+            annualized_volatility=annualized_volatility,
+        )
+        raw_threshold_bps = (prob_shock_hurdle / max(1e-4, elasticity)) * 10_000.0
+        return max(min_threshold_bps, min(max_threshold_bps, raw_threshold_bps))
 
 
 # =============================================================================

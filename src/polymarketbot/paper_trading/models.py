@@ -4,7 +4,61 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
+
+
+class BrokenBasketPolicy(str, Enum):
+    """Execution policy when a multi-leg basket suffers execution failure (broken leg)."""
+
+    UNWIND_MARKET = "unwind_market"         # Cross spread immediately to market-sell filled partial legs into CLOB bids
+    SYNTHETIC_CONVERT = "synthetic_convert" # Convert filled legs via NegRiskAdapter or complete set merge
+    ABORT_HOLD = "abort_hold"               # Halt and leave partial inventory intact
+
+
+@dataclass
+class AntiDelusionConfig:
+    """Institutional configuration eliminating the 8 backtest delusions in paper trading."""
+
+    enabled: bool = True
+
+    # 1. Fill Rate Delusion (Empirical Logistic Model)
+    use_logistic_fill_model: bool = True
+    fill_model_path: str = "data/derived/fill_model.json"
+    fill_model_coef: tuple[float, float, float] = (1.9969502915862272, -3.966170297458595, -0.21375437197755692)
+    require_earned_fill: bool = True
+    deterministic_fills: bool = False
+
+    # 2. Adverse Selection & Binance Lead-Lag Alpha Gate
+    enable_markout_haircut: bool = True
+    markout_drift_cents: float = 0.5         # 0.5c / share adverse drift on passive sweep fills
+    binance_surge_threshold_bps: float = 10.0 # > 10 bps Binance jump pulls threatened resting quotes
+
+    # 3. Latency Taker Sniping Delusion
+    max_taker_snipe_prob: float = 0.05       # P(snipe) <= 5% against co-located bots
+    taker_latency_ms: float = 120.0
+    latency_decay_rate: float = 15.0
+
+    # 4. Broken Basket & Sequential Leg Risk
+    broken_basket_policy: BrokenBasketPolicy = BrokenBasketPolicy.UNWIND_MARKET
+
+    # 5. UMA Settlement Delay & Capital Lockup
+    uma_liveness_hours: float = 2.0
+    relayer_queue_delay_hours: float = 1.11  # Total 3.11 hours
+    lockup_duration_seconds: float = 11196.0  # 3.11 * 3600 seconds
+
+    # 6. Polygon PoS Gas & Fee Friction
+    dynamic_polygon_gas: bool = True
+    taker_fee_rate: float = 0.04             # Polymarket exact taker fee rate: C * 0.04 * (p * (1 - p))
+
+    # 7. Order Book Depth & Non-Linear Market Impact (Kyle's Lambda)
+    kyle_lambda: float = 0.004               # 0.004 * (Size / Depth)^1.2
+    kyle_exponent: float = 1.2
+
+    # 8. Realistic Capital Utilization & Opportunity Gating
+    max_capital_utilization: float = 0.95
+    prevent_infinite_compounding: bool = True
+    max_market_capacity_usd: float = 5000.0
 
 
 @dataclass
@@ -19,6 +73,7 @@ class VirtualQuote:
     post_only_valid: bool = True
     queue_ahead: float = 0.0
     timestamp: float = field(default_factory=time.time)
+    fill_probability: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +142,11 @@ class SimulatedFill:
     avg_cost_after: float
     realized_pnl: float
     trigger_reason: str
+    markout_drift: float = 0.0
+    markout_haircut_usd: float = 0.0
+    taker_fee_usd: float = 0.0
+    slippage_usd: float = 0.0
+    fill_probability: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +164,43 @@ class SimulatedFill:
             "avg_cost_after": round(self.avg_cost_after, 4),
             "realized_pnl": round(self.realized_pnl, 4),
             "trigger_reason": self.trigger_reason,
+            "markout_drift": round(self.markout_drift, 4),
+            "markout_haircut_usd": round(self.markout_haircut_usd, 4),
+            "taker_fee_usd": round(self.taker_fee_usd, 4),
+            "slippage_usd": round(self.slippage_usd, 4),
+            "fill_probability": round(self.fill_probability, 4),
+        }
+
+
+@dataclass
+class PendingSettlement:
+    """Record of a market resolution pending the mandatory 3.11-hour UMA settlement lockup."""
+
+    settlement_id: str
+    condition_id: str
+    resolution_timestamp: float
+    unlock_timestamp: float  # resolution_timestamp + 3.11 * 3600
+    payout_usd: float
+    redemption_gas_usd: float
+    net_payout_usd: float
+    payout_numerators: dict[str, float]
+    shares_redeemed: dict[str, float]
+    is_unlocked: bool = False
+    unlocked_at: Optional[float] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "settlement_id": self.settlement_id,
+            "condition_id": self.condition_id,
+            "resolution_timestamp": self.resolution_timestamp,
+            "unlock_timestamp": self.unlock_timestamp,
+            "payout_usd": round(self.payout_usd, 4),
+            "redemption_gas_usd": round(self.redemption_gas_usd, 4),
+            "net_payout_usd": round(self.net_payout_usd, 4),
+            "payout_numerators": self.payout_numerators,
+            "shares_redeemed": {k: round(v, 4) for k, v in self.shares_redeemed.items()},
+            "is_unlocked": self.is_unlocked,
+            "unlocked_at": self.unlocked_at,
         }
 
 

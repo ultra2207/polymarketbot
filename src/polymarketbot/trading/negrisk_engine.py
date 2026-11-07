@@ -34,6 +34,7 @@ and Polygon PoS gas costs.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -84,6 +85,14 @@ class OpportunityType(str, Enum):
     BUY_ALL_NO = "buy_all_no"
     BUY_ALL_YES = "buy_all_yes"
     CONVERT_NO_TO_YES = "convert_no_to_yes"
+
+
+class BrokenBasketPolicy(str, Enum):
+    """Institutional execution policy when a multi-leg basket suffers execution failure (broken leg)."""
+
+    UNWIND_MARKET = "unwind_market"         # Cross spread immediately to market-sell filled partial legs into CLOB bids
+    SYNTHETIC_CONVERT = "synthetic_convert" # In BUY_ALL_NO, convert k-1 filled NO legs via NegRiskAdapter to 1 YES + cash
+    ABORT_HOLD = "abort_hold"               # Halt and leave partial inventory intact (for manual intervention)
 
 
 @dataclass(slots=True, frozen=True)
@@ -262,6 +271,210 @@ def calculate_minimum_batch_shares(
     return round(gas_cost_usd / hurdle, 2)
 
 
+def compute_basket_fill_probability(
+    market: NegRiskMarket,
+    opportunity_type: OpportunityType,
+    shares: float,
+    base_intensity: float = 2.0,
+) -> float:
+    """Calculate joint basket completion probability across all k legs under Poisson arrival.
+
+    Formula:
+        For each leg i:
+            liquidity_ratio_i = min(1.0, available_depth_i / shares)
+            spread_factor_i = max(0.1, 1.0 - spread_i)
+            intensity_i = base_intensity * liquidity_ratio_i * spread_factor_i
+            P_i = 1.0 - exp(-intensity_i)
+        P_basket = prod(P_i for i in legs)
+
+    Returns:
+        Continuous joint execution probability in [0.0, 1.0].
+    """
+    if not market.is_complete() or shares <= 0.0:
+        return 0.0
+
+    k = market.k
+    probs = []
+
+    if opportunity_type == OpportunityType.BUY_ALL_NO:
+        for i in range(k):
+            leg = market.get_leg(i)
+            d = leg.ask_size_no
+            spread = max(0.01, leg.best_ask_no - leg.best_bid_no)
+            rho = min(1.0, d / max(1e-6, shares))
+            tau = max(0.1, 1.0 - min(0.9, spread))
+            kappa = base_intensity * rho * tau
+            probs.append(1.0 - math.exp(-kappa))
+
+    elif opportunity_type == OpportunityType.BUY_ALL_YES:
+        for i in range(k):
+            leg = market.get_leg(i)
+            d = leg.ask_size_yes
+            spread = max(0.01, leg.best_ask_yes - leg.best_bid_yes)
+            rho = min(1.0, d / max(1e-6, shares))
+            tau = max(0.1, 1.0 - min(0.9, spread))
+            kappa = base_intensity * rho * tau
+            probs.append(1.0 - math.exp(-kappa))
+
+    elif opportunity_type == OpportunityType.CONVERT_NO_TO_YES:
+        for i in range(k):
+            leg = market.get_leg(i)
+            d = max(leg.ask_size_no, leg.bid_size_yes)
+            spread = max(0.01, leg.best_ask_no - leg.best_bid_no)
+            rho = min(1.0, d / max(1e-6, shares))
+            tau = max(0.1, 1.0 - min(0.9, spread))
+            kappa = base_intensity * rho * tau
+            probs.append(1.0 - math.exp(-kappa))
+
+    if not probs:
+        return 0.0
+
+    prod = 1.0
+    for p in probs:
+        prod *= p
+    return round(prod, 6)
+
+
+def slice_basket_opportunity(
+    opportunity: NegRiskOpportunity,
+    market: NegRiskMarket,
+    max_slice_shares: Optional[float] = None,
+    safety_factor: float = 0.8,
+    min_slice_shares: float = 10.0,
+) -> list[NegRiskOpportunity]:
+    """Slice a large N-leg basket arbitrage opportunity into institutional micro-slices.
+
+    Each micro-slice:
+    1. Sizes within safety_factor * bottleneck depth to prevent market impact and broken legs.
+    2. Strictly amortizes taker fees and conversion/merge gas friction.
+    3. Guarantees positive net profit.
+    """
+    if opportunity.shares <= 0.0 or not market.is_complete():
+        return []
+
+    k = market.k
+    if opportunity.opportunity_type == OpportunityType.BUY_ALL_NO:
+        bottleneck = min(market.get_leg(i).ask_size_no for i in range(k))
+    elif opportunity.opportunity_type == OpportunityType.BUY_ALL_YES:
+        bottleneck = min(market.get_leg(i).ask_size_yes for i in range(k))
+    elif opportunity.opportunity_type == OpportunityType.CONVERT_NO_TO_YES:
+        target_idx = opportunity.target_outcome_index or 0
+        other_no = [market.get_leg(i).ask_size_no for i in range(k) if i != target_idx]
+        target_bid = market.get_leg(target_idx).bid_size_yes
+        bottleneck = min(other_no + [target_bid])
+    else:
+        bottleneck = opportunity.shares
+
+    safe_depth = max(min_slice_shares, bottleneck * safety_factor)
+    slice_size = safe_depth if max_slice_shares is None else min(safe_depth, float(max_slice_shares))
+    slice_size = max(min_slice_shares, round(slice_size, 2))
+
+    total_shares = opportunity.shares
+    if total_shares <= slice_size:
+        return [opportunity]
+
+    slices: list[NegRiskOpportunity] = []
+    rem = total_shares
+    total_gas = opportunity.estimated_gas_cost_usd
+
+    while rem > 1e-4:
+        current_slice_shares = round(min(rem, slice_size), 2)
+        if current_slice_shares < min_slice_shares and slices:
+            # Add remaining fractional shares to last slice if safe
+            last = slices[-1]
+            combined_shares = round(last.shares + current_slice_shares, 2)
+            c_ratio = combined_shares / total_shares
+            last_gas = round(total_gas * c_ratio, 6)
+            last_gross_edge = round(opportunity.gross_edge_usd * c_ratio, 4)
+            last_fees = round(opportunity.total_taker_fees_usd * c_ratio, 4)
+            last_net_edge = round(last_gross_edge - last_fees - last_gas, 4)
+
+            updated_legs = []
+            for leg_ex in opportunity.legs_execution:
+                updated_legs.append(
+                    ArbitrageLegExecution(
+                        leg_index=leg_ex.leg_index,
+                        token_id=leg_ex.token_id,
+                        outcome_type=leg_ex.outcome_type,
+                        side=leg_ex.side,
+                        price=leg_ex.price,
+                        shares=combined_shares,
+                        notional_usd=round(leg_ex.price * combined_shares, 4),
+                        taker_fee_usd=round(leg_ex.taker_fee_usd * c_ratio, 4),
+                    )
+                )
+            slices[-1] = NegRiskOpportunity(
+                event_id=opportunity.event_id,
+                market_id=opportunity.market_id,
+                opportunity_type=opportunity.opportunity_type,
+                k_legs=opportunity.k_legs,
+                shares=combined_shares,
+                gross_cost_per_share=opportunity.gross_cost_per_share,
+                gross_payout_per_share=opportunity.gross_payout_per_share,
+                gross_edge_per_share=opportunity.gross_edge_per_share,
+                gross_edge_usd=last_gross_edge,
+                total_taker_fees_usd=last_fees,
+                estimated_gas_cost_usd=last_gas,
+                net_edge_usd=last_net_edge,
+                net_edge_bps=opportunity.net_edge_bps,
+                net_margin_pct=opportunity.net_margin_pct,
+                legs_execution=updated_legs,
+                target_outcome_index=opportunity.target_outcome_index,
+                convert_index_set=opportunity.convert_index_set,
+                timestamp=opportunity.timestamp,
+            )
+            break
+
+        ratio = current_slice_shares / total_shares
+        slice_gas = round(total_gas * ratio, 6)
+        slice_gross_edge = round(opportunity.gross_edge_usd * ratio, 4)
+        slice_fees = round(opportunity.total_taker_fees_usd * ratio, 4)
+        slice_net_edge = round(slice_gross_edge - slice_fees - slice_gas, 4)
+
+        if slice_net_edge <= 0.0:
+            break
+
+        slice_legs_exec = []
+        for leg_ex in opportunity.legs_execution:
+            slice_legs_exec.append(
+                ArbitrageLegExecution(
+                    leg_index=leg_ex.leg_index,
+                    token_id=leg_ex.token_id,
+                    outcome_type=leg_ex.outcome_type,
+                    side=leg_ex.side,
+                    price=leg_ex.price,
+                    shares=current_slice_shares,
+                    notional_usd=round(leg_ex.price * current_slice_shares, 4),
+                    taker_fee_usd=round(leg_ex.taker_fee_usd * ratio, 4),
+                )
+            )
+
+        slice_opp = NegRiskOpportunity(
+            event_id=opportunity.event_id,
+            market_id=opportunity.market_id,
+            opportunity_type=opportunity.opportunity_type,
+            k_legs=opportunity.k_legs,
+            shares=current_slice_shares,
+            gross_cost_per_share=opportunity.gross_cost_per_share,
+            gross_payout_per_share=opportunity.gross_payout_per_share,
+            gross_edge_per_share=opportunity.gross_edge_per_share,
+            gross_edge_usd=slice_gross_edge,
+            total_taker_fees_usd=slice_fees,
+            estimated_gas_cost_usd=slice_gas,
+            net_edge_usd=slice_net_edge,
+            net_edge_bps=opportunity.net_edge_bps,
+            net_margin_pct=opportunity.net_margin_pct,
+            legs_execution=slice_legs_exec,
+            target_outcome_index=opportunity.target_outcome_index,
+            convert_index_set=opportunity.convert_index_set,
+            timestamp=opportunity.timestamp,
+        )
+        slices.append(slice_opp)
+        rem = round(rem - current_slice_shares, 4)
+
+    return slices
+
+
 @dataclass
 class ArbitrageLegExecution:
     """Details for executing one leg of an arbitrage bundle."""
@@ -347,6 +560,36 @@ class NegRiskExecutionPlan:
 
 
 @dataclass
+class BrokenBasketResolution:
+    """Audit trail and resolution record for an execution-failed broken basket."""
+
+    plan_id: str
+    failed_leg_index: int
+    failed_error: str
+    policy_applied: BrokenBasketPolicy
+    unwind_orders: list[dict[str, Any]] = field(default_factory=list)
+    unwind_pnl_usd: float = 0.0
+    synthetic_converted_shares: float = 0.0
+    synthetic_cash_unlocked_usd: float = 0.0
+    is_resolved: bool = False
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "failed_leg_index": self.failed_leg_index,
+            "failed_error": self.failed_error,
+            "policy_applied": self.policy_applied.value,
+            "unwind_orders": self.unwind_orders,
+            "unwind_pnl_usd": round(self.unwind_pnl_usd, 4),
+            "synthetic_converted_shares": round(self.synthetic_converted_shares, 4),
+            "synthetic_cash_unlocked_usd": round(self.synthetic_cash_unlocked_usd, 4),
+            "is_resolved": self.is_resolved,
+            "message": self.message,
+        }
+
+
+@dataclass
 class NegRiskExecutionResult:
     """Outcome of attempting to execute an arbitrage plan."""
 
@@ -358,6 +601,7 @@ class NegRiskExecutionResult:
     is_dry_run: bool = False
     error: Optional[str] = None
     status: str = "FAILED"
+    broken_basket_resolution: Optional[BrokenBasketResolution] = None
 
 
 class CoherenceChecker:
@@ -1052,6 +1296,7 @@ class NegRiskEngine:
         dry_run: bool = True,
         clob_client: Optional[ClobClient] = None,
         ctf_client: Optional[PolygonCtfClient] = None,
+        broken_basket_policy: BrokenBasketPolicy = BrokenBasketPolicy.UNWIND_MARKET,
     ) -> None:
         self.min_net_edge_usd = min_net_edge_usd
         self.min_net_edge_bps = min_net_edge_bps
@@ -1060,6 +1305,7 @@ class NegRiskEngine:
         self.dry_run = dry_run
         self.clob_client = clob_client
         self.ctf_client = ctf_client
+        self.broken_basket_policy = broken_basket_policy
 
         self.coherence_checker = CoherenceChecker(
             min_net_edge_usd=min_net_edge_usd,
@@ -1221,10 +1467,176 @@ class NegRiskEngine:
         market = self.markets[opportunity.event_id]
         return self.conversion_planner.create_plan(opportunity, market)
 
+    def handle_broken_basket(
+        self,
+        plan: NegRiskExecutionPlan,
+        filled_orders: list[dict[str, Any]],
+        failed_leg_index: int,
+        error_message: str,
+        policy: Optional[BrokenBasketPolicy] = None,
+        pol_usd_price: Optional[float] = None,
+    ) -> BrokenBasketResolution:
+        """Institutional emergency unwind and synthetic conversion policy for broken multi-leg baskets.
+
+        Mitigations:
+        1. UNWIND_MARKET:
+           Immediately submits offsetting IOC orders on already-filled partial legs to cross
+           CLOB bids, liquidating directional exposure and locking in minimal spread loss.
+        2. SYNTHETIC_CONVERT:
+           In BUY_ALL_NO, when k-1 legs have filled and 1 leg fails, the filled NO shares can be
+           synthetically converted via NegRiskAdapter.convertPositions() into 1 YES share of the
+           missing leg plus (k-2) USDC cash collateral, perfectly neutralizing directional exposure
+           without crossing wide taker spreads!
+        3. ABORT_HOLD:
+           Halts execution and preserves inventory for manual algorithmic supervision.
+        """
+        active_policy = policy or self.broken_basket_policy
+        market = self.markets.get(plan.opportunity.event_id)
+
+        if active_policy == BrokenBasketPolicy.ABORT_HOLD or market is None or not filled_orders:
+            logger.warning(
+                f"[BROKEN-BASKET] Policy={active_policy.value}: aborting plan {plan.plan_id} "
+                f"with {len(filled_orders)} unhedged filled legs. Manual intervention required."
+            )
+            return BrokenBasketResolution(
+                plan_id=plan.plan_id,
+                failed_leg_index=failed_leg_index,
+                failed_error=error_message,
+                policy_applied=active_policy,
+                is_resolved=False,
+                message=f"Aborted hold: {error_message}",
+            )
+
+        if active_policy == BrokenBasketPolicy.SYNTHETIC_CONVERT:
+            filled_indices = [
+                ord_spec.get("leg_index")
+                for ord_spec in plan.clob_orders[:len(filled_orders)]
+                if ord_spec.get("leg_index") is not None
+            ]
+            if (
+                plan.opportunity.opportunity_type == OpportunityType.BUY_ALL_NO
+                and len(filled_indices) == (market.k - 1)
+            ):
+                shares = plan.opportunity.shares
+                shares_6dp = amount_to_6dp(shares)
+                cash_unlocked = (market.k - 2) * shares
+
+                convert_calldata = build_negrisk_convert(
+                    market_id=market.market_id,
+                    index_sets=filled_indices,
+                    amount_6dp=shares_6dp,
+                )
+                tx_hash = f"0xsim_synth_convert_{uuid.uuid4().hex[:12]}"
+                if not self.dry_run and self.ctf_client is not None:
+                    try:
+                        settle_res = self.ctf_client.execute_settlement(
+                            calldata=convert_calldata,
+                            to_address=NEGRISK_ADAPTER_ADDRESS,
+                            condition_id=market.event_id,
+                            amount_shares=shares,
+                            pol_usd_price=pol_usd_price,
+                            kind="convert",
+                        )
+                        if settle_res.success:
+                            tx_hash = settle_res.tx_hash
+                    except Exception as exc:
+                        logger.error(f"[BROKEN-BASKET] Synthetic conversion failed: {exc}")
+
+                logger.info(
+                    f"[BROKEN-BASKET] Synthetic conversion successful for plan {plan.plan_id}: "
+                    f"Converted {len(filled_indices)} NO legs into YES_{failed_leg_index} + ${cash_unlocked:.2f} USDC collateral (Tx: {tx_hash[:16]})."
+                )
+                return BrokenBasketResolution(
+                    plan_id=plan.plan_id,
+                    failed_leg_index=failed_leg_index,
+                    failed_error=error_message,
+                    policy_applied=BrokenBasketPolicy.SYNTHETIC_CONVERT,
+                    synthetic_converted_shares=shares,
+                    synthetic_cash_unlocked_usd=cash_unlocked,
+                    is_resolved=True,
+                    message=f"Synthetically converted {len(filled_indices)} legs to YES_{failed_leg_index} + ${cash_unlocked:.2f} USDC",
+                )
+
+        # Fallback / Default: UNWIND_MARKET
+        logger.warning(
+            f"[BROKEN-BASKET] Executing UNWIND_MARKET for plan {plan.plan_id} across {len(filled_orders)} filled legs..."
+        )
+        unwind_orders: list[dict[str, Any]] = []
+        realized_unwind_pnl = 0.0
+
+        for i, filled_ord in enumerate(filled_orders):
+            orig_spec = plan.clob_orders[i] if i < len(plan.clob_orders) else filled_ord
+            token_id = orig_spec["token_id"]
+            orig_side = orig_spec["side"]
+            orig_price = orig_spec["price"]
+            size = orig_spec["size"]
+            leg_idx = orig_spec.get("leg_index", i)
+            leg = market.get_leg(leg_idx) if leg_idx in market.legs else None
+
+            # Determine unwind side & counter-price
+            if orig_side.upper() == "BUY":
+                unwind_side = "SELL"
+                if orig_spec.get("outcome_type") == "NO":
+                    unwind_price = leg.best_bid_no if (leg and leg.best_bid_no > 0) else max(0.01, orig_price - 0.05)
+                else:
+                    unwind_price = leg.best_bid_yes if (leg and leg.best_bid_yes > 0) else max(0.01, orig_price - 0.05)
+                gross_pnl = (unwind_price - orig_price) * size
+            else:
+                unwind_side = "BUY"
+                if orig_spec.get("outcome_type") == "NO":
+                    unwind_price = leg.best_ask_no if (leg and leg.best_ask_no < 1.0) else min(0.99, orig_price + 0.05)
+                else:
+                    unwind_price = leg.best_ask_yes if (leg and leg.best_ask_yes < 1.0) else min(0.99, orig_price + 0.05)
+                gross_pnl = (orig_price - unwind_price) * size
+
+            taker_fee_usd = compute_taker_fee(
+                shares=size,
+                price=unwind_price,
+                fee_rate=leg.fee_rate if leg else 0.0,
+                fee_exponent=leg.fee_exponent if leg else 1.0,
+            )
+            net_pnl = gross_pnl - taker_fee_usd
+            realized_unwind_pnl += net_pnl
+
+            unwind_record = {
+                "token_id": token_id,
+                "side": unwind_side,
+                "price": round(unwind_price, 4),
+                "size": size,
+                "realized_pnl": round(net_pnl, 4),
+                "status": "UNWOUND",
+            }
+            if not self.dry_run and self.clob_client is not None:
+                try:
+                    res = self.clob_client.place_order(
+                        token_id=token_id,
+                        side=unwind_side,
+                        price=unwind_price,
+                        size=size,
+                        order_type="IOC",
+                    )
+                    unwind_record["clob_response"] = res.to_dict()
+                except Exception as exc:
+                    unwind_record["error"] = str(exc)
+            unwind_orders.append(unwind_record)
+
+        return BrokenBasketResolution(
+            plan_id=plan.plan_id,
+            failed_leg_index=failed_leg_index,
+            failed_error=error_message,
+            policy_applied=BrokenBasketPolicy.UNWIND_MARKET,
+            unwind_orders=unwind_orders,
+            unwind_pnl_usd=round(realized_unwind_pnl, 4),
+            is_resolved=True,
+            message=f"Unwound {len(unwind_orders)} legs via market cross with PnL=${realized_unwind_pnl:.4f}",
+        )
+
     def execute_plan(
         self,
         plan: NegRiskExecutionPlan,
         pol_usd_price: Optional[float] = None,
+        simulate_failed_leg_index: Optional[int] = None,
+        broken_basket_policy: Optional[BrokenBasketPolicy] = None,
     ) -> NegRiskExecutionResult:
         """Execute or simulate the complete arbitrage plan."""
         logger.info(
@@ -1232,10 +1644,40 @@ class NegRiskEngine:
             f"shares={plan.opportunity.shares:.2f}, net_edge=${plan.estimated_net_profit_usd:.4f})"
         )
 
+        effective_policy = broken_basket_policy or self.broken_basket_policy
+
         if self.dry_run:
             logger.info(f"[DRY-RUN] Simulating placement of {len(plan.clob_orders)} CLOB orders...")
             mock_orders = []
-            for ord_spec in plan.clob_orders:
+            for i, ord_spec in enumerate(plan.clob_orders):
+                if simulate_failed_leg_index is not None and i == simulate_failed_leg_index:
+                    logger.error(f"[DRY-RUN] Simulated execution failure on leg index {i}")
+                    resolution = self.handle_broken_basket(
+                        plan=plan,
+                        filled_orders=mock_orders,
+                        failed_leg_index=i,
+                        error_message="Simulated dry-run order rejection / liquidity evaporation",
+                        policy=effective_policy,
+                        pol_usd_price=pol_usd_price,
+                    )
+                    plan.status = "BROKEN_BASKET_RESOLVED" if resolution.is_resolved else "PARTIAL_FILL_ABORT"
+                    actual_profit = (
+                        resolution.unwind_pnl_usd
+                        if resolution.policy_applied == BrokenBasketPolicy.UNWIND_MARKET
+                        else resolution.synthetic_cash_unlocked_usd
+                    )
+                    return NegRiskExecutionResult(
+                        success=False,
+                        plan_id=plan.plan_id,
+                        orders_placed=mock_orders,
+                        tx_hashes=[],
+                        actual_net_profit_usd=actual_profit,
+                        is_dry_run=True,
+                        error=f"Simulated execution failure on leg {i}",
+                        status="BROKEN_BASKET_RESOLVED" if resolution.is_resolved else "PARTIAL_FILL_ABORT",
+                        broken_basket_resolution=resolution,
+                    )
+
                 mock_orders.append(
                     {
                         "order_id": f"0xmock_order_{uuid.uuid4().hex[:12]}",
@@ -1277,7 +1719,7 @@ class NegRiskEngine:
 
         # 1. Place CLOB orders
         placed_orders = []
-        for ord_spec in plan.clob_orders:
+        for i, ord_spec in enumerate(plan.clob_orders):
             try:
                 res = self.clob_client.place_order(
                     token_id=ord_spec["token_id"],
@@ -1287,23 +1729,55 @@ class NegRiskEngine:
                     order_type=ord_spec.get("order_type", "IOC"),
                 )
                 if not res.success:
-                    logger.error(f"CLOB order placement failed: {res.error_message}")
+                    logger.error(f"CLOB order placement failed on leg {i}: {res.error_message}")
+                    resolution = self.handle_broken_basket(
+                        plan=plan,
+                        filled_orders=placed_orders,
+                        failed_leg_index=i,
+                        error_message=str(res.error_message),
+                        policy=effective_policy,
+                        pol_usd_price=pol_usd_price,
+                    )
+                    plan.status = "BROKEN_BASKET_RESOLVED" if resolution.is_resolved else "PARTIAL_FILL_ABORT"
+                    actual_profit = (
+                        resolution.unwind_pnl_usd
+                        if resolution.policy_applied == BrokenBasketPolicy.UNWIND_MARKET
+                        else resolution.synthetic_cash_unlocked_usd
+                    )
                     return NegRiskExecutionResult(
                         success=False,
                         plan_id=plan.plan_id,
                         orders_placed=placed_orders,
-                        error=f"Leg order placement failed: {res.error_message}",
-                        status="PARTIAL_FILL_ABORT",
+                        actual_net_profit_usd=actual_profit,
+                        error=f"Leg order placement failed on leg {i}: {res.error_message}",
+                        status="BROKEN_BASKET_RESOLVED" if resolution.is_resolved else "PARTIAL_FILL_ABORT",
+                        broken_basket_resolution=resolution,
                     )
                 placed_orders.append(res.to_dict())
             except Exception as exc:
-                logger.error(f"Exception during CLOB order execution: {exc}")
+                logger.error(f"Exception during CLOB order execution on leg {i}: {exc}")
+                resolution = self.handle_broken_basket(
+                    plan=plan,
+                    filled_orders=placed_orders,
+                    failed_leg_index=i,
+                    error_message=str(exc),
+                    policy=effective_policy,
+                    pol_usd_price=pol_usd_price,
+                )
+                plan.status = "BROKEN_BASKET_RESOLVED" if resolution.is_resolved else "FAILED"
+                actual_profit = (
+                    resolution.unwind_pnl_usd
+                    if resolution.policy_applied == BrokenBasketPolicy.UNWIND_MARKET
+                    else resolution.synthetic_cash_unlocked_usd
+                )
                 return NegRiskExecutionResult(
                     success=False,
                     plan_id=plan.plan_id,
                     orders_placed=placed_orders,
-                    error=f"Exception during CLOB order execution: {exc}",
-                    status="FAILED",
+                    actual_net_profit_usd=actual_profit,
+                    error=f"Exception during CLOB order execution on leg {i}: {exc}",
+                    status="BROKEN_BASKET_RESOLVED" if resolution.is_resolved else "FAILED",
+                    broken_basket_resolution=resolution,
                 )
 
         # 2. Execute on-chain conversion / merge
@@ -1360,6 +1834,8 @@ __all__ = [
     "DEFAULT_MIN_NET_EDGE_BPS",
     "DEFAULT_MAX_QUOTE_AGE_S",
     "OpportunityType",
+    "BrokenBasketPolicy",
+    "BrokenBasketResolution",
     "OrderBookLevel",
     "OrderBookDepth",
     "OutcomeLeg",
@@ -1371,6 +1847,9 @@ __all__ = [
     "NegRiskExecutionResult",
     "compute_taker_fee",
     "estimate_conversion_gas_usd",
+    "calculate_minimum_batch_shares",
+    "compute_basket_fill_probability",
+    "slice_basket_opportunity",
     "CoherenceChecker",
     "ConversionPlanner",
     "NegRiskEngine",

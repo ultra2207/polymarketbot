@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from polymarketbot.logs import get_logger
+from polymarketbot.trading.domain2.robust_hazard import RobustHazardModel
 
 log = get_logger("domain2_knobs")
 
@@ -173,6 +174,8 @@ class Domain2KnobOptimizer:
         max_single_bet = initial_cash * knobs.max_single_bet_pct
         max_cat_exposure = initial_cash * knobs.max_category_pct
 
+        hazard_model = RobustHazardModel()
+
         for t in trades:
             now_ms = t["venue_ts_ms"]
 
@@ -224,11 +227,13 @@ class Domain2KnobOptimizer:
             if not (knobs.min_price <= price <= knobs.max_price):
                 continue
 
-            # Net Edge Hurdle
-            p_hat = t.get("token_payout", 1.0)
-            # Use empirical hazard decay for out-of-sample realism
-            hazard = min(0.0003 + 0.0015 * (max(0.0, h_before) ** 1.6), 0.25)
-            est_p_win = 1.0 - hazard
+            # Net Edge Hurdle evaluated dynamically via institutional RobustHazardModel
+            est_p_win, hazard, _ = hazard_model.evaluate_candidate(
+                category=cat,
+                price=price,
+                hours_to_resolution=max(0.01, h_before),
+                is_uma_proposed=(h_before <= 2.0),
+            )
             net_edge_bps = ((est_p_win - price) / price) * 10000.0
             if net_edge_bps < knobs.min_net_edge_bps:
                 continue

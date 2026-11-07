@@ -214,6 +214,20 @@ class PolymarketLiveClient:
             if trade_price > 0 and trade_size > 0:
                 self.engine.on_trade(aid, trade_price, trade_size, trade_side, timestamp=ts)
 
+        # 5. Market resolution / UMA settlement event
+        elif ev_type in ("market_resolved", "resolution", "settlement"):
+            cid = data.get("condition_id")
+            payouts = data.get("payout_numerators") or data.get("payouts") or data.get("payout")
+            if cid and payouts and cid in self.engine.markets:
+                self.engine.settle_market(cid, payouts)
+
+        # 6. Binance cross-venue spot tick
+        elif ev_type in ("binance_tick", "binance_price"):
+            sym = data.get("symbol", "BTCUSDT")
+            px = float(data.get("price", 0.0))
+            if px > 0:
+                self.engine.update_binance_spot(sym, px)
+
     async def run(self, duration_seconds: Optional[float] = None) -> None:
         """Run the live paper trading WebSocket listener and epoch simulator.
 

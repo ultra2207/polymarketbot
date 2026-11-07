@@ -322,25 +322,25 @@ class SelfTradeGuard:
                         )
 
             # -------------------------------------------------------------
-            # 2. Complementary Binary Market Crossing Check (YES + NO >= 1.0)
+            # 2. Complementary Binary Market Crossing Check (YES + NO > 1.0)
             # -------------------------------------------------------------
-            if self.check_complementary_binary and tid in self._complementary_tokens:
+            if is_taker and self.check_complementary_binary and tid in self._complementary_tokens:
                 comp_tid = self._complementary_tokens[tid]
 
                 if side_norm == "BUY":
-                    # Taker BUY on YES @ P1 + resting BUY on NO @ P2 >= 1.0 creates a synthetic self-mint/merge cross
+                    # Taker BUY on YES @ P1 + resting BUY on NO @ P2 > 1.0 creates a synthetic self-mint/merge cross
                     max_comp_buy = self._max_buy_price.get(comp_tid)
-                    if max_comp_buy is not None and (p + max_comp_buy) >= 1.000:
+                    if max_comp_buy is not None and (p + max_comp_buy) > 1.000001:
                         comp_crossing = [
                             o for o in self._buy_by_token.get(comp_tid, {}).values()
-                            if (p + o.price) >= 1.000
+                            if (p + o.price) > 1.000001
                         ]
                         if comp_crossing:
                             self._prevented_trades += 1
                             comp_crossing.sort(key=lambda o: o.price, reverse=True)
                             reason = (
                                 f"Complementary self-trade violation: Taker BUY {tid} @ ${p:.4f} + "
-                                f"resting BUY {comp_tid} @ ${comp_crossing[0].price:.4f} >= $1.00 "
+                                f"resting BUY {comp_tid} @ ${comp_crossing[0].price:.4f} > $1.00 "
                                 f"({p + comp_crossing[0].price:.4f})"
                             )
                             logger.warning(f"[STP GUARD] {reason}")

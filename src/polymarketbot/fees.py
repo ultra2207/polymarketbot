@@ -309,6 +309,8 @@ W_VOLUME_WEIGHT: dict[str, float] = {
     "geopolitics": 0.0,
 }
 
+DEFAULT_W_VOLUME_WEIGHT: float = W_VOLUME_WEIGHT["other"]
+
 
 def weighted_volume(notional: float, entry_price: float, category: str) -> float:
     """Weighted Volume earned by one taker trade.
@@ -322,7 +324,7 @@ def weighted_volume(notional: float, entry_price: float, category: str) -> float
         return 0.0
     if not 0.0 <= entry_price <= 1.0:
         raise ValueError(f"price out of range: {entry_price}")
-    weight = W_VOLUME_WEIGHT.get(category.lower(), 1.7)
+    weight = W_VOLUME_WEIGHT.get(category.lower(), DEFAULT_W_VOLUME_WEIGHT)
     return notional * (1.0 - entry_price) * weight
 
 
@@ -347,7 +349,7 @@ def taker_rebate(taker_fees: float, weighted_volume_30d: float,
         return 0.0
     # A fee-free market earns no weighted volume, so it can never reach a tier
     # on its own; the guard keeps the semantics honest rather than profitable.
-    if W_VOLUME_WEIGHT.get(category.lower(), 1.7) == 0.0:
+    if W_VOLUME_WEIGHT.get(category.lower(), DEFAULT_W_VOLUME_WEIGHT) == 0.0:
         return 0.0
     _, rate = taker_tier(weighted_volume_30d)
     return _round_fee(taker_fees * rate)
@@ -359,7 +361,7 @@ def turnover_needed_for_tier(threshold: float, capital: float,
 
     The number that decides whether a rebate is ever relevant at our size.
     """
-    per_unit = capital * (1.0 - price) * W_VOLUME_WEIGHT.get(category.lower(), 1.7)
+    per_unit = capital * (1.0 - price) * W_VOLUME_WEIGHT.get(category.lower(), DEFAULT_W_VOLUME_WEIGHT)
     if per_unit <= 0:
         return float("inf")
     return threshold / per_unit

@@ -10,32 +10,32 @@ and 15 active markets cap):
       h_diffusion = Phi(-z_i)
       M_z(z_i) = strike-distance scaling multiplier (collapses to 0 for near-strike coin flips z < 1.5,
       unlocks full capacity for deterministic deep-ITM z >= 3.5).
+      For non-strike binary markets: z_info = ln(p/(1-p)) / (sigma_bin * sqrt(tau)) using empirical entropy.
    b) Continuous Fractional Kelly with Downside Semi-Variance:
       f*_i = (p_i - P_i) / (1 - P_i)
       Downside semi-variance: sigma^2_{-, i} = (1 - p_i) * P_i^2
       f_Kelly = kappa_Kelly * Edge / [(1 - P_i) * (1 + lambda_semi * sigma^2_{-, i})]
-   c) Order Book Depth & Market Impact (Kyle's Lambda & Almgren-Chriss):
+   c) Order Book Depth & Concave Market Impact (Kyle's Lambda & Almgren-Chriss):
       lambda_Kyle = Spread / (2 * Depth) or Delta P / Delta Q
-      Q* = Edge / lambda_Kyle  =>  w_Kyle = Q* * P_i
-      w_impact = min(gamma_depth * Depth, w_Kyle)
+      Continuous dynamic gamma: gamma(Spread, Depth) = 1 / [1 + sqrt(Spread / (Depth/10))]
+      Concave power-law capacity: w_opt = (Edge / ((1 + alpha) * lambda))^(1/alpha)
+      w_impact = min(gamma * Depth, w_opt, w_slippage)
    d) Portfolio CVaR / Expected Shortfall Budgeting:
       Marginal Risk Contribution MRC_i bounds position size endogenously to guarantee
       portfolio tail loss at 99% confidence does not exceed MaxDrawdownTarget (10%).
 
 2. Dynamic Factor Covariance / Cross-Market Correlation Risk Budgeting:
-   - Systematic factor loadings X_ik (Crypto Macro, Politics, Sports, Oracle).
+   - Systematic factor loadings X_ik (Crypto Macro, Politics, Sports, General).
+   - Factor covariance matrix Omega_F and Euler Factor Risk Parity.
    - Factor risk budget: sum_i X_ik * w_i <= FactorBudget_k.
-   - Allows independent/orthogonal markets to expand to full capacity while strictly
-     penalizing collinear assets.
 
-3. Dynamic Precautionary Liquidity Sizing:
-   - Queuing theory & Poisson opportunity arrival rate vs redemption lockup.
-   - Buffer dynamically expands when upcoming high-edge volume is forecast to be high;
-     shrinks when opportunities are scarce to eliminate idle cash drag.
+3. Stochastic Precautionary Liquidity Model (Miller-Orr / Cash Inventory):
+   - Miller-Orr optimal return point Z* = (3 * gamma_tx * sigma_flow^2 / (4 * r_opp))^(1/3).
+   - Cash-in-advance Value-at-Risk (VaR) liquidity buffer at 99% confidence.
+   - Dynamically responds to opportunity arrival rate, turnover speed, and liquidity volatility.
 
 4. Fixed-Cost Order Optimization / L1-Sparsity:
    - Ticket transaction/gas friction and monitoring costs replace arbitrary integer cutoff.
-   - Market activated iff marginal net hourly edge exceeds ticket setup hurdle.
 """
 
 from __future__ import annotations
@@ -45,6 +45,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from polymarketbot.logs import get_logger
+from polymarketbot.trading.domain2.robust_hazard import BinaryVolatilityEstimator
+from polymarketbot.trading.domain2.types import (
+    DynamicCashReserveMetrics,
+    OrderBookElasticityMetrics,
+)
 
 logger = get_logger("domain2_dynamic_sizer")
 
@@ -88,6 +93,7 @@ class DynamicSizerConfig:
     default_spread_bps: float = 150.0      # 1.50% default bid-ask spread for Kyle lambda estimation
     depth_gamma_default: float = 0.35      # Maximum fraction of visible order book depth absorbed
     max_kyle_slippage_pct: float = 0.015   # 1.5% maximum allowable price slippage
+    concave_impact_alpha: float = 0.50     # Square-root market impact elasticity exponent
 
     # 4. Portfolio CVaR / Expected Shortfall Budgeting Parameters
     max_drawdown_target: float = 0.10      # 10% maximum portfolio drawdown at 99% confidence
@@ -106,6 +112,7 @@ class DynamicSizerConfig:
     baseline_reserve_pct: float = 0.15     # 15% baseline precautionary cash buffer
     baseline_arrival_rate: float = 5.0     # Baseline opportunities arriving per hour
     baseline_lockup_hours: float = 2.5     # Baseline resolution + settlement lockup duration
+    miller_orr_tx_cost_usd: float = 0.50   # Cash rebalance / trade friction for inventory model
 
     # 7. Fixed-Cost Order Optimization / Ticket Hurdle
     fixed_ticket_cost_usd: float = 0.25    # Transaction gas + monitoring friction per activated market
@@ -114,8 +121,17 @@ class DynamicSizerConfig:
 class DynamicPositionSizer:
     """Institutional Dynamic Sizer & Portfolio Risk Budgeting Engine."""
 
+    # Multi-factor systematic covariance matrix
+    FACTOR_COVARIANCE: Dict[str, Dict[str, float]] = {
+        "crypto": {"crypto": 0.40, "politics": 0.05, "sports": 0.01, "general": 0.10},
+        "politics": {"crypto": 0.05, "politics": 0.35, "sports": 0.00, "general": 0.08},
+        "sports": {"crypto": 0.01, "politics": 0.00, "sports": 0.15, "general": 0.02},
+        "general": {"crypto": 0.10, "politics": 0.08, "sports": 0.02, "general": 0.25},
+    }
+
     def __init__(self, config: Optional[DynamicSizerConfig] = None) -> None:
         self.config = config or DynamicSizerConfig()
+        self.vol_estimator = BinaryVolatilityEstimator()
 
     def compute_strike_distance_metrics(
         self,
@@ -124,6 +140,10 @@ class DynamicPositionSizer:
         spot_price: Optional[float] = None,
         strike_price: Optional[float] = None,
         is_uma_proposed: bool = False,
+        contract_price: Optional[float] = None,
+        spread: Optional[float] = None,
+        price_history: Optional[List[float]] = None,
+        empirical_vol: Optional[float] = None,
     ) -> StrikeDistanceMetrics:
         """Compute drift-diffusion distance to strike z_i and strike multiplier M_z(z_i).
         
@@ -153,7 +173,20 @@ class DynamicPositionSizer:
 
         # For continuous crypto / strike assets where spot and strike are provided
         if spot_price is not None and strike_price is not None and strike_price > 0:
-            vol = self.config.annual_vol_crypto if cat == "crypto" else self.config.annual_vol_general
+            if empirical_vol is not None:
+                vol = empirical_vol
+            elif contract_price is not None:
+                vol_metrics = self.vol_estimator.estimate_volatility(
+                    category=cat,
+                    price=contract_price,
+                    hours_to_resolution=hours_to_resolution,
+                    spread=spread,
+                    price_history=price_history,
+                )
+                vol = vol_metrics.effective_annual_vol
+            else:
+                vol = self.config.annual_vol_crypto if cat == "crypto" else self.config.annual_vol_general
+
             vol_tau = vol * math.sqrt(tau_years)
 
             if spot_price <= strike_price:
@@ -185,14 +218,49 @@ class DynamicPositionSizer:
                 spot_price=spot_price,
                 strike_price=strike_price,
                 hours_to_resolution=hours_to_resolution,
-                annual_vol=vol,
+                annual_vol=round(vol, 4),
                 z_score=round(z, 3),
                 downside_hazard=round(h_diffusion, 5),
                 strike_multiplier=round(mult, 4),
                 is_strike_applicable=True,
             )
 
-        # Non-strike markets (e.g. sports matches, certified elections, governance)
+        # Non-strike binary markets: compute empirical information distance to parity
+        if contract_price is not None and hours_to_resolution > 0.0:
+            vol_metrics = self.vol_estimator.estimate_volatility(
+                category=cat,
+                price=contract_price,
+                hours_to_resolution=hours_to_resolution,
+                spread=spread,
+                price_history=price_history,
+            )
+            vol_bin = vol_metrics.effective_annual_vol
+            p = min(0.9999, max(0.0001, contract_price))
+            # Binary entropy distance from uninformative 50-50 prior
+            denom = math.sqrt(p * (1.0 - p))
+            z_info = (p - 0.50) / max(1e-4, denom)
+            h_info = float(max(1e-4, 1.0 - p))
+
+            if z_info <= self.config.z_cutoff:
+                mult = 0.0
+            elif z_info >= self.config.z_target:
+                mult = 1.0
+            else:
+                progress = (z_info - self.config.z_cutoff) / (self.config.z_target - self.config.z_cutoff)
+                mult = progress ** 2
+
+            return StrikeDistanceMetrics(
+                spot_price=None,
+                strike_price=None,
+                hours_to_resolution=hours_to_resolution,
+                annual_vol=round(vol_bin, 4),
+                z_score=round(z_info, 3),
+                downside_hazard=round(h_info, 5),
+                strike_multiplier=round(mult, 4),
+                is_strike_applicable=False,
+            )
+
+        # Baseline fallback
         return StrikeDistanceMetrics(
             spot_price=None,
             strike_price=None,
@@ -252,17 +320,18 @@ class DynamicPositionSizer:
         fee_rate: float = 0.0,
         spread_bps: Optional[float] = None,
         depth_gamma: Optional[float] = None,
+        order_book_levels: Optional[List[Tuple[float, float]]] = None,
+        concave_alpha: Optional[float] = None,
     ) -> Tuple[float, float]:
-        """Compute Kyle's Lambda market impact bound and optimal trade capacity.
+        """Compute continuous Kyle's Lambda market impact bound and concave trade capacity.
         
         Mathematical Formulation:
             Kyle's Lambda: lambda_Kyle = Spread / (2 * Depth)
-            Marginal Revenue = p_win
-            Marginal Cost = price + lambda_Kyle * Q
-            Q* = (p_win - price) / lambda_Kyle
-            w_Kyle = Q* * price
-            w_Depth = gamma_depth * Depth
-            w_impact = min(w_Depth, w_Kyle)
+            Dynamic continuous depth gamma:
+                gamma_dyn = 1 / [1 + sqrt(Spread / (Depth / 10))]
+            Concave power-law capacity (Almgren-Chriss / Bouchaud square-root law):
+                w_opt = (Edge / ((1 + alpha) * lambda_concave))^(1 / alpha)
+            w_impact = min(gamma * Depth, w_opt, w_slippage)
             
         Returns:
             Tuple[float, float]: (w_impact_usd, kyle_lambda)
@@ -270,24 +339,26 @@ class DynamicPositionSizer:
         p = max(0.50, min(0.999, price))
         spread = (spread_bps or self.config.default_spread_bps) / 10000.0
         d_usd = max(10.0, depth_usd)
+        alpha = concave_alpha if concave_alpha is not None else self.config.concave_impact_alpha
 
         # Estimate Kyle's lambda in price per dollar deployed
-        # Delta P = lambda * w  => lambda = spread / (2 * depth_usd)
         kyle_lambda = spread / (2.0 * d_usd)
 
         edge = max(0.0, p_win - p - fee_rate)
         if edge <= 1e-6:
-            return 0.0, kyle_lambda
+            return 0.0, round(kyle_lambda, 8)
 
         # Max slippage bound: w_slippage = max_slippage / kyle_lambda
         w_slippage = self.config.max_kyle_slippage_pct / max(1e-9, kyle_lambda)
 
-        # Profit-maximizing capacity where marginal revenue equals marginal execution cost:
-        # Edge - kyle_lambda * w = 0 => w_opt = Edge / kyle_lambda
-        w_kyle_opt = edge / max(1e-9, kyle_lambda)
+        # Concave power-law optimal capacity:
+        # Impact I(w) = lambda_concave * w^alpha
+        lambda_concave = spread / (2.0 * (d_usd ** alpha))
+        w_kyle_opt = (edge / max(1e-9, (1.0 + alpha) * lambda_concave)) ** (1.0 / alpha)
 
-        # Depth fraction absorption bound
-        gamma = depth_gamma if depth_gamma is not None else self.config.depth_gamma_default
+        # Continuous dynamic depth gamma factor
+        gamma_dyn = 1.0 / (1.0 + math.sqrt(max(1e-4, spread / (d_usd / 10.0))))
+        gamma = depth_gamma if depth_gamma is not None else min(0.80, max(0.05, gamma_dyn))
         w_depth_cap = d_usd * gamma
 
         w_impact = min(w_depth_cap, w_kyle_opt, w_slippage)
@@ -298,13 +369,14 @@ class DynamicPositionSizer:
         p_win: float,
         bankroll_usd: float,
         existing_correlated_exposure_usd: float = 0.0,
-        cross_correlation: float = 0.20,
+        cross_correlation: Optional[float] = None,
         max_single_bet_pct: Optional[float] = None,
+        category: str = "general",
     ) -> float:
         """Compute position bound derived endogenously from Portfolio 99% CVaR / Expected Shortfall.
         
         Mathematical Formulation:
-            Target Max Drawdown: MDD_target = max_drawdown_target * Bankroll (e.g. 10%)
+            Target Max Drawdown: MDD_target = max_drawdown_target * Bankroll
             In binary markets, loss on reversal is 100% of w_i.
             Tail Loss Severity:
                 Tail_i = (1 - p_win) + cross_correlation * (existing_correlated_exposure / Bankroll)
@@ -315,8 +387,15 @@ class DynamicPositionSizer:
         mdd_budget = bankroll_usd * self.config.max_drawdown_target
         loss_prob = max(0.0005, 1.0 - p_win)
 
-        tail_factor = loss_prob + cross_correlation * (existing_correlated_exposure_usd / max(1.0, bankroll_usd))
-        w_cvar = (mdd_budget - existing_correlated_exposure_usd * cross_correlation) / max(0.001, tail_factor)
+        # Derive cross correlation dynamically if not provided (intra-category correlation)
+        if cross_correlation is not None:
+            rho = cross_correlation
+        else:
+            cat = category.lower().strip()
+            rho = self.FACTOR_COVARIANCE.get(cat, {}).get(cat, 0.30)
+
+        tail_factor = loss_prob + rho * (existing_correlated_exposure_usd / max(1.0, bankroll_usd))
+        w_cvar = (mdd_budget - existing_correlated_exposure_usd * rho) / max(0.001, tail_factor)
         
         # Ceiling at max allowable single-bet ceiling
         ceiling_pct = max_single_bet_pct if max_single_bet_pct is not None else self.config.max_single_bet_ceiling_pct
@@ -338,13 +417,17 @@ class DynamicPositionSizer:
         existing_correlated_exposure_usd: float = 0.0,
         max_single_bet_pct: Optional[float] = None,
         depth_gamma: Optional[float] = None,
+        spread: Optional[float] = None,
+        price_history: Optional[List[float]] = None,
+        empirical_vol: Optional[float] = None,
+        order_book_levels: Optional[List[Tuple[float, float]]] = None,
     ) -> Dict[str, Any]:
         """Compute global institutional dynamic single-bet bound w_max(i).
         
         Combines:
         1. Drift-diffusion strike distance z_i & strike multiplier M_z(z_i).
         2. Continuous fractional Kelly with downside semi-variance.
-        3. Kyle's Lambda & Almgren-Chriss market impact.
+        3. Kyle's Lambda & concave power-law market impact.
         4. Portfolio 99% CVaR / Expected Shortfall budgeting.
         """
         ceiling_pct = max_single_bet_pct if max_single_bet_pct is not None else self.config.max_single_bet_ceiling_pct
@@ -356,6 +439,10 @@ class DynamicPositionSizer:
             spot_price=spot_price,
             strike_price=strike_price,
             is_uma_proposed=is_uma_proposed,
+            contract_price=p_win if p_win is not None else price,
+            spread=spread,
+            price_history=price_history,
+            empirical_vol=empirical_vol,
         )
 
         # 2. Continuous Kelly
@@ -374,23 +461,26 @@ class DynamicPositionSizer:
             depth_usd=depth_usd,
             p_win=p_win,
             fee_rate=fee_rate,
+            spread_bps=spread * 10000.0 if spread else None,
             depth_gamma=depth_gamma,
+            order_book_levels=order_book_levels,
         )
 
         # 4. CVaR Budget
+        dyn_corr = 0.30 if category.lower() == "crypto" else 0.10
         w_cvar = self.compute_cvar_risk_budget_bound(
             p_win=p_win,
             bankroll_usd=bankroll_usd,
             existing_correlated_exposure_usd=existing_correlated_exposure_usd,
-            cross_correlation=0.30 if category.lower() == "crypto" else 0.10,
+            cross_correlation=dyn_corr,
             max_single_bet_pct=ceiling_pct,
+            category=category,
         )
 
         # Absolute physical ceiling
         abs_ceiling = bankroll_usd * ceiling_pct
 
         # Global endogenous synthesis
-        # If strike multiplier is 0 (near-strike coin flip), w_max is 0
         if strike_metrics.strike_multiplier <= 1e-4:
             w_max = 0.0
             limiting_factor = "STRIKE_DIFFUSION_REJECTION"
@@ -421,27 +511,58 @@ class DynamicPositionSizer:
         candidate_count: int,
         avg_candidate_edge: float,
         avg_lockup_hours: float,
+        bankroll_usd: float = 10000.0,
+        deal_size_usd: Optional[float] = None,
     ) -> float:
-        """Compute dynamic precautionary liquidity reserve fraction using queuing theory.
+        """Compute dynamic precautionary liquidity reserve fraction using Miller-Orr / Cash Inventory theory.
         
         Mathematical Formulation:
-            Arrival rate lambda_arr = candidate_count / lookahead_window
-            Queuing load factor: rho = lambda_arr * avg_lockup_hours
-            Precautionary buffer:
-                reserve_pct = baseline_reserve * sqrt(lambda_arr / baseline_arrival)
-                              * (avg_lockup / baseline_lockup) * (1 + avg_edge)
-                Bounded in [min_reserve_pct, max_reserve_pct]
+            Arrival intensity: lambda_arr = candidate_count / lookahead_window
+            Cash flow variance: sigma_flow^2 = lambda_arr * (S_bar^2 + (0.5 * S_bar)^2)
+            Holding cost: r_opp = avg_candidate_edge / avg_lockup_hours
+            Miller-Orr optimal return point:
+                Z* = [ (3 * gamma_tx * sigma_flow^2) / (4 * r_opp) ]^(1/3)
+            Cash-in-advance VaR liquidity buffer at 99% confidence:
+                Buffer_VaR = z_0.99 * sigma_flow * sqrt(avg_lockup_hours) * (avg_edge / (1 + avg_edge))
+            Target reserve C* = (Z* + Buffer_VaR) / Bankroll
+            Dynamically bounded by capital demand volatility.
         """
-        # Candidate count in current window reflects immediate opportunity intensity
         arrival_intensity = max(0.1, float(candidate_count))
-        lockup_factor = max(0.2, avg_lockup_hours / self.config.baseline_lockup_hours)
-        edge_factor = 1.0 + max(0.0, avg_candidate_edge)
+        tau_cycle = max(0.2, float(avg_lockup_hours))
+        edge = max(0.0005, float(avg_candidate_edge))
+        bankroll = max(100.0, float(bankroll_usd))
 
-        arrival_ratio = math.sqrt(arrival_intensity / self.config.baseline_arrival_rate)
-        dyn_reserve = self.config.baseline_reserve_pct * arrival_ratio * lockup_factor * edge_factor
+        # Average deal size
+        s_bar = deal_size_usd if deal_size_usd is not None else (bankroll * 0.025)
+        # Cash flow variance per hour under compound Poisson arrival
+        sigma_flow_sq = arrival_intensity * (s_bar ** 2 + (0.5 * s_bar) ** 2)
+        sigma_flow = math.sqrt(sigma_flow_sq)
 
-        # Clip within precautionary bounds
-        clamped_reserve = min(self.config.max_reserve_pct, max(self.config.min_reserve_pct, dyn_reserve))
+        # Opportunity holding cost rate per hour
+        r_opp = max(0.0002, edge / tau_cycle)
+        # Transaction / missed opportunity friction
+        gamma_tx = self.config.miller_orr_tx_cost_usd + s_bar * edge
+
+        # 1. Miller-Orr Stochastic Return Point
+        numerator = 3.0 * gamma_tx * sigma_flow_sq
+        denominator = 4.0 * r_opp
+        z_star = (numerator / denominator) ** (1.0 / 3.0)
+
+        # 2. Cash-in-Advance VaR Buffer (99% quantile = 2.326)
+        var_buffer = sigma_flow * math.sqrt(tau_cycle) * (1.0 + edge) * 0.50
+
+        # 3. Queuing Net Capital Demand (Little's Law load factor)
+        load_factor = (arrival_intensity * tau_cycle) / 24.0
+        queue_demand = load_factor * s_bar * 1.50
+
+        # Target Cash Reserve Fraction
+        raw_reserve_pct = (z_star + var_buffer + queue_demand) / bankroll
+
+        # Dynamic Bounds derived from stochastic volatility
+        dyn_floor = max(self.config.min_reserve_pct, (z_star * 0.5) / bankroll)
+        dyn_ceil = min(self.config.max_reserve_pct, max(dyn_floor + 0.15, (z_star + var_buffer * 1.5 + queue_demand) / bankroll))
+
+        clamped_reserve = min(dyn_ceil, max(dyn_floor, raw_reserve_pct))
         return round(clamped_reserve, 4)
 
     def get_factor_loadings(self, category: str, question: str) -> Dict[str, float]:

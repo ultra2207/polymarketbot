@@ -54,7 +54,11 @@ from polymarketbot.rewards.scoring import (
     compute_minimum_score,
     quadratic_order_score,
 )
-from polymarketbot.trading.base import BaseMarketMakingEngine
+from polymarketbot.trading.base import (
+    BaseMarketMakingEngine,
+    DEFAULT_FALLBACK_ASK,
+    DEFAULT_FALLBACK_BID,
+)
 from polymarketbot.simulator.book import (
     DepthInfo,
     SyntheticOrderBook,
@@ -246,10 +250,20 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         return self.portfolio.get_equity(marks)
 
     def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
-        book = self.book_yes if token_side.upper() == "YES" else self.book_no
-        b = book.best_bid_real or 0.49
-        a = book.best_ask_real or 0.51
-        return b, a
+        tok = token_side.upper()
+        book = self.book_yes if tok == "YES" else self.book_no
+        b = book.best_bid_real
+        a = book.best_ask_real
+        if b is None or a is None:
+            comp_book = self.book_no if tok == "YES" else self.book_yes
+            if b is None and comp_book.best_ask_real is not None:
+                b = round(1.0 - comp_book.best_ask_real, 4)
+            if a is None and comp_book.best_bid_real is not None:
+                a = round(1.0 - comp_book.best_bid_real, 4)
+        return (
+            b if b is not None else DEFAULT_FALLBACK_BID,
+            a if a is not None else DEFAULT_FALLBACK_ASK,
+        )
 
     def credit_reward(self, amount: float, condition_id: str, note: str = "") -> None:
         self.portfolio.credit_reward(amount, condition_id=condition_id, note=note)

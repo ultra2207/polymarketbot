@@ -415,3 +415,148 @@ def test_round_tick_helper() -> None:
     assert round_tick(0.486, 0.01) == 0.49
     assert round_tick(0.489, 0.01, mode="floor") == 0.48
     assert round_tick(0.481, 0.01, mode="ceil") == 0.49
+
+
+# =============================================================================
+# 7. Institutional Avellaneda-Stoikov / Guéant Pair Quoting & Execution Leg Risk
+# =============================================================================
+
+def test_avellaneda_stoikov_reservation_prices_and_gueant_spreads() -> None:
+    """Validate Avellaneda-Stoikov reservation prices and Guéant-Tapia optimal pair spreads:
+
+    1. When q = 0 (neutral):
+       r_yes == mid_yes, r_no == mid_no.
+       Optimal spread reflects Guéant-Tapia arrival intensity kappa and capital carrying cost.
+    2. When q > 0 (long YES):
+       delta_r(q) = q * gamma * sigma^2 * tau > 0
+       r_yes shifts down (discourages buying more YES)
+       r_no shifts up (eagerly bids for NO to neutralize delta)
+    """
+    config = ComplementQuoterConfig(
+        use_avellaneda_stoikov=True,
+        risk_aversion_gamma=0.2,
+        pair_volatility=0.10,
+        holding_horizon_tau=1.0,
+        arrival_intensity_kappa=20.0,
+        capital_carrying_cost_rate=0.05,
+        target_pair_margin=0.015,
+    )
+    quoter = ComplementQuoter(condition_id="0xas_test", config=config)
+
+    # 1. Neutral inventory (q = 0)
+    decision_neutral = quoter.compute_quotes(mid_yes=0.48, mid_no=0.49)
+    assert decision_neutral.can_quote_double_bids is True
+    assert decision_neutral.reservation_price_yes == pytest.approx(0.48)
+    assert decision_neutral.reservation_price_no == pytest.approx(0.49)
+    assert decision_neutral.var_penalty_usd == 0.0
+    assert decision_neutral.optimal_pair_spread > 0.0
+
+    # 2. Long YES inventory (q = +30)
+    quoter.record_fill("YES", "BUY", price=0.48, size=30.0)
+    assert quoter.net_imbalance == 30.0
+
+    decision_skewed = quoter.compute_quotes(mid_yes=0.48, mid_no=0.49, best_ask_no=0.51)
+    # Expected delta_r = 30 * 0.2 * (0.10^2) * 1.0 = 30 * 0.2 * 0.01 = 0.06
+    # r_yes = 0.48 - 0.5 * 0.06 = 0.450
+    # r_no = 0.49 + 0.5 * 0.06 = 0.520
+    assert decision_skewed.reservation_price_yes == pytest.approx(0.450)
+    assert decision_skewed.reservation_price_no == pytest.approx(0.520)
+
+    # Reservation price on YES dropped; on NO rose
+    assert decision_skewed.reservation_price_yes < decision_neutral.reservation_price_yes
+    assert decision_skewed.reservation_price_no > decision_neutral.reservation_price_no
+
+
+def test_execution_leg_risk_asymmetric_fill_unhedging_and_var_penalty() -> None:
+    """Validate instantaneous Value-at-Risk (VaR) adverse selection penalty on hanging unhedged leg."""
+    config = ComplementQuoterConfig(
+        use_avellaneda_stoikov=True,
+        risk_aversion_gamma=0.2,
+        pair_volatility=0.15,
+        holding_horizon_tau=1.0,
+        arrival_intensity_kappa=10.0,
+        unhedge_time_horizon_seconds=120.0,
+        var_confidence_z=1.96,
+        base_quote_size=20.0,
+        max_quote_size=100.0,
+        min_quote_size=5.0,
+    )
+    quoter = ComplementQuoter(condition_id="0xleg_risk_test", config=config)
+
+    # Create unhedged directional inventory: 50 YES filled
+    quoter.record_fill("YES", "BUY", price=0.48, size=50.0)
+    assert quoter.net_imbalance == 50.0
+
+    decision = quoter.compute_quotes(
+        mid_yes=0.48,
+        mid_no=0.49,
+        best_bid_yes=0.47,
+        best_ask_yes=0.49,
+        best_bid_no=0.48,
+        best_ask_no=0.50,
+    )
+
+    # VaR penalty must be positive for unhedged 50 shares
+    assert decision.var_penalty_usd > 0.0
+
+    # NO is the pair completer: boosted size & tightened towards ask
+    assert decision.no_quote.is_skew_boosted is True
+    assert decision.no_quote.bid_size > 20.0
+    assert decision.yes_quote.is_skew_faded is True
+    assert decision.yes_quote.bid_size < 20.0
+
+    # Pair margin bound is strictly maintained
+    assert decision.expected_combined_cost <= (1.000 - config.target_pair_margin)
+
+
+# =============================================================================
+# 8. Dynamic Economic Order Quantity (EOQ) Batch Merging
+# =============================================================================
+
+def test_dynamic_eoq_batch_merging_balances_gas_and_carrying_cost() -> None:
+    """Validate batch size for CTF.mergePositions() as exact Economic Order Quantity (EOQ):
+
+    Q* = sqrt((2 * S * D) / H)
+    Where S is dynamic Polygon PoS gas cost, D is arrival rate, H is carrying cost.
+    """
+    config = ComplementQuoterConfig(
+        use_eoq_batching=True,
+        merge_gas_units=78_000,
+        gas_price_gwei=40.0,       # 40 Gwei
+        pol_usd_price=0.20,         # $0.20 POL
+        complete_set_arrival_rate=10_000.0,  # 10k sets/year
+        capital_carrying_cost_rate=0.05,     # 5% capital cost
+        max_gas_friction_cents_per_pair=0.05,# 0.05c/share hurdle
+    )
+    quoter = ComplementQuoter(condition_id="0xeoq_test", config=config)
+
+    # Expected dynamic gas cost:
+    # 78,000 * 40e-9 POL * $0.20 = 0.000624 USD
+    expected_gas_usd = quoter.compute_dynamic_gas_cost_usd()
+    assert expected_gas_usd == pytest.approx(0.000624, abs=1e-6)
+
+    # Optimal EOQ batch size:
+    # S = 0.000624, D = 10,000, H = 0.05 * 0.98 = 0.049
+    # Q* = sqrt((2 * 0.000624 * 10,000) / 0.049) = sqrt(12.48 / 0.049) = sqrt(254.69) ~ 15.96
+    # Hurdle check: 0.000624 / 0.0005 = 1.25 shares
+    # Optimal Q = max(1.25, 15.96) = 15.96 shares
+    eoq = quoter.compute_optimal_eoq_batch_size()
+    assert eoq == pytest.approx(15.96, abs=0.1)
+
+    # Verify auto_merge_threshold dynamically reflects EOQ
+    assert quoter.auto_merge_threshold == eoq
+
+    # Case B: Gas spikes 5x to 200 Gwei -> Batch size must scale up to amortize gas!
+    config_high_gas = ComplementQuoterConfig(
+        use_eoq_batching=True,
+        merge_gas_units=78_000,
+        gas_price_gwei=200.0,      # 200 Gwei
+        pol_usd_price=0.20,
+        complete_set_arrival_rate=10_000.0,
+        capital_carrying_cost_rate=0.05,
+    )
+    quoter_high_gas = ComplementQuoter(condition_id="0xeoq_high_gas", config=config_high_gas)
+    eoq_high_gas = quoter_high_gas.compute_optimal_eoq_batch_size()
+    assert eoq_high_gas > eoq
+    # sqrt(5) ~ 2.236x higher
+    assert eoq_high_gas == pytest.approx(eoq * (200.0 / 40.0) ** 0.5, abs=0.5)

@@ -73,6 +73,7 @@ class Domain2CircuitBreaker:
         current_market_cost_usdc: float,
         total_open_exposure_usdc: float,
         active_markets_count: int,
+        dynamic_w_max: Optional[float] = None,
     ) -> Tuple[bool, float, Optional[str]]:
         """Validate if a discount trade opportunity satisfies all risk boundaries.
 
@@ -114,8 +115,15 @@ class Domain2CircuitBreaker:
                 f"Active markets count ({active_markets_count}) reached cap ({self.max_concurrent_markets})"
             )
 
-        # 5. Check per-market allocation limits
-        max_market_cap = current_equity_usdc * self.max_market_allocation_pct
+        # 5. Check per-market allocation limits (bounded by dynamic sizer if supplied)
+        if dynamic_w_max is not None:
+            max_market_cap = float(dynamic_w_max)
+        else:
+            max_market_cap = current_equity_usdc * self.max_market_allocation_pct
+
+        if dynamic_w_max is not None and dynamic_w_max <= 0.0:
+            return False, 0.0, f"Market {cid[:14]} rejected by dynamic sizer (w_max = $0.00)"
+
         remaining_market_cap = max(0.0, max_market_cap - current_market_cost_usdc)
         if remaining_market_cap < 1.0:
             return False, 0.0, f"Market allocation cap (${max_market_cap:.2f}) exhausted"
@@ -127,3 +135,4 @@ class Domain2CircuitBreaker:
 
         alloc_cap = min(remaining_market_cap, remaining_portfolio_cap)
         return True, alloc_cap, None
+

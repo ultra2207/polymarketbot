@@ -18,12 +18,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper_trading.engine import PaperTradingEngine
 from polymarketbot.paper_trading.models import MarketConfig
 from polymarketbot.rewards.scanner import MarketOpportunity, OpportunityScanner
+
+if TYPE_CHECKING:
+    from polymarketbot.paper_trading.engine import PaperTradingEngine
 
 logger = get_logger("market_switching")
 

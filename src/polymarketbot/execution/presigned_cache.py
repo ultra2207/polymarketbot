@@ -85,11 +85,11 @@ def make_bucket_key(
 
     Avoids runtime Decimal serialization overhead, running in under 50 nanoseconds.
     """
-    token_str = str(token_id)
+    token_str = token_id if isinstance(token_id, str) else str(token_id)
     side_norm = "BUY" if (side == "BUY" or side == 0 or side == "0") else "SELL"
-    # Discrete tick index: e.g. 0.55 / 0.01 = 55
-    price_tick = int(round(price / tick_size)) if tick_size > 0 else int(round(price * 10_000))
-    size_cents = int(round(size * 100))
+    inv_tick = 1.0 / tick_size if tick_size > 0 else 10000.0
+    price_tick = int(price * inv_tick + 0.5)
+    size_cents = int(size * 100.0 + 0.5)
     return (token_str, side_norm, price_tick, size_cents)
 
 
@@ -372,7 +372,7 @@ class PreSignedOrderCache:
         key = make_bucket_key(token_id, side, price, size, tick_size)
         with self._lock:
             bucket = self._buckets.get(key)
-            if bucket and len(bucket) > 0:
+            if bucket:
                 self._hits += 1
                 return bucket.popleft()
             self._misses += 1

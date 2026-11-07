@@ -19,6 +19,7 @@ from polymarketbot.trading.virtual_queue_book import (
     CancellationDecision,
     CancellationModel,
     CancellationUrgency,
+    DynamicQueueDepletionTracker,
     FastL2Book,
     OrderBookLevel,
     OrderSide,
@@ -624,4 +625,114 @@ def test_rate_limited_monitor_execution():
     assert results["m1"]["action"] == "CANCEL_SENT"
     # Second was rate limited
     assert results["m2"]["action"] == "RATE_LIMITED_DEFERRED"
+
+
+# ============================================================================
+# 5. Dynamic Queue Depletion & Hazard Rate Model Tests
+# ============================================================================
+
+def test_dynamic_queue_depletion_tracker_velocity():
+    tracker = DynamicQueueDepletionTracker(history_seconds=30.0)
+    t0 = 1000.0
+
+    # Stream trades
+    tracker.record_trade(price=0.50, size=500.0, timestamp=t0)
+    tracker.record_trade(price=0.50, size=1500.0, timestamp=t0 + 2.0)
+    tracker.record_cancellation(price=0.50, size=50.0, timestamp=t0)
+    tracker.record_cancellation(price=0.50, size=150.0, timestamp=t0 + 2.0)
+
+    # In 2.0 seconds, 2000 shares executed -> ~1000 shares/sec
+    trade_vel = tracker.get_trade_velocity(lookback_seconds=5.0)
+    assert pytest.approx(trade_vel, rel=0.1) == 1000.0
+
+    cancel_vel = tracker.get_cancellation_velocity(lookback_seconds=5.0)
+    assert pytest.approx(cancel_vel, rel=0.1) == 100.0
+
+
+def test_dynamic_queue_depletion_time_calculation():
+    tracker = DynamicQueueDepletionTracker()
+    t0 = 1000.0
+    tracker.record_trade(price=0.50, size=1000.0, timestamp=t0)
+    tracker.record_trade(price=0.50, size=1000.0, timestamp=t0 + 2.0)  # ~1000 shares/sec
+
+    # Queue ahead is 500 shares -> expected clearance time is ~0.50 seconds
+    depletion_time = tracker.calculate_depletion_time(queue_ahead=500.0, standing_depth=2000.0)
+    assert 0.40 <= depletion_time <= 0.60
+
+
+def test_dynamic_front_queue_threshold_scaling():
+    tracker = DynamicQueueDepletionTracker()
+    t0 = 1000.0
+
+    # High velocity market: 10,000 shares in 2s = 5,000 shares/sec
+    tracker.record_trade(price=0.50, size=5000.0, timestamp=t0)
+    tracker.record_trade(price=0.50, size=5000.0, timestamp=t0 + 2.0)
+
+    # Reaction time = 150ms, safety multiplier = 1.5 -> threshold = 5000 * 0.150 * 1.5 = 1125 shares!
+    thresh_high = tracker.calculate_dynamic_front_threshold(reaction_time_s=0.150, safety_multiplier=1.5)
+    assert thresh_high > 1000.0
+
+    # Quiet market: 0 trades -> returns min_threshold floor (25.0)
+    tracker_quiet = DynamicQueueDepletionTracker()
+    thresh_quiet = tracker_quiet.calculate_dynamic_front_threshold(min_threshold=25.0)
+    assert thresh_quiet == 25.0
+
+
+def test_dynamic_hazard_cancellation_model():
+    tracker = QueuePositionTracker()
+    # Order placed with 100 shares ahead and 400 shares behind
+    # Total queue = 500, queue rank = 100 / 500 = 0.20
+    order = tracker.track_order(
+        order_id="hazard_ord",
+        side="BUY",
+        price=0.50,
+        size=50.0,
+        initial_depth_ahead=100.0,
+        cancellation_model=CancellationModel.DYNAMIC_HAZARD,
+    )
+    order.queue_behind = 400.0
+
+    # 100 shares cancelled
+    tracker.on_level_delta("BUY", 0.50, 550.0, 450.0)
+
+    # In dynamic hazard model, rank=0.20 means weight behind is ~0.58
+    # Majority of cancellations should come from queue_behind rather than queue_ahead
+    assert order.queue_ahead < 100.0
+    assert order.queue_behind < 400.0
+    # Behind reduction should be greater than ahead reduction
+    reduced_ahead = 100.0 - order.queue_ahead
+    reduced_behind = 400.0 - order.queue_behind
+    assert reduced_behind > reduced_ahead
+
+
+def test_queue_aware_cancellation_with_dynamic_depletion():
+    tracker = QueuePositionTracker()
+    t0 = 1000.0
+    # Simulate trade burst into tracker
+    tracker.depletion_tracker.record_trade(price=0.50, size=4000.0, timestamp=t0)
+    tracker.depletion_tracker.record_trade(price=0.50, size=4000.0, timestamp=t0 + 2.0)
+
+    # Order has 600 shares ahead (which is > static 300 threshold!)
+    order = tracker.track_order(
+        order_id="burst_order",
+        side="BUY",
+        price=0.50,
+        size=100.0,
+        initial_depth_ahead=600.0,
+    )
+
+    policy = QueueAwareCancellationPolicy(
+        tracker=tracker,
+        config=QueueCancellationConfig(front_queue_threshold=300.0),
+    )
+
+    # 1. Static evaluation: 600 > 300 -> Classified as MONITOR (not urgent)
+    decision_static = policy.evaluate_order(order, toxic_shock_magnitude=5.0, use_dynamic_depletion=False)
+    assert decision_static.urgency == CancellationUrgency.MONITOR
+
+    # 2. Dynamic evaluation: High trade velocity raises front threshold > 600 -> Upgraded to URGENT!
+    decision_dynamic = policy.evaluate_order(order, toxic_shock_magnitude=5.0, use_dynamic_depletion=True)
+    assert decision_dynamic.urgency == CancellationUrgency.URGENT
+    assert decision_dynamic.recommended_action == "CANCEL_IMMEDIATE"
+
 

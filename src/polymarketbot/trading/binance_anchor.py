@@ -28,6 +28,10 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from polymarketbot.fees import FeeSchedule
 from polymarketbot.logs import get_logger
+from polymarketbot.trading.binance_quant_engine import (
+    CrossVenueLeadLagKalmanFilter,
+    HighFrequencyEWMAVolEstimator,
+)
 
 if TYPE_CHECKING:
     from polymarketbot.trading.as_inventory_engine import (
@@ -243,7 +247,7 @@ class BinanceTick:
 
 
 class BinanceSpotFeed:
-    """Tracks Binance spot prices and computes rolling velocity/momentum."""
+    """Tracks Binance spot prices and computes rolling velocity/momentum and dynamic EWMA volatility."""
 
     def __init__(self, symbol: str = "BTCUSDT", max_history_seconds: float = 60.0) -> None:
         self.symbol = symbol.upper()
@@ -251,6 +255,10 @@ class BinanceSpotFeed:
         self._history: deque[BinanceTick] = deque()
         self.latest_price: float = 0.0
         self.latest_timestamp: float = 0.0
+        self.ewma_vol_estimator = HighFrequencyEWMAVolEstimator(
+            half_life_seconds=max_history_seconds,
+            initial_volatility=0.55,
+        )
 
     def update_price(self, price: float, timestamp: Optional[float] = None) -> None:
         """Record a new price tick from WebSocket or REST."""
@@ -260,6 +268,7 @@ class BinanceSpotFeed:
         self.latest_price = float(price)
         self.latest_timestamp = float(ts)
         self._history.append(BinanceTick(timestamp=ts, price=self.latest_price))
+        self.ewma_vol_estimator.update_tick(self.latest_price, self.latest_timestamp)
 
         cutoff = ts - self.max_history_seconds
         while self._history and self._history[0].timestamp < cutoff:
@@ -285,14 +294,22 @@ class BinanceSpotFeed:
 
         return ((self.latest_price - ref_tick.price) / ref_tick.price) * 10_000.0
 
-    def get_realized_volatility(self, lookback_seconds: float = 60.0, min_ticks: int = 5) -> float:
+    def get_dynamic_ewma_volatility(self) -> float:
+        """Directly return high-frequency online EWMA volatility updating on each tick."""
+        return self.ewma_vol_estimator.get_current_volatility()
+
+    def get_realized_volatility(
+        self,
+        lookback_seconds: float = 60.0,
+        min_ticks: int = 5,
+        fallback: float = 0.55,
+    ) -> float:
         """Calculate rolling sample standard deviation of log returns ln(Pt / Pt-1).
 
         sigma_annual = s_dlnP * sqrt(31_557_600 / dt_avg)
         Bounded within [0.10, 2.50].
-        Fallback baseline 0.55 if fewer than min_ticks ticks or zero prices.
+        Fallback baseline if fewer than min_ticks ticks or zero prices.
         """
-        fallback = 0.55
         if len(self._history) < min_ticks or self.latest_price <= 0.0:
             return fallback
 
@@ -355,8 +372,9 @@ class BlackScholesBinaryEngine:
         strike_k: float,
         spot_s: float,
         time_to_expiry_seconds: float,
+        mu_annual: float = 0.0,
     ) -> Tuple[float, float, float]:
-        """Compute fair probability of Up (Call) and Down (Put).
+        """Compute fair probability of Up (Call) and Down (Put) incorporating drift mu.
 
         Returns:
             (p_fair_up, p_fair_down, d2)
@@ -378,9 +396,11 @@ class BlackScholesBinaryEngine:
             p_up = 1.0 if spot_s >= strike_k else 0.0
             return p_up, 1.0 - p_up, 0.0
 
-        # Under risk-neutral digital option pricing: d2 = (ln(S/K) - 0.5 * sigma^2 * tau) / (sigma * sqrt(tau))
+        # Under risk-neutral digital option pricing with short-term drift mu:
+        # d2 = (ln(S/K) + (mu - 0.5 * sigma^2) * tau) / (sigma * sqrt(tau))
         log_moneyness = math.log(spot_s / strike_k)
-        drift_adjustment = -0.5 * (self.sigma_per_sqrt_sec ** 2) * tau
+        mu_per_sec = mu_annual / 31_557_600.0
+        drift_adjustment = (mu_per_sec - 0.5 * (self.sigma_per_sqrt_sec ** 2)) * tau
         d2 = (log_moneyness + drift_adjustment) / vol_term
 
         p_up = max(0.001, min(0.999, self.norm_cdf(d2)))
@@ -478,8 +498,15 @@ class BinanceAnchoredQuoter:
         capital_available: float = 100.0,
         market_spread_cents: Optional[float] = None,
         binance_feed: Optional[BinanceSpotFeed] = None,
+        micro_price: Optional[float] = None,
+        mu_annual: float = 0.0,
+        dynamic_surge_threshold: bool = False,
     ) -> BinanceQuoteDecision:
-        """Compute optimal maker bids on Up and Down tokens."""
+        """Compute optimal maker bids on Up and Down tokens.
+
+        Supports volume-weighted micro-price, short-term drift mu, and dynamic
+        analytical elasticity-scaled toxic surge thresholds.
+        """
         if binance_feed is not None:
             self.bs_engine.update_volatility(binance_feed.get_realized_volatility())
 
@@ -490,7 +517,14 @@ class BinanceAnchoredQuoter:
             half_spread = self.half_spread
             max_pair_cost = self.max_pair_cost
 
-        p_up, p_down, d2 = self.bs_engine.price_digital_option(strike_k, spot_s, tau_seconds)
+        # Anchor to volume-weighted micro-price if provided, else arithmetic spot
+        effective_spot = micro_price if (micro_price is not None and micro_price > 0.0) else spot_s
+        p_up, p_down, d2 = self.bs_engine.price_digital_option(
+            strike_k=strike_k,
+            spot_s=effective_spot,
+            time_to_expiry_seconds=tau_seconds,
+            mu_annual=mu_annual,
+        )
 
         # 1. Base quotes centered around fair value
         bid_up = p_up - half_spread
@@ -532,20 +566,30 @@ class BinanceAnchoredQuoter:
         size_up = self.ticket_size
         size_down = self.ticket_size
 
-        if velocity_5s_bps >= self.surge_threshold_bps:
+        if dynamic_surge_threshold:
+            surge_hurdle_bps = CrossVenueLeadLagKalmanFilter.calculate_dynamic_surge_threshold_bps(
+                spot_s=effective_spot,
+                strike_k=strike_k,
+                tau_seconds=tau_seconds,
+                annualized_volatility=self.bs_engine.sigma,
+            )
+        else:
+            surge_hurdle_bps = self.surge_threshold_bps
+
+        if velocity_5s_bps >= surge_hurdle_bps:
             # Binance surging upward: Down bid is toxic (fast takers will dump Down)
             is_toxic = True
             suppressed_side = "DOWN"
             size_down = 0.0  # Pull Down bid
             bid_up = min(0.99, bid_up + self.tick_size)  # Up is more valuable
-            reason = f"TOXIC UP-SURGE: Binance +{velocity_5s_bps:.1f} bps in 5s. Suppressed Down bid."
-        elif velocity_5s_bps <= -self.surge_threshold_bps:
+            reason = f"TOXIC UP-SURGE: Binance +{velocity_5s_bps:.1f} bps in 5s (hurdle {surge_hurdle_bps:.1f} bps). Suppressed Down bid."
+        elif velocity_5s_bps <= -surge_hurdle_bps:
             # Binance dumping downward: Up bid is toxic (fast takers will dump Up)
             is_toxic = True
             suppressed_side = "UP"
             size_up = 0.0  # Pull Up bid
             bid_down = min(0.99, bid_down + self.tick_size)
-            reason = f"TOXIC DOWN-SURGE: Binance {velocity_5s_bps:.1f} bps in 5s. Suppressed Up bid."
+            reason = f"TOXIC DOWN-SURGE: Binance {velocity_5s_bps:.1f} bps in 5s (hurdle {surge_hurdle_bps:.1f} bps). Suppressed Up bid."
 
         # Capital constraint
         if capital_available < (size_up * bid_up + size_down * bid_down):

@@ -10,6 +10,7 @@ from polymarketbot.trading.as_inventory_engine import (
     ASInventoryConfig,
     ASQuoteDecision,
     AvellanedaStoikovEngine,
+    DynamicASCalibrator,
     InventoryRegime,
     QuotePair,
     QuoteSide,
@@ -314,3 +315,81 @@ def test_execution_speed_benchmark(engine: AvellanedaStoikovEngine):
     # Ensure each calculation takes < 1.0 ms
     assert avg_ms < 1.5, f"Average quote calculation time {avg_ms:.2f}ms exceeds 1.5ms"
     assert elapsed < 1.0, f"Total benchmark elapsed {elapsed:.2f}s exceeds 1.0s"
+
+
+# =============================================================================
+# 7. Dynamic Calibration (Gamma, Kappa, A, & Dynamic Margins)
+# =============================================================================
+
+def test_dynamic_as_calibrator_gamma():
+    calibrator = DynamicASCalibrator()
+
+    # Small capital ($100) -> higher risk aversion gamma (defensive inventory)
+    gamma_small = calibrator.calibrate_gamma(capital_usd=100.0, target_sharpe=2.0, volatility_annual=0.55)
+    # Large institutional capital ($10,000) -> lower risk aversion gamma (can absorb inventory)
+    gamma_large = calibrator.calibrate_gamma(capital_usd=10000.0, target_sharpe=2.0, volatility_annual=0.55)
+
+    assert gamma_small > gamma_large
+    assert 0.001 <= gamma_large <= 0.05
+    assert 0.10 <= gamma_small <= 1.0
+
+    # Higher target Sharpe or lower volatility increases gamma
+    gamma_high_sr = calibrator.calibrate_gamma(capital_usd=1000.0, target_sharpe=4.0, volatility_annual=0.55)
+    gamma_low_sr = calibrator.calibrate_gamma(capital_usd=1000.0, target_sharpe=1.0, volatility_annual=0.55)
+    assert gamma_high_sr > gamma_low_sr
+
+
+def test_dynamic_as_calibrator_kappa_from_depth():
+    calibrator = DynamicASCalibrator()
+
+    # Dense book: L1 (500) >> L2 (100) at 1c spread -> rapid depth decay -> high kappa
+    kappa_dense = calibrator.calibrate_kappa_from_depth(spread=0.01, l1_size=500.0, l2_size=100.0, tick_size=0.01)
+
+    # Thin wide book: L1 (50) ~= L2 (50) at 4c spread -> low decay -> lower kappa
+    kappa_thin = calibrator.calibrate_kappa_from_depth(spread=0.04, l1_size=50.0, l2_size=50.0, tick_size=0.01)
+
+    assert kappa_dense > kappa_thin
+    assert 5.0 <= kappa_thin <= 200.0
+    assert 5.0 <= kappa_dense <= 200.0
+
+
+def test_dynamic_as_calibrator_from_arrivals_regression():
+    calibrator = DynamicASCalibrator()
+
+    # Synthetic arrival data obeying lambda(delta) = 2.0 * exp(-60 * delta)
+    deltas = [0.01, 0.02, 0.03, 0.04]
+    total_time_s = 1000.0
+    # Expected counts: A * exp(-kappa * delta) * total_time
+    counts = [int(2.0 * math.exp(-60.0 * d) * total_time_s) for d in deltas]
+
+    est_a, est_kappa = calibrator.calibrate_from_order_arrivals(deltas, counts, total_time_s)
+    # Check that estimated A and kappa are close to ground truth (2.0 and 60.0)
+    assert pytest.approx(est_a, rel=0.25) == 2.0
+    assert pytest.approx(est_kappa, rel=0.25) == 60.0
+
+
+def test_as_engine_with_dynamic_parameters(engine: AvellanedaStoikovEngine):
+    calibrator = DynamicASCalibrator()
+    gamma_dyn = calibrator.calibrate_gamma(capital_usd=500.0, target_sharpe=2.5)
+    kappa_dyn = calibrator.calibrate_kappa_from_depth(spread=0.02, l1_size=200.0, l2_size=80.0)
+
+    # Dynamic target pair margin of 2.0c
+    dynamic_margin = 0.020
+
+    decision = engine.evaluate_market_quotes(
+        fair_price_yes=0.55,
+        inventory_yes=10.0,
+        inventory_no=0.0,
+        tau_seconds=200.0,
+        gamma=gamma_dyn,
+        kappa=kappa_dyn,
+        target_pair_margin=dynamic_margin,
+    )
+
+    # Guarantees pair bid cost <= 1.00 - dynamic_margin = 0.980
+    assert decision.pair_bid_cost <= 0.980
+    assert decision.pair_bid_margin_cents >= 2.0
+    assert decision.is_pair_arbitrage_guaranteed
+    assert decision.yes_quote.bid_price < decision.yes_quote.ask_price
+    assert decision.no_quote.bid_price < decision.no_quote.ask_price
+

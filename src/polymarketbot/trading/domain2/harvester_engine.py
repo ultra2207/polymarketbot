@@ -14,6 +14,7 @@ from typing import Optional, Dict, List, Any, Tuple
 from polymarketbot.logs import get_logger
 from polymarketbot.trading.client import LiveClobClient
 from polymarketbot.trading.ctf import PolygonCtfClient
+from polymarketbot.rewards.queue_valuation import PolygonPoSEnvironment
 from polymarketbot.trading.domain2.types import (
     Domain2MarketState,
     UmaProposalEvent,
@@ -21,10 +22,17 @@ from polymarketbot.trading.domain2.types import (
     ConditionResolutionEvent,
     DiscountOpportunity,
     Domain2Position,
+    LiveBookMetrics,
 )
 from polymarketbot.trading.domain2.event_listener import Domain2EventListener
 from polymarketbot.trading.domain2.circuit_breaker import Domain2CircuitBreaker
 from polymarketbot.trading.domain2.clob_order_placer import Domain2ClobOrderPlacer
+from polymarketbot.trading.domain2.maker_pricing_engine import (
+    SettlementMakerPricingEngine,
+    RollingTradeBuffer,
+    parse_l2_book,
+    calculate_upward_drift_rate,
+)
 from polymarketbot.trading.domain2.settlement_worker import Domain2SettlementWorker
 from polymarketbot.trading.domain2.ortools_allocator import (
     Domain2Candidate,
@@ -47,15 +55,19 @@ class Domain2SettlementHarvester:
         dry_run: bool = True,
         circuit_breaker: Optional[Domain2CircuitBreaker] = None,
         allocator: Optional[Domain2OrtoolsAllocator] = None,
+        pos_env: Optional[PolygonPoSEnvironment] = None,
+        order_placer: Optional[Domain2ClobOrderPlacer] = None,
+        pricing_engine: Optional[SettlementMakerPricingEngine] = None,
     ):
         self.clob_client = clob_client
         self.ctf_client = ctf_client
         self.dry_run = dry_run
         self.available_cash = initial_capital_usdc
         self.initial_capital = initial_capital_usdc
+        self.pos_env = pos_env or PolygonPoSEnvironment()
 
         # Mathematical Global Optima Allocator (Google OR-Tools)
-        self.allocator = allocator or Domain2OrtoolsAllocator()
+        self.allocator = allocator or Domain2OrtoolsAllocator(pos_env=self.pos_env)
 
         # Emergency Circuit Breaker (Broad bounds so math controls entry, halted on disputes)
         self.circuit_breaker = circuit_breaker or Domain2CircuitBreaker(
@@ -68,9 +80,12 @@ class Domain2SettlementHarvester:
             max_hours_to_expiry=72.0,
         )
 
-        self.order_placer = Domain2ClobOrderPlacer(
+        self.pricing_engine = pricing_engine or SettlementMakerPricingEngine()
+
+        self.order_placer = order_placer or Domain2ClobOrderPlacer(
             clob_client=self.clob_client,
             target_discount_bps=150.0,  # 1.50% discount ($0.985 limit bid)
+            pricing_engine=self.pricing_engine,
         )
 
         self.settlement_worker = Domain2SettlementWorker(
@@ -86,11 +101,75 @@ class Domain2SettlementHarvester:
 
         self._positions: Dict[str, Domain2Position] = {}
         self._market_states: Dict[str, Domain2MarketState] = {}
+        self.trade_buffer = RollingTradeBuffer(window_seconds=3600.0)
 
     def get_portfolio_equity(self) -> float:
         """Calculate total mark-to-market portfolio equity."""
         pos_val = sum(p.shares * p.entry_price for p in self._positions.values() if not p.is_redeemed)
         return self.available_cash + pos_val
+
+    def extract_live_market_depth_and_velocity(
+        self,
+        token_id: str,
+        condition_id: str,
+        hours_to_expiry: float,
+        proposed_price: float = 1.0,
+        candidate_price: Optional[float] = None,
+        volume_24h_usd: Optional[float] = None,
+    ) -> LiveBookMetrics:
+        """Extract live L2 order book depth, standing queue ahead, rolling velocity, and drift rate."""
+        book_data = None
+        if hasattr(self.clob_client, "get_order_book"):
+            try:
+                book_data = self.clob_client.get_order_book(token_id)
+            except Exception as e:
+                logger.debug("Could not fetch live order book for token {}: {}", token_id[:10], e)
+
+        tick = self.order_placer.tick_size
+        def_p = candidate_price if candidate_price is not None else 0.980
+
+        if book_data and isinstance(book_data, dict) and (book_data.get("bids") or book_data.get("asks")):
+            best_bid, best_ask, q_ahead, spread = parse_l2_book(
+                book_data=book_data,
+                tick_size=tick,
+                default_price=def_p,
+                proposed_price=proposed_price,
+            )
+            is_live = True
+        else:
+            best_ask = candidate_price if candidate_price is not None else 0.985
+            best_bid = round(max(0.01, best_ask - tick), 4)
+            spread = round(best_ask - best_bid, 4)
+            q_ahead = max(20.0, (volume_24h_usd or 1000.0) / (24.0 * max(0.01, best_bid)))
+            is_live = False
+
+        # Calculate dynamic taker sell velocity from rolling trade buffer
+        v_sell = self.trade_buffer.calculate_taker_sell_velocity(
+            token_id=token_id,
+            standing_depth_ahead=q_ahead,
+            hours_to_expiry=hours_to_expiry,
+            volume_24h_usd=volume_24h_usd,
+            candidate_price=candidate_price,
+        )
+
+        drift_rate = calculate_upward_drift_rate(
+            best_bid=best_bid,
+            hours_to_expiry=hours_to_expiry,
+            proposed_price=proposed_price,
+        )
+
+        discount_bps = max(0.0, (proposed_price - best_bid) * 10000.0)
+
+        return LiveBookMetrics(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            spread=spread,
+            standing_depth_ahead=q_ahead,
+            taker_sell_velocity_shares_hr=v_sell,
+            drift_rate_usd_hr=round(drift_rate, 6),
+            discount_bps=round(discount_bps, 2),
+            is_live_book=is_live,
+        )
 
     def handle_proposal(self, event: UmaProposalEvent) -> None:
         """Process incoming UMA ProposePrice event."""
@@ -100,20 +179,30 @@ class Domain2SettlementHarvester:
 
         # Evaluate discount opportunity
         hours_left = max(0.0, (event.expiration_timestamp - time.time()) / 3600.0) if event.expiration_timestamp > 0 else 2.0
-        
-        # In production, query book via LiveClobClient or book feed
-        # Here we construct an opportunity assuming standard winning outcome
+
+        # Dynamically extract real live market depth, queue ahead, velocity, and drift rate
+        metrics = self.extract_live_market_depth_and_velocity(
+            token_id=event.identifier,
+            condition_id=cid,
+            hours_to_expiry=hours_left,
+            proposed_price=event.proposed_price or 1.0,
+        )
+
         opp = DiscountOpportunity(
             condition_id=cid,
             winning_asset_id=event.identifier,
             losing_asset_id="",
             proposed_price=event.proposed_price or 1.0,
-            best_bid=0.980,
-            best_ask=0.988,
-            discount_bps=150.0,
+            best_bid=metrics.best_bid,
+            best_ask=metrics.best_ask,
+            discount_bps=metrics.discount_bps,
             hours_to_liveness_expiry=hours_left,
-            recommended_bid_price=0.985,
+            recommended_bid_price=metrics.best_bid,
             recommended_size_usdc=1000.0,
+            standing_depth_ahead=metrics.standing_depth_ahead,
+            taker_sell_velocity_shares_hr=metrics.taker_sell_velocity_shares_hr,
+            tick_size=self.order_placer.tick_size,
+            drift_rate_usd_hr=metrics.drift_rate_usd_hr,
         )
 
         # Check circuit breaker
@@ -203,6 +292,12 @@ class Domain2SettlementHarvester:
         self._positions[cid] = pos
         self._market_states[cid] = Domain2MarketState.LIVENESS_ACTIVE
         self.settlement_worker.register_position(pos)
+        self.trade_buffer.record_trade(
+            token_id=asset_id,
+            shares=shares,
+            price=price,
+            side="BUY",
+        )
         logger.info("Recorded fill for {}: {} shares @ ${:.4f} (${:.2f} USDC)", cid[:14], shares, price, cost)
         return pos
 
@@ -293,6 +388,7 @@ class Domain2SettlementHarvester:
 
             from polymarketbot.fees import schedule_from_market
             fee_sched = schedule_from_market(m)
+            dynamic_gas_usd = self.pos_env.gas_units_to_usd(82_000)
 
             cand = Domain2Candidate(
                 condition_id=cid,
@@ -306,8 +402,9 @@ class Domain2SettlementHarvester:
                 fee_exponent=fee_sched.exponent,
                 fee_schedule=fee_sched,
                 is_taker=False,  # Maker limit bids pay 0.0% fee
-                redemption_gas_usd=0.005,  # Polygon PoS CTF.redeemPositions gas
+                redemption_gas_usd=round(dynamic_gas_usd, 6),  # Dynamic Polygon PoS EIP-1559 gas
                 is_uma_proposed=(hours_left <= 2.0),
+                pos_env=self.pos_env,
             )
             candidates.append(cand)
 
@@ -341,17 +438,31 @@ class Domain2SettlementHarvester:
             if self.circuit_breaker.is_market_halted(cid):
                 continue
 
+            # Dynamically extract real live market depth, queue ahead, velocity, and drift rate
+            metrics = self.extract_live_market_depth_and_velocity(
+                token_id=alloc.token_id,
+                condition_id=cid,
+                hours_to_expiry=alloc.hours_to_resolution,
+                proposed_price=1.0,
+                candidate_price=alloc.price,
+                volume_24h_usd=getattr(alloc, "depth_usd", getattr(alloc, "allocated_usd", 1000.0)),
+            )
+
             opp = DiscountOpportunity(
                 condition_id=cid,
                 winning_asset_id=alloc.token_id,
                 losing_asset_id="",
                 proposed_price=1.0,
-                best_bid=alloc.price - 0.005,
-                best_ask=alloc.price,
-                discount_bps=(1.0 - alloc.price) * 10000.0,
+                best_bid=metrics.best_bid,
+                best_ask=metrics.best_ask,
+                discount_bps=metrics.discount_bps,
                 hours_to_liveness_expiry=alloc.hours_to_resolution,
-                recommended_bid_price=alloc.effective_avg_price or alloc.price,
+                recommended_bid_price=alloc.effective_avg_price or metrics.best_bid,
                 recommended_size_usdc=alloc.allocated_usd,
+                standing_depth_ahead=metrics.standing_depth_ahead,
+                taker_sell_velocity_shares_hr=metrics.taker_sell_velocity_shares_hr,
+                tick_size=self.order_placer.tick_size,
+                drift_rate_usd_hr=metrics.drift_rate_usd_hr,
             )
 
             order_res = self.order_placer.place_discount_bid(opp, alloc.allocated_usd)

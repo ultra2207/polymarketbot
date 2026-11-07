@@ -359,3 +359,72 @@ def test_binance_anchored_quoter_dynamic_feed_and_spread():
     assert dec_tight.combined_pair_cost <= 0.99
 
 
+def test_binance_spot_feed_dynamic_ewma_volatility():
+    feed = BinanceSpotFeed(symbol="ETHUSDT")
+    t0 = 1000.0
+
+    # Stream a series of high-frequency ticks
+    prices = [3000.0, 3005.0, 3002.0, 3010.0, 3008.0, 3015.0]
+    for i, p in enumerate(prices):
+        feed.update_price(p, timestamp=t0 + i * 1.5)
+
+    ewma_vol = feed.get_dynamic_ewma_volatility()
+    assert 0.10 <= ewma_vol <= 2.50
+
+
+def test_black_scholes_engine_drift_mu():
+    engine = BlackScholesBinaryEngine(annualized_volatility=0.55)
+    strike = 75000.0
+    spot = 75000.0
+    tau = 300.0
+
+    p_up_zero, _, _ = engine.price_digital_option(strike, spot, tau, mu_annual=0.0)
+    p_up_pos, _, _ = engine.price_digital_option(strike, spot, tau, mu_annual=3.0)
+    p_up_neg, _, _ = engine.price_digital_option(strike, spot, tau, mu_annual=-3.0)
+
+    # Positive drift shifts probability up; negative drift shifts down
+    assert p_up_pos > p_up_zero
+    assert p_up_neg < p_up_zero
+
+
+def test_binance_anchored_quoter_with_micro_price_and_drift():
+    quoter = BinanceAnchoredQuoter()
+    strike = 75000.0
+    mid_spot = 75000.0
+    # Heavy bid queue yields micro-price of 75020.0
+    micro_p = 75020.0
+    tau = 300.0
+
+    dec_mid = quoter.evaluate_quotes(strike_k=strike, spot_s=mid_spot, tau_seconds=tau)
+    dec_micro = quoter.evaluate_quotes(
+        strike_k=strike,
+        spot_s=mid_spot,
+        tau_seconds=tau,
+        micro_price=micro_p,
+        mu_annual=1.5,
+    )
+
+    # Micro-price above strike with positive drift gives higher fair Up probability
+    assert dec_micro.p_fair_up > dec_mid.p_fair_up
+    assert dec_micro.combined_pair_cost <= quoter.max_pair_cost
+
+
+def test_binance_anchored_quoter_dynamic_surge_threshold():
+    quoter = BinanceAnchoredQuoter(surge_threshold_bps=1.0)
+    strike = 75000.0
+    spot = 75000.0
+
+    # Near expiry (tau = 20s), analytical elasticity explodes, making a 0.5 bps Binance move toxic!
+    dec_dyn = quoter.evaluate_quotes(
+        strike_k=strike,
+        spot_s=spot,
+        tau_seconds=20.0,
+        velocity_5s_bps=0.5,
+        dynamic_surge_threshold=True,
+    )
+    # With static threshold (1.0), 0.5 bps would not trigger, but with dynamic it triggers!
+    assert dec_dyn.is_toxic_surge
+    assert dec_dyn.surge_side_suppressed == "DOWN"
+
+
+

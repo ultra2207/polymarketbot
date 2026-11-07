@@ -67,6 +67,45 @@ class ConditionResolutionEvent:
     tx_hash: str
 
 
+class MakerExecutionRegime(str, Enum):
+    """Maker quote execution regime for settlement discount harvesting."""
+    MAKER_IMPROVE_INSIDE_SPREAD = "MAKER_IMPROVE_INSIDE_SPREAD"  # Option A: Penny inside spread (Q_ahead = 0, first in line)
+    MAKER_JOIN_TOP_QUEUE = "MAKER_JOIN_TOP_QUEUE"                # Option B: Join top queue at best_bid (wider profit, queue delay)
+    TAKER_SWEEP_IMMEDIATE = "TAKER_SWEEP_IMMEDIATE"              # Taker Fallback: Immediate sweep when expiry acute & edge > fee
+
+
+@dataclass
+class LiveBookMetrics:
+    """Real-time market depth, queue ahead, trade velocity, and drift metrics."""
+    best_bid: float
+    best_ask: float
+    spread: float
+    standing_depth_ahead: float
+    taker_sell_velocity_shares_hr: float
+    drift_rate_usd_hr: float
+    discount_bps: float
+    is_live_book: bool = True
+
+
+@dataclass
+class MakerPricingDecision:
+    """Detailed decision output from SettlementMakerPricingEngine."""
+    regime: MakerExecutionRegime
+    quote_price: float
+    quote_size: float
+    side: str = "BUY"
+    p_fill: float = 0.0
+    t_clear_hours: float = 0.0
+    expected_arr: float = 0.0
+    spread: float = 0.0
+    standing_depth_ahead: float = 0.0
+    taker_sell_velocity_shares_hr: float = 0.0
+    is_taker: bool = False
+    fee_rate_bps: float = 0.0
+    reason: str = ""
+    drift_rate_usd_hr: float = 0.0
+
+
 @dataclass
 class DiscountOpportunity:
     """Evaluated discount opportunity on a proposed condition."""
@@ -80,6 +119,10 @@ class DiscountOpportunity:
     hours_to_liveness_expiry: float
     recommended_bid_price: float
     recommended_size_usdc: float
+    standing_depth_ahead: float = 0.0
+    taker_sell_velocity_shares_hr: float = 0.0
+    tick_size: float = 0.001
+    drift_rate_usd_hr: float = 0.0
 
 
 @dataclass
@@ -97,3 +140,48 @@ class Domain2Position:
     is_redeemed: bool = False
     redeem_tx_hash: Optional[str] = None
     realized_pnl: Optional[float] = None
+
+
+@dataclass
+class BinaryMarketVolatilityMetrics:
+    """Institutional empirical volatility and entropy metrics for binary contracts."""
+    realized_qv: Optional[float] = None
+    implied_vol: Optional[float] = None
+    entropy: float = 0.0
+    effective_annual_vol: float = 0.0
+    method: str = "entropy"
+
+
+@dataclass
+class DynamicCashReserveMetrics:
+    """Institutional cash inventory and queuing metrics (Miller-Orr / Baumol-Tobin)."""
+    target_reserve_pct: float
+    target_reserve_usd: float
+    miller_orr_z_usd: float
+    var_buffer_usd: float
+    arrival_intensity: float
+    lockup_hours: float
+    stockout_prob_pct: float
+    min_reserve_pct: float
+    max_reserve_pct: float
+
+
+@dataclass
+class OrderBookElasticityMetrics:
+    """Continuous price impact elasticity and order book profile metrics."""
+    elasticity: float
+    concave_alpha: float
+    dynamic_depth_gamma: float
+    continuous_kyle_lambda: float
+    optimal_capacity_usd: float
+
+
+@dataclass
+class DynamicSettlementDelayMetrics:
+    """Dynamic UMA liveness, relayer queue latency, and on-chain gas metrics."""
+    liveness_remaining_hours: float
+    relayer_queue_delay_hours: float
+    dispute_contingency_hours: float
+    effective_turnover_latency_hours: float
+    redemption_gas_usd: float
+

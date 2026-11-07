@@ -110,6 +110,24 @@ class ComplementQuoterConfig:
     gas_fee_per_merge: float = 0.0016     # Polygon PoS gas fee per CTF merge in USD (empirical default)
     merge_cooldown_seconds: float = 0.0   # Cooldown between consecutive merges (0 for testing/immediate)
 
+    # Institutional Avellaneda-Stoikov / Guéant Pair MM Parameters
+    use_avellaneda_stoikov: bool = False  # Toggle for full dynamic AS / Guéant model
+    risk_aversion_gamma: float = 0.1      # Absolute risk aversion gamma (CARA)
+    pair_volatility: float = 0.05         # Volatility sigma_pair (annualized / normalized)
+    holding_horizon_tau: float = 1.0      # Inventory horizon tau
+    arrival_intensity_kappa: float = 15.0 # Order arrival intensity parameter kappa (lambda(delta) = A e^(-kappa delta))
+    capital_carrying_cost_rate: float = 0.05 # Annual carrying cost / interest rate (5%)
+    var_confidence_z: float = 1.96        # 95% confidence z-score for VaR penalty
+    unhedge_time_horizon_seconds: float = 60.0 # Expected unhedged leg duration (seconds)
+
+    # Dynamic Economic Order Quantity (EOQ) Batch Merging Parameters
+    use_eoq_batching: bool = False        # Toggle for dynamic Economic Order Quantity (EOQ) batching
+    complete_set_arrival_rate: float = 500.0 # Expected complete sets filled per unit period (for EOQ)
+    merge_gas_units: int = 78_000         # Typical gas units for CTF.mergePositions
+    gas_price_gwei: Optional[float] = None # Dynamic gas price in Gwei
+    pol_usd_price: Optional[float] = None  # Dynamic POL exchange rate in USD
+    max_gas_friction_cents_per_pair: float = 0.05 # Hard hurdle: max 0.05c/share gas friction
+
     @property
     def gas_friction_cents_per_pair(self) -> float:
         """On-chain CTF.mergePositions gas friction in cents per complete-set pair."""
@@ -149,6 +167,12 @@ class ComplementQuoteDecision:
     expected_carry_pct: float             # expected_pair_carry / expected_combined_cost * 100
     auto_merge_eligible: bool
     reason: str = ""
+    # Institutional Quant & Avellaneda-Stoikov Metadata
+    reservation_price_yes: Optional[float] = None
+    reservation_price_no: Optional[float] = None
+    var_penalty_usd: float = 0.0
+    optimal_pair_spread: float = 0.0
+    dynamic_eoq_threshold: Optional[float] = None
 
 
 @dataclass
@@ -250,8 +274,64 @@ class ComplementQuoter:
             return 0.0
         return self.cost_basis_no / self.shares_no
 
+    # -------------------------------------------------------------------------
+    # Inventory Properties & Dynamic EOQ Merging
+    # -------------------------------------------------------------------------
+
+    def compute_dynamic_gas_cost_usd(self) -> float:
+        """Compute current Polygon PoS gas cost for CTF.mergePositions in USD."""
+        if self.config.gas_price_gwei is not None and self.config.pol_usd_price is not None:
+            gwei = float(self.config.gas_price_gwei)
+            pol_px = float(self.config.pol_usd_price)
+            gas_pol = self.config.merge_gas_units * (gwei * 1e-9)
+            return round(gas_pol * pol_px, 6)
+        return self.config.gas_fee_per_merge
+
+    def compute_optimal_eoq_batch_size(
+        self,
+        arrival_rate: Optional[float] = None,
+        carrying_cost_rate: Optional[float] = None,
+    ) -> float:
+        """Calculate optimal Economic Order Quantity (EOQ) batch size for CTF complete-set merging.
+
+        Mathematical Formulation:
+            Q* = sqrt((2 * S * D) / H)
+
+        Where:
+            S = Dynamic Polygon PoS gas fee per merge transaction in USD
+            D = Complete-set flow arrival rate (shares/year)
+            H = Carrying cost of holding unmerged complete sets (USD/share/year)
+                H = carrying_cost_rate * cost_basis_per_share
+
+        Balancing:
+            - Gas friction (cost drops with larger Q)
+            - Capital lockup and settlement interest (cost increases with larger Q)
+
+        Enforces hard minimum hurdle: Q >= S / (max_gas_friction_cents / 100).
+        """
+        s_gas_cost = self.compute_dynamic_gas_cost_usd()
+        d_arrival = arrival_rate if arrival_rate is not None else self.config.complete_set_arrival_rate
+        c_rate = carrying_cost_rate if carrying_cost_rate is not None else self.config.capital_carrying_cost_rate
+
+        # Basis: purchase cost of 1 complete set (typically ~$0.97 - $0.99)
+        basis = self.avg_cost_yes + self.avg_cost_no
+        if basis <= 0.0:
+            basis = 0.98
+
+        h_carrying = max(1e-6, c_rate * basis)
+        raw_eoq = math.sqrt((2.0 * s_gas_cost * max(1.0, d_arrival)) / h_carrying)
+
+        # Enforce maximum gas friction hurdle (e.g. < 0.05c/share)
+        hurdle_usd = self.config.max_gas_friction_cents_per_pair / 100.0
+        min_hurdle_shares = (s_gas_cost / hurdle_usd) if hurdle_usd > 0 else 1.0
+
+        optimal_q = max(min_hurdle_shares, raw_eoq)
+        return round(optimal_q, 2)
+
     @property
     def auto_merge_threshold(self) -> float:
+        if self.config.use_eoq_batching:
+            return self.compute_optimal_eoq_batch_size()
         return self.config.auto_merge_threshold
 
     # -------------------------------------------------------------------------
@@ -295,6 +375,18 @@ class ComplementQuoter:
         mid_sum = round(mid_yes + mid_no, 4)
         q = self.net_imbalance
         C = self.paired_units
+
+        # Institutional Avellaneda-Stoikov / Guéant pair market making model
+        if self.config.use_avellaneda_stoikov:
+            return self.compute_as_quotes(
+                mid_yes=mid_yes,
+                mid_no=mid_no,
+                best_bid_yes=best_bid_yes,
+                best_bid_no=best_bid_no,
+                best_ask_yes=best_ask_yes,
+                best_ask_no=best_ask_no,
+            )
+
         can_quote = mid_sum <= self.config.max_mid_sum
 
         if not can_quote:
@@ -466,8 +558,233 @@ class ComplementQuoter:
             expected_combined_cost=expected_cost,
             expected_pair_carry=expected_carry,
             expected_carry_pct=expected_carry_pct,
-            auto_merge_eligible=(C >= self.config.auto_merge_threshold),
+            auto_merge_eligible=(C >= self.auto_merge_threshold),
             reason=f"Quoting complement pair: carry=+${expected_carry:.4f}/share (+{expected_carry_pct:.1f}%)",
+        )
+
+    def compute_as_quotes(
+        self,
+        mid_yes: float,
+        mid_no: float,
+        best_bid_yes: Optional[float] = None,
+        best_bid_no: Optional[float] = None,
+        best_ask_yes: Optional[float] = None,
+        best_ask_no: Optional[float] = None,
+    ) -> ComplementQuoteDecision:
+        """Institutional Multi-Asset Avellaneda-Stoikov & Guéant Pair Market Making Model.
+
+        Formulation:
+        1. Reservation Price (Indifference Price):
+           Under net directional inventory imbalance q = pos_YES - pos_NO:
+               delta_r(q) = q * gamma * sigma_pair^2 * tau
+               r_yes = mid_yes - 0.5 * delta_r(q)
+               r_no  = mid_no  + 0.5 * delta_r(q)
+        2. Guéant-Tapia Optimal Spread:
+           delta_base = max(tick_size, (1 / gamma) * ln(1 + gamma / kappa) + 0.5 * c_carry * tau + gas_friction_per_share)
+        3. Execution Leg-Risk & Asymmetric Fill Unhedging:
+           Instantaneous Value-at-Risk:
+               VaR(q) = z_alpha * |q| * sigma_pair * sqrt(delta_t / 31536000)
+               pi_adverse = VaR(q) / max(1.0, |q| + 1.0)
+           - Excess leg (e.g. YES when q > 0):
+             delta_yes = delta_base + pi_adverse (fades quote away from mid)
+             size fades down towards min_quote_size (or 0 if |q| >= max_imbalance)
+           - Pair-completer leg (e.g. NO when q > 0):
+             urgency_skew = min(1.0, |q| / q_scale) * max(0.0, best_ask_no - mid_no)
+             delta_no = max(0.001, delta_base - urgency_skew) (aggresses closer to mid/ask)
+             size scales up to max_skew_multiplier * base_size
+        4. Pair Margin Carry Bound:
+           Bid(YES) + Bid(NO) <= 1.000 - target_pair_margin.
+        """
+        mid_sum = round(mid_yes + mid_no, 4)
+        q = self.net_imbalance
+        C = self.paired_units
+        can_quote = mid_sum <= self.config.max_mid_sum
+
+        if not can_quote:
+            reason = (
+                f"Mid sum {mid_sum:.4f} > max allowed {self.config.max_mid_sum:.4f}; "
+                "paired bids withheld to avoid negative/insufficient carry"
+            )
+            dummy_yes = LegQuote(outcome="YES", bid_price=0.0, bid_size=0.0, is_quoted=False, reason=reason)
+            dummy_no = LegQuote(outcome="NO", bid_price=0.0, bid_size=0.0, is_quoted=False, reason=reason)
+            return ComplementQuoteDecision(
+                condition_id=self.condition_id,
+                mid_yes=mid_yes,
+                mid_no=mid_no,
+                mid_sum=mid_sum,
+                can_quote_double_bids=False,
+                yes_quote=dummy_yes,
+                no_quote=dummy_no,
+                paired_inventory_c=C,
+                net_imbalance_q=q,
+                expected_combined_cost=0.0,
+                expected_pair_carry=0.0,
+                expected_carry_pct=0.0,
+                auto_merge_eligible=(C >= self.auto_merge_threshold),
+                reason=reason,
+            )
+
+        # 1. Avellaneda-Stoikov Reservation Price
+        gamma = max(1e-4, self.config.risk_aversion_gamma)
+        sigma = max(1e-4, self.config.pair_volatility)
+        tau = max(1e-4, self.config.holding_horizon_tau)
+        kappa = max(1e-4, self.config.arrival_intensity_kappa)
+        c_carry = max(0.0, self.config.capital_carrying_cost_rate)
+        z_var = max(0.0, self.config.var_confidence_z)
+        dt_sec = max(1.0, self.config.unhedge_time_horizon_seconds)
+
+        delta_r = q * gamma * (sigma ** 2) * tau
+        r_yes = mid_yes - 0.5 * delta_r
+        r_no = mid_no + 0.5 * delta_r
+
+        # 2. Guéant-Tapia Optimal Base Half-Spread
+        gueant_spread = (1.0 / gamma) * math.log(1.0 + (gamma / kappa)) + 0.5 * c_carry * tau
+        eoq_threshold = self.compute_optimal_eoq_batch_size()
+        gas_cost_usd = self.compute_dynamic_gas_cost_usd()
+        gas_friction_per_share = gas_cost_usd / max(1.0, eoq_threshold)
+        delta_base = max(self.config.tick_size, gueant_spread + gas_friction_per_share)
+
+        # 3. Execution Leg Risk & Instantaneous VaR Penalty
+        t_year = dt_sec / 31_536_000.0
+        var_usd = z_var * abs(q) * sigma * math.sqrt(t_year)
+        pi_adverse = var_usd / max(1.0, abs(q) + 1.0)
+
+        # Sizing parameters
+        base_size = self.config.base_quote_size
+        max_size = self.config.max_quote_size
+        min_size = self.config.min_quote_size
+        q_scale = max(1.0, self.config.skew_scale_shares)
+        skew_intensity = min(1.0, abs(q) / q_scale)
+
+        boost_mult = 1.0 + (self.config.max_skew_multiplier - 1.0) * skew_intensity
+        fade_mult = max(self.config.min_fade_multiplier, 1.0 - skew_intensity)
+
+        is_yes_quoted = True
+        is_no_quoted = True
+        is_yes_boosted = False
+        is_no_boosted = False
+        is_yes_faded = False
+        is_no_faded = False
+
+        if q > 0.0:
+            # Excess YES -> NO is pair completer
+            is_no_boosted = True
+            is_yes_faded = True
+
+            spread_to_ask_no = max(0.0, (best_ask_no - mid_no)) if (best_ask_no is not None and best_ask_no > mid_no) else delta_base
+            urgency_skew_no = skew_intensity * spread_to_ask_no
+            delta_no = max(0.001, delta_base - urgency_skew_no)
+            delta_yes = delta_base + pi_adverse
+
+            if q >= self.config.max_directional_imbalance:
+                size_yes = 0.0
+                is_yes_quoted = False
+                yes_reason = f"AS-Guéant: Imbalance q={q:.1f} >= cap; YES bid paused (VaR=${var_usd:.4f})"
+                size_no = max_size
+                no_reason = f"AS-Guéant: Maximum aggression pair-completer NO bid (q={q:+.1f})"
+            else:
+                size_no = min(max_size, round(base_size * boost_mult, 2))
+                size_yes = max(min_size, round(base_size * fade_mult, 2))
+                yes_reason = f"AS-Guéant: Faded YES (q={q:+.1f}, VaR=${var_usd:.4f})"
+                no_reason = f"AS-Guéant: Boosted NO pair-completer (q={q:+.1f})"
+
+        elif q < 0.0:
+            # Excess NO -> YES is pair completer
+            is_yes_boosted = True
+            is_no_faded = True
+
+            spread_to_ask_yes = max(0.0, (best_ask_yes - mid_yes)) if (best_ask_yes is not None and best_ask_yes > mid_yes) else delta_base
+            urgency_skew_yes = skew_intensity * spread_to_ask_yes
+            delta_yes = max(0.001, delta_base - urgency_skew_yes)
+            delta_no = delta_base + pi_adverse
+
+            if abs(q) >= self.config.max_directional_imbalance:
+                size_no = 0.0
+                is_no_quoted = False
+                no_reason = f"AS-Guéant: Imbalance q={q:.1f} >= cap; NO bid paused (VaR=${var_usd:.4f})"
+                size_yes = max_size
+                yes_reason = f"AS-Guéant: Maximum aggression pair-completer YES bid (q={q:+.1f})"
+            else:
+                size_yes = min(max_size, round(base_size * boost_mult, 2))
+                size_no = max(min_size, round(base_size * fade_mult, 2))
+                no_reason = f"AS-Guéant: Faded NO (q={q:+.1f}, VaR=${var_usd:.4f})"
+                yes_reason = f"AS-Guéant: Boosted YES pair-completer (q={q:+.1f})"
+
+        else:
+            delta_yes = delta_base
+            delta_no = delta_base
+            size_yes = base_size
+            size_no = base_size
+            yes_reason = "AS-Guéant: Balanced inventory; quoting base spread & size"
+            no_reason = "AS-Guéant: Balanced inventory; quoting base spread & size"
+
+        # 4. Price Calculation from Reservation Prices & Rounding
+        raw_bid_yes = r_yes - delta_yes
+        raw_bid_no = r_no - delta_no
+
+        bid_yes = round_tick(raw_bid_yes, self.config.tick_size)
+        bid_no = round_tick(raw_bid_no, self.config.tick_size)
+
+        bid_yes = max(self.config.min_price, min(self.config.max_price, bid_yes))
+        bid_no = max(self.config.min_price, min(self.config.max_price, bid_no))
+
+        # 5. Margin & Carry Bound Enforcement
+        max_pair_cost = round(1.000 - self.config.target_pair_margin, 4)
+        if round(bid_yes + bid_no, 4) > max_pair_cost:
+            excess = round((bid_yes + bid_no) - max_pair_cost, 4)
+            half_excess = excess / 2.0
+            bid_yes = round_tick(bid_yes - half_excess, self.config.tick_size, mode="floor")
+            bid_no = round_tick(bid_no - half_excess, self.config.tick_size, mode="floor")
+            while round(bid_yes + bid_no, 4) > max_pair_cost:
+                if bid_yes >= bid_no:
+                    bid_yes = round(bid_yes - self.config.tick_size, 4)
+                else:
+                    bid_no = round(bid_no - self.config.tick_size, 4)
+
+        expected_cost = round(bid_yes + bid_no, 4)
+        expected_carry = round(1.000 - expected_cost, 4)
+        expected_carry_pct = round((expected_carry / max(1e-6, expected_cost)) * 100.0, 2)
+        total_pair_spread = round(delta_yes + delta_no, 4)
+
+        yes_quote = LegQuote(
+            outcome="YES",
+            bid_price=bid_yes,
+            bid_size=size_yes,
+            is_quoted=is_yes_quoted,
+            is_skew_boosted=is_yes_boosted,
+            is_skew_faded=is_yes_faded,
+            reason=yes_reason,
+        )
+        no_quote = LegQuote(
+            outcome="NO",
+            bid_price=bid_no,
+            bid_size=size_no,
+            is_quoted=is_no_quoted,
+            is_skew_boosted=is_no_boosted,
+            is_skew_faded=is_no_faded,
+            reason=no_reason,
+        )
+
+        return ComplementQuoteDecision(
+            condition_id=self.condition_id,
+            mid_yes=mid_yes,
+            mid_no=mid_no,
+            mid_sum=mid_sum,
+            can_quote_double_bids=True,
+            yes_quote=yes_quote,
+            no_quote=no_quote,
+            paired_inventory_c=C,
+            net_imbalance_q=q,
+            expected_combined_cost=expected_cost,
+            expected_pair_carry=expected_carry,
+            expected_carry_pct=expected_carry_pct,
+            auto_merge_eligible=(C >= self.auto_merge_threshold),
+            reason=f"AS-Guéant pair quotes: carry=+${expected_carry:.4f}/share (+{expected_carry_pct:.1f}%) | r=({r_yes:.3f}, {r_no:.3f})",
+            reservation_price_yes=round(r_yes, 4),
+            reservation_price_no=round(r_no, 4),
+            var_penalty_usd=round(var_usd, 4),
+            optimal_pair_spread=total_pair_spread,
+            dynamic_eoq_threshold=eoq_threshold,
         )
 
     # -------------------------------------------------------------------------
@@ -645,8 +962,8 @@ class ComplementQuoter:
             total_merged_shares=self.total_merged_shares,
             total_unlocked_usd=self.total_unlocked_usdc,
             total_gas_fees=self.total_gas_fees,
-            gas_fee_per_merge=self.config.gas_fee_per_merge,
-            auto_merge_threshold=self.config.auto_merge_threshold,
+            gas_fee_per_merge=self.compute_dynamic_gas_cost_usd(),
+            auto_merge_threshold=self.auto_merge_threshold,
         )
 
     def build_merge_transaction(self, amount_shares: Optional[float] = None) -> dict[str, Any]:

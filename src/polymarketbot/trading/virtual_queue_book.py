@@ -26,6 +26,7 @@ from __future__ import annotations
 import bisect
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -73,6 +74,7 @@ class CancellationModel(str, Enum):
     PROPORTIONAL = "PROPORTIONAL"
     CONSERVATIVE = "CONSERVATIVE"
     OPTIMISTIC = "OPTIMISTIC"
+    DYNAMIC_HAZARD = "DYNAMIC_HAZARD"
 
 
 class CancellationUrgency(str, Enum):
@@ -584,8 +586,132 @@ class FastL2Book:
 
 
 # ============================================================================
-# 3. VIRTUAL QUEUE POSITION TRACKING (QueuePositionTracker)
+# 3. VIRTUAL QUEUE POSITION TRACKING & DEPLETION
 # ============================================================================
+
+@dataclass(slots=True, frozen=True)
+class TradeEvent:
+    """Historical trade execution event."""
+    timestamp: float
+    price: float
+    size: float
+
+
+class DynamicQueueDepletionTracker:
+    """Tracks high-frequency trade arrival velocity, cancellation intensity, and dynamic queue depletion.
+
+    Replaces static/fixed cancellation thresholds and flat queue clearance assumptions
+    with institutional order book trade velocity modeling.
+    """
+
+    def __init__(self, history_seconds: float = 30.0) -> None:
+        self.history_seconds = history_seconds
+        self._trades: deque[TradeEvent] = deque()
+        self._cancellations: deque[Tuple[float, float, float]] = deque()  # (ts, price, size)
+        self._total_trade_volume: float = 0.0
+
+    def record_trade(self, price: float, size: float, timestamp: Optional[float] = None) -> None:
+        """Record an executed trade event."""
+        ts = timestamp if timestamp is not None else time.time()
+        self._trades.append(TradeEvent(ts, float(price), float(size)))
+        self._total_trade_volume += float(size)
+        self._prune(ts)
+
+    def record_cancellation(self, price: float, size: float, timestamp: Optional[float] = None) -> None:
+        """Record a limit order cancellation event."""
+        ts = timestamp if timestamp is not None else time.time()
+        self._cancellations.append((ts, float(price), float(size)))
+        self._prune(ts)
+
+    def _prune(self, current_ts: float) -> None:
+        cutoff = current_ts - self.history_seconds
+        while self._trades and self._trades[0].timestamp < cutoff:
+            ev = self._trades.popleft()
+            self._total_trade_volume = max(0.0, self._total_trade_volume - ev.size)
+        while self._cancellations and self._cancellations[0][0] < cutoff:
+            self._cancellations.popleft()
+
+    def get_trade_velocity(self, lookback_seconds: float = 10.0) -> float:
+        """Returns trade volume consumption velocity in shares/second."""
+        if not self._trades:
+            return 0.0
+        latest_ts = self._trades[-1].timestamp
+        cutoff = latest_ts - lookback_seconds
+        recent = [t for t in self._trades if t.timestamp >= cutoff]
+        if not recent:
+            return 0.0
+        dt = max(0.1, latest_ts - recent[0].timestamp) if len(recent) > 1 else max(1.0, lookback_seconds)
+        vol = sum(t.size for t in recent)
+        return vol / dt
+
+    def get_cancellation_velocity(self, lookback_seconds: float = 10.0) -> float:
+        """Returns cancellation velocity in shares/second."""
+        if not self._cancellations:
+            return 0.0
+        latest_ts = self._cancellations[-1][0]
+        cutoff = latest_ts - lookback_seconds
+        recent = [c for c in self._cancellations if c[0] >= cutoff]
+        if not recent:
+            return 0.0
+        dt = max(0.1, latest_ts - recent[0][0]) if len(recent) > 1 else max(1.0, lookback_seconds)
+        vol = sum(c[2] for c in recent)
+        return vol / dt
+
+    def calculate_depletion_time(
+        self,
+        queue_ahead: float,
+        standing_depth: Optional[float] = None,
+        lookback_seconds: float = 10.0,
+    ) -> float:
+        """Calculates expected time to queue depletion (time to fill) in seconds.
+
+        t_deplete = Q_ahead / (v_trade + lambda_cancel * Q_ahead)
+        """
+        if queue_ahead <= 1e-9:
+            return 0.0
+        v_trade = self.get_trade_velocity(lookback_seconds)
+        v_cancel = self.get_cancellation_velocity(lookback_seconds)
+
+        depth = standing_depth if standing_depth and standing_depth > 0.0 else (queue_ahead * 2.0)
+        cancel_fraction = min(1.0, queue_ahead / max(1.0, depth))
+        effective_depletion_rate = v_trade + v_cancel * cancel_fraction
+
+        if effective_depletion_rate <= 1e-4:
+            return 999.0
+        return queue_ahead / effective_depletion_rate
+
+    def calculate_dynamic_front_threshold(
+        self,
+        reaction_time_s: float = 0.150,  # 150ms cancellation round-trip latency
+        safety_multiplier: float = 1.5,
+        min_threshold: float = 25.0,
+        max_threshold: float = 2000.0,
+    ) -> float:
+        """Calculates dynamic front-of-queue threshold based on current trade velocity.
+
+        Threshold = max(min_floor, v_trade * reaction_time * safety_multiplier)
+        """
+        v_trade = self.get_trade_velocity(lookback_seconds=5.0)
+        dynamic_thresh = v_trade * reaction_time_s * safety_multiplier
+        return max(min_threshold, min(max_threshold, dynamic_thresh))
+
+    def calculate_dynamic_sweep_size(
+        self,
+        default_sweep: float = 1000.0,
+        lookback_seconds: float = 10.0,
+    ) -> float:
+        """Estimates institutional taker sweep size dynamically from recent trade sizes."""
+        if not self._trades:
+            return default_sweep
+        cutoff = self._trades[-1].timestamp - lookback_seconds
+        recent = [t.size for t in self._trades if t.timestamp >= cutoff]
+        if not recent:
+            return default_sweep
+        avg_size = sum(recent) / len(recent)
+        max_size = max(recent)
+        estimated = max(avg_size * 3.0, max_size * 1.2)
+        return max(100.0, min(10000.0, estimated))
+
 
 class QueuePositionTracker:
     """Tracks virtual queue priority for resting limit orders under FIFO matching.
@@ -605,7 +731,7 @@ class QueuePositionTracker:
        If V_trade > Q_ahead, the remainder executes into q_bot (partial/full fill).
     3. Level Size Changes:
        - Delta S > 0 (New liquidity): Enters at the tail of the queue -> Q_behind += Delta S.
-       - Delta S < 0 (Cancellations): Attributed via Proportional, Conservative, or Optimistic models.
+       - Delta S < 0 (Cancellations): Attributed via Proportional, Conservative, Optimistic, or Dynamic Hazard models.
     """
 
     def __init__(self, book: Optional[FastL2Book] = None) -> None:
@@ -613,6 +739,7 @@ class QueuePositionTracker:
         self._orders: Dict[str, TrackedOrder] = {}
         # Index: (side, price) -> list of order_ids sorted by arrival time
         self._price_queue: Dict[Tuple[OrderSide, float], List[str]] = {}
+        self.depletion_tracker = DynamicQueueDepletionTracker()
 
         if self.book is not None:
             self.book.add_listener(self._on_book_level_change)
@@ -750,13 +877,17 @@ class QueuePositionTracker:
         now = time.time() if timestamp is None else float(timestamp)
 
         order_ids = list(self._price_queue.get(key, []))
+        trade_vol = float(size)
+        if trade_vol <= 1e-9:
+            return []
+
+        # Record trade in dynamic depletion tracker
+        self.depletion_tracker.record_trade(price=p_norm, size=trade_vol, timestamp=now)
+
         if not order_ids:
             return []
 
         fills: List[Tuple[TrackedOrder, float]] = []
-        trade_vol = float(size)
-        if trade_vol <= 1e-9:
-            return []
 
         for oid in order_ids:
             order = self._orders.get(oid)
@@ -830,6 +961,7 @@ class QueuePositionTracker:
             else:
                 # Queue Reduction (Cancellations)
                 reduction = abs(delta)
+                self.depletion_tracker.record_cancellation(price=p_norm, size=reduction, timestamp=now)
                 self._apply_cancellation_reduction(order, reduction)
 
     def _apply_cancellation_reduction(self, order: TrackedOrder, reduction: float) -> None:
@@ -845,6 +977,26 @@ class QueuePositionTracker:
             ahead_ratio = order.queue_ahead / total_other_depth
             reduce_ahead = min(order.queue_ahead, reduction * ahead_ratio)
             reduce_behind = min(order.queue_behind, reduction - reduce_ahead)
+
+            order.queue_ahead = round(max(0.0, order.queue_ahead - reduce_ahead), 4)
+            order.queue_behind = round(max(0.0, order.queue_behind - reduce_behind), 4)
+
+        elif order.cancellation_model == CancellationModel.DYNAMIC_HAZARD:
+            # Dynamic Hazard-Rate Model:
+            # Cancellations arrive at hazard rates increasing with queue rank and depth behind
+            total_other_depth = order.queue_ahead + order.queue_behind
+            if total_other_depth <= 1e-9:
+                order.queue_ahead = 0.0
+                order.queue_behind = 0.0
+                return
+
+            rank = order.queue_rank
+            # Orders further behind cancel at a higher hazard rate
+            weight_behind = min(0.90, max(0.10, 0.50 + 0.40 * rank))
+            weight_ahead = 1.0 - weight_behind
+
+            reduce_behind = min(order.queue_behind, reduction * weight_behind)
+            reduce_ahead = min(order.queue_ahead, reduction - reduce_behind)
 
             order.queue_ahead = round(max(0.0, order.queue_ahead - reduce_ahead), 4)
             order.queue_behind = round(max(0.0, order.queue_behind - reduce_behind), 4)
@@ -990,6 +1142,7 @@ class QueueAwareCancellationPolicy:
         order: TrackedOrder,
         toxic_shock_magnitude: float,
         estimated_sweep_size: float = 1000.0,
+        use_dynamic_depletion: bool = False,
     ) -> CancellationDecision:
         """Evaluate cancellation urgency for a single tracked limit order.
 
@@ -997,10 +1150,23 @@ class QueueAwareCancellationPolicy:
             order: The tracked limit order.
             toxic_shock_magnitude: Magnitude of toxic price jump (e.g. in bps or cents).
             estimated_sweep_size: Expected taker sweep volume that snipers will dispatch.
+            use_dynamic_depletion: If True, uses trade velocity and standing depth to scale thresholds.
 
         Returns:
             CancellationDecision with urgency, rank, and rationale.
         """
+        # Determine dynamic or configured thresholds
+        if use_dynamic_depletion and hasattr(self.tracker, "depletion_tracker"):
+            front_thresh = self.tracker.depletion_tracker.calculate_dynamic_front_threshold(
+                min_threshold=self.config.front_queue_threshold
+            )
+            eff_sweep = self.tracker.depletion_tracker.calculate_dynamic_sweep_size(
+                default_sweep=estimated_sweep_size
+            )
+        else:
+            front_thresh = self.config.front_queue_threshold
+            eff_sweep = estimated_sweep_size
+
         # If shock is below sensitivity threshold, order is safe
         if toxic_shock_magnitude < self.config.min_toxic_shock_threshold:
             return CancellationDecision(
@@ -1010,7 +1176,7 @@ class QueueAwareCancellationPolicy:
                 urgency=CancellationUrgency.SAFE,
                 queue_ahead=order.queue_ahead,
                 queue_rank=order.queue_rank,
-                estimated_sweep_size=estimated_sweep_size,
+                estimated_sweep_size=eff_sweep,
                 reason=f"Shock {toxic_shock_magnitude:.2f} below threshold {self.config.min_toxic_shock_threshold:.2f}",
                 priority_score=999.0,
                 recommended_action="NO_ACTION",
@@ -1018,15 +1184,15 @@ class QueueAwareCancellationPolicy:
 
         q_ahead = order.queue_ahead
         deep_threshold = max(
-            self.config.front_queue_threshold * 2.0,
-            estimated_sweep_size * self.config.sweep_protection_multiplier,
+            front_thresh * 2.0,
+            eff_sweep * self.config.sweep_protection_multiplier,
         )
 
         # Tier 1: Front of Queue (Direct line of fire)
-        if q_ahead <= self.config.front_queue_threshold:
+        if q_ahead <= front_thresh:
             reason = (
                 f"Front of queue: Q_ahead={q_ahead:.1f} <= threshold "
-                f"({self.config.front_queue_threshold:.1f}). "
+                f"({front_thresh:.1f}). "
                 f"Adverse selection imminent!"
             )
             # Priority score: lower Q_ahead gives higher priority (sorted first)
@@ -1038,7 +1204,7 @@ class QueueAwareCancellationPolicy:
                 urgency=CancellationUrgency.URGENT,
                 queue_ahead=q_ahead,
                 queue_rank=order.queue_rank,
-                estimated_sweep_size=estimated_sweep_size,
+                estimated_sweep_size=eff_sweep,
                 reason=reason,
                 priority_score=priority_score,
                 recommended_action="CANCEL_IMMEDIATE",
@@ -1046,7 +1212,7 @@ class QueueAwareCancellationPolicy:
 
         # Tier 2: Deep Queue (Protected by competitor buffer)
         elif q_ahead >= deep_threshold:
-            buffer_ratio = q_ahead / max(1.0, estimated_sweep_size)
+            buffer_ratio = q_ahead / max(1.0, eff_sweep)
             reason = (
                 f"Deep queue cushion: Q_ahead={q_ahead:.1f} is {buffer_ratio:.1f}x sweep size "
                 f"({deep_threshold:.1f} safe depth). Defers cancel to conserve API rate limits."
@@ -1059,7 +1225,7 @@ class QueueAwareCancellationPolicy:
                 urgency=CancellationUrgency.THROTTLED,
                 queue_ahead=q_ahead,
                 queue_rank=order.queue_rank,
-                estimated_sweep_size=estimated_sweep_size,
+                estimated_sweep_size=eff_sweep,
                 reason=reason,
                 priority_score=priority_score,
                 recommended_action="DEFER",
@@ -1079,7 +1245,7 @@ class QueueAwareCancellationPolicy:
                 urgency=CancellationUrgency.MONITOR,
                 queue_ahead=q_ahead,
                 queue_rank=order.queue_rank,
-                estimated_sweep_size=estimated_sweep_size,
+                estimated_sweep_size=eff_sweep,
                 reason=reason,
                 priority_score=priority_score,
                 recommended_action="MONITOR",
@@ -1090,6 +1256,7 @@ class QueueAwareCancellationPolicy:
         threatened_side: Union[str, OrderSide],
         toxic_shock_magnitude: float,
         estimated_sweep_size: float = 1000.0,
+        use_dynamic_depletion: bool = False,
     ) -> List[CancellationDecision]:
         """Evaluate all active orders on the threatened side during a toxic price shock.
 
@@ -1097,6 +1264,7 @@ class QueueAwareCancellationPolicy:
             threatened_side: The side exposed to adverse selection (e.g. SELL asks when spot surges).
             toxic_shock_magnitude: Magnitude of toxic shock (e.g. basis points).
             estimated_sweep_size: Expected taker sweep volume.
+            use_dynamic_depletion: Whether to calculate dynamic queue depletion thresholds.
 
         Returns:
             List of CancellationDecisions sorted in priority order (URGENT first, lowest Q_ahead first).
@@ -1105,7 +1273,12 @@ class QueueAwareCancellationPolicy:
         active_orders = [o for o in self.tracker.get_all_active_orders() if o.side == side]
 
         decisions = [
-            self.evaluate_order(o, toxic_shock_magnitude, estimated_sweep_size)
+            self.evaluate_order(
+                order=o,
+                toxic_shock_magnitude=toxic_shock_magnitude,
+                estimated_sweep_size=estimated_sweep_size,
+                use_dynamic_depletion=use_dynamic_depletion,
+            )
             for o in active_orders
         ]
 
@@ -1246,12 +1419,14 @@ class VirtualQueueOrderBookEngine:
         toxic_shock_magnitude: float,
         estimated_sweep_size: float = 1000.0,
         cancellation_pool: Optional[Any] = None,
+        use_dynamic_depletion: bool = False,
     ) -> Dict[str, Any]:
         """Orchestrate queue-aware defensive cancellations during a toxic price shock."""
         decisions = self.cancellation_policy.evaluate_threatened_orders(
             threatened_side=threatened_side,
             toxic_shock_magnitude=toxic_shock_magnitude,
             estimated_sweep_size=estimated_sweep_size,
+            use_dynamic_depletion=use_dynamic_depletion,
         )
         return self.cancellation_policy.execute_cancellations(
             decisions=decisions,

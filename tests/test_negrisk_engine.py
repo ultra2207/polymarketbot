@@ -8,6 +8,8 @@ import pytest
 from polymarketbot.fees import FeeSchedule
 from polymarketbot.trading.negrisk_engine import (
     NEGRISK_ADAPTER_ADDRESS,
+    BrokenBasketPolicy,
+    BrokenBasketResolution,
     CoherenceChecker,
     ConversionPlanner,
     NegRiskEngine,
@@ -17,8 +19,10 @@ from polymarketbot.trading.negrisk_engine import (
     NegRiskOpportunity,
     OpportunityType,
     OutcomeLeg,
+    compute_basket_fill_probability,
     compute_taker_fee,
     estimate_conversion_gas_usd,
+    slice_basket_opportunity,
 )
 from polymarketbot.trading.settlement import (
     NEGRISK_CONVERT_SELECTOR,
@@ -612,4 +616,153 @@ def test_historical_tape_vector_event_496282():
     # Net edge ~ 0.055 per share (matching negrisk_cells.parquet net of 0.055471)
     net_per_share = opp.net_edge_usd / opp.shares
     assert pytest.approx(net_per_share, abs=0.005) == 0.055
+
+
+# ---------------------------------------------------------------------------
+# 9. Institutional Multi-Leg Basket Slicing & Joint Fill Probability
+# ---------------------------------------------------------------------------
+def test_compute_basket_fill_probability():
+    market = _build_3way_market()
+    # Leg depths: 100, 150, 200 shares
+    market.legs[0].ask_size_no = 100.0
+    market.legs[0].best_ask_no = 0.60
+    market.legs[0].best_bid_no = 0.58
+
+    market.legs[1].ask_size_no = 150.0
+    market.legs[1].best_ask_no = 0.62
+    market.legs[1].best_bid_no = 0.60
+
+    market.legs[2].ask_size_no = 200.0
+    market.legs[2].best_ask_no = 0.61
+    market.legs[2].best_bid_no = 0.59
+
+    # For a small order of 20 shares (deep liquidity), fill probability should be high
+    prob_small = compute_basket_fill_probability(
+        market=market,
+        opportunity_type=OpportunityType.BUY_ALL_NO,
+        shares=20.0,
+        base_intensity=3.0,
+    )
+    assert 0.70 <= prob_small <= 1.0
+
+    # For an oversized order of 500 shares (far exceeding book depth), fill probability drops
+    prob_large = compute_basket_fill_probability(
+        market=market,
+        opportunity_type=OpportunityType.BUY_ALL_NO,
+        shares=500.0,
+        base_intensity=3.0,
+    )
+    assert prob_large < prob_small
+    assert 0.0 <= prob_large < 0.20
+
+
+def test_slice_basket_opportunity_amortization():
+    """Validate dynamic slicing of large basket into micro-slices with amortized gas/fees."""
+    market = _build_3way_market()
+    market.legs[0].best_ask_no = 0.58
+    market.legs[0].ask_size_no = 300.0
+    market.legs[1].best_ask_no = 0.60
+    market.legs[1].ask_size_no = 300.0
+    market.legs[2].best_ask_no = 0.60
+    market.legs[2].ask_size_no = 300.0
+
+    now = time.time()
+    for leg in market.legs.values():
+        leg.last_update_ts = now
+
+    checker = CoherenceChecker(min_net_edge_usd=0.01)
+    opps = checker.scan_market(market=market, pol_usd_price=0.10, gas_price_gwei=40.0)
+    opp = [o for o in opps if o.opportunity_type == OpportunityType.BUY_ALL_NO][0]
+    assert opp.shares == 300.0
+
+    # Slice into chunks of max 80 shares
+    slices = slice_basket_opportunity(
+        opportunity=opp,
+        market=market,
+        max_slice_shares=80.0,
+        min_slice_shares=10.0,
+    )
+
+    # 300 shares / 80 shares = 3 slices of 80 + 1 slice of 60 = 4 slices
+    assert len(slices) == 4
+    total_sliced_shares = sum(s.shares for s in slices)
+    assert pytest.approx(total_sliced_shares) == 300.0
+
+    # Every micro-slice must be independently profitable net of amortized fees and gas
+    for s in slices:
+        assert s.shares <= 80.0
+        assert s.net_edge_usd > 0.0
+        assert s.gross_edge_usd > s.total_taker_fees_usd + s.estimated_gas_cost_usd
+
+
+# ---------------------------------------------------------------------------
+# 10. Broken-Leg Execution Risk Handling & Emergency Unwind / Hedging
+# ---------------------------------------------------------------------------
+def test_broken_leg_unwind_market_policy():
+    """When a multi-leg basket suffers execution failure on leg 2, UNWIND_MARKET sells filled legs."""
+    engine = NegRiskEngine(dry_run=True, broken_basket_policy=BrokenBasketPolicy.UNWIND_MARKET)
+
+    engine.register_market(SAMPLE_EVENT_ID, SAMPLE_MARKET_ID, k=3, title="Broken Leg Test Market")
+    engine.register_leg(SAMPLE_EVENT_ID, 0, SAMPLE_COND_0, SAMPLE_COND_0, "600", "601", title="Leg 0")
+    engine.register_leg(SAMPLE_EVENT_ID, 1, SAMPLE_COND_1, SAMPLE_COND_1, "602", "603", title="Leg 1")
+    engine.register_leg(SAMPLE_EVENT_ID, 2, SAMPLE_COND_2, SAMPLE_COND_2, "604", "605", title="Leg 2")
+
+    now = time.time()
+    engine.update_leg_quotes(SAMPLE_EVENT_ID, 0, best_ask_no=0.58, ask_size_no=100.0, best_bid_no=0.56, timestamp=now)
+    engine.update_leg_quotes(SAMPLE_EVENT_ID, 1, best_ask_no=0.60, ask_size_no=100.0, best_bid_no=0.58, timestamp=now)
+    engine.update_leg_quotes(SAMPLE_EVENT_ID, 2, best_ask_no=0.60, ask_size_no=100.0, best_bid_no=0.58, timestamp=now)
+
+    opps = engine.scan_all()
+    opp = [o for o in opps if o.opportunity_type == OpportunityType.BUY_ALL_NO][0]
+    plan = engine.plan_execution(opp)
+
+    # Simulate execution failure on leg 2 (leg 0 and leg 1 succeed)
+    res = engine.execute_plan(plan, simulate_failed_leg_index=2)
+
+    assert res.success is False
+    assert res.status == "BROKEN_BASKET_RESOLVED"
+    assert res.broken_basket_resolution is not None
+    assert res.broken_basket_resolution.is_resolved is True
+    assert res.broken_basket_resolution.policy_applied == BrokenBasketPolicy.UNWIND_MARKET
+    assert res.broken_basket_resolution.failed_leg_index == 2
+
+    # Verify 2 offsetting unwind orders were placed
+    assert len(res.broken_basket_resolution.unwind_orders) == 2
+    for unwind_ord in res.broken_basket_resolution.unwind_orders:
+        assert unwind_ord["side"] == "SELL"
+        assert unwind_ord["status"] == "UNWOUND"
+
+
+def test_broken_leg_synthetic_convert_policy():
+    """In BUY_ALL_NO, when leg 2 fails and legs 0,1 fill, SYNTHETIC_CONVERT converts to YES_2 + cash."""
+    engine = NegRiskEngine(dry_run=True, broken_basket_policy=BrokenBasketPolicy.SYNTHETIC_CONVERT)
+
+    engine.register_market(SAMPLE_EVENT_ID, SAMPLE_MARKET_ID, k=3, title="Synth Convert Test Market")
+    engine.register_leg(SAMPLE_EVENT_ID, 0, SAMPLE_COND_0, SAMPLE_COND_0, "700", "701", title="Leg 0")
+    engine.register_leg(SAMPLE_EVENT_ID, 1, SAMPLE_COND_1, SAMPLE_COND_1, "702", "703", title="Leg 1")
+    engine.register_leg(SAMPLE_EVENT_ID, 2, SAMPLE_COND_2, SAMPLE_COND_2, "704", "705", title="Leg 2")
+
+    now = time.time()
+    engine.update_leg_quotes(SAMPLE_EVENT_ID, 0, best_ask_no=0.58, ask_size_no=150.0, timestamp=now)
+    engine.update_leg_quotes(SAMPLE_EVENT_ID, 1, best_ask_no=0.60, ask_size_no=150.0, timestamp=now)
+    engine.update_leg_quotes(SAMPLE_EVENT_ID, 2, best_ask_no=0.60, ask_size_no=150.0, timestamp=now)
+
+    opps = engine.scan_all()
+    opp = [o for o in opps if o.opportunity_type == OpportunityType.BUY_ALL_NO][0]
+    assert opp.shares == 150.0
+    plan = engine.plan_execution(opp)
+
+    # Leg 2 fails; legs 0 and 1 filled
+    res = engine.execute_plan(plan, simulate_failed_leg_index=2)
+
+    assert res.success is False
+    assert res.status == "BROKEN_BASKET_RESOLVED"
+    assert res.broken_basket_resolution is not None
+    assert res.broken_basket_resolution.is_resolved is True
+    assert res.broken_basket_resolution.policy_applied == BrokenBasketPolicy.SYNTHETIC_CONVERT
+
+    # In 3-way NegRisk, converting 2 NO legs yields 1 YES + (3 - 2) * 150.0 = $150.00 USDC cash
+    assert res.broken_basket_resolution.synthetic_converted_shares == 150.0
+    assert res.broken_basket_resolution.synthetic_cash_unlocked_usd == 150.0
+    assert "YES_2" in res.broken_basket_resolution.message
 

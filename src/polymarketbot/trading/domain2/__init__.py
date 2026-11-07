@@ -17,6 +17,16 @@ from polymarketbot.trading.domain2.types import (
     ConditionResolutionEvent,
     DiscountOpportunity,
     Domain2Position,
+    MakerExecutionRegime,
+    MakerPricingDecision,
+    LiveBookMetrics,
+)
+from polymarketbot.trading.domain2.maker_pricing_engine import (
+    SettlementMakerPricingEngine,
+    MakerEngineConfig,
+    RollingTradeBuffer,
+    parse_l2_book,
+    calculate_upward_drift_rate,
 )
 from polymarketbot.trading.domain2.event_listener import (
     Domain2EventListener,
@@ -49,6 +59,14 @@ __all__ = [
     "ConditionResolutionEvent",
     "DiscountOpportunity",
     "Domain2Position",
+    "MakerExecutionRegime",
+    "MakerPricingDecision",
+    "LiveBookMetrics",
+    "SettlementMakerPricingEngine",
+    "MakerEngineConfig",
+    "RollingTradeBuffer",
+    "parse_l2_book",
+    "calculate_upward_drift_rate",
     "Domain2EventListener",
     "Domain2CircuitBreaker",
     "Domain2ClobOrderPlacer",

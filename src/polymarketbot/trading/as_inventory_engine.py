@@ -143,6 +143,112 @@ class ASQuoteDecision:
     reason: str
 
 
+class DynamicASCalibrator:
+    """Dynamic calibration of Avellaneda-Stoikov parameters (gamma, kappa, A).
+
+    Replaces static/hardcoded parameters with state-of-the-art institutional prop firm methods.
+    """
+
+    @staticmethod
+    def calibrate_gamma(
+        capital_usd: float,
+        target_sharpe: float = 2.0,
+        volatility_annual: float = 0.55,
+        risk_scale: float = 25.0,
+    ) -> float:
+        """Dynamically scales absolute risk aversion gamma with portfolio capital and target Sharpe.
+
+        Formula:
+            gamma = (risk_scale / max(10.0, capital)) * (target_sharpe / max(0.10, volatility_annual))
+        """
+        c = max(10.0, float(capital_usd))
+        vol = max(0.10, float(volatility_annual))
+        sr = max(0.1, float(target_sharpe))
+        gamma = (risk_scale / c) * (sr / vol)
+        return max(0.001, min(1.0, gamma))
+
+    @staticmethod
+    def calibrate_kappa_from_depth(
+        spread: float,
+        l1_size: float = 100.0,
+        l2_size: float = 50.0,
+        tick_size: float = 0.01,
+    ) -> float:
+        """Dynamically calibrates liquidity decay parameter kappa from order book depth profile.
+
+        In LOB depth models, depth density decays as Q(delta) ~ exp(-kappa * delta).
+        kappa = ln(Q_1 / Q_2) / delta_distance
+        """
+        q1 = max(1.0, float(l1_size))
+        q2 = max(1.0, float(l2_size))
+        s = max(tick_size, float(spread))
+
+        if q1 > q2:
+            kappa_from_decay = math.log(q1 / q2) / tick_size
+        else:
+            kappa_from_decay = 2.0 / s
+
+        kappa_from_spread = 2.0 / s
+        kappa = 0.5 * (kappa_from_decay + kappa_from_spread)
+        return max(5.0, min(200.0, kappa))
+
+    @staticmethod
+    def calibrate_intensity_A(
+        trade_rate_per_sec: float,
+        fill_ratio_at_touch: float = 0.5,
+    ) -> float:
+        """Dynamically estimates baseline arrival intensity A at touch from trade velocity."""
+        rate = max(0.01, float(trade_rate_per_sec))
+        fill_p = max(0.1, min(1.0, float(fill_ratio_at_touch)))
+        a = rate / fill_p
+        return max(0.1, min(20.0, a))
+
+    @staticmethod
+    def calibrate_from_order_arrivals(
+        deltas: list[float],
+        fill_counts: list[int],
+        total_time_seconds: float,
+    ) -> Tuple[float, float]:
+        """Calibrates (A, kappa) via log-linear regression: ln(lambda) = ln(A) - kappa * delta.
+
+        Args:
+            deltas: List of half-spread distances from mid.
+            fill_counts: Observed execution counts at each distance.
+            total_time_seconds: Duration of observation window.
+
+        Returns:
+            Tuple of (estimated_A, estimated_kappa).
+        """
+        if len(deltas) < 2 or len(deltas) != len(fill_counts) or total_time_seconds <= 0.0:
+            return 1.5, 50.0
+
+        valid_points = []
+        for d, c in zip(deltas, fill_counts):
+            if c > 0:
+                lam = float(c) / total_time_seconds
+                valid_points.append((d, math.log(lam)))
+
+        if len(valid_points) < 2:
+            return 1.5, 50.0
+
+        n = len(valid_points)
+        sum_x = sum(p[0] for p in valid_points)
+        sum_y = sum(p[1] for p in valid_points)
+        sum_xx = sum(p[0] ** 2 for p in valid_points)
+        sum_xy = sum(p[0] * p[1] for p in valid_points)
+
+        denom = n * sum_xx - sum_x ** 2
+        if abs(denom) <= 1e-9:
+            return 1.5, 50.0
+
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        intercept = (sum_y - slope * sum_x) / n
+
+        kappa = max(5.0, min(200.0, -slope))
+        a = max(0.1, min(50.0, math.exp(min(10.0, intercept))))
+        return a, kappa
+
+
 class AvellanedaStoikovEngine:
     """Avellaneda-Stoikov & Guéant-Tapia-Manziadi Dynamic Inventory Market Making Engine.
 
@@ -152,6 +258,7 @@ class AvellanedaStoikovEngine:
 
     def __init__(self, config: Optional[ASInventoryConfig] = None) -> None:
         self.config = config or ASInventoryConfig()
+        self.calibrator = DynamicASCalibrator()
 
     # =========================================================================
     # 1. Classical Avellaneda-Stoikov & Guéant-Tapia-Manziadi Analytical Core
@@ -472,6 +579,7 @@ class AvellanedaStoikovEngine:
         ask_yes: float,
         ask_no: float,
         net_inventory_q: float,
+        target_pair_margin: Optional[float] = None,
     ) -> Tuple[float, float, float, float]:
         """Enforce strict structural pair arbitrage bounds and discrete tick rounding.
 
@@ -482,7 +590,7 @@ class AvellanedaStoikovEngine:
             4. Strict tick snapping
         """
         tick = self.config.tick_size
-        margin = self.config.target_pair_margin
+        margin = target_pair_margin if target_pair_margin is not None else self.config.target_pair_margin
         max_pair_bid = round(1.00 - margin, 4)
         min_pair_ask = round(1.00 + margin, 4)
 
@@ -581,8 +689,15 @@ class AvellanedaStoikovEngine:
         tau_seconds: float = 300.0,
         annualized_volatility: Optional[float] = None,
         use_rewards_optimization: bool = True,
+        gamma: Optional[float] = None,
+        kappa: Optional[float] = None,
+        intensity_A: Optional[float] = None,
+        target_pair_margin: Optional[float] = None,
     ) -> ASQuoteDecision:
         """Compute the full institutional Avellaneda-Stoikov & Guéant quoting decision.
+
+        Supports dynamic risk aversion gamma, order arrival intensity decay kappa,
+        and dynamic complete-set arbitrage margin bounds.
 
         Args:
             fair_price_yes: Fair binary probability of YES in (0, 1).
@@ -591,6 +706,10 @@ class AvellanedaStoikovEngine:
             tau_seconds: Remaining time horizon in seconds.
             annualized_volatility: Volatility parameter (default from config).
             use_rewards_optimization: Whether to incorporate quadratic rewards co-objective.
+            gamma: Optional dynamically calibrated CARA risk aversion parameter.
+            kappa: Optional dynamically calibrated order arrival decay parameter.
+            intensity_A: Optional dynamically calibrated arrival intensity at touch.
+            target_pair_margin: Optional dynamically calibrated minimum locked pair margin.
 
         Returns:
             ASQuoteDecision with complete quotes, reservation prices, scores, and arbitrage guarantees.
@@ -600,6 +719,8 @@ class AvellanedaStoikovEngine:
         p_no = round(1.0 - p_yes, 4)
         tau = max(0.1, float(tau_seconds))
         sig_sec = self.calculate_sigma_per_sqrt_sec(annualized_volatility)
+        effective_gamma = gamma if gamma is not None else self.config.gamma
+        effective_kappa = kappa if kappa is not None else self.config.kappa
 
         # Net directional inventory
         q_net = float(inventory_yes - inventory_no)
@@ -621,6 +742,7 @@ class AvellanedaStoikovEngine:
             net_inventory_q=q_net,
             tau_seconds=tau,
             sigma_per_sqrt_sec=sig_sec,
+            gamma=effective_gamma,
         )
         # For NO token, net inventory is -q_net
         r_no = self.calculate_reservation_price(
@@ -628,6 +750,7 @@ class AvellanedaStoikovEngine:
             net_inventory_q=-q_net,
             tau_seconds=tau,
             sigma_per_sqrt_sec=sig_sec,
+            gamma=effective_gamma,
         )
 
         # 2. Dynamic Ticket Sizes
@@ -640,8 +763,20 @@ class AvellanedaStoikovEngine:
             delta_b_no = self.optimize_spread_with_rewards(QuoteSide.BID, -q_net, tau, sig_sec, size_b_no)
             delta_a_no = self.optimize_spread_with_rewards(QuoteSide.ASK, -q_net, tau, sig_sec, size_a_no)
         else:
-            delta_b_yes, delta_a_yes, _ = self.calculate_gtm_half_spreads(q_net, tau, sig_sec)
-            delta_b_no, delta_a_no, _ = self.calculate_gtm_half_spreads(-q_net, tau, sig_sec)
+            delta_b_yes, delta_a_yes, _ = self.calculate_gtm_half_spreads(
+                net_inventory_q=q_net,
+                tau_seconds=tau,
+                sigma_per_sqrt_sec=sig_sec,
+                gamma=effective_gamma,
+                kappa=effective_kappa,
+            )
+            delta_b_no, delta_a_no, _ = self.calculate_gtm_half_spreads(
+                net_inventory_q=-q_net,
+                tau_seconds=tau,
+                sigma_per_sqrt_sec=sig_sec,
+                gamma=effective_gamma,
+                kappa=effective_kappa,
+            )
 
         # Continuous prices
         raw_b_yes = p_yes - delta_b_yes
@@ -650,12 +785,14 @@ class AvellanedaStoikovEngine:
         raw_a_no = p_no + delta_a_no
 
         # 4. Enforce Complete-Set Arbitrage Bounds & Tick Grid Snapping
+        effective_margin = target_pair_margin if target_pair_margin is not None else self.config.target_pair_margin
         b_yes, b_no, a_yes, a_no = self.enforce_complete_set_arbitrage_bounds(
             bid_yes=raw_b_yes,
             bid_no=raw_b_no,
             ask_yes=raw_a_yes,
             ask_no=raw_a_no,
             net_inventory_q=q_net,
+            target_pair_margin=effective_margin,
         )
 
         # Recalculate discrete post-snap half-spreads
@@ -676,8 +813,6 @@ class AvellanedaStoikovEngine:
         q_two = round(score_a_yes + score_b_no, 4)
 
         # Official Polymarket single-sided penalty rules:
-        # In [0.10, 0.90]: Q_min = max(min(Q1, Q2), max(Q1, Q2) / c)
-        # Outside [0.10, 0.90]: Q_min = min(Q1, Q2)
         c_penalty = self.config.rewards_single_sided_c
         if 0.10 <= p_yes <= 0.90:
             q_min = round(max(min(q_one, q_two), max(q_one, q_two) / c_penalty), 4)
@@ -723,7 +858,7 @@ class AvellanedaStoikovEngine:
         pair_ask_cost = round(a_yes + a_no, 4)
         pair_ask_margin = round((pair_ask_cost - 1.00) * 100.0, 2)
 
-        is_arb_guaranteed = (pair_bid_cost <= round(1.00 - self.config.target_pair_margin, 4))
+        is_arb_guaranteed = (pair_bid_cost <= round(1.00 - effective_margin, 4))
 
         # Diagnostic reason
         skew_desc = f"q_net={q_net:+.1f} ({regime.value})"
@@ -760,6 +895,10 @@ class AvellanedaStoikovEngine:
         inventory_no: float = 0.0,
         annualized_volatility: Optional[float] = None,
         use_rewards_optimization: bool = True,
+        gamma: Optional[float] = None,
+        kappa: Optional[float] = None,
+        intensity_A: Optional[float] = None,
+        target_pair_margin: Optional[float] = None,
     ) -> ASQuoteDecision:
         """Evaluate AS quotes directly from underlying crypto spot and strike using digital BS.
 
@@ -792,4 +931,8 @@ class AvellanedaStoikovEngine:
             tau_seconds=tau,
             annualized_volatility=vol,
             use_rewards_optimization=use_rewards_optimization,
+            gamma=gamma,
+            kappa=kappa,
+            intensity_A=intensity_A,
+            target_pair_margin=target_pair_margin,
         )

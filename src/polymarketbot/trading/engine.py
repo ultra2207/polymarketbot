@@ -51,7 +51,12 @@ from polymarketbot.rewards.queue_valuation import (
 from polymarketbot.rewards.scoring import quadratic_order_score
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.models import RiskConfig
-from polymarketbot.trading.base import BaseMarketMakingEngine, PositionView
+from polymarketbot.trading.base import (
+    BaseMarketMakingEngine,
+    DEFAULT_FALLBACK_ASK,
+    DEFAULT_FALLBACK_BID,
+    PositionView,
+)
 from polymarketbot.execution import PreSignedOrderCache, SelfTradeGuard
 from polymarketbot.trading.client import (
     ClobAPIError,
@@ -363,9 +368,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                 price_jump_window_seconds=60.0,
                 price_jump_threshold_cents=2.0,
                 cooldown_duration_seconds=300.0,
-                daily_loss_limit_usd=min(15.0, init_cash * 0.05 if init_cash > 0 else 15.0),
+                daily_loss_limit_usd=round(init_cash * 0.05, 2) if init_cash > 0 else 15.0,
                 daily_loss_limit_pct=0.05,
-                max_drawdown_usd=min(30.0, init_cash * 0.10 if init_cash > 0 else 30.0),
+                max_drawdown_usd=round(init_cash * 0.10, 2) if init_cash > 0 else 30.0,
                 max_drawdown_pct=0.10,
                 allow_short=False,
                 min_merge_notional_usd=1.0,
@@ -423,11 +428,17 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         self.ctf_client = ctf_client or PolygonCtfClient(dry_run=self.dry_run)
 
         # Wire Self-Trade Prevention (Wash Trading Guard)
-        if self.clob_client.self_trade_guard is None:
-            self.clob_client.self_trade_guard = SelfTradeGuard()
-        self.clob_client.self_trade_guard.link_complementary_tokens(
-            self.asset_id_yes, self.asset_id_no
-        )
+        guard = getattr(self.clob_client, "self_trade_guard", None)
+        if guard is None:
+            try:
+                guard = SelfTradeGuard()
+                self.clob_client.self_trade_guard = guard
+            except (AttributeError, TypeError):
+                guard = None
+        if guard is not None and hasattr(guard, "link_complementary_tokens"):
+            guard.link_complementary_tokens(
+                self.asset_id_yes, self.asset_id_no
+            )
 
         # Settlement durability: the signed payload is stored in this engine's
         # database before it is broadcast, so a timed-out settlement survives a
@@ -1134,9 +1145,19 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
 
     def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
         tok = token_side.upper()
-        bid = self._best_bids.get(tok, 0.49 if tok == "YES" else 0.49)
-        ask = self._best_asks.get(tok, 0.51 if tok == "YES" else 0.51)
-        return bid, ask
+        if tok in self._best_bids and tok in self._best_asks:
+            return self._best_bids[tok], self._best_asks[tok]
+        # Cross-infer from complementary token if available
+        comp = "NO" if tok == "YES" else "YES"
+        if comp in self._best_bids and comp in self._best_asks:
+            b_comp = self._best_bids[comp]
+            a_comp = self._best_asks[comp]
+            if 0.0 < b_comp < 1.0 and 0.0 < a_comp < 1.0:
+                return round(1.0 - a_comp, 4), round(1.0 - b_comp, 4)
+        return (
+            self._best_bids.get(tok, DEFAULT_FALLBACK_BID),
+            self._best_asks.get(tok, DEFAULT_FALLBACK_ASK),
+        )
 
     def credit_reward(self, amount: float, condition_id: str, note: str = "") -> None:
         """Credit modelled rewards to simulated cash only.

@@ -697,6 +697,7 @@ class LiveClobClient:
 
         # Simulated state for dry-run tracking
         self._mock_orders: dict[str, dict[str, Any]] = {}
+        self._mock_books: dict[str, dict[str, Any]] = {}
         self._mock_balance_usd: float = 100.0
 
     # ------------------------------------------------------------------
@@ -2064,6 +2065,39 @@ class LiveClobClient:
             "end_date_iso": str(end_date_iso) if end_date_iso else None,
             "raw": payload,
         }
+
+    def get_order_book(self, token_id: str) -> dict[str, Any]:
+        """Fetch live level-2 order book from ``GET /book?token_id={token_id}``.
+
+        Returns:
+            dict containing "bids" and "asks" lists with {"price": str, "size": str}.
+
+        Raises:
+            ClobAPIError: on any failed call or non-object body.
+            ValueError: for an empty token id.
+        """
+        if not token_id:
+            raise ValueError("token_id is required")
+
+        if self.dry_run and hasattr(self, "_mock_books") and str(token_id) in self._mock_books:
+            return self._mock_books[str(token_id)]
+
+        path = "/book"
+        params = {"token_id": str(token_id)}
+        payload = self._request("GET", path, params=params, auth=False)
+        if not isinstance(payload, dict):
+            raise ClobAPIError(
+                f"GET {path} returned an unexpected body: {payload!r}",
+                status_code=200,
+                path=path,
+            )
+        return payload
+
+    def set_mock_book(self, token_id: str, book: dict[str, Any]) -> None:
+        """Register a mock order book for dry-run or testing."""
+        if not hasattr(self, "_mock_books"):
+            self._mock_books = {}
+        self._mock_books[str(token_id)] = book
 
     # ------------------------------------------------------------------
     # Rewards / scoring telemetry

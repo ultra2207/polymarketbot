@@ -16,10 +16,13 @@ Features:
 - Google OR-Tools SCIP solver.
 - Mathematical rejection of toxic negative-utility risks (e.g. low-edge high-hazard bets).
 - Dynamic diversification across orthogonal categories (crypto, weather, politics, sports).
+- Continuous microstructure Kyle's lambda and concave order book depth elasticity.
+- Dynamic EIP-1559 gas friction and UMA settlement delay integration.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,7 +30,9 @@ from ortools.linear_solver import pywraplp
 
 from polymarketbot.fees import FeeSchedule, taker_fee
 from polymarketbot.logs import get_logger
+from polymarketbot.rewards.queue_valuation import PolygonPoSEnvironment
 from polymarketbot.trading.domain2.robust_hazard import (
+    BinaryVolatilityEstimator,
     RobustHazardModel,
     calculate_cycle_velocity,
 )
@@ -60,6 +65,10 @@ class Domain2Candidate:
     order_book_levels: Optional[List[Tuple[float, float]]] = None  # [(price, size_shares), ...]
     spot_price: Optional[float] = None
     strike_price: Optional[float] = None
+    spread: Optional[float] = None
+    price_history: Optional[List[float]] = None
+    empirical_vol: Optional[float] = None
+    pos_env: Optional[PolygonPoSEnvironment] = None
 
     @property
     def estimated_win_prob(self) -> float:
@@ -67,7 +76,7 @@ class Domain2Candidate:
         if self.p_hat is not None:
             return float(self.p_hat)
         
-        # Use institutional robust multi-layer hazard evaluation
+        # Use institutional robust multi-layer hazard evaluation with empirical volatility
         model = RobustHazardModel()
         p_win, _, _ = model.evaluate_candidate(
             category=self.category,
@@ -76,6 +85,9 @@ class Domain2Candidate:
             is_uma_proposed=self.is_uma_proposed,
             spot_price=self.spot_price,
             strike_price=self.strike_price,
+            underlying_vol_annual=self.empirical_vol,
+            spread=self.spread,
+            price_history=self.price_history,
         )
         return float(p_win)
 
@@ -139,6 +151,7 @@ class Domain2OrtoolsAllocator:
         use_precautionary_reserve: bool = True,
         use_factor_risk_budgeting: bool = True,
         use_fixed_ticket_cost: bool = True,
+        pos_env: Optional[PolygonPoSEnvironment] = None,
     ) -> None:
         self.reserve_pct = float(reserve_pct)
         self.max_drawdown_target = float(max_drawdown_target)
@@ -153,6 +166,7 @@ class Domain2OrtoolsAllocator:
         self.use_precautionary_reserve = use_precautionary_reserve
         self.use_factor_risk_budgeting = use_factor_risk_budgeting
         self.use_fixed_ticket_cost = use_fixed_ticket_cost
+        self.pos_env = pos_env or PolygonPoSEnvironment()
 
     def optimize_allocation(
         self,
@@ -166,7 +180,7 @@ class Domain2OrtoolsAllocator:
 
         n = len(candidates)
 
-        # 1. Dynamic Precautionary Liquidity Reserve
+        # 1. Dynamic Precautionary Liquidity Reserve (Continuous Miller-Orr / Cash Inventory Model)
         if self.use_precautionary_reserve and n > 0:
             avg_edge = sum(max(0.0, c.estimated_win_prob - c.price) for c in candidates) / n
             avg_lockup = sum(max(0.1, c.hours_to_resolution) for c in candidates) / n
@@ -174,6 +188,7 @@ class Domain2OrtoolsAllocator:
                 candidate_count=n,
                 avg_candidate_edge=avg_edge,
                 avg_lockup_hours=avg_lockup,
+                bankroll_usd=bankroll_usd,
             )
         else:
             eff_reserve_pct = self.reserve_pct
@@ -197,11 +212,7 @@ class Domain2OrtoolsAllocator:
                 expected_daily_capital_velocity=0.0,
             )
 
-        # 1. Decision Variables
-        # For each candidate i, we model discrete orderbook levels k:
-        # x[(i, k)]: Capital allocated to level k of candidate i [0.0, cap_k]
-        # w[i]: Total capital allocated to candidate i (sum_k x[(i, k)])
-        # z[i]: Binary indicator variable in {0, 1}
+        # Decision Variables
         x_vars: Dict[Tuple[int, int], Any] = {}
         w_vars: Dict[int, Any] = {}
         z_vars: Dict[int, Any] = {}
@@ -210,7 +221,7 @@ class Domain2OrtoolsAllocator:
         objective = solver.Objective()
         expected_hourly_growth_rates: Dict[int, float] = {}
 
-        hazard_model = RobustHazardModel()
+        hazard_model = RobustHazardModel(delay_model=None)
 
         for i, c in enumerate(candidates):
             z_vars[i] = solver.BoolVar(f"z_{i}")
@@ -226,6 +237,9 @@ class Domain2OrtoolsAllocator:
                     is_uma_proposed=c.is_uma_proposed,
                     spot_price=c.spot_price,
                     strike_price=c.strike_price,
+                    underlying_vol_annual=c.empirical_vol,
+                    spread=c.spread,
+                    price_history=c.price_history,
                 )
 
             # Compute Dynamic Single-Bet Bound w_max(i)
@@ -241,6 +255,14 @@ class Domain2OrtoolsAllocator:
             else:
                 effective_fee_per_share = 0.0
 
+            # Dynamic EIP-1559 gas calculation: uses candidate's pos_env if specified, otherwise candidate's explicit gas
+            if c.pos_env is not None:
+                candidate_gas_usd = c.pos_env.gas_units_to_usd(82_000)
+            elif c.redemption_gas_usd is not None:
+                candidate_gas_usd = c.redemption_gas_usd
+            else:
+                candidate_gas_usd = self.pos_env.gas_units_to_usd(82_000)
+
             if self.use_dynamic_sizing:
                 sizing_info = self.dynamic_sizer.compute_dynamic_single_bet_bound(
                     category=c.category,
@@ -255,6 +277,10 @@ class Domain2OrtoolsAllocator:
                     fee_rate=effective_fee_per_share,
                     max_single_bet_pct=self.max_single_bet_pct,
                     depth_gamma=self.depth_gamma,
+                    spread=c.spread,
+                    price_history=c.price_history,
+                    empirical_vol=c.empirical_vol,
+                    order_book_levels=c.order_book_levels,
                 )
                 cand_upper_bound = min(usable_capital, sizing_info["w_max_usd"], default_max_single_usd)
             else:
@@ -285,7 +311,6 @@ class Domain2OrtoolsAllocator:
 
             for k, (lvl_price, lvl_shares) in enumerate(raw_levels):
                 px = max(0.50, min(0.999, lvl_price))
-                # Capacity of this level discounted by depth_gamma and dynamic candidate bound
                 lvl_cap_usd = lvl_shares * px * self.depth_gamma if c.depth_usd > 0 else cand_upper_bound
                 lvl_cap_usd = max(0.0, min(cand_upper_bound, lvl_cap_usd, usable_capital))
 
@@ -293,7 +318,6 @@ class Domain2OrtoolsAllocator:
                     continue
 
                 var_x = solver.NumVar(0.0, lvl_cap_usd, f"x_{i}_{k}")
-                # Level capacity bound coupled with activation z[i]
                 solver.Add(var_x <= lvl_cap_usd * z_vars[i])
 
                 x_vars[(i, k)] = var_x
@@ -313,7 +337,7 @@ class Domain2OrtoolsAllocator:
                     fee_per_share = 0.0
 
                 min_shares = max(1.0, self.min_order_usd / px)
-                gas_per_share = c.redemption_gas_usd / min_shares
+                gas_per_share = candidate_gas_usd / min_shares
 
                 raw_edge = (p_win - px - fee_per_share - gas_per_share) / px
                 variance_penalty = self.lambda_var * (hazard / (px ** 2))
@@ -328,7 +352,6 @@ class Domain2OrtoolsAllocator:
             w_vars[i] = solver.NumVar(0.0, cand_upper_bound, f"w_{i}")
             if market_level_vars:
                 solver.Add(w_vars[i] == solver.Sum(market_level_vars))
-                # Semi-continuous constraint on total market allocation
                 solver.Add(w_vars[i] >= self.min_order_usd * z_vars[i])
                 solver.Add(w_vars[i] <= cand_upper_bound * z_vars[i])
             else:
@@ -347,7 +370,7 @@ class Domain2OrtoolsAllocator:
                 rep_fee = rep_f_rate * ((rep_px * (1.0 - rep_px)) ** rep_f_exp) if rep_f_rate > 0 else 0.0
             else:
                 rep_fee = 0.0
-            rep_gas = c.redemption_gas_usd / max(1.0, self.min_order_usd / rep_px)
+            rep_gas = candidate_gas_usd / max(1.0, self.min_order_usd / rep_px)
             rep_edge = (p_win - rep_px - rep_fee - rep_gas) / rep_px - self.lambda_var * (hazard / (rep_px ** 2))
             expected_hourly_growth_rates[i] = rep_edge * velocity_weight
 
@@ -361,7 +384,7 @@ class Domain2OrtoolsAllocator:
             upper_k = max(self.max_active_markets, 50)
             solver.Add(solver.Sum([z_vars[i] for i in range(n)]) <= upper_k)
 
-        # 4. Factor Covariance / Correlation Risk Budgeting
+        # 4. Dynamic Multi-Factor Covariance & Risk Budgeting
         categories: Set[str] = {c.category for c in candidates}
         if self.use_factor_risk_budgeting:
             factor_budgets = self.dynamic_sizer.compute_factor_risk_budgets(
@@ -387,7 +410,7 @@ class Domain2OrtoolsAllocator:
 
         objective.SetMaximization()
 
-        # Solve
+        # Solve SCIP
         status = solver.Solve()
         status_str = "OPTIMAL" if status == pywraplp.Solver.OPTIMAL else (
             "FEASIBLE" if status == pywraplp.Solver.FEASIBLE else "SUBOPTIMAL"
@@ -403,7 +426,6 @@ class Domain2OrtoolsAllocator:
                     p_win = c.estimated_win_prob
                     hazard_pct = (1.0 - p_win) * 100.0
 
-                    # Calculate total shares and volume-weighted average price across filled levels
                     total_shares = 0.0
                     levels_hit = 0
                     for k, (lvl_px, _, _) in enumerate(candidate_levels[i]):
@@ -415,7 +437,6 @@ class Domain2OrtoolsAllocator:
 
                     eff_avg_px = alloc_val / total_shares if total_shares > 1e-6 else c.price
 
-                    # Calculate fee and gas for allocated position
                     if c.is_taker:
                         if c.fee_schedule is not None:
                             f_rate = c.fee_schedule.rate
@@ -427,8 +448,15 @@ class Domain2OrtoolsAllocator:
                     else:
                         fee_per_share_alloc = 0.0
 
+                    if c.pos_env is not None:
+                        candidate_gas_usd = c.pos_env.gas_units_to_usd(82_000)
+                    elif c.redemption_gas_usd is not None:
+                        candidate_gas_usd = c.redemption_gas_usd
+                    else:
+                        candidate_gas_usd = self.pos_env.gas_units_to_usd(82_000)
+
                     alloc_fee_usd = round(total_shares * fee_per_share_alloc, 4)
-                    alloc_gas_usd = round(c.redemption_gas_usd, 4) if total_shares > 0 else 0.0
+                    alloc_gas_usd = round(candidate_gas_usd, 4) if total_shares > 0 else 0.0
                     gas_per_share_alloc = alloc_gas_usd / max(1e-6, total_shares)
                     net_edge = ((p_win - eff_avg_px - fee_per_share_alloc - gas_per_share_alloc) / eff_avg_px) * 100.0
 
