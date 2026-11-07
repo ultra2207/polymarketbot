@@ -633,3 +633,26 @@ def test_interdomain_router_meta_integration():
     assert "RewardHarvester" in plan_dict["allocations"]
 
 
+def test_meta_optimizer_marginal_vs_effective_objective():
+    """Test objective='marginal' vs objective='effective' and confirm mathematical superiority of marginal routing."""
+    optimizer = MetaOptimizerCapitalRouter()
+    cap = 10_000_000.0
+
+    plan_marginal = optimizer.optimize(cap, objective="marginal")
+    plan_effective = optimizer.optimize(cap, objective="effective")
+
+    # Marginal routing achieves strictly higher annual profit ($73.78M vs $70.22M)
+    assert plan_marginal.total_annual_profit_usd > plan_effective.total_annual_profit_usd
+    diff = plan_marginal.total_annual_profit_usd - plan_effective.total_annual_profit_usd
+    assert diff > 3_000_000.0  # Over $3M/year higher profit
+
+    # Effective objective forces RH up to its hard $3M cap, starving CS
+    assert plan_effective.allocations["RewardHarvester"].allocated_usd == 3_000_000.0
+    assert plan_effective.allocations["CtfSplitter"].allocated_usd == 1_000_000.0
+
+    # Marginal objective stops RH at $1.185M (where its marginal return equals CS) and gives CS $2.815M
+    assert plan_marginal.allocations["RewardHarvester"].allocated_usd == 1_185_000.0
+    assert plan_marginal.allocations["CtfSplitter"].allocated_usd == 2_815_000.0
+
+
+
