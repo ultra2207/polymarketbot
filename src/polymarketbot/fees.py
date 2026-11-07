@@ -108,6 +108,89 @@ def maker_rebate(taker_fees: float, schedule: FeeSchedule) -> float:
     return _round_fee(taker_fees * schedule.rebate_rate)
 
 
+def maker_fee_rebate(
+    price: float,
+    shares: float,
+    schedule: FeeSchedule,
+    maker_rebate_share_pct: float | None = 0.20,
+    rounding_dp: int | None = None,
+) -> float:
+    """Rebate paid to maker filling a resting limit order from taker fee pool.
+
+    When taker pays fee:
+        F_taker = taker_fee(shares, price, schedule)
+    The resting maker receives volume share rebate:
+        R_maker = gamma_rebate * F_taker
+    typically 20% to 50% of the taker fee pool.
+
+    Args:
+        price: Execution price between 0.0 and 1.0.
+        shares: Number of filled shares.
+        schedule: Market FeeSchedule.
+        maker_rebate_share_pct: Override maker rebate share fraction. If 0.20 (the default)
+            and schedule.rebate_rate > 0, schedule.rebate_rate is preferred.
+        rounding_dp: Rounding decimal places (defaults to config formula rounding_dp).
+
+    Returns:
+        Maker rebate in USDC (always >= 0.0).
+    """
+    if shares <= 0.0 or schedule.rate <= 0.0:
+        return 0.0
+    if not 0.0 <= price <= 1.0:
+        raise ValueError(f"price out of range: {price}")
+
+    if maker_rebate_share_pct is not None and maker_rebate_share_pct != 0.20:
+        gamma = float(maker_rebate_share_pct)
+    elif schedule.rebate_rate > 0.0:
+        gamma = float(schedule.rebate_rate)
+    else:
+        gamma = float(maker_rebate_share_pct if maker_rebate_share_pct is not None else 0.20)
+
+    if gamma <= 0.0:
+        return 0.0
+
+    dp = rounding_dp if rounding_dp is not None else int(_config()["formula"]["rounding_dp"])
+    t_fee = taker_fee(shares, price, schedule, rounding_dp=dp)
+    return _round_fee(t_fee * gamma, dp)
+
+
+def effective_maker_price(
+    price: float,
+    shares: float,
+    side: str,
+    schedule: FeeSchedule | None = None,
+    maker_rebate_usd: float | None = None,
+    maker_rebate_share_pct: float | None = 0.20,
+) -> float:
+    """Calculate the net effective price for a maker fill after volume share rebate.
+
+    For BUY (bid fill):
+        effective_price = price - (rebate / shares)
+        e.g., buying at $0.980 with $0.0008 (0.08c) rebate -> $0.9792 net cost.
+
+    For SELL (ask fill):
+        effective_price = price + (rebate / shares)
+        e.g., selling at $0.020 with $0.0008 rebate -> $0.0208 net proceeds.
+    """
+    if shares <= 0.0:
+        return float(price)
+    if maker_rebate_usd is not None:
+        rebate = float(maker_rebate_usd)
+    elif schedule is not None:
+        rebate = maker_fee_rebate(price, shares, schedule, maker_rebate_share_pct=maker_rebate_share_pct)
+    else:
+        rebate = 0.0
+
+    rebate_per_share = rebate / shares
+    side_norm = side.upper()
+    if side_norm == "BUY":
+        return round(float(price) - rebate_per_share, 6)
+    elif side_norm == "SELL":
+        return round(float(price) + rebate_per_share, 6)
+    else:
+        raise ValueError(f"side must be BUY or SELL, got {side}")
+
+
 def fee_category(market_category: str, path: str | Path = CONFIG) -> str:
     """Map our coarse category to a fee-table category."""
     mapping = _config(path).get("category_map", {})

@@ -130,6 +130,7 @@ class Domain2ClobOrderPlacer:
             taker_sell_velocity_shares_hr=getattr(opportunity, "taker_sell_velocity_shares_hr", None),
             tick_size=getattr(opportunity, "tick_size", self.tick_size),
             proposed_price=opportunity.proposed_price,
+            schedule=getattr(opportunity, "fee_schedule", None),
         )
 
     def place_discount_bid(
@@ -197,6 +198,8 @@ class Domain2ClobOrderPlacer:
                     "standing_depth_ahead": decision.standing_depth_ahead,
                     "taker_sell_velocity_shares_hr": decision.taker_sell_velocity_shares_hr,
                     "drift_rate_usd_hr": decision.drift_rate_usd_hr,
+                    "maker_rebate_usd": decision.maker_rebate_usd,
+                    "effective_price": decision.effective_price,
                 }
                 logger.info("Order successfully placed: order_id={} [{}]", result.order_id, decision.regime.value)
             else:

@@ -15,12 +15,35 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from polymarketbot.logs import get_logger
 from polymarketbot.trading.domain2.types import DiscountOpportunity
 
 logger = get_logger("liquidity_router")
+
+
+class StrategyName(str, Enum):
+    """Canonical institutional nomenclature for Polymarket trading engines."""
+
+    REWARD_HARVESTER = "RewardHarvester"
+    """Continuous quoting, spread harvesting & 1440-epoch quadratic liquidity rewards (Former Domain 1)."""
+
+    SETTLEMENT_HARVESTER = "SettlementHarvester"
+    """Pre-settlement discount & resolution cycle burst harvester (Former Domain 2)."""
+
+    BASKET_PARITY = "BasketParity"
+    """Cross-spread synthetic basket arbitrage - Permanently gated at $0 capital (Former Domain 3)."""
+
+    LATENCY_SNIPER = "LatencySniper"
+    """High-frequency Binance USD-M futures lead-lag jump taker sniper (Former Strategy A)."""
+
+    CTF_SPLITTER = "CtfSplitter"
+    """On-chain complete-set minting (CTF.splitPosition) & selective cross-split arbitrage (Former Strategy C)."""
+
+    CAPITAL_ROUTER = "CapitalRouter"
+    """Dynamic inter-strategy treasury controller and liquidity loan manager."""
 
 
 @dataclass
@@ -150,14 +173,22 @@ class InterDomainLiquidityRouter:
         )
 
     def register_domain1(self, engine: Any) -> None:
-        """Register or update Domain 1 trading engine / cash manager."""
+        """Register or update Domain 1 (RewardHarvester) trading engine / cash manager."""
         self.domain1_engine = engine
-        logger.info("Domain 1 registered with InterDomainLiquidityRouter")
+        logger.info("RewardHarvester (Domain 1) registered with CapitalRouter")
+
+    def register_reward_harvester(self, engine: Any) -> None:
+        """Register or update RewardHarvester (Domain 1) trading engine."""
+        self.register_domain1(engine)
 
     def register_domain2(self, harvester: Any) -> None:
-        """Register or update Domain 2 settlement harvester."""
+        """Register or update Domain 2 (SettlementHarvester) settlement harvester."""
         self.domain2_harvester = harvester
-        logger.info("Domain 2 registered with InterDomainLiquidityRouter")
+        logger.info("SettlementHarvester (Domain 2) registered with CapitalRouter")
+
+    def register_settlement_harvester(self, harvester: Any) -> None:
+        """Register or update SettlementHarvester (Domain 2) settlement harvester."""
+        self.register_domain2(harvester)
 
     def compute_opportunity_arr(self, opportunity: DiscountOpportunity) -> float:
         """Compute the Annualized Return Rate (ARR) in percent for an evaluated discount opportunity."""
@@ -525,3 +556,7 @@ class InterDomainLiquidityRouter:
             "weighted_settlement_arr_pct": round(weighted_arr, 2),
             "incremental_arr_boost_pct": round(incremental_arr_boost, 2),
         }
+
+
+# Canonical Institutional Alias
+CapitalRouter = InterDomainLiquidityRouter

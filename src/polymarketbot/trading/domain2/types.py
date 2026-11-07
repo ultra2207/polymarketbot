@@ -104,6 +104,8 @@ class MakerPricingDecision:
     fee_rate_bps: float = 0.0
     reason: str = ""
     drift_rate_usd_hr: float = 0.0
+    maker_rebate_usd: float = 0.0
+    effective_price: float = 0.0
 
 
 @dataclass
@@ -123,6 +125,8 @@ class DiscountOpportunity:
     taker_sell_velocity_shares_hr: float = 0.0
     tick_size: float = 0.001
     drift_rate_usd_hr: float = 0.0
+    fee_schedule: Optional[Any] = None
+    maker_rebate_share_pct: float = 0.20
 
 
 @dataclass
@@ -140,6 +144,8 @@ class Domain2Position:
     is_redeemed: bool = False
     redeem_tx_hash: Optional[str] = None
     realized_pnl: Optional[float] = None
+    maker_rebate_usd: float = 0.0
+    effective_price: Optional[float] = None
 
 
 @dataclass

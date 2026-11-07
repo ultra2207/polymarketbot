@@ -338,20 +338,27 @@ class Domain2SettlementHarvester:
         shares: float,
         price: float,
         liveness_expiry_ts: int,
+        is_maker: bool = True,
+        maker_rebate_usd: float = 0.0,
     ) -> Domain2Position:
         """Record trade execution fill into internal inventory and settlement tracker."""
         cid = condition_id.lower()
-        cost = shares * price
-        self.available_cash -= cost
+        gross_cost = shares * price
+        rebate = float(maker_rebate_usd)
+        net_cost = gross_cost - rebate
+        effective_price = net_cost / max(1e-6, shares)
+        self.available_cash -= net_cost
 
         pos = Domain2Position(
             condition_id=cid,
             asset_id=asset_id,
             shares=shares,
-            cost_basis_usdc=cost,
-            entry_price=price,
+            cost_basis_usdc=net_cost,
+            entry_price=effective_price,
             liveness_expiry_ts=liveness_expiry_ts,
             proposed_price=1.0,
+            maker_rebate_usd=rebate,
+            effective_price=effective_price,
         )
         self._positions[cid] = pos
         self._market_states[cid] = Domain2MarketState.LIVENESS_ACTIVE
@@ -362,7 +369,10 @@ class Domain2SettlementHarvester:
             price=price,
             side="BUY",
         )
-        logger.info("Recorded fill for {}: {} shares @ ${:.4f} (${:.2f} USDC)", cid[:14], shares, price, cost)
+        logger.info(
+            "Recorded fill for {}: {} shares @ ${:.4f} (gross ${:.2f}, rebate ${:.4f}, net cost ${:.2f} USDC)",
+            cid[:14], shares, price, gross_cost, rebate, net_cost,
+        )
         return pos
 
     def poll_settlements(self) -> None:

@@ -47,13 +47,38 @@ from polymarketbot.trading.binance_anchor import (
     MarketHorizonInfo,
 )
 from polymarketbot.trading.ctf import MergeExecutionResult, PolygonCtfClient
+from polymarketbot.trading.ctf_split_arbitrage import (
+    CtfCrossSplitArbitrageEngine,
+    CtfSplitArbConfig,
+    CtfSplitExecutionPlan,
+    CtfSplitExecutionResult,
+    CtfSplitLeg,
+    CtfSplitOpportunity,
+    OrderBatchLeg,
+    SplitTransactionPayload,
+    encode_split_positions_calldata,
+    estimate_polygon_eip1559_gas_usd,
+)
 from polymarketbot.trading.engine import RealMoneyTradingEngine
+from polymarketbot.trading.latency_sniper import (
+    BinanceLatencySniperEngine,
+    LatencySniperConfig,
+    PolymarketTopBook,
+    SnipeDecision,
+    SniperTelemetry,
+    TakerOrder,
+    VIP_REBATE_RATES,
+    calculate_taker_fee as calculate_latency_sniper_taker_fee,
+    get_vip_rebate_rate,
+)
 from polymarketbot.trading.liquidity_router import (
     ActiveSettlementLoan,
+    CapitalRouter,
     CashInventoryManager,
     InterDomainLiquidityRouter,
     LiquidityRouterConfig,
     SimpleCashInventoryManager,
+    StrategyName,
 )
 from polymarketbot.trading.negrisk_engine import (
     CoherenceChecker,
@@ -91,6 +116,7 @@ __all__ = [
     "AvellanedaStoikovEngine",
     "BaseMarketMakingEngine",
     "BinanceAnchoredQuoter",
+    "BinanceLatencySniperEngine",
     "BinanceQuoteDecision",
     "BinanceSpotFeed",
     "BlackScholesBinaryEngine",
@@ -107,6 +133,12 @@ __all__ = [
     "ConversionPlanner",
     "compute_taker_fee",
     "CrossVenueLeadLagKalmanFilter",
+    "CtfCrossSplitArbitrageEngine",
+    "CtfSplitArbConfig",
+    "CtfSplitExecutionPlan",
+    "CtfSplitExecutionResult",
+    "CtfSplitLeg",
+    "CtfSplitOpportunity",
     "DynamicASCalibrator",
     "DynamicQueueDepletionTracker",
     "estimate_conversion_gas_usd",
@@ -118,6 +150,7 @@ __all__ = [
     "HorizonRegime",
     "InterDomainLiquidityRouter",
     "InventoryRegime",
+    "LatencySniperConfig",
     "LegQuote",
     "LifecycleExitOptimizer",
     "LiquidityRouterConfig",
@@ -137,6 +170,7 @@ __all__ = [
     "OrderSide",
     "OutcomeLeg",
     "PolygonCtfClient",
+    "PolymarketTopBook",
     "QueueAwareCancellationPolicy",
     "QueueCancellationConfig",
     "QueuePositionTracker",
@@ -144,7 +178,22 @@ __all__ = [
     "RateLimitTokenBucket",
     "RealMoneyTradingEngine",
     "SimpleCashInventoryManager",
+    "SnipeDecision",
+    "SniperTelemetry",
+    "TakerOrder",
     "TrackedOrder",
+    "VIP_REBATE_RATES",
     "VirtualQueueOrderBookEngine",
+    # Institutional Strategy Nomenclature
+    "StrategyName",
+    "CapitalRouter",
+    "LatencySniperEngine",
+    "CtfSplitterEngine",
+    "RewardHarvesterEngine",
 ]
+
+# Canonical Strategy Engine Aliases
+LatencySniperEngine = BinanceLatencySniperEngine
+CtfSplitterEngine = CtfCrossSplitArbitrageEngine
+RewardHarvesterEngine = RealMoneyTradingEngine
 

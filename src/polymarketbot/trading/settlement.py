@@ -76,6 +76,7 @@ ROUTER_REDEEM_SIGNATURE = "redeem(bytes31,uint256,uint256)"
 NEGRISK_CONVERT_SIGNATURE = "convertPositions(bytes32,uint256,uint256)"
 NEGRISK_MERGE_SIGNATURE = "mergePositions(bytes32,uint256)"
 CTF_MERGE_SIGNATURE = "mergePositions(address,bytes32,bytes32,uint256[],uint256)"
+CTF_SPLIT_SIGNATURE = "splitPosition(address,bytes32,bytes32,uint256[],uint256)"
 CTF_BALANCE_SIGNATURE = "balanceOf(address,uint256)"
 IS_APPROVED_FOR_ALL_SIGNATURE = "isApprovedForAll(address,address)"
 TRANSFER_SIGNATURE = "Transfer(address,address,uint256)"
@@ -90,6 +91,7 @@ ROUTER_REDEEM_SELECTOR = "d217a3cc"         # redeem(bytes31,uint256,uint256)
 NEGRISK_CONVERT_SELECTOR = "c64748c4"       # convertPositions(bytes32,uint256,uint256)
 NEGRISK_MERGE_SELECTOR = "b10c5c17"         # mergePositions(bytes32,uint256)
 CTF_MERGE_SELECTOR = "9e7212ad"             # mergePositions(address,bytes32,bytes32,uint256[],uint256)
+CTF_SPLIT_SELECTOR = "72ce4275"             # splitPosition(address,bytes32,bytes32,uint256[],uint256)
 CTF_BALANCE_SELECTOR = "00fdd58e"           # balanceOf(address,uint256)
 IS_APPROVED_FOR_ALL_SELECTOR = "e985e9c5"   # isApprovedForAll(address,address)
 TRANSFER_TOPIC = keccak256(TRANSFER_SIGNATURE.encode("utf-8")).hex()
@@ -101,6 +103,7 @@ for _sig, _expected in (
     (NEGRISK_CONVERT_SIGNATURE, NEGRISK_CONVERT_SELECTOR),
     (NEGRISK_MERGE_SIGNATURE, NEGRISK_MERGE_SELECTOR),
     (CTF_MERGE_SIGNATURE, CTF_MERGE_SELECTOR),
+    (CTF_SPLIT_SIGNATURE, CTF_SPLIT_SELECTOR),
     (CTF_BALANCE_SIGNATURE, CTF_BALANCE_SELECTOR),
     (IS_APPROVED_FOR_ALL_SIGNATURE, IS_APPROVED_FOR_ALL_SELECTOR),
 ):
@@ -310,6 +313,34 @@ def build_ctf_merge(
         + b"".join(indices)
     )
     return "0x" + CTF_MERGE_SELECTOR + words.hex()
+
+
+def build_ctf_split(
+    condition_id: str,
+    amount_6dp: int,
+    *,
+    collateral_token: str = USDC_E,
+    index_sets: Sequence[int] = (1, 2),
+    parent_collection_id: str = ZERO_BYTES32,
+) -> str:
+    """Calldata for CTF ``splitPosition(address,bytes32,bytes32,uint256[],uint256)``.
+
+    Byte-for-byte compatible with ``PolygonCtfClient.encode_split_positions``;
+    ``amount_6dp`` is in 6-decimal base units.
+    """
+    if not index_sets:
+        raise ValueError("index_sets partition cannot be empty")
+    indices = [_word_uint(index, "index_set") for index in index_sets]
+    words = (
+        _word_address(collateral_token, "collateral_token")
+        + _word_bytes32(parent_collection_id, "parent_collection_id")
+        + _word_bytes32(condition_id, "condition_id")
+        + _word_uint(160, "indexSets head offset")
+        + _word_uint(amount_6dp, "amount_6dp")
+        + _word_uint(len(indices), "indexSets length")
+        + b"".join(indices)
+    )
+    return "0x" + CTF_SPLIT_SELECTOR + words.hex()
 
 
 # ---------------------------------------------------------------------------

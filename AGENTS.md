@@ -33,6 +33,10 @@ runs have already wasted hours here.
   skip units already present. Then a 300-second cap is not a failure — it is
   progress, and the next bounded run continues where the last one stopped.
   `scripts/screen_calibration.py` writes one parquet per quarter for this reason.
+- **Subagent / background waiting cadence.** Never poll or set rapid sub-minute
+  timers (e.g. 15–30s) when waiting on background subagents or long tasks. Wait
+  and check on a ~3-minute (180s) cadence to prevent wasting LLM context tokens,
+  relying on reactive notifications to wake execution when subagents finish.
 
 
 ## Time budget — hard rule

@@ -9,9 +9,9 @@ This guide provides targeted instructions for:
 
 > [!IMPORTANT]
 > **Why Oracle Cloud Amsterdam (`eu-amsterdam-1`) is Our Designated Target:**
-> 1. **UK IP Geoblock**: Polymarket restricts and geoblocks UK IP addresses. Deploying in London (`uk-london-1`) risks account restriction or API 403 errors. Amsterdam is an EU hub with zero geoblock issues.
-> 2. **Network Latency & Peering**: Amsterdam is home to AMS-IX (one of the largest internet exchanges globally) and direct Cloudflare/Polymarket transit paths, delivering faster and more predictable execution latencies than AWS Dublin (`eu-west-1`).
-> 3. **Cost Superiority**: OCI Always Free provides up to **4 ARM Ampere cores and 24 GB RAM for $0/month forever**. It is definitely not worth paying for AWS after the 12-month free tier.
+> 1. **UK IP Geoblock**: Polymarket restricts and geoblocks UK IP addresses. Deploying in London (`uk-london-1` or AWS `eu-west-2`) risks account restriction or API 403 geoblock errors. Amsterdam is an EU hub with zero geoblock issues.
+> 2. **Network Latency & Direct Peering**: Amsterdam is home to AMS-IX (one of the largest internet exchanges globally) and direct low-latency Cloudflare/Polymarket transit paths. Benchmarks show `eu-amsterdam-1` (OCI) provides faster and more predictable round-trip latency than AWS Dublin (`eu-west-1`) and AWS London (`eu-west-2`).
+> 3. **Cost & Hardware Superiority**: OCI Always Free provides up to **4 ARM Ampere cores and 24 GB RAM for $0/month forever**. Because OCI `eu-amsterdam-1` is both faster and provides 24x the RAM of AWS free tier (1 GB), it is definitely not worth paying for AWS.
 
 ---
 

@@ -204,6 +204,8 @@ class MakerEngineConfig:
     acute_resolution_hours: float = 0.25           # 15 minutes cutoff for taker sweep
     min_taker_net_margin_bps: float = 30.0         # 30 bps min hurdle for taking
     taker_fee_param_c: float = 0.0                 # 0 for Polymarket 0% standard fee, 1.0 for dynamic fee
+    maker_rebate_share_pct: float = 0.20           # 20% to 50% taker fee pool redistributed to maker
+    fee_schedule: Optional[Any] = None
     queue_clearance_fraction_limit: float = 0.50   # t_clear must be <= 50% of remaining tau for Option B
     min_queue_time_window_hours: float = 0.05      # ~3 mins Polygon PoS batch relayer window (replaces ad-hoc 0.5h)
     max_quote_price: float = 0.992
@@ -235,6 +237,25 @@ class SettlementMakerPricingEngine:
         if c <= 0.0:
             return 0.0
         return c * 0.04 * price * (1.0 - price)
+
+    def calculate_maker_rebate(
+        self,
+        price: float,
+        shares: float = 1.0,
+        schedule: Optional[Any] = None,
+    ) -> float:
+        """Calculate maker fee rebate in USDC earned upon resting limit order fill."""
+        sched = schedule or self.config.fee_schedule
+        if sched is not None and getattr(sched, "rate", 0.0) > 0:
+            from polymarketbot.fees import maker_fee_rebate
+            return maker_fee_rebate(
+                price, shares, sched, maker_rebate_share_pct=self.config.maker_rebate_share_pct
+            )
+        c = self.config.taker_fee_param_c
+        if c > 0.0 and shares > 0.0 and 0.0 < price < 1.0:
+            taker_f = c * 0.04 * price * (1.0 - price) * shares
+            return round(taker_f * self.config.maker_rebate_share_pct, 5)
+        return 0.0
 
     def calculate_upward_drift_rate(
         self,
@@ -282,6 +303,7 @@ class SettlementMakerPricingEngine:
         taker_sell_velocity_shares_hr: Optional[float] = None,
         tick_size: Optional[float] = None,
         proposed_price: float = 1.0,
+        schedule: Optional[Any] = None,
     ) -> MakerPricingDecision:
         """Evaluate market conditions and determine the optimal quote price and execution regime."""
         ts = tick_size if (tick_size is not None and tick_size > 0) else self.config.default_tick_size
@@ -345,6 +367,8 @@ class SettlementMakerPricingEngine:
                     f"taking ask immediately at {best_ask:.4f}"
                 ),
                 drift_rate_usd_hr=round(drift_rate_usd_hr, 6),
+                maker_rebate_usd=0.0,
+                effective_price=best_ask,
             )
 
         # -------------------------------------------------------------
@@ -365,8 +389,12 @@ class SettlementMakerPricingEngine:
         else:
             p_fill_b = p_fill_b_calib
 
+        rebate_b = self.calculate_maker_rebate(p_quote_b, order_shares, schedule=schedule)
+        rebate_b_per_share = rebate_b / max(1e-6, order_shares)
+        p_eff_b = max(0.001, p_quote_b - rebate_b_per_share)
+
         t_hold_b_hours = max(0.05, tau + t_clear_b_hours)
-        margin_b = max(0.0, (proposed_price - p_quote_b) / p_quote_b)
+        margin_b = max(0.0, (proposed_price - p_eff_b) / p_eff_b)
         arr_b = (margin_b * (8760.0 / t_hold_b_hours)) * p_fill_b
 
         # -------------------------------------------------------------
@@ -386,8 +414,10 @@ class SettlementMakerPricingEngine:
                 taker_sell_velocity_shares_hr=v_sell,
                 is_taker=False,
                 fee_rate_bps=0.0,
-                reason=f"Spread is 1 tick ({spread:.4f}); joining top queue at {p_quote_b:.4f} behind {q_ahead:.1f} shares (t_clear={t_clear_b_hours*60:.1f}m)",
+                reason=f"Spread is 1 tick ({spread:.4f}); joining top queue at {p_quote_b:.4f} behind {q_ahead:.1f} shares (t_clear={t_clear_b_hours*60:.1f}m, eff_px={p_eff_b:.4f})",
                 drift_rate_usd_hr=round(drift_rate_usd_hr, 6),
+                maker_rebate_usd=round(rebate_b, 5),
+                effective_price=round(p_eff_b, 6),
             )
 
         # -------------------------------------------------------------
@@ -403,8 +433,12 @@ class SettlementMakerPricingEngine:
         p_fill_a_calib = self.compute_empirical_logistic_fill_prob(0.0, order_shares)
         p_fill_a = max(p_fill_a_poisson, p_fill_a_calib)
 
+        rebate_a = self.calculate_maker_rebate(p_quote_a, order_shares, schedule=schedule)
+        rebate_a_per_share = rebate_a / max(1e-6, order_shares)
+        p_eff_a = max(0.001, p_quote_a - rebate_a_per_share)
+
         t_hold_a_hours = max(0.05, tau + t_fill_a_hours)
-        margin_a = max(0.0, (proposed_price - p_quote_a) / p_quote_a)
+        margin_a = max(0.0, (proposed_price - p_eff_a) / p_eff_a)
         arr_a = (margin_a * (8760.0 / t_hold_a_hours)) * p_fill_a
 
         # -------------------------------------------------------------
@@ -431,8 +465,10 @@ class SettlementMakerPricingEngine:
                 taker_sell_velocity_shares_hr=v_sell,
                 is_taker=False,
                 fee_rate_bps=0.0,
-                reason=f"Option C chosen: Queue clears fast ({t_clear_b_hours*60:.1f}m <= {self.config.queue_clearance_fraction_limit*tau*60:.1f}m) and E[ARR_B]={arr_b:.1f}% > E[ARR_A]={arr_a:.1f}%",
+                reason=f"Option C chosen: Queue clears fast ({t_clear_b_hours*60:.1f}m <= {self.config.queue_clearance_fraction_limit*tau*60:.1f}m) and E[ARR_B]={arr_b:.1f}% > E[ARR_A]={arr_a:.1f}% (eff_px={p_eff_b:.4f})",
                 drift_rate_usd_hr=round(drift_rate_usd_hr, 6),
+                maker_rebate_usd=round(rebate_b, 5),
+                effective_price=round(p_eff_b, 6),
             )
         else:
             # Option A is superior: penny inside spread to be first in line with 0 queue ahead
@@ -455,6 +491,8 @@ class SettlementMakerPricingEngine:
                 taker_sell_velocity_shares_hr=v_sell,
                 is_taker=False,
                 fee_rate_bps=0.0,
-                reason=f"Option A chosen: Pennying inside spread at {p_quote_a:.4f} (Q_ahead=0); {', '.join(reason_details)}",
+                reason=f"Option A chosen: Pennying inside spread at {p_quote_a:.4f} (Q_ahead=0, eff_px={p_eff_a:.4f}); {', '.join(reason_details)}",
                 drift_rate_usd_hr=round(drift_rate_usd_hr, 6),
+                maker_rebate_usd=round(rebate_a, 5),
+                effective_price=round(p_eff_a, 6),
             )

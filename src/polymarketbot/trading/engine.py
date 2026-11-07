@@ -58,6 +58,7 @@ from polymarketbot.trading.base import (
     PositionView,
 )
 from polymarketbot.execution import PreSignedOrderCache, SelfTradeGuard
+from polymarketbot.fees import FeeSchedule, effective_maker_price, maker_fee_rebate
 from polymarketbot.trading.client import (
     ClobAPIError,
     ClobAuthCredentials,
@@ -135,6 +136,7 @@ class RealMoneyFillRecord:
     is_maker: bool
     order_id: str = ""
     notes: str = ""
+    maker_rebate_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -345,6 +347,8 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         tick_size: float = 0.01,
         neg_risk: bool = False,
         fee_rate_bps: int = 0,
+        fee_schedule: Optional[FeeSchedule] = None,
+        maker_rebate_share_pct: float = 0.20,
         days_to_resolution: float = 7.0,
         book_stale_seconds: float = 30.0,
         merge_cooldown_seconds: float = 60.0,
@@ -356,6 +360,8 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         self.neg_risk: bool = bool(neg_risk)
         self.event_id: Optional[str] = event_id
         self.fee_rate_bps: int = int(fee_rate_bps)
+        self.fee_schedule: Optional[FeeSchedule] = fee_schedule
+        self.maker_rebate_share_pct: float = float(maker_rebate_share_pct)
         self.days_to_resolution: float = float(days_to_resolution)
         self.book_stale_seconds: float = float(book_stale_seconds)
         self.merge_cooldown_seconds: float = float(merge_cooldown_seconds)
@@ -1524,10 +1530,28 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             return confirmed
 
     def _taker_fee(self, size: float, price: float) -> float:
-        """Exchange taker fee for a fill, from the market's fee_rate_bps."""
-        if self.fee_rate_bps <= 0 or size <= 0.0 or price <= 0.0:
+        """Exchange taker fee for a fill, from fee_schedule or fee_rate_bps."""
+        if size <= 0.0 or price <= 0.0:
+            return 0.0
+        if self.fee_schedule is not None and self.fee_schedule.rate > 0:
+            from polymarketbot.fees import taker_fee
+            return taker_fee(size, price, self.fee_schedule)
+        if self.fee_rate_bps <= 0:
             return 0.0
         return float(size) * float(price) * (self.fee_rate_bps / 10_000.0)
+
+    def _maker_rebate(self, size: float, price: float) -> float:
+        """Exchange maker fee rebate for a resting maker fill."""
+        if size <= 0.0 or price <= 0.0:
+            return 0.0
+        if self.fee_schedule is not None and self.fee_schedule.rate > 0:
+            return maker_fee_rebate(
+                price, size, self.fee_schedule, maker_rebate_share_pct=self.maker_rebate_share_pct
+            )
+        elif self.fee_rate_bps > 0:
+            t_fee = float(size) * float(price) * (self.fee_rate_bps / 10_000.0)
+            return round(t_fee * self.maker_rebate_share_pct, 5)
+        return 0.0
 
     def _marketable_price(self, token_side: str, side: str) -> Optional[float]:
         bid, ask = self.get_best_bid_ask(token_side)
@@ -2256,17 +2280,20 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         fee_usd: float = 0.0,
         ts: Optional[float] = None,
         is_taker: bool = False,
+        maker_rebate_usd: float = 0.0,
     ) -> None:
         """Apply a confirmed fill to cash, inventory, cost basis, and realized PnL.
 
         A resting maker BUY already reserved its collateral at placement when
         the endpoint reports free cash, so its fill only moves the reserve.
+        Maker fills on fee-charging markets earn a positive volume share rebate.
         """
         tok = str(tok).upper()
         side = str(side).upper()
         size = float(fill_sz)
         price = float(fill_px)
         fee = float(fee_usd)
+        rebate = float(maker_rebate_usd)
         if size <= 0.0 or not (0.0 < price < 1.0):
             return
         if tok not in ("YES", "NO") or side not in ("BUY", "SELL"):
@@ -2279,7 +2306,10 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             avg_attr = "avg_cost_yes" if tok == "YES" else "avg_cost_no"
             shares = float(getattr(self, shares_attr))
             avg = float(getattr(self, avg_attr))
-            realized = 0.0
+            realized = rebate
+            if rebate > 0.0:
+                self.cash += rebate
+                self.actual_rebates_usd += rebate
             allow_short = bool(getattr(self.risk_manager.config, "allow_short", False))
 
             if side == "BUY":
@@ -2289,7 +2319,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                         avg = (shares * avg + size * price) / new_shares
                 else:
                     cover = min(size, -shares)
-                    realized = (avg - price) * cover
+                    realized += (avg - price) * cover
                     if size + shares >= -1e-12:
                         new_shares = size + shares
                         avg = price if new_shares > 1e-12 else 0.0
@@ -2302,7 +2332,8 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             else:
                 if shares > 1e-12:
                     sold = min(size, shares)
-                    realized = 0.0 if self._cost_basis_unknown else (price - avg) * sold
+                    gain = 0.0 if self._cost_basis_unknown else (price - avg) * sold
+                    realized += gain
                     remaining = shares - sold
                     if size > sold + 1e-9:
                         extra = size - sold
@@ -2450,6 +2481,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         is_maker: bool,
         order_id: str,
         fee_usd: float,
+        maker_rebate_usd: float = 0.0,
         realized_pnl: float,
         note: str,
     ) -> None:
@@ -2477,6 +2509,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                 "is_maker": 1 if is_maker else 0,
                 "order_id": str(order_id or ""),
                 "fee_usd": float(fee_usd),
+                "maker_rebate_usd": float(maker_rebate_usd),
                 "mid_at_fill": mid,
                 "best_bid_at_fill": bid_at_fill,
                 "best_ask_at_fill": ask_at_fill,
@@ -2513,6 +2546,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         note: str,
     ) -> RealMoneyFillRecord:
         fee = self._taker_fee(size, price) if is_taker else 0.0
+        rebate = 0.0 if is_taker else self._maker_rebate(size, price)
         record = RealMoneyFillRecord(
             fill_id=str(uuid.uuid4())[:8],
             timestamp=ts,
@@ -2524,12 +2558,15 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             is_maker=not is_taker,
             order_id=str(qdata.get("order_id", "") or ""),
             notes=f"Live CLOB fill reconciled ({note})",
+            maker_rebate_usd=rebate,
         )
         self.fills_history.append(record)
         shares_attr = "shares_yes" if str(tok).upper() == "YES" else "shares_no"
         shares_before = float(getattr(self, shares_attr, 0.0) or 0.0)
         realized_before = float(self.realized_pnl)
-        self._apply_fill(tok, side, size, price, fee_usd=fee, ts=ts, is_taker=is_taker)
+        self._apply_fill(
+            tok, side, size, price, fee_usd=fee, ts=ts, is_taker=is_taker, maker_rebate_usd=rebate
+        )
         realized_delta = float(self.realized_pnl) - realized_before
         shares_after = float(getattr(self, shares_attr, 0.0) or 0.0)
 
@@ -2546,6 +2583,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             is_maker=not is_taker,
             order_id=order_id,
             fee_usd=fee,
+            maker_rebate_usd=rebate,
             realized_pnl=realized_delta,
             note=record.notes,
         )
@@ -2739,6 +2777,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             fill_size = min(remaining, float(trade_size))
             if fill_size <= 1e-9:
                 continue
+            rebate = self._maker_rebate(fill_size, quote_price)
             fill_rec = RealMoneyFillRecord(
                 fill_id=str(uuid.uuid4())[:8],
                 timestamp=ts,
@@ -2750,9 +2789,12 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                 is_maker=True,
                 order_id=qdata.get("order_id", ""),
                 notes="Simulated maker fill matched against market trade (Dry-Run)",
+                maker_rebate_usd=rebate,
             )
             self.fills_history.append(fill_rec)
-            self._apply_fill(tok, side, fill_size, quote_price, ts=ts)
+            self._apply_fill(
+                tok, side, fill_size, quote_price, ts=ts, is_taker=False, maker_rebate_usd=rebate
+            )
             qdata["size_matched"] = matched + fill_size
             if quote_size - qdata["size_matched"] <= 1e-9:
                 self._discard_dry_run_quote(qid)

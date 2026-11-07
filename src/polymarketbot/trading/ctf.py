@@ -57,6 +57,8 @@ CTF_CONTRACT_POLYGON = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 DEFAULT_COLLATERAL_USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Bridged USDC.e
 ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000"
 
+# splitPosition(address,bytes32,bytes32,uint256[],uint256) -> 0x72ce4275
+SPLIT_POSITIONS_SELECTOR = "72ce4275"
 # mergePositions(address,bytes32,bytes32,uint256[],uint256) -> 0x9e7212ad
 MERGE_POSITIONS_SELECTOR = "9e7212ad"
 # redeemPositions(address,bytes32,bytes32,uint256[]) -> 0x01b7037c
@@ -657,6 +659,52 @@ class PolygonCtfClient:
         calldata = (
             "0x"
             + MERGE_POSITIONS_SELECTOR
+            + collat
+            + parent
+            + cond
+            + offset_partition
+            + amount_hex
+            + arr_len
+            + arr_elems
+        )
+        return calldata
+
+    def encode_split_positions(
+        self,
+        condition_id: str,
+        amount_shares: float,
+        index_sets: Optional[List[int]] = None,
+        collateral_token: Optional[str] = None,
+        parent_collection_id: str = ZERO_BYTES32,
+    ) -> str:
+        """ABI-encode calldata for splitPosition(collateralToken, parentCollectionId, conditionId, indexSets, amount).
+
+        Args:
+            condition_id: 32-byte hex condition identifier.
+            amount_shares: Decimal shares to mint/split (e.g. 25.0).
+            index_sets: Partition index sets ([1, 2] for binary YES/NO).
+            collateral_token: Backing ERC-20 address (default: USDC.e).
+            parent_collection_id: Parent collection ID (default: 32 zero bytes).
+
+        Returns:
+            Hex string starting with '0x'.
+        """
+        indices = index_sets or [1, 2]
+        collat = (collateral_token or self.collateral_address).lower().removeprefix("0x").rjust(64, "0")
+        parent = parent_collection_id.lower().removeprefix("0x").rjust(64, "0")
+        cond = condition_id.lower().removeprefix("0x").rjust(64, "0")
+
+        # Head offset to dynamic array `indexSets` is at word index 5 (5 * 32 = 160 = 0xa0)
+        offset_partition = hex(160)[2:].rjust(64, "0")
+        amount_raw = int(round(amount_shares * 1_000_000))
+        amount_hex = hex(amount_raw)[2:].rjust(64, "0")
+
+        arr_len = hex(len(indices))[2:].rjust(64, "0")
+        arr_elems = "".join(hex(idx)[2:].rjust(64, "0") for idx in indices)
+
+        calldata = (
+            "0x"
+            + SPLIT_POSITIONS_SELECTOR
             + collat
             + parent
             + cond

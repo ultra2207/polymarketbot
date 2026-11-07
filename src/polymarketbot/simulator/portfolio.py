@@ -55,6 +55,7 @@ class PortfolioTransaction:
     realized_pnl: float
     cash_after: float
     notes: str = ""
+    maker_rebate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -206,6 +207,7 @@ class SimulatedPortfolio:
         net_cash_delta: float,
         realized_pnl: float,
         notes: str = "",
+        maker_rebate: float = 0.0,
     ) -> PortfolioTransaction:
         tx = PortfolioTransaction(
             tx_id=str(uuid.uuid4())[:8],
@@ -221,6 +223,7 @@ class SimulatedPortfolio:
             realized_pnl=realized_pnl,
             cash_after=self.cash,
             notes=notes,
+            maker_rebate=float(maker_rebate),
         )
         self.transactions.append(tx)
         return tx
@@ -384,6 +387,7 @@ class SimulatedPortfolio:
         size: float,
         is_maker: bool = True,
         notes: str = "",
+        maker_rebate_usd: float = 0.0,
     ) -> PortfolioTransaction:
         """Execute a simulated trade fill against the portfolio."""
         side_norm = side.upper()
@@ -397,6 +401,7 @@ class SimulatedPortfolio:
         pos = self.get_position(condition_id)
         notional = price * size
         fee = notional * (0.0 if is_maker else self.taker_fee_rate)
+        rebate = float(maker_rebate_usd) if is_maker else 0.0
         tx_type = (
             (TransactionType.FILL_BUY_MAKER if is_maker else TransactionType.FILL_BUY_TAKER)
             if side_norm == "BUY"
@@ -406,7 +411,7 @@ class SimulatedPortfolio:
         realized_gain = 0.0
 
         if side_norm == "BUY":
-            cash_needed = notional + fee
+            cash_needed = max(0.0, notional + fee - rebate)
             if self.cash < cash_needed:
                 log.warning(
                     f"Insufficient cash for BUY fill: needed ${cash_needed:.2f}, available ${self.cash:.2f}. "
@@ -415,23 +420,27 @@ class SimulatedPortfolio:
                 if self.cash <= 0:
                     raise ValueError(f"Zero cash available for BUY fill (needed ${cash_needed:.2f})")
                 # Clip size to available cash
-                size = max(0.01, (self.cash - fee) / price)
+                size = max(0.01, (self.cash - fee + rebate) / price)
                 notional = price * size
-                cash_needed = notional + fee
+                cash_needed = max(0.0, notional + fee - rebate)
 
             self.cash -= cash_needed
+            if rebate > 0:
+                self.total_rebates_usd = getattr(self, "total_rebates_usd", 0.0) + rebate
 
+            # Net cost basis accounts for maker fee rebate
+            net_basis = notional - rebate
             if outcome_norm == "YES":
                 current_shares = pos.shares_yes
                 current_cost = pos.avg_cost_yes
                 new_shares = current_shares + size
-                pos.avg_cost_yes = ((current_shares * current_cost) + notional) / new_shares
+                pos.avg_cost_yes = ((current_shares * current_cost) + net_basis) / new_shares
                 pos.shares_yes = new_shares
             elif outcome_norm == "NO":
                 current_shares = pos.shares_no
                 current_cost = pos.avg_cost_no
                 new_shares = current_shares + size
-                pos.avg_cost_no = ((current_shares * current_cost) + notional) / new_shares
+                pos.avg_cost_no = ((current_shares * current_cost) + net_basis) / new_shares
                 pos.shares_no = new_shares
             else:
                 raise ValueError(f"Unsupported outcome: {outcome_norm}")
@@ -511,6 +520,12 @@ class SimulatedPortfolio:
                     pos.avg_cost_yes = ((curr_yes * curr_cost_yes) + collateral_needed) / new_yes if new_yes > 0 else 0.0
                     pos.shares_yes = new_yes
 
+            if rebate > 0:
+                cash_delta += rebate
+                realized_gain += rebate
+                self.total_realized_pnl += rebate
+                pos.realized_pnl += rebate
+                self.total_rebates_usd = getattr(self, "total_rebates_usd", 0.0) + rebate
             actual_size = held_to_sell + deficit_to_mint
             notional = price * actual_size
             self.cash += cash_delta
@@ -531,6 +546,7 @@ class SimulatedPortfolio:
             net_cash_delta=net_cash_delta,
             realized_pnl=realized_gain,
             notes=notes or f"Fill {side_norm} {size:.2f} {outcome_norm} @ ${price:.3f} ({'MAKER' if is_maker else 'TAKER'})",
+            maker_rebate=rebate,
         )
 
         log.info(

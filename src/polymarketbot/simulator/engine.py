@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from polymarketbot.fees import taker_fee
+from polymarketbot.fees import maker_fee_rebate, taker_fee
 from polymarketbot.logs import get_logger
 from polymarketbot.rewards.allocator import (
     ContinuousOptimizationGovernor,
@@ -100,6 +100,7 @@ class FillRecord:
     queue_depleted: float = 0.0
     post_fill_drift: float = 0.0
     notes: str = ""
+    maker_rebate_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -541,6 +542,11 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         )
 
         for fill in fills:
+            rebate = 0.0
+            sched = getattr(self, "fee_schedule", None)
+            if fill.is_maker and sched is not None and getattr(sched, "rate", 0.0) > 0:
+                rebate = maker_fee_rebate(fill.fill_price, fill.fill_size, sched)
+            fill.maker_rebate_usd = rebate
             # Process fill into portfolio ledger
             tx = self.portfolio.process_fill(
                 condition_id=self.condition_id,
@@ -550,6 +556,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                 size=fill.fill_size,
                 is_maker=fill.is_maker,
                 notes=fill.notes,
+                maker_rebate_usd=rebate,
             )
 
             # Record fill to SQLite

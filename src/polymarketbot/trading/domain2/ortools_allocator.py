@@ -187,6 +187,7 @@ class Domain2Allocation:
     effective_avg_price: float = 0.0
     levels_consumed: int = 1
     total_fee_usd: float = 0.0
+    maker_rebate_usd: float = 0.0
     redemption_gas_usd: float = 0.0
     t_cycle_hours: float = 0.0
     annualized_arr_pct: float = 0.0
@@ -449,12 +450,18 @@ class Domain2OrtoolsAllocator:
                         f_exp = c.fee_exponent
                     fee_per_share = f_rate * ((px * (1.0 - px)) ** f_exp) if f_rate > 0 else 0.0
                 else:
-                    fee_per_share = 0.0
+                    if c.fee_schedule is not None and c.fee_schedule.rate > 0:
+                        reb_rate = c.fee_schedule.rebate_rate if c.fee_schedule.rebate_rate > 0 else 0.20
+                        f_taker = c.fee_schedule.rate * ((px * (1.0 - px)) ** c.fee_schedule.exponent)
+                        fee_per_share = - (reb_rate * f_taker)
+                    else:
+                        fee_per_share = 0.0
 
                 min_shares = max(1.0, self.min_order_usd / px)
                 gas_per_share = candidate_gas_usd / min_shares
 
-                raw_edge = (p_win - px - fee_per_share - gas_per_share) / px
+                eff_px = max(0.001, px + fee_per_share)
+                raw_edge = (p_win - eff_px - gas_per_share) / eff_px
                 variance_penalty = self.lambda_var * (hazard / (px ** 2))
                 risk_adjusted_edge = raw_edge - variance_penalty
                 
@@ -487,9 +494,14 @@ class Domain2OrtoolsAllocator:
                     rep_f_exp = c.fee_exponent
                 rep_fee = rep_f_rate * ((rep_px * (1.0 - rep_px)) ** rep_f_exp) if rep_f_rate > 0 else 0.0
             else:
-                rep_fee = 0.0
+                if c.fee_schedule is not None and c.fee_schedule.rate > 0:
+                    reb_rate = c.fee_schedule.rebate_rate if c.fee_schedule.rebate_rate > 0 else 0.20
+                    rep_fee = - (reb_rate * c.fee_schedule.rate * ((rep_px * (1.0 - rep_px)) ** c.fee_schedule.exponent))
+                else:
+                    rep_fee = 0.0
+            rep_eff_px = max(0.001, rep_px + rep_fee)
             rep_gas = candidate_gas_usd / max(1.0, self.min_order_usd / rep_px)
-            rep_edge = (p_win - rep_px - rep_fee - rep_gas) / rep_px - self.lambda_var * (hazard / (rep_px ** 2))
+            rep_edge = (p_win - rep_eff_px - rep_gas) / rep_eff_px - self.lambda_var * (hazard / (rep_px ** 2))
             expected_hourly_growth_rates[i] = rep_edge * v_hourly
             expected_arr_rates[i] = rep_edge * v_annual
 
@@ -564,8 +576,14 @@ class Domain2OrtoolsAllocator:
                             f_rate = c.fee_rate
                             f_exp = c.fee_exponent
                         fee_per_share_alloc = f_rate * ((eff_avg_px * (1.0 - eff_avg_px)) ** f_exp) if f_rate > 0 else 0.0
+                        rebate_per_share_alloc = 0.0
                     else:
                         fee_per_share_alloc = 0.0
+                        if c.fee_schedule is not None and c.fee_schedule.rate > 0:
+                            reb_rate = c.fee_schedule.rebate_rate if c.fee_schedule.rebate_rate > 0 else 0.20
+                            rebate_per_share_alloc = reb_rate * c.fee_schedule.rate * ((eff_avg_px * (1.0 - eff_avg_px)) ** c.fee_schedule.exponent)
+                        else:
+                            rebate_per_share_alloc = 0.0
 
                     if c.pos_env is not None:
                         candidate_gas_usd = c.pos_env.gas_units_to_usd(82_000)
@@ -575,9 +593,11 @@ class Domain2OrtoolsAllocator:
                         candidate_gas_usd = self.pos_env.gas_units_to_usd(82_000)
 
                     alloc_fee_usd = round(total_shares * fee_per_share_alloc, 4)
+                    alloc_rebate_usd = round(total_shares * rebate_per_share_alloc, 4)
                     alloc_gas_usd = round(candidate_gas_usd, 4) if total_shares > 0 else 0.0
                     gas_per_share_alloc = alloc_gas_usd / max(1e-6, total_shares)
-                    net_edge = ((p_win - eff_avg_px - fee_per_share_alloc - gas_per_share_alloc) / eff_avg_px) * 100.0
+                    eff_cost_px = max(0.001, eff_avg_px - rebate_per_share_alloc)
+                    net_edge = ((p_win - eff_cost_px - fee_per_share_alloc - gas_per_share_alloc) / eff_cost_px) * 100.0
 
                     allocations.append(
                         Domain2Allocation(
@@ -597,6 +617,7 @@ class Domain2OrtoolsAllocator:
                             effective_avg_price=round(eff_avg_px, 4),
                             levels_consumed=max(1, levels_hit),
                             total_fee_usd=alloc_fee_usd,
+                            maker_rebate_usd=alloc_rebate_usd,
                             redemption_gas_usd=alloc_gas_usd,
                             t_cycle_hours=round(candidate_cycle_times.get(i, 0.0), 4),
                             annualized_arr_pct=round(expected_arr_rates.get(i, 0.0) * 100.0, 2),
