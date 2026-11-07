@@ -73,12 +73,17 @@ from polymarketbot.trading.latency_sniper import (
 )
 from polymarketbot.trading.liquidity_router import (
     ActiveSettlementLoan,
+    AllocationSlice,
     CapitalRouter,
     CashInventoryManager,
     InterDomainLiquidityRouter,
     LiquidityRouterConfig,
+    MetaAllocationPlan,
+    MetaOptimizerCapitalRouter,
     SimpleCashInventoryManager,
+    StrategyCapacityModel,
     StrategyName,
+    get_default_strategy_models,
 )
 from polymarketbot.trading.negrisk_engine import (
     CoherenceChecker,
@@ -113,6 +118,7 @@ __all__ = [
     "ASInventoryConfig",
     "ASQuoteDecision",
     "ActiveSettlementLoan",
+    "AllocationSlice",
     "AvellanedaStoikovEngine",
     "BaseMarketMakingEngine",
     "BinanceAnchoredQuoter",
@@ -158,6 +164,8 @@ __all__ = [
     "MarketHorizonClassifier",
     "MarketHorizonInfo",
     "MergeExecutionResult",
+    "MetaAllocationPlan",
+    "MetaOptimizerCapitalRouter",
     "MultiLevelOrderFlowImbalanceTracker",
     "NegRiskEngine",
     "NegRiskExecutionPlan",
@@ -180,6 +188,8 @@ __all__ = [
     "SimpleCashInventoryManager",
     "SnipeDecision",
     "SniperTelemetry",
+    "StrategyCapacityModel",
+    "get_default_strategy_models",
     "TakerOrder",
     "TrackedOrder",
     "VIP_REBATE_RATES",
