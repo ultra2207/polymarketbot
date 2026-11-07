@@ -314,44 +314,47 @@ class LivePaperSoakDaemon:
                         # Detect price jumps in trailing 500ms
                         vel = self.sniper_engine.get_binance_velocity_bps(now_ms, lookback_ms=500.0)
                         if abs(vel) >= self.sniper_engine.config.min_jump_bps:
-                            # Evaluate snipe against top-of-book
-                            t_eval_start = time.perf_counter_ns()
-                            simulated_book = PolymarketTopBook(
-                                token_id="1001",
-                                best_bid=0.50,
-                                best_bid_size=500.0,
-                                best_ask=0.52,
-                                best_ask_size=500.0,
-                                timestamp_ms=now_ms - 250.0,  # 250ms stale
-                            )
-                            opp = self.sniper_engine.evaluate_snipe(simulated_book, now_ms)
-                            t_eval_us = (time.perf_counter_ns() - t_eval_start) / 1000.0
+                            # Realistic 250ms Speed Bump Reality:
+                            # Bot liquidity canceled in 30-50ms; only rare lingering human quotes exist (~30% chance)
+                            # Surviving retail quote size is small (median 40 shares = ~$20 notional)
+                            if (int(now_ms) % 3) == 0:  # ~33% lingering retail quote existence
+                                t_eval_start = time.perf_counter_ns()
+                                simulated_book = PolymarketTopBook(
+                                    token_id="1001",
+                                    best_bid=0.50,
+                                    best_bid_size=40.0,
+                                    best_ask=0.52,
+                                    best_ask_size=40.0,
+                                    timestamp_ms=now_ms - 850.0,  # lingering human quote (>500ms)
+                                )
+                                opp = self.sniper_engine.evaluate_snipe(simulated_book, now_ms)
+                                t_eval_us = (time.perf_counter_ns() - t_eval_start) / 1000.0
 
-                            if opp:
-                                order = self.sniper_engine.execute_snipe(opp, now_ms)
-                                if order:
-                                    gross = order.expected_profit_usd
-                                    fee = order.taker_fee_usd
-                                    rebate = order.rebate_usd
-                                    self.metrics["LatencySniper"].update_equity(gross, fee, rebate)
-                                    self.metrics["LatencySniper"].total_trades += 1
-                                    self.db.record_trade(
-                                        "LatencySniper",
-                                        opp.token_id,
-                                        order.side,
-                                        order.price,
-                                        order.size,
-                                        gross,
-                                        fee,
-                                        rebate,
-                                        latency_us=t_eval_us,
-                                        details=f"Binance Jump: {vel:+.1f}bps | Exec: {t_eval_us:.1f}us",
-                                    )
-                                    log.info(
-                                        f"{C_GREEN}[SNIPE HIT]{C_RESET} {symbol} Jump: {vel:+.1f}bps | "
-                                        f"Side: {order.side} | Edge: +${order.expected_profit_usd:.2f} | "
-                                        f"VIP Rebate: +${rebate:.4f} | Reaction: {t_eval_us:.1f}µs"
-                                    )
+                                if opp:
+                                    order = self.sniper_engine.execute_snipe(opp, now_ms)
+                                    if order:
+                                        gross = order.expected_profit_usd
+                                        fee = order.taker_fee_usd
+                                        rebate = order.rebate_usd
+                                        self.metrics["LatencySniper"].update_equity(gross, fee, rebate)
+                                        self.metrics["LatencySniper"].total_trades += 1
+                                        self.db.record_trade(
+                                            "LatencySniper",
+                                            opp.token_id,
+                                            order.side,
+                                            order.price,
+                                            order.size,
+                                            gross,
+                                            fee,
+                                            rebate,
+                                            latency_us=t_eval_us,
+                                            details=f"Binance Jump: {vel:+.1f}bps | Exec: {t_eval_us:.1f}us",
+                                        )
+                                        log.info(
+                                            f"{C_GREEN}[SNIPE HIT]{C_RESET} {symbol} Jump: {vel:+.1f}bps | "
+                                            f"Side: {order.side} | Edge: +${order.expected_profit_usd:.2f} | "
+                                            f"VIP Rebate: +${rebate:.4f} | Reaction: {t_eval_us:.1f}µs"
+                                        )
                     time.sleep(0.10)
             except Exception as e:
                 time.sleep(1.0)

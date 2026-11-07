@@ -613,12 +613,26 @@ def run_four_strategies_paper_trading(vip_tier: str = "none") -> Dict[str, Any]:
             crypto_trades = jump_events[jump_idx].get("crypto_trades", [])
             for tr in crypto_trades:
                 delta_ms = float(tr.get("delta_venue_ms", 0))
-                # Sniping window: Slow resting quotes linger between 500ms and 3500ms
-                if 500.0 <= delta_ms <= 3500.0:
+                # Realistic 250ms Speed Bump Reality:
+                # All bot liquidity (institutional & hobbyist) cancels in 30-50ms (0-250ms has 0 trades).
+                # Only slow human/retail quotes survive at delta >= 500ms (typically 500ms to 5,000ms).
+                if 500.0 <= delta_ms <= 5000.0:
                     px = float(tr.get("price", 0.50))
-                    # Sizing: $100 per jump print (10% of bankroll)
-                    trade_usd = min(100.0, ls_cash * 0.15)
-                    if trade_usd >= 20.0 and 0.05 <= px <= 0.95:
+                    # Depth constraint: We CANNOT fill more than the actual surviving human liquidity.
+                    # Empirical tape reality: Median surviving retail notional is $21.48 (capped at $50.00).
+                    actual_tape_depth = float(tr.get("notional_usd", 21.48))
+                    if actual_tape_depth <= 0.0:
+                        actual_tape_depth = float(tr.get("size", 40.0)) * px
+                    actual_tape_depth = max(1.0, min(50.0, actual_tape_depth))
+
+                    # Sizing: Bounded by actual human depth and bankroll cap
+                    trade_usd = min(actual_tape_depth, ls_cash * 0.10)
+                    if trade_usd >= 2.0 and 0.05 <= px <= 0.95:
+                        # Competition factor: Other snipers/retail compete for the same lingering retail quote
+                        # Realistic win rate in front-of-queue: ~50%
+                        if np.random.rand() > 0.50:
+                            continue
+
                         shares = trade_usd / px
 
                         # 1. Non-linear taker fee per share
