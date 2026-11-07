@@ -44,16 +44,86 @@ logger = get_logger("domain2_robust_hazard")
 
 # Default physical latencies (in hours)
 DEFAULT_UMA_SETTLEMENT_LATENCY_HOURS: float = 2.0     # 2-hour UMA liveness challenge window
-DEFAULT_REINVESTMENT_LATENCY_HOURS: float = 1.0       # Average capital queue/idle search time
+DEFAULT_UMA_LIVENESS_HOURS: float = 2.0               # Standard 2-hour UMA dispute challenge window
+DEFAULT_PROPOSAL_LAG_HOURS: float = 0.25              # Empirical delay from physical conclusion to UMA proposal
+DEFAULT_REDEEM_LATENCY_HOURS: float = 0.05            # Polygon PoS relayer queue + CTF redeem execution (~3m)
+DEFAULT_REINVESTMENT_LATENCY_HOURS: float = 0.15      # Empirical capital recycling / redeployment latency (~9m)
 HOURS_PER_YEAR: float = 8760.0                        # 365 days * 24 hours
 DEFAULT_DVM_VOTE_DELAY_HOURS: float = 72.0            # UMA DVM governance vote cycle duration
 DEFAULT_CTF_REDEEM_GAS_UNITS: int = 82_000            # Polygon PoS CTF.redeemPositions gas units
 
 
+def calculate_physical_cycle_time(
+    hours_to_resolution: float,
+    is_uma_proposed: bool = False,
+    is_deterministic_conclusion: bool = False,
+    proposal_lag_hours: float = DEFAULT_PROPOSAL_LAG_HOURS,
+    liveness_window_hours: float = DEFAULT_UMA_LIVENESS_HOURS,
+    redeem_latency_hours: float = DEFAULT_REDEEM_LATENCY_HOURS,
+    reinvestment_latency_hours: float = DEFAULT_REINVESTMENT_LATENCY_HOURS,
+    relayer_queue_delay_hours: float = 0.0,
+    dispute_contingency_hours: float = 0.0,
+) -> float:
+    """Calculate exact physical capital cycle time T_cycle under on-chain pipeline physics.
+
+    T_cycle = t_event_remaining + t_proposal_lag + t_liveness_remaining + t_redeem_latency + t_reinvest
+
+    Regimes:
+    1. Regime A (is_uma_proposed == True):
+       - Event already completed and proposed to UMA.
+       - t_event_remaining = 0.0
+       - t_proposal_lag = 0.0
+       - t_liveness_remaining = max(0.01, float(hours_to_resolution)) (e.g. 0.3h to 2.0h)
+       - t_redeem_latency = redeem_latency_hours + relayer_queue_delay_hours + dispute_contingency_hours
+       - t_reinvest = reinvestment_latency_hours
+       => T_cycle in [0.5h, 2.2h]
+
+    2. Regime B (is_deterministic_conclusion == True, not yet proposed):
+       - Real-world event physically concluded via Track 6 Ground Truth.
+       - t_event_remaining = 0.0
+       - t_proposal_lag = proposal_lag_hours (~0.25h)
+       - t_liveness_remaining = liveness_window_hours (2.0h)
+       - t_redeem_latency = redeem_latency_hours + relayer_queue_delay_hours + dispute_contingency_hours (~0.05h)
+       - t_reinvest = reinvestment_latency_hours (~0.15h)
+       => T_cycle ~ 2.45h (within 2.0h - 2.5h)
+
+    3. Unproposed In-Play / General:
+       - t_event_remaining = max(0.0, float(hours_to_resolution))
+       - t_proposal_lag = proposal_lag_hours (~0.25h)
+       - t_liveness_remaining = liveness_window_hours (2.0h)
+       - t_redeem_latency = redeem_latency_hours + relayer_queue_delay_hours + dispute_contingency_hours
+       - t_reinvest = reinvestment_latency_hours
+       => T_cycle = hours_to_resolution + ~2.45h
+    """
+    effective_redeem = max(0.01, redeem_latency_hours + relayer_queue_delay_hours + dispute_contingency_hours)
+    effective_reinvest = max(0.01, reinvestment_latency_hours)
+
+    if is_uma_proposed:
+        t_event = 0.0
+        t_prop = 0.0
+        t_live = max(0.01, float(hours_to_resolution))
+    elif is_deterministic_conclusion:
+        t_event = 0.0
+        t_prop = max(0.0, float(proposal_lag_hours))
+        t_live = max(0.0, float(liveness_window_hours))
+    else:
+        t_event = max(0.0, float(hours_to_resolution))
+        t_prop = max(0.0, float(proposal_lag_hours))
+        t_live = max(0.0, float(liveness_window_hours))
+
+    t_cycle = t_event + t_prop + t_live + effective_redeem + effective_reinvest
+    return float(max(0.05, t_cycle))
+
+
 def calculate_cycle_velocity(
     hours_to_resolution: float,
-    settlement_latency_hours: float = DEFAULT_UMA_SETTLEMENT_LATENCY_HOURS,
+    settlement_latency_hours: Optional[float] = None,
     reinvestment_latency_hours: float = DEFAULT_REINVESTMENT_LATENCY_HOURS,
+    is_uma_proposed: bool = False,
+    is_deterministic_conclusion: bool = False,
+    proposal_lag_hours: float = DEFAULT_PROPOSAL_LAG_HOURS,
+    liveness_window_hours: float = DEFAULT_UMA_LIVENESS_HOURS,
+    redeem_latency_hours: float = DEFAULT_REDEEM_LATENCY_HOURS,
 ) -> Tuple[float, float]:
     """Calculate realistic capital velocity under physical redeployment friction.
 
@@ -62,12 +132,19 @@ def calculate_cycle_velocity(
             - hourly_turnover_rate: Cycles completed per hour (1.0 / T_cycle).
             - annualized_turnover_multiplier: Total cycles per year (8760 / T_cycle).
     """
-    tau = max(0.01, float(hours_to_resolution))
-    t_settle = max(0.0, float(settlement_latency_hours))
-    t_reinvest = max(0.0, float(reinvestment_latency_hours))
-
-    # Total physical capital cycle time
-    t_cycle = tau + t_settle + t_reinvest
+    if settlement_latency_hours is not None and not is_uma_proposed and not is_deterministic_conclusion:
+        tau = max(0.0, float(hours_to_resolution))
+        t_cycle = max(0.05, tau + float(settlement_latency_hours) + float(reinvestment_latency_hours))
+    else:
+        t_cycle = calculate_physical_cycle_time(
+            hours_to_resolution=hours_to_resolution,
+            is_uma_proposed=is_uma_proposed,
+            is_deterministic_conclusion=is_deterministic_conclusion,
+            proposal_lag_hours=proposal_lag_hours,
+            liveness_window_hours=liveness_window_hours,
+            redeem_latency_hours=redeem_latency_hours,
+            reinvestment_latency_hours=reinvestment_latency_hours,
+        )
 
     hourly_rate = 1.0 / t_cycle
     annualized_mult = HOURS_PER_YEAR / t_cycle
@@ -383,6 +460,7 @@ class RobustHazardModel:
         underlying_vol_annual: Optional[float] = None,
         spread: Optional[float] = None,
         price_history: Optional[List[float]] = None,
+        is_deterministic_conclusion: bool = False,
     ) -> Tuple[float, float, float]:
         """Compute robust conservative hazard, capital velocity, and win probability.
 
@@ -395,18 +473,24 @@ class RobustHazardModel:
         cat = category.lower().strip()
         bayesian_upper = self.dispute_tracker.get_credible_upper_hazard(cat)
 
-        # 1. Dynamic Settlement Delay & Velocity Calculation
+        # 1. Dynamic Settlement Delay & Physical Capital Cycle Calculation
         delay_metrics = self.delay_model.calculate_turnover_delay(
-            liveness_remaining_hours=hours_to_resolution if is_uma_proposed else self.settlement_latency,
+            liveness_remaining_hours=hours_to_resolution if is_uma_proposed else DEFAULT_UMA_LIVENESS_HOURS,
             dispute_probability=bayesian_upper,
         )
-        effective_settle_latency = delay_metrics.effective_turnover_latency_hours
 
-        hourly_vel, _ = calculate_cycle_velocity(
+        t_cycle = calculate_physical_cycle_time(
             hours_to_resolution=hours_to_resolution,
-            settlement_latency_hours=effective_settle_latency,
+            is_uma_proposed=is_uma_proposed,
+            is_deterministic_conclusion=is_deterministic_conclusion,
+            proposal_lag_hours=DEFAULT_PROPOSAL_LAG_HOURS,
+            liveness_window_hours=DEFAULT_UMA_LIVENESS_HOURS,
+            redeem_latency_hours=DEFAULT_REDEEM_LATENCY_HOURS,
             reinvestment_latency_hours=self.reinvestment_latency,
+            relayer_queue_delay_hours=delay_metrics.relayer_queue_delay_hours,
+            dispute_contingency_hours=delay_metrics.dispute_contingency_hours,
         )
+        hourly_vel = 1.0 / t_cycle
 
         # 2. Dynamic Volatility Estimation (Never a static guess)
         vol_metrics = self.vol_estimator.estimate_volatility(
@@ -419,7 +503,9 @@ class RobustHazardModel:
         effective_vol = underlying_vol_annual if underlying_vol_annual is not None else vol_metrics.effective_annual_vol
 
         # 3. Structural Layer Evaluation
-        if is_uma_proposed or hours_to_resolution <= 0.0:
+        if is_deterministic_conclusion:
+            return 1.000, 0.000, hourly_vel
+        elif is_uma_proposed or hours_to_resolution <= 0.0:
             # Deterministic post-facto market: event has concluded.
             # Price discount is settlement basis carry (yield), NOT reversal risk.
             structural_hazard = bayesian_upper

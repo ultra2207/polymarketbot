@@ -3,9 +3,15 @@
 A complete, production-tested guide for running **PolymarketBot** natively on Linux Cloud Virtual Machines.
 
 This guide provides targeted instructions for:
-1. **Primary Deployment**: **Oracle Cloud Infrastructure (OCI) Always Free Tier** (Region: `uk-london-1`)
-2. **Secondary Deployment**: **AWS 12-Month Free Tier** (Region: `eu-west-2`, London)
+1. **Primary Deployment**: **Oracle Cloud Infrastructure (OCI) Always Free Tier** (Region: **`eu-amsterdam-1`**, Amsterdam)
+2. **Secondary / Fallback**: **AWS 12-Month Free Tier** (Region: `eu-central-1`, Frankfurt)
 3. **Alternative Budget VPS**: **Hetzner Cloud** (CX22 / CPX11) or **DigitalOcean**
+
+> [!IMPORTANT]
+> **Why Oracle Cloud Amsterdam (`eu-amsterdam-1`) is Our Designated Target:**
+> 1. **UK IP Geoblock**: Polymarket restricts and geoblocks UK IP addresses. Deploying in London (`uk-london-1`) risks account restriction or API 403 errors. Amsterdam is an EU hub with zero geoblock issues.
+> 2. **Network Latency & Peering**: Amsterdam is home to AMS-IX (one of the largest internet exchanges globally) and direct Cloudflare/Polymarket transit paths, delivering faster and more predictable execution latencies than AWS Dublin (`eu-west-1`).
+> 3. **Cost Superiority**: OCI Always Free provides up to **4 ARM Ampere cores and 24 GB RAM for $0/month forever**. It is definitely not worth paying for AWS after the 12-month free tier.
 
 ---
 
@@ -35,18 +41,18 @@ The Docker daemon (`dockerd`, `containerd`, shim processes, bridge networking, a
 
 | Cloud Provider | Instance Shape | Architecture | vCPU / RAM | Monthly Cost | Primary Region |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Oracle Cloud (OCI)** | `VM.Standard.A1.Flex` | **ARM64** (Ampere) | Up to 4 OCPUs / 24 GB RAM | **$0.00 (Always Free)** | `uk-london-1` |
-| **Oracle Cloud (OCI)** | `VM.Standard.E2.1.Micro` | **x86_64** (AMD) | 1 OCPU (shared) / 1 GB RAM | **$0.00 (Always Free)** | `uk-london-1` |
-| **AWS Free Tier** | `t2.micro` or `t3.micro` | **x86_64** (Intel/AMD) | 1–2 vCPU / 1 GB RAM | **$0.00 (12 Months)** | `eu-west-2` (London) |
-| **Hetzner Cloud** | `CX22` / `CPX11` | **x86_64** (Intel/AMD) | 2 vCPU / 2–4 GB RAM | **~€3.79 – €4.50/mo** | Falkenstein / Ashburn |
+| **Oracle Cloud (OCI)** | `VM.Standard.A1.Flex` | **ARM64** (Ampere) | Up to 4 OCPUs / 24 GB RAM | **$0.00 (Always Free)** | **`eu-amsterdam-1` (Primary)** |
+| **Oracle Cloud (OCI)** | `VM.Standard.E2.1.Micro` | **x86_64** (AMD) | 1 OCPU (shared) / 1 GB RAM | **$0.00 (Always Free)** | **`eu-amsterdam-1`** |
+| **AWS Free Tier** | `t2.micro` or `t3.micro` | **x86_64** (Intel/AMD) | 1–2 vCPU / 1 GB RAM | **$0.00 (12 Months)** | `eu-central-1` (Frankfurt) |
+| **Hetzner Cloud** | `CX22` / `CPX11` | **x86_64** (Intel/AMD) | 2 vCPU / 2–4 GB RAM | **~€3.79 – €4.50/mo** | Falkenstein / Helsinki |
 
 ---
 
-## 3. Deployment Walkthrough: Oracle Cloud (OCI) in `uk-london-1`
+## 3. Deployment Walkthrough: Oracle Cloud (OCI) in `eu-amsterdam-1`
 
 ### Step 3.1: Create Compute Instance
 1. Log in to [Oracle Cloud Console](https://cloud.oracle.com).
-2. Set region selector (top-right) to **UK South (London)** (`uk-london-1`).
+2. Set region selector (top-right) to **Netherlands Northwest (Amsterdam)** (`eu-amsterdam-1`).
 3. Open navigation menu (top-left) -> **Compute** -> **Instances** -> **Create Instance**.
 4. **Name**: `polymarketbot-node1`
 5. **Placement & Availability Domain**: Select any available AD (e.g. `AD-1` or `AD-2`).

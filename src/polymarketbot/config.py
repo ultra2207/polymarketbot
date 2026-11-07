@@ -30,6 +30,10 @@ class BotConfig:
     POLYGON_RPC_URL: str = ""
     CLOB_API_URL: str = "https://clob.polymarket.com"
     CLOB_WS_URL: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    DATA_GOV_API_KEY: str = ""
+    GOOGLE_CIVIC_API_KEY: str = ""
+    FRED_API_KEY: str = ""
+    BLS_API_KEY: str = ""
 
     # Convenient lowercase property accessors
     @property
@@ -71,6 +75,22 @@ class BotConfig:
     @property
     def clob_ws_url(self) -> str:
         return self.CLOB_WS_URL
+
+    @property
+    def data_gov_api_key(self) -> str:
+        return self.DATA_GOV_API_KEY
+
+    @property
+    def google_civic_api_key(self) -> str:
+        return self.GOOGLE_CIVIC_API_KEY
+
+    @property
+    def fred_api_key(self) -> str:
+        return self.FRED_API_KEY
+
+    @property
+    def bls_api_key(self) -> str:
+        return self.BLS_API_KEY
 
     def is_live_trading_ready(self) -> bool:
         """Check if minimum credentials required for live signed trading are set."""
@@ -196,6 +216,10 @@ def load_config(env_path: Union[str, Path] = ".env") -> BotConfig:
         POLYGON_RPC_URL=_get_val("POLYGON_RPC_URL", ""),
         CLOB_API_URL=_get_val("CLOB_API_URL", "https://clob.polymarket.com"),
         CLOB_WS_URL=_get_val("CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+        DATA_GOV_API_KEY=_get_val("DATA_GOV_API_KEY", "") or _get_val("FEC_API_KEY", ""),
+        GOOGLE_CIVIC_API_KEY=_get_val("GOOGLE_CIVIC_API_KEY", ""),
+        FRED_API_KEY=_get_val("FRED_API_KEY", ""),
+        BLS_API_KEY=_get_val("BLS_API_KEY", ""),
     )
 
     return config

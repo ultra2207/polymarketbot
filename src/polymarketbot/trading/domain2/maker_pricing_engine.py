@@ -172,7 +172,8 @@ class RollingTradeBuffer:
             dyn_floor = shares_24h / (24.0 * 4.0)
         else:
             # Scale floor by standing queue depth ahead and time horizon
-            dyn_floor = max(1.0, standing_depth_ahead / max(0.5, 2.0 * tau))
+            # Uses Polygon PoS minimum batch relayer window (0.05h ~ 3 mins) instead of ad-hoc heuristics
+            dyn_floor = max(1.0, standing_depth_ahead / max(0.05, 2.0 * tau))
 
         return max(1.0, round(dyn_floor, 2))
 
@@ -204,6 +205,7 @@ class MakerEngineConfig:
     min_taker_net_margin_bps: float = 30.0         # 30 bps min hurdle for taking
     taker_fee_param_c: float = 0.0                 # 0 for Polymarket 0% standard fee, 1.0 for dynamic fee
     queue_clearance_fraction_limit: float = 0.50   # t_clear must be <= 50% of remaining tau for Option B
+    min_queue_time_window_hours: float = 0.05      # ~3 mins Polygon PoS batch relayer window (replaces ad-hoc 0.5h)
     max_quote_price: float = 0.992
     min_quote_price: float = 0.950
 
@@ -300,7 +302,7 @@ class SettlementMakerPricingEngine:
         if taker_sell_velocity_shares_hr is not None and taker_sell_velocity_shares_hr > 0.0:
             v_sell = float(taker_sell_velocity_shares_hr)
         else:
-            v_sell = max(1.0, q_ahead / max(0.5, 2.0 * tau))
+            v_sell = max(1.0, q_ahead / max(self.config.min_queue_time_window_hours, 2.0 * tau))
 
         v_sell = max(1.0, v_sell)  # Prevent division by zero
 

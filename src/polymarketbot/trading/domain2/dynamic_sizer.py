@@ -144,6 +144,7 @@ class DynamicPositionSizer:
         spread: Optional[float] = None,
         price_history: Optional[List[float]] = None,
         empirical_vol: Optional[float] = None,
+        is_deterministic_conclusion: bool = False,
     ) -> StrikeDistanceMetrics:
         """Compute drift-diffusion distance to strike z_i and strike multiplier M_z(z_i).
         
@@ -159,7 +160,7 @@ class DynamicPositionSizer:
         cat = category.lower().strip()
 
         # If post-proposal or deterministic resolution, distance to strike is infinite (outcome settled)
-        if is_uma_proposed or hours_to_resolution <= 0.0:
+        if is_uma_proposed or is_deterministic_conclusion or hours_to_resolution <= 0.0:
             return StrikeDistanceMetrics(
                 spot_price=spot_price,
                 strike_price=strike_price,
@@ -421,6 +422,7 @@ class DynamicPositionSizer:
         price_history: Optional[List[float]] = None,
         empirical_vol: Optional[float] = None,
         order_book_levels: Optional[List[Tuple[float, float]]] = None,
+        is_deterministic_conclusion: bool = False,
     ) -> Dict[str, Any]:
         """Compute global institutional dynamic single-bet bound w_max(i).
         
@@ -443,6 +445,7 @@ class DynamicPositionSizer:
             spread=spread,
             price_history=price_history,
             empirical_vol=empirical_vol,
+            is_deterministic_conclusion=is_deterministic_conclusion,
         )
 
         # 2. Continuous Kelly
