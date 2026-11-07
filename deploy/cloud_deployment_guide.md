@@ -212,9 +212,9 @@ sudo journalctl -u polymarketbot -f -o cat
 
 ### Selecting Execution Modes
 
-By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across all 4 production pillars ($1,000 each = $4,000 total):
+By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across the Active 3-Pillar Trinity ($1,000 each = $3,000 total):
 ```ini
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
 ```
 
 ### Preflight Health Audit (Run before or after starting daemon):

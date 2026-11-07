@@ -749,9 +749,17 @@ def run_four_strategies_paper_trading(vip_tier: str = "none") -> Dict[str, Any]:
     logger.info("CtfSplitter finished: Final Equity=${:.2f}, Trades={}", cs_cash, len(cs_trades))
 
     # ==========================================================================
-    # 5. CONSOLIDATED BLENDED PORTFOLIO ($4,000 Total Capital)
+    # 5. CONSOLIDATED PORTFOLIOS (Active 3-Pillar Trinity vs Legacy 4-Way)
     # ==========================================================================
-    logger.info(">>> Computing Consolidated Blended Portfolio ($4,000 Total) <<<")
+    logger.info(">>> Computing Consolidated Portfolios <<<")
+    # Active 3-Pillar Trinity ($3,000 Total Capital: RewardHarvester + SettlementHarvester + CtfSplitter)
+    blended_3p_equity_series = [
+        e1 + e2 + e4
+        for e1, e2, e4 in zip(rh_equity_series, sh_equity_series, cs_equity_series)
+    ]
+    trades_3p = rh_trades + sh_trades + cs_trades
+
+    # Legacy 4-Way ($4,000 Total Capital)
     blended_equity_series = [
         e1 + e2 + e3 + e4
         for e1, e2, e3, e4 in zip(rh_equity_series, sh_equity_series, ls_equity_series, cs_equity_series)
@@ -761,16 +769,17 @@ def run_four_strategies_paper_trading(vip_tier: str = "none") -> Dict[str, Any]:
     # Compute risk-adjusted metrics for each
     metrics_rh = calculate_risk_adjusted_metrics("RewardHarvester", rh_equity_series, 1000.0, dur_days, rh_trades)
     metrics_sh = calculate_risk_adjusted_metrics("SettlementHarvester", sh_equity_series, 1000.0, dur_days, sh_trades)
-    metrics_ls = calculate_risk_adjusted_metrics("LatencySniper", ls_equity_series, 1000.0, dur_days, ls_trades)
+    metrics_ls = calculate_risk_adjusted_metrics("LatencySniper [BENCHED]", ls_equity_series, 1000.0, dur_days, ls_trades)
     metrics_cs = calculate_risk_adjusted_metrics("CtfSplitter", cs_equity_series, 1000.0, dur_days, cs_trades)
-    metrics_blended = calculate_risk_adjusted_metrics("Blended Portfolio", blended_equity_series, 4000.0, dur_days, all_trades)
+    metrics_3p = calculate_risk_adjusted_metrics("Active 3-Pillar Trinity", blended_3p_equity_series, 3000.0, dur_days, trades_3p)
+    metrics_blended = calculate_risk_adjusted_metrics("Legacy 4-Strategy Blended", blended_equity_series, 4000.0, dur_days, all_trades)
 
     results = {
         "metadata": {
             "simulation_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "duration_hours": round(dur_hours, 2),
             "duration_days": round(dur_days, 3),
-            "total_portfolio_capital_usd": 4000.0,
+            "active_portfolio_capital_usd": 3000.0,
             "capital_per_strategy_usd": 1000.0,
             "vip_tier": vip_tier,
             "vip_rebate_pct": round(get_vip_rebate_rate(vip_tier) * 100.0, 1),
@@ -778,9 +787,10 @@ def run_four_strategies_paper_trading(vip_tier: str = "none") -> Dict[str, Any]:
         "performance_metrics": {
             "reward_harvester": asdict(metrics_rh),
             "settlement_harvester": asdict(metrics_sh),
-            "latency_sniper": asdict(metrics_ls),
+            "latency_sniper_benched": asdict(metrics_ls),
             "ctf_splitter": asdict(metrics_cs),
-            "blended_portfolio": asdict(metrics_blended),
+            "active_3pillar_trinity": asdict(metrics_3p),
+            "legacy_4strategy_blended": asdict(metrics_blended),
         },
     }
 

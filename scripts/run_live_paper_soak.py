@@ -203,10 +203,10 @@ class SoakTelemetryDb:
                     uptime_sec,
                     total_equity,
                     total_net_pnl,
-                    strats["LatencySniper"].net_pnl,
-                    strats["Domain2ARR"].net_pnl,
-                    strats["CtfSplitter"].net_pnl,
-                    strats["SettlementHarvester"].net_pnl,
+                    strats["LatencySniper"].net_pnl if "LatencySniper" in strats else 0.0,
+                    strats["Domain2ARR"].net_pnl if "Domain2ARR" in strats else 0.0,
+                    strats["CtfSplitter"].net_pnl if "CtfSplitter" in strats else 0.0,
+                    strats["SettlementHarvester"].net_pnl if "SettlementHarvester" in strats else 0.0,
                     clob_rtt_ms,
                     binance_rtt_ms,
                     trades_count,
@@ -221,38 +221,44 @@ class SoakTelemetryDb:
 # ==============================================================================
 
 class LivePaperSoakDaemon:
-    """Master controller managing the 4 trading strategies concurrently."""
+    """Master controller managing the Active 3-Pillar Production Trinity (or legacy 4-strategy mode)."""
 
     def __init__(
         self,
         capital_per_strategy: float = 1000.0,
         vip_tier: str = "none",
         duration: Optional[float] = None,
+        enable_latency_sniper: bool = False,
     ) -> None:
         self.capital_per_strategy = capital_per_strategy
         self.vip_tier = vip_tier.lower()
         self.duration = duration
+        self.enable_latency_sniper = enable_latency_sniper
         self.running = False
         self.db = SoakTelemetryDb()
         self.start_time = 0.0
 
-        # Performance tracking metrics
-        self.metrics = {
-            "LatencySniper": StrategyMetrics("LatencySniper", capital_per_strategy, capital_per_strategy, capital_per_strategy),
+        # Active Production Pillars (3 Pillars active by default; LatencySniper benched due to 23.9% ARR)
+        self.metrics: Dict[str, StrategyMetrics] = {
             "Domain2ARR": StrategyMetrics("Domain2ARR", capital_per_strategy, capital_per_strategy, capital_per_strategy * 0.40),
-            "CtfSplitter": StrategyMetrics("CtfSplitter", capital_per_strategy, capital_per_strategy, capital_per_strategy * 0.25),
             "SettlementHarvester": StrategyMetrics("SettlementHarvester", capital_per_strategy, capital_per_strategy, capital_per_strategy * 0.40),
+            "CtfSplitter": StrategyMetrics("CtfSplitter", capital_per_strategy, capital_per_strategy, capital_per_strategy * 0.25),
         }
+        if self.enable_latency_sniper:
+            self.metrics["LatencySniper"] = StrategyMetrics(
+                "LatencySniper [BENCHED]", capital_per_strategy, capital_per_strategy, capital_per_strategy
+            )
 
         # Subsystems
-        self.presigned_cache = PreSignedOrderCache()
-        self.sniper_engine = BinanceLatencySniperEngine(
-            config=LatencySniperConfig(vip_tier=self.vip_tier, min_jump_bps=12.0),
-            presigned_cache=self.presigned_cache,
-        )
         self.ctf_engine = CtfCrossSplitArbitrageEngine(
             config=CtfSplitArbConfig(vip_tier=self.vip_tier, min_net_edge_usd=0.50),
         )
+        if self.enable_latency_sniper:
+            self.presigned_cache = PreSignedOrderCache()
+            self.sniper_engine = BinanceLatencySniperEngine(
+                config=LatencySniperConfig(vip_tier=self.vip_tier, min_jump_bps=12.0),
+                presigned_cache=self.presigned_cache,
+            )
 
         # Network latency monitors
         self.last_clob_rtt_ms = 0.0
@@ -261,10 +267,13 @@ class LivePaperSoakDaemon:
     def start(self) -> None:
         self.running = True
         self.start_time = time.time()
+        active_count = len(self.metrics)
         log.info(
-            f"Starting Live Paper Soak Daemon | Capital: ${self.capital_per_strategy * 4:,.2f} "
-            f"($1,000 x 4) | VIP Tier: {self.vip_tier.upper()}"
+            f"Starting Live Paper Soak Daemon | Active Capital: ${self.capital_per_strategy * active_count:,.2f} "
+            f"(${self.capital_per_strategy:,.0f} x {active_count} pillars) | VIP Tier: {self.vip_tier.upper()}"
         )
+        if not self.enable_latency_sniper:
+            log.info("Note: LatencySniper is BENCHED (23.9% ARR vs 2,554% 3-pillar ARR). Focus is 100% on Maker, Settlement & Parity.")
 
         # Register signals
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -272,12 +281,14 @@ class LivePaperSoakDaemon:
 
         # Launch background strategy worker threads
         threads = [
-            threading.Thread(target=self._run_latency_sniper_loop, daemon=True, name="SniperLoop"),
             threading.Thread(target=self._run_domain2_maker_loop, daemon=True, name="Domain2Loop"),
             threading.Thread(target=self._run_ctf_splitter_loop, daemon=True, name="CtfSplitterLoop"),
             threading.Thread(target=self._run_settlement_harvester_loop, daemon=True, name="SettlementLoop"),
             threading.Thread(target=self._run_network_ping_loop, daemon=True, name="NetworkPingLoop"),
         ]
+        if self.enable_latency_sniper:
+            threads.append(threading.Thread(target=self._run_latency_sniper_loop, daemon=True, name="SniperLoop"))
+
         for t in threads:
             t.start()
 
@@ -551,11 +562,12 @@ class LivePaperSoakDaemon:
                         f"{pnl_color}{m.net_pnl:>+10.2f}{C_RESET} {m.max_drawdown_pct * 100:>6.2f}% {m.total_trades:>6}"
                     )
                 print(f"{C_DIM}------------------------------------------------------------------------------{C_RESET}")
+                tot_cap = self.capital_per_strategy * len(self.metrics)
                 tot_color = C_GREEN if total_net_pnl >= 0 else C_RED
                 print(
-                    f"{C_BOLD}TOTAL PORTFOLIO{C_RESET}          $4,000.00   "
+                    f"{C_BOLD}TOTAL ACTIVE PORTFOLIO{C_RESET}   ${tot_cap:<11.2f} "
                     f"${total_equity:<15.2f} {tot_color}{total_net_pnl:>+10.2f}{C_RESET} "
-                    f"Max Return: {tot_color}{(total_net_pnl / 4000.0) * 100:+.3f}%{C_RESET}"
+                    f"Max Return: {tot_color}{(total_net_pnl / tot_cap) * 100:+.3f}%{C_RESET}"
                 )
                 print(f"{C_BOLD}=============================================================================={C_RESET}\n")
 
@@ -569,13 +581,20 @@ class LivePaperSoakDaemon:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="24/7 Live Paper Trading Soak Daemon")
-    parser.add_argument("--capital", type=float, default=4000.0, help="Total virtual bankroll across 4 engines (default: $4,000)")
+    parser.add_argument("--capital", type=float, default=3000.0, help="Total virtual bankroll across active pillars (default: $3,000)")
     parser.add_argument("--vip-tier", type=str, default="none", help="Polymarket VIP Rebate Tier (none, bronze, silver, gold, platinum)")
     parser.add_argument("--duration", type=float, default=None, help="Optional duration in seconds to run before halting")
+    parser.add_argument("--enable-latency-sniper", action="store_true", help="Enable experimental LatencySniper (benched by default due to 23.9%% ARR)")
     args = parser.parse_args()
 
-    capital_each = args.capital / 4.0
-    daemon = LivePaperSoakDaemon(capital_per_strategy=capital_each, vip_tier=args.vip_tier, duration=args.duration)
+    num_pillars = 4 if args.enable_latency_sniper else 3
+    capital_each = args.capital / float(num_pillars)
+    daemon = LivePaperSoakDaemon(
+        capital_per_strategy=capital_each,
+        vip_tier=args.vip_tier,
+        duration=args.duration,
+        enable_latency_sniper=args.enable_latency_sniper,
+    )
     daemon.start()
     return 0
 

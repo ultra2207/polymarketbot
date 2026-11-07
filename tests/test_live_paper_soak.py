@@ -65,8 +65,16 @@ def test_live_paper_soak_daemon_lifecycle(tmp_path: Path) -> None:
 
     assert daemon.capital_per_strategy == 500.0
     assert daemon.vip_tier == "bronze"
-    assert len(daemon.metrics) == 4
-    assert daemon.metrics["LatencySniper"].starting_cash == 500.0
+    # Default is Active 3-Pillar Trinity
+    assert len(daemon.metrics) == 3
+    assert "Domain2ARR" in daemon.metrics
+    assert "SettlementHarvester" in daemon.metrics
+    assert "CtfSplitter" in daemon.metrics
+
+    # Test optional latency sniper
+    daemon_with_sniper = LivePaperSoakDaemon(capital_per_strategy=500.0, vip_tier="bronze", enable_latency_sniper=True)
+    assert len(daemon_with_sniper.metrics) == 4
+    assert "LatencySniper" in daemon_with_sniper.metrics
 
 
 def test_preflight_auditor_local_sanity() -> None:

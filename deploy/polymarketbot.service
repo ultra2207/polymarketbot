@@ -22,9 +22,10 @@ Environment=DUCKDB_MEMORY_LIMIT=1GB
 Environment=DUCKDB_THREADS=2
 
 # Execution Command
-# Default (Leading to Dec 1): 24/7 Zero-Capital Live Paper Trading Soak across all 4 production strategies
-#   Allocates $1,000 each to LatencySniper, Domain2ARR, CtfSplitter, and SettlementHarvester.
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
+# Default (Leading to Dec 1): 24/7 Zero-Capital Live Paper Trading Soak across the Active 3-Pillar Trinity
+#   Allocates $1,000 each to Domain2ARR (Maker), SettlementHarvester, and CtfSplitter ($3,000 total).
+#   (LatencySniper benched due to 23.9% ARR retail capacity ceiling).
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
 
 # Alternate modes (override via systemctl edit polymarketbot):
 #   Preflight Verification:
