@@ -501,13 +501,17 @@ def _last_taped_block(root: Path) -> int | None:
     restart leaves a small permanent hole between the last run and the new head.
     """
     try:
-        import duckdb
+        from polymarketbot.db import connect as db_connect
 
         path = Path(root) / "polygon_logs" / "**" / "*.parquet"
-        row = duckdb.connect().execute(
-            "SELECT MAX(block_number) FROM read_parquet(?)", [str(path)]
-        ).fetchone()
-        return int(row[0]) if row and row[0] is not None else None
+        con = db_connect(threads=2, memory_limit="1GB")
+        try:
+            row = con.execute(
+                "SELECT MAX(block_number) FROM read_parquet(?)", [str(path)]
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else None
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001 - a missing or partial tape must not stop the stream
         return None
 

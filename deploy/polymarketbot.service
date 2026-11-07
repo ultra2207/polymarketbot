@@ -1,0 +1,62 @@
+[Unit]
+Description=Polymarket High-Frequency Market Making & Harvesting Daemon
+Documentation=https://github.com/ultra2207/polymarketbot
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=polymarketbot
+Group=polymarketbot
+WorkingDirectory=/opt/polymarketbot
+
+# Environment configuration: checks /etc/polymarketbot first, then local repo fallback
+EnvironmentFile=-/etc/polymarketbot/polymarketbot.env
+EnvironmentFile=-/opt/polymarketbot/.env
+
+# Python and Low-RAM VPS Memory Optimization
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONOPTIMIZE=1
+Environment=MALLOC_ARENA_MAX=2
+Environment=DUCKDB_MEMORY_LIMIT=1GB
+Environment=DUCKDB_THREADS=2
+
+# Execution Command
+# Default: Autonomous paper trading & quadratic rewards harvester
+# Alternate modes (uncomment desired mode or override via systemctl edit polymarketbot):
+#   Paper Trading (multi-market):
+#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_paper_trading.py --markets 5
+#   Background Data Collector:
+#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_data_collector.py --allow-long --duration 0
+#   Real Money Quoting (Requires --live, --yes, and populated credentials):
+#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_real_money_trader.py --live --yes --budget-pct 0.20
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_autonomous_daemon.py --capital 100
+
+# Reliability & Crash Recovery
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+FinalKillSignal=SIGKILL
+
+# Low-RAM VPS Resource Protection (Guards 1GB - 4GB instances against OOM thrashing)
+MemoryHigh=1.2G
+MemoryMax=1.5G
+MemorySwapMax=0
+CPUQuota=95%
+
+# Process and Security Hardening
+LimitNOFILE=65535
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polymarketbot/data /var/log/polymarketbot /var/lib/polymarketbot /tmp
+PrivateTmp=true
+
+# Logging to Systemd Journal with automatic log rotation
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarketbot
+
+[Install]
+WantedBy=multi-user.target

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import duckdb
 
+from polymarketbot.db import connect as db_connect
 from polymarketbot.logs import IST, get_logger
 
 log = get_logger("monitor_collector")
@@ -48,13 +49,16 @@ def writer_health() -> dict[str, float]:
     g = "data/tape/health_metrics/**/*.parquet"
     cutoff = int((time.time() - 600) * 1e9)
     try:
-        con = duckdb.connect()
-        rows = con.sql(
-            f"SELECT metric, max(value) FROM read_parquet('{g}') "
-            f"WHERE recv_ts_ns >= {cutoff} "
-            "AND metric IN ('queue_depth','spills','compaction_errors') GROUP BY 1"
-        ).fetchall()
-        return {r[0]: float(r[1]) for r in rows}
+        con = db_connect(threads=2, memory_limit="1GB")
+        try:
+            rows = con.sql(
+                f"SELECT metric, max(value) FROM read_parquet('{g}') "
+                f"WHERE recv_ts_ns >= {cutoff} "
+                "AND metric IN ('queue_depth','spills','compaction_errors') GROUP BY 1"
+            ).fetchall()
+            return {r[0]: float(r[1]) for r in rows}
+        finally:
+            con.close()
     except Exception as exc:  # noqa: BLE001 - monitor must not die
         log.warning(f"health query failed: {exc}")
         return {}

@@ -349,6 +349,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         book_stale_seconds: float = 30.0,
         merge_cooldown_seconds: float = 60.0,
         event_id: Optional[str] = None,
+        router: Optional[Any] = None,
     ) -> None:
         init_cash = float(initial_cash)
         self.tick_size: float = float(tick_size) if float(tick_size) > 0.0 else 0.01
@@ -460,6 +461,11 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
 
         if self.dry_run and hasattr(self.clob_client, "_mock_balance_usd"):
             self.clob_client._mock_balance_usd = self.total_wallet_balance
+
+        # Inter-Domain Dynamic Liquidity Router
+        self.router = router
+        if self.router is not None and hasattr(self.router, "register_domain1"):
+            self.router.register_domain1(self)
 
         # Wallet & Inventory State
         self.cash: float = self.initial_cash
@@ -1142,6 +1148,45 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
     def get_equity(self, prices: Optional[dict[str, tuple[float, float]]] = None) -> float:
         """Free cash + locked collateral + inventory at fresh mid (else avg cost)."""
         return self.get_cash() + self.get_locked_cash() + self._inventory_value()
+
+    # -------------------------------------------------------------------------
+    # Inter-Domain Dynamic Liquidity Routing Hooks
+    # -------------------------------------------------------------------------
+
+    def loan_capital(self, amount: float) -> bool:
+        """Loan unencumbered capital to Domain 2 via InterDomainLiquidityRouter."""
+        amt = float(amount)
+        if amt <= 0.0 or amt > self.cash:
+            return False
+        self.cash -= amt
+        if hasattr(self, "risk_manager") and hasattr(self.risk_manager, "portfolio_state"):
+            self.risk_manager.portfolio_state.current_cash_usd = self.cash
+        logger.info(
+            "RealMoneyTradingEngine loaned ${:.2f} to Domain 2; cash remaining: ${:.2f}",
+            amt, self.cash,
+        )
+        return True
+
+    def repatriate_capital(self, returned_usd: float, profit_usd: float) -> None:
+        """Receive repatriated principal and profit from Domain 2 settlement."""
+        ret = float(returned_usd)
+        prof = float(profit_usd)
+        total = ret + prof
+        self.cash += total
+        self.realized_pnl += prof
+        if hasattr(self, "risk_manager") and hasattr(self.risk_manager, "portfolio_state"):
+            self.risk_manager.portfolio_state.current_cash_usd = self.cash
+        logger.info(
+            "RealMoneyTradingEngine repatriated ${:.2f} (${:.2f} principal + ${:.2f} profit); cash now: ${:.2f}",
+            total, ret, prof, self.cash,
+        )
+
+    def get_unencumbered_cash(self, min_reserve_pct: float = 0.20) -> float:
+        """Get unencumbered cash available for inter-domain lending above reserve buffer."""
+        free_cash = self.get_cash()
+        total_eq = self.get_equity()
+        reserve_buffer = total_eq * float(min_reserve_pct)
+        return max(0.0, free_cash - reserve_buffer)
 
     def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
         tok = token_side.upper()

@@ -34,10 +34,13 @@ import datetime
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
 PYTHON = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 COLLECTOR = REPO_ROOT / "scripts" / "run_data_collector.py"
 HEALTH_GLOB = str(REPO_ROOT / "data" / "tape" / "health_metrics" / "**" / "*.parquet")
@@ -78,11 +81,15 @@ def collector_pids() -> list[int]:
 def health_age_s() -> float | None:
     """Age of the newest health row; None when there is no health table."""
     try:
-        import duckdb
+        from polymarketbot.db import connect as db_connect
 
-        value = duckdb.sql(
-            f"SELECT max(recv_ts_ns) FROM read_parquet('{HEALTH_GLOB}')"
-        ).fetchall()[0][0]
+        con = db_connect(threads=2, memory_limit="1GB")
+        try:
+            value = con.sql(
+                f"SELECT max(recv_ts_ns) FROM read_parquet('{HEALTH_GLOB}')"
+            ).fetchall()[0][0]
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001 - no table yet is not an error
         return None
     if not value:

@@ -1,24 +1,64 @@
-# data (top-level tape only; do not ignore src/polymarketbot/data/)
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Data and artifacts (top-level only; do not ignore src/polymarketbot/data/)
 /data/
 *.part
 .tmp/
 
-# python
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
+# Temporary and scratch storage
+scratch/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.duckdb*
+duckdb_spill/
 
-# os
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+
+# Environments and package management
+.venv/
+env/
+venv/
+ENV/
+
+# Secrets and credentials (never commit secrets)
+.env
+.env.*
+!.env.example
+secrets/
+key.txt
+*.pem
+*.key
+deploy/.env
+deploy/*.env
+!deploy/env.template
+
+# OS-specific artifacts
 .DS_Store
 Thumbs.db
+desktop.ini
+ehthumbs.db
 
-# secrets (RPC keys etc.)
-.env
+# Logs
+*.log
+logs/
 
-# scratch
-scratch/
-
-# local secrets
-key.txt
-secrets/
+# IDE and editors
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace

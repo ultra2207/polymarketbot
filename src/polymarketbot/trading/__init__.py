@@ -48,6 +48,13 @@ from polymarketbot.trading.binance_anchor import (
 )
 from polymarketbot.trading.ctf import MergeExecutionResult, PolygonCtfClient
 from polymarketbot.trading.engine import RealMoneyTradingEngine
+from polymarketbot.trading.liquidity_router import (
+    ActiveSettlementLoan,
+    CashInventoryManager,
+    InterDomainLiquidityRouter,
+    LiquidityRouterConfig,
+    SimpleCashInventoryManager,
+)
 from polymarketbot.trading.negrisk_engine import (
     CoherenceChecker,
     ConversionPlanner,
@@ -80,6 +87,7 @@ from polymarketbot.trading.virtual_queue_book import (
 __all__ = [
     "ASInventoryConfig",
     "ASQuoteDecision",
+    "ActiveSettlementLoan",
     "AvellanedaStoikovEngine",
     "BaseMarketMakingEngine",
     "BinanceAnchoredQuoter",
@@ -89,6 +97,7 @@ __all__ = [
     "CancellationDecision",
     "CancellationModel",
     "CancellationUrgency",
+    "CashInventoryManager",
     "ClobAuthCredentials",
     "CoherenceChecker",
     "ComplementMergeRecord",
@@ -107,9 +116,11 @@ __all__ = [
     "HighFrequencyEWMAVolEstimator",
     "HighFrequencyVolEstimator",
     "HorizonRegime",
+    "InterDomainLiquidityRouter",
     "InventoryRegime",
     "LegQuote",
     "LifecycleExitOptimizer",
+    "LiquidityRouterConfig",
     "LiveClobClient",
     "MarketHorizonClassifier",
     "MarketHorizonInfo",
@@ -132,6 +143,7 @@ __all__ = [
     "QuotePair",
     "RateLimitTokenBucket",
     "RealMoneyTradingEngine",
+    "SimpleCashInventoryManager",
     "TrackedOrder",
     "VirtualQueueOrderBookEngine",
 ]

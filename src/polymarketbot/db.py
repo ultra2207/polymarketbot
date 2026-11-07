@@ -1,17 +1,8 @@
 """Shared DuckDB connection settings.
 
-Every script used to hardcode `threads = 8`, which leaves most of a 24-thread
-machine idle. Measured on the one-month tape aggregation:
-
-    threads=8   1.61 s
-    threads=12  1.41 s
-    threads=16  1.36 s
-    threads=20  1.28 s
-
-So the gain is real but bounded (~20%): these jobs are I/O- and
-decompression-bound, not CPU-bound. Adding more threads past the physical core
-count mostly adds contention. The defaults below reflect that measurement
-rather than a guess.
+Configures memory limit and thread allocations for local and cloud environments.
+Supports DUCKDB_MEMORY_LIMIT and DUCKDB_THREADS environment variables to prevent
+OOM on low-RAM cloud instances (e.g. 1GB-4GB VPS).
 """
 
 from __future__ import annotations
@@ -26,16 +17,31 @@ TEMP_DIR = Path("data/tmp")
 
 def connect(
     threads: int | None = None,
-    memory_limit: str = "8GB",
+    memory_limit: str | None = None,
     temp_dir: Path | str | None = TEMP_DIR,
 ) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
 
-    # Never exceed physical cores; hyperthreads add little for scan workloads.
-    physical = max(1, (os.cpu_count() or 8) // 2)
-    n = threads or min(16, physical)
+    # Resolve memory limit: explicit parameter -> DUCKDB_MEMORY_LIMIT env -> default 1GB
+    # 1GB ensures stability on low-RAM cloud VPS (e.g. Oracle Cloud Free Tier 1GB micro).
+    mem = memory_limit or os.environ.get("DUCKDB_MEMORY_LIMIT", "1GB")
+
+    # Resolve threads: explicit parameter -> DUCKDB_THREADS env -> default 2
+    # Bounded to physical core count.
+    physical = max(1, (os.cpu_count() or 2) // 2)
+    env_threads = os.environ.get("DUCKDB_THREADS")
+    if threads is not None:
+        n = threads
+    elif env_threads:
+        try:
+            n = int(env_threads)
+        except ValueError:
+            n = min(2, physical)
+    else:
+        n = min(2, physical)
+
     con.execute(f"SET threads = {n}")
-    con.execute(f"SET memory_limit = '{memory_limit}'")
+    con.execute(f"SET memory_limit = '{mem}'")
 
     # These jobs produce unordered aggregates and Parquet files; preserving
     # insertion order costs memory for no benefit.

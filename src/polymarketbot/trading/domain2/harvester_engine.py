@@ -10,8 +10,11 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, TYPE_CHECKING
 from polymarketbot.logs import get_logger
+
+if TYPE_CHECKING:
+    from polymarketbot.trading.liquidity_router import InterDomainLiquidityRouter
 from polymarketbot.trading.client import LiveClobClient
 from polymarketbot.trading.ctf import PolygonCtfClient
 from polymarketbot.rewards.queue_valuation import PolygonPoSEnvironment
@@ -58,21 +61,31 @@ class Domain2SettlementHarvester:
         pos_env: Optional[PolygonPoSEnvironment] = None,
         order_placer: Optional[Domain2ClobOrderPlacer] = None,
         pricing_engine: Optional[SettlementMakerPricingEngine] = None,
+        router: Optional[InterDomainLiquidityRouter] = None,
     ):
         self.clob_client = clob_client
         self.ctf_client = ctf_client
         self.dry_run = dry_run
         self.available_cash = initial_capital_usdc
         self.initial_capital = initial_capital_usdc
+        self.router = router
+        if self.router is not None and hasattr(self.router, "register_domain2"):
+            self.router.register_domain2(self)
         self.pos_env = pos_env or PolygonPoSEnvironment()
 
         # Mathematical Global Optima Allocator (Google OR-Tools)
         self.allocator = allocator or Domain2OrtoolsAllocator(pos_env=self.pos_env)
 
         # Emergency Circuit Breaker (Broad bounds so math controls entry, halted on disputes)
+        effective_exposure_cap = initial_capital_usdc
+        if effective_exposure_cap <= 0.0 and self.router is not None:
+            effective_exposure_cap = float(self.router.get_total_portfolio_equity() or 10000.0)
+        elif effective_exposure_cap <= 0.0:
+            effective_exposure_cap = 10000.0
+
         self.circuit_breaker = circuit_breaker or Domain2CircuitBreaker(
-            max_market_allocation_pct=0.10,
-            max_portfolio_exposure_usdc=initial_capital_usdc,
+            max_market_allocation_pct=0.15 if self.router else 0.10,
+            max_portfolio_exposure_usdc=effective_exposure_cap,
             max_concurrent_markets=15,
             min_price=0.850,
             max_price=0.998,
@@ -104,9 +117,35 @@ class Domain2SettlementHarvester:
         self.trade_buffer = RollingTradeBuffer(window_seconds=3600.0)
 
     def get_portfolio_equity(self) -> float:
-        """Calculate total mark-to-market portfolio equity."""
+        """Calculate total mark-to-market portfolio equity.
+
+        When dynamic liquidity router is active, equity represents the unified
+        inter-domain portfolio equity to prevent cash-drag circuit breaker rejections.
+        """
+        if self.router is not None and hasattr(self.router, "get_total_portfolio_equity"):
+            return float(self.router.get_total_portfolio_equity())
+        return self.get_domain2_local_equity()
+
+    def get_domain2_local_equity(self) -> float:
+        """Calculate Domain 2 local cash + positions equity."""
         pos_val = sum(p.shares * p.entry_price for p in self._positions.values() if not p.is_redeemed)
         return self.available_cash + pos_val
+
+    def receive_routed_capital(self, amount_usd: float) -> None:
+        """Receive loaned liquidity from Domain 1 via InterDomainLiquidityRouter."""
+        self.available_cash += float(amount_usd)
+        logger.info(
+            "Domain 2 received ${:.2f} routed capital; available_cash=${:.2f}",
+            amount_usd, self.available_cash,
+        )
+
+    def repatriate_routed_capital(self, amount_usd: float) -> None:
+        """Deduct swept capital upon settlement repatriation back to Domain 1."""
+        self.available_cash = max(0.0, self.available_cash - float(amount_usd))
+        logger.info(
+            "Domain 2 swept ${:.2f} back to Domain 1; available_cash=${:.2f}",
+            amount_usd, self.available_cash,
+        )
 
     def extract_live_market_depth_and_velocity(
         self,
@@ -223,8 +262,18 @@ class Domain2SettlementHarvester:
             logger.info("Entry rejected by circuit breaker for condition {}: {}", cid[:14], reason)
             return
 
+        # Request unencumbered capital from Domain 1 via Liquidity Router if needed
+        if self.router is not None and self.available_cash < alloc_cap:
+            needed = alloc_cap - self.available_cash
+            routed = self.router.request_settlement_capital(opp, needed)
+            logger.info("Liquidity router allocated ${:.2f} for condition {}", routed, cid[:14])
+
         # Place passive limit bid
         alloc_to_use = min(alloc_cap, self.available_cash)
+        if alloc_to_use <= 0.0:
+            logger.info("Insufficient capital to quote condition {}: available ${:.2f}", cid[:14], self.available_cash)
+            return
+
         order_res = self.order_placer.place_discount_bid(opp, alloc_to_use)
         if order_res and order_res.success:
             self._market_states[cid] = Domain2MarketState.QUOTING
@@ -262,6 +311,12 @@ class Domain2SettlementHarvester:
                 pos.realized_pnl = profit
                 self.available_cash += payout_proceeds
                 self._market_states[res.condition_id] = Domain2MarketState.SETTLED
+                if self.router is not None:
+                    self.router.release_settlement_capital(
+                        condition_id=res.condition_id,
+                        returned_usd=pos.cost_basis_usdc,
+                        profit_usd=profit,
+                    )
                 logger.info(
                     "Settlement complete for condition {}: proceeds ${:,.2f}, profit ${:,.2f}",
                     res.condition_id[:14], payout_proceeds, profit,
@@ -312,6 +367,12 @@ class Domain2SettlementHarvester:
                 pos.realized_pnl = profit
                 self.available_cash += payout_proceeds
                 self._market_states[res.condition_id] = Domain2MarketState.SETTLED
+                if self.router is not None:
+                    self.router.release_settlement_capital(
+                        condition_id=res.condition_id,
+                        returned_usd=pos.cost_basis_usdc,
+                        profit_usd=profit,
+                    )
 
     def scan_universe_candidates(
         self,
