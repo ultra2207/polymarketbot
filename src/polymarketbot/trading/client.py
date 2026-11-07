@@ -71,12 +71,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
+import orjson
 import requests
 
 from polymarketbot.dataapi import DataAPIClient
-from polymarketbot.execution.fast_cancel import DedicatedCancellationPool
 from polymarketbot.logs import get_logger
 from polymarketbot.net import install_doh_fallback
 from polymarketbot.risk.fast_signer import (
@@ -293,6 +293,16 @@ USDC_ASSET_ADDRESSES = frozenset({
     "0x2791bca1f2de4661ed88a30c99a7a9449aa84174",
     "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
 })
+
+from polymarketbot.execution.fast_cancel import DedicatedCancellationPool
+from polymarketbot.execution.hft_pool import HftConnectionPool
+from polymarketbot.execution.presigned_cache import PreSignedOrder, PreSignedOrderCache
+from polymarketbot.execution.self_trade import (
+    MakerOrderRecord,
+    SelfTradeGuard,
+    STPAction,
+    STPCheckResult,
+)
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -566,6 +576,9 @@ class LiveClobClient:
         timeout: float = 5.0,
         dry_run: bool = False,
         use_fast_cancel_pool: bool = False,
+        use_hft_pool: bool = False,
+        presigned_cache: Optional[PreSignedOrderCache] = None,
+        self_trade_guard: Optional[SelfTradeGuard] = None,
         order_version: Optional[int] = None,
     ) -> None:
         self.credentials = credentials or ClobAuthCredentials.from_env()
@@ -574,6 +587,10 @@ class LiveClobClient:
         self.verifying_contract = verifying_contract
         self.timeout = timeout
         self.signature_type = int(self.credentials.signature_type)
+
+        # HFT execution components
+        self.presigned_cache = presigned_cache
+        self.self_trade_guard = self_trade_guard
 
         # CLOB order version: resolved from GET /version unless injected.
         self._version_lock = threading.Lock()
@@ -659,6 +676,24 @@ class LiveClobClient:
                 self._fast_cancel_pool = DedicatedCancellationPool(host=host, auto_warm=False)
             except Exception as e:
                 logger.warning(f"Failed to initialize fast cancel pool: {e}")
+
+        # Dedicated pre-warmed HFT execution and cancellation pool
+        self.hft_pool: Optional[HftConnectionPool] = None
+        if use_hft_pool and not self.dry_run:
+            try:
+                host = self.base_url.removeprefix("https://").removeprefix("http://").split("/")[0]
+                self.hft_pool = HftConnectionPool(
+                    host=host,
+                    pool_size=4,
+                    timeout=self.timeout,
+                    api_key=self.credentials.api_key,
+                    api_secret=self.credentials.api_secret,
+                    passphrase=self.credentials.passphrase,
+                    signer_address=self.signer_address,
+                    auto_warm=False,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize HFT connection pool: {e}")
 
         # Simulated state for dry-run tracking
         self._mock_orders: dict[str, dict[str, Any]] = {}
@@ -864,7 +899,17 @@ class LiveClobClient:
         return self._get_session()
 
     def close(self) -> None:
-        """Close every session created by this client (best effort)."""
+        """Close every session and connection pool created by this client (best effort)."""
+        if self.hft_pool is not None:
+            try:
+                self.hft_pool.close()
+            except Exception:
+                pass
+        if self._fast_cancel_pool is not None:
+            try:
+                self._fast_cancel_pool.close()
+            except Exception:
+                pass
         with self._sessions_lock:
             sessions = list(self._sessions)
             self._sessions.clear()
@@ -1301,23 +1346,74 @@ class LiveClobClient:
                     size,
                 )
 
+            # -------------------------------------------------------------
+            # Self-Trade Prevention (Wash Trading Guard) Check
+            # -------------------------------------------------------------
+            if self.self_trade_guard is not None:
+                stp_check = self.self_trade_guard.check_order(
+                    token_id=token_str,
+                    side=side_norm,
+                    price=rounded_price,
+                    size=rounded_size,
+                    is_taker=not post_only,
+                )
+                if not stp_check.allowed:
+                    if stp_check.action == STPAction.CANCEL_MAKER:
+                        for crossing_ord in stp_check.crossing_orders:
+                            self.cancel_order(crossing_ord.order_id)
+                    else:
+                        logger.warning(
+                            f"Order placement blocked by SelfTradeGuard: {stp_check.reason}"
+                        )
+                        return self._placement_failure(
+                            "STP_REJECTED",
+                            stp_check.reason,
+                            side,
+                            price,
+                            size,
+                        )
+
+            # -------------------------------------------------------------
+            # Pre-Signed Order Cache (Zero-Latency Quoting)
+            # -------------------------------------------------------------
+            fast_order = None
+            payload = None
+            raw_bytes = None
             order_version = self._resolve_order_version()
-            fast_order, payload = self.build_signed_order(
-                token_id=token_str,
-                side=side_norm,
-                price=rounded_price,
-                size=rounded_size,
-                expiration=int(expiration),
-                fee_rate_bps=int(fee_rate_bps),
-                neg_risk=neg_risk_flag,
-                order_type=order_type,
-                tick_size=market_tick,
-                metadata=metadata,
-                builder_code=builder_code,
-                post_only=post_only,
-                order_version=order_version,
-            )
-            sig = payload.get("signature") or payload.get("order", {}).get("signature", "")
+
+            if self.presigned_cache is not None:
+                cached = self.presigned_cache.pop_order(
+                    token_id=token_str,
+                    side=side_norm,
+                    price=rounded_price,
+                    size=rounded_size,
+                    tick_size=market_tick,
+                )
+                if cached is not None:
+                    fast_order = cached.order
+                    payload = cached.payload
+                    raw_bytes = cached.raw_json_bytes
+                    sig = cached.signature
+                    order_version = cached.version
+
+            if payload is None:
+                fast_order, payload = self.build_signed_order(
+                    token_id=token_str,
+                    side=side_norm,
+                    price=rounded_price,
+                    size=rounded_size,
+                    expiration=int(expiration),
+                    fee_rate_bps=int(fee_rate_bps),
+                    neg_risk=neg_risk_flag,
+                    order_type=order_type,
+                    tick_size=market_tick,
+                    metadata=metadata,
+                    builder_code=builder_code,
+                    post_only=post_only,
+                    order_version=order_version,
+                )
+                sig = payload.get("signature") or payload.get("order", {}).get("signature", "")
+                raw_bytes = orjson.dumps(payload)
         except ClobAPIError as e:
             logger.error(f"CLOB order setup failed: {e}")
             return self._placement_failure("REJECTED", str(e), side, price, size)
@@ -1345,6 +1441,14 @@ class LiveClobClient:
                 "status": "LIVE",
                 "order_version": order_version,
             }
+            if self.self_trade_guard is not None:
+                self.self_trade_guard.register_maker_order(
+                    order_id=mock_id,
+                    token_id=token_str,
+                    side=side_norm,
+                    price=rounded_price,
+                    size=rounded_size,
+                )
             return OrderPlacementResult(
                 success=True,
                 order_id=mock_id,
@@ -1355,6 +1459,43 @@ class LiveClobClient:
                 raw_response={"orderID": mock_id, "status": "LIVE", "mock": True, "order_version": order_version},
                 signature=sig,
                 is_dry_run=True,
+            )
+
+        # -------------------------------------------------------------
+        # Live Placement via HFT Connection Pool
+        # -------------------------------------------------------------
+        if self.hft_pool is not None:
+            resp = self.hft_pool.place_order(raw_bytes if raw_bytes is not None else payload)
+            data = resp.data
+            if resp.success and isinstance(data, dict) and data.get("success", True):
+                order_id = str(data.get("orderID") or data.get("id") or "")
+                logger.info(
+                    f"Live CLOB order placed via HFT pool: ID={order_id} "
+                    f"(v{order_version} {side_norm} {rounded_size} @ ${rounded_price} in {resp.latency_ms:.2f}ms)"
+                )
+                if self.self_trade_guard is not None:
+                    self.self_trade_guard.register_maker_order(
+                        order_id=order_id,
+                        token_id=token_str,
+                        side=side_norm,
+                        price=rounded_price,
+                        size=rounded_size,
+                    )
+                return OrderPlacementResult(
+                    success=True,
+                    order_id=order_id,
+                    status="LIVE",
+                    side=side_norm,
+                    price=rounded_price,
+                    size=rounded_size,
+                    raw_response=data,
+                    signature=sig,
+                    is_dry_run=False,
+                )
+            err = (data.get("errorMsg") or data.get("error") if isinstance(data, dict) else resp.error) or "HFT order rejected"
+            logger.error(f"HFT CLOB order placement failed: {err}")
+            return self._placement_failure(
+                "REJECTED", str(err), side, price, size, raw=data if isinstance(data, dict) else {}, signature=sig
             )
 
         path = "/order"
@@ -1432,6 +1573,14 @@ class LiveClobClient:
                 f"Live CLOB order placed successfully: ID={order_id} "
                 f"(v{order_version} {side_norm} {rounded_size} @ ${rounded_price})"
             )
+            if self.self_trade_guard is not None:
+                self.self_trade_guard.register_maker_order(
+                    order_id=order_id,
+                    token_id=token_str,
+                    side=side_norm,
+                    price=rounded_price,
+                    size=rounded_size,
+                )
             return OrderPlacementResult(
                 success=True,
                 order_id=order_id,
@@ -1443,6 +1592,155 @@ class LiveClobClient:
                 signature=sig,
                 is_dry_run=False,
             )
+
+    def place_orders(
+        self,
+        orders: Sequence[dict[str, Any]],
+    ) -> List[OrderPlacementResult]:
+        """Submit a batch of orders to Polymarket CLOB via POST /orders.
+
+        Uses pre-signed cache when available and HFT connection pool for single-RTT execution.
+        """
+        results: List[OrderPlacementResult] = []
+        if not orders:
+            return results
+
+        prepared_payloads: List[dict[str, Any]] = []
+        prepared_indices: List[int] = []
+
+        for idx, ord_spec in enumerate(orders):
+            token_id = str(ord_spec.get("token_id", "")).strip()
+            side = str(ord_spec.get("side", "")).upper()
+            price = float(ord_spec.get("price", 0.0))
+            size = float(ord_spec.get("size", 0.0))
+            tick_size = float(ord_spec.get("tick_size") or DEFAULT_TICK_SIZE)
+            post_only = bool(ord_spec.get("post_only", False))
+
+            if not token_id.isdigit() or side not in ("BUY", "SELL") or not (0 < price < 1) or size <= 0:
+                results.append(self._placement_failure("REJECTED", "Invalid batch order parameters", side, price, size))
+                continue
+
+            rounded_price = self._round_to_tick(price, tick_size)
+            rounded_size = float(_quantize(Decimal(str(size)), 2, ROUND_DOWN))
+
+            if self.self_trade_guard is not None:
+                stp_check = self.self_trade_guard.check_order(token_id, side, rounded_price, rounded_size, is_taker=not post_only)
+                if not stp_check.allowed:
+                    results.append(self._placement_failure("STP_REJECTED", stp_check.reason, side, price, size))
+                    continue
+
+            payload = None
+            sig = ""
+            order_version = self._resolve_order_version()
+
+            if self.presigned_cache is not None:
+                cached = self.presigned_cache.pop_order(token_id, side, rounded_price, rounded_size, tick_size)
+                if cached is not None:
+                    payload = cached.payload
+                    sig = cached.signature
+                    order_version = cached.version
+
+            if payload is None:
+                try:
+                    _, payload = self.build_signed_order(
+                        token_id=token_id,
+                        side=side,
+                        price=rounded_price,
+                        size=rounded_size,
+                        tick_size=tick_size,
+                        post_only=post_only,
+                        order_version=order_version,
+                    )
+                    sig = payload.get("signature") or payload.get("order", {}).get("signature", "")
+                except Exception as e:
+                    results.append(self._placement_failure("ERROR", str(e), side, price, size))
+                    continue
+
+            prepared_payloads.append(payload)
+            prepared_indices.append(idx)
+            results.append(OrderPlacementResult(
+                success=True,
+                order_id="",
+                status="PENDING",
+                side=side,
+                price=rounded_price,
+                size=rounded_size,
+                signature=sig,
+                is_dry_run=self.dry_run,
+            ))
+
+        if not prepared_payloads:
+            return results
+
+        if self.dry_run:
+            for p_idx in prepared_indices:
+                mock_id = f"mock_ord_{uuid.uuid4().hex[:12]}"
+                res = results[p_idx]
+                results[p_idx] = OrderPlacementResult(
+                    success=True,
+                    order_id=mock_id,
+                    status="LIVE",
+                    side=res.side,
+                    price=res.price,
+                    size=res.size,
+                    signature=res.signature,
+                    is_dry_run=True,
+                    raw_response={"orderID": mock_id, "status": "LIVE", "mock": True},
+                )
+                if self.self_trade_guard is not None:
+                    self.self_trade_guard.register_maker_order(
+                        order_id=mock_id,
+                        token_id=orders[p_idx]["token_id"],
+                        side=res.side,
+                        price=res.price,
+                        size=res.size,
+                    )
+            return results
+
+        # Live dispatch
+        raw_body = orjson.dumps(prepared_payloads)
+        if self.hft_pool is not None:
+            resp = self.hft_pool.place_orders(raw_body)
+            data = resp.data
+        else:
+            try:
+                data = self._request("POST", "/orders", body=raw_body.decode("utf-8"))
+            except Exception as e:
+                for p_idx in prepared_indices:
+                    res = results[p_idx]
+                    results[p_idx] = self._placement_failure("NETWORK_ERROR", str(e), res.side, res.price, res.size, signature=res.signature)
+                return results
+
+        if isinstance(data, list):
+            for i, p_idx in enumerate(prepared_indices):
+                item = data[i] if i < len(data) else {}
+                res = results[p_idx]
+                if isinstance(item, dict) and item.get("success", True):
+                    oid = str(item.get("orderID") or item.get("id") or "")
+                    results[p_idx] = OrderPlacementResult(
+                        success=True,
+                        order_id=oid,
+                        status="LIVE",
+                        side=res.side,
+                        price=res.price,
+                        size=res.size,
+                        signature=res.signature,
+                        raw_response=item,
+                        is_dry_run=False,
+                    )
+                    if self.self_trade_guard is not None:
+                        self.self_trade_guard.register_maker_order(
+                            order_id=oid,
+                            token_id=orders[p_idx]["token_id"],
+                            side=res.side,
+                            price=res.price,
+                            size=res.size,
+                        )
+                else:
+                    err = item.get("errorMsg") if isinstance(item, dict) else "Batch item rejected"
+                    results[p_idx] = self._placement_failure("REJECTED", str(err), res.side, res.price, res.size, raw=item if isinstance(item, dict) else {}, signature=res.signature)
+
+        return results
 
     def _retry_with_refreshed_version(
         self,
@@ -1495,10 +1793,17 @@ class LiveClobClient:
         if not order_id:
             return False
 
+        if self.self_trade_guard is not None:
+            self.self_trade_guard.unregister_maker_order(order_id)
+
         if self.dry_run:
             logger.info(f"[DRY-RUN] Simulated CLOB DELETE /order | Cancelled order {order_id}")
             self._mock_orders.pop(order_id, None)
             return True
+
+        if self.hft_pool is not None:
+            res = self.hft_pool.cancel_order(order_id)
+            return res.success
 
         path = "/order"
         payload = json.dumps({"orderID": order_id})
@@ -1519,11 +1824,18 @@ class LiveClobClient:
 
         Returns False on any failure (transport error or non-2xx).
         """
+        if self.self_trade_guard is not None:
+            self.self_trade_guard.clear()
+
         if self.dry_run:
             count = len(self._mock_orders)
             self._mock_orders.clear()
             logger.info(f"[DRY-RUN] Simulated CLOB DELETE /cancel-all | Cleared {count} resting orders.")
             return True
+
+        if self.hft_pool is not None:
+            res = self.hft_pool.cancel_all()
+            return res.success
 
         try:
             self._request("DELETE", "/cancel-all")

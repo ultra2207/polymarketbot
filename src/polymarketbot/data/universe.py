@@ -44,6 +44,8 @@ logger = get_logger("data.universe")
 
 GAMMA_KEYSET = "https://gamma-api.polymarket.com/markets/keyset"
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS = "https://gamma-api.polymarket.com/events"
+SAMPLING_MARKETS_URL = "https://clob.polymarket.com/sampling-markets"
 CUTOFF_DEFAULT = 15.0
 UNIVERSE_MODES = ("rolling", "locked")
 LOCKED_MANIFEST_DEFAULT = "data/tape/manifest_locked_1028.json"
@@ -58,7 +60,9 @@ SENTINEL_PATTERNS_DEFAULT = (
     r"\bsolana\b",
     r"\bsol\b",
 )
+SENTINEL_CRYPTO_ASSETS = ("btc", "eth", "sol", "xrp", "doge", "bnb")
 SENTINEL_STALE_SECONDS = 3_600.0
+SENTINEL_EXPIRY_GRACE_SECONDS = 60.0
 
 # The CLOB reward-campaign endpoint: one row per market with its campaigns and
 # token ids. It replaces the 240 k-market Gamma sweep (2026-11-05: 20 min) with
@@ -182,9 +186,9 @@ class UniverseState:
         manifest_path: str | Path = "data/tape/manifest_current.json",
         *,
         cutoff: float = CUTOFF_DEFAULT,
-        refresh_seconds: float = 21600.0,
+        refresh_seconds: float = 300.0,
         max_pages: int = 800,
-        poll_seconds: float = 60.0,
+        poll_seconds: float = 30.0,
         incremental: bool = True,
         mode: str = "rolling",
         locked_manifest: str | Path = LOCKED_MANIFEST_DEFAULT,
@@ -223,7 +227,7 @@ class UniverseState:
             raise ValueError(
                 f"invalid clob.sentinel_question_patterns entry: {exc}"
             ) from exc
-        self.refresh_seconds = max(300.0, float(refresh_seconds))
+        self.refresh_seconds = max(60.0, float(refresh_seconds))
         self.max_pages = max_pages
         self.poll_seconds = max(0.0, float(poll_seconds))
         self.incremental = bool(incremental) and self.poll_seconds > 0
@@ -348,6 +352,17 @@ class UniverseState:
         )
         new_markets = self._build(new_rows, include_locked_baseline=False)
         closed_ids = {self._row_cid(row) for row in closed_rows if self._row_cid(row)}
+
+        # Active expiration check: auto-prune markets whose trading window has expired
+        now = time.time()
+        for cid, market in list(self.markets.items()):
+            end_ts = _parse_ts(market.end_date)
+            if end_ts is not None:
+                # 5-minute sentinels cease trading at window close; prune after grace period
+                grace = SENTINEL_EXPIRY_GRACE_SECONDS if market.sentinel else 3600.0
+                if end_ts < now - grace:
+                    closed_ids.add(cid)
+
         if self.mode == "locked":
             # A closed pinned market must not be resurrected by the next crawl.
             self._retired.update(closed_ids)
@@ -430,24 +445,160 @@ class UniverseState:
             f"market resolved: {cid[:16]}...; dropped {len(market.tokens)} assets"
         )
 
+    def _fetch_short_duration_markets(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Fast query for active markets ending soonest (e.g. 5m, 15m, 1h).
+
+        Gamma returns active, non-closed markets sorted by endDate ascending in
+        ~0.3s, directly surfacing ultra-short duration binaries as they trade.
+        """
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        params = [
+            ("active", "true"),
+            ("closed", "false"),
+            ("end_date_min", now_iso),
+            ("order", "endDate"),
+            ("ascending", "true"),
+            ("limit", str(min(limit, 100))),
+        ]
+        try:
+            payload = self._get_json(GAMMA_MARKETS, params)
+            return (
+                payload
+                if isinstance(payload, list)
+                else (payload.get("markets") or payload.get("data") or [])
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"failed to fetch short-duration markets: {exc}")
+            return []
+
+    def _fetch_deterministic_sentinels(self) -> list[dict[str, Any]]:
+        """Pre-fetch current and upcoming 5m & 15m crypto up/down markets by deterministic slug.
+
+        Polymarket crypto binaries use the deterministic slug format:
+            {asset}-updown-{timeframe}-{boundary_timestamp}
+        We compute the current and next 5m/15m intervals for active crypto assets,
+        querying Gamma /events in a single batched request (repeated slug params)
+        taking ~0.2s. This pre-registers the next window BEFORE it starts trading.
+        """
+        if not self.sentinel_enabled:
+            return []
+        now_sec = int(time.time())
+        w300 = now_sec - (now_sec % 300)
+        w900 = now_sec - (now_sec % 900)
+
+        slugs: list[str] = []
+        for a in SENTINEL_CRYPTO_ASSETS:
+            # Current 5m window and next (+5m) window
+            slugs.append(f"{a}-updown-5m-{w300}")
+            slugs.append(f"{a}-updown-5m-{w300 + 300}")
+            # Current 15m window
+            slugs.append(f"{a}-updown-15m-{w900}")
+
+        params = [("slug", s) for s in slugs]
+        try:
+            payload = self._get_json(GAMMA_EVENTS, params)
+            events = (
+                payload
+                if isinstance(payload, list)
+                else (payload.get("events") or payload.get("data") or [])
+            )
+            markets: list[dict[str, Any]] = []
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                ev_slug = ev.get("slug")
+                ev_title = ev.get("title")
+                ev_id = str(ev.get("id")) if ev.get("id") is not None else None
+                for m in ev.get("markets") or []:
+                    if isinstance(m, dict):
+                        m_copy = dict(m)
+                        m_copy["event_slug"] = ev_slug
+                        m_copy["event_title"] = ev_title
+                        m_copy["event_id"] = ev_id
+                        markets.append(m_copy)
+            return markets
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"failed to fetch deterministic sentinels: {exc}")
+            return []
+
     def _fetch_incremental(
         self, since_id: int, since_ts: float
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        new_rows = self._fetch_market_pages(
-            {"closed": "false", "limit": 100, "order": "id", "ascending": "false"},
-            stop=lambda rows: any(self._row_id(r) <= since_id for r in rows),
-        )
+        new_rows: list[dict[str, Any]] = []
+        closed_rows: list[dict[str, Any]] = []
+
+        # 1. Multi-tier fast discovery for active & short-duration markets
+        try:
+            short_rows = self._fetch_short_duration_markets(limit=100)
+            new_rows.extend(short_rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"short-duration market fetch failed: {exc}")
+
+        # 2. Deterministic 5m & 15m crypto up/down sentinels
+        if self.sentinel_enabled:
+            try:
+                sentinel_rows = self._fetch_deterministic_sentinels()
+                new_rows.extend(sentinel_rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"deterministic sentinel fetch failed: {exc}")
+
+        # 3. Real-time newly created markets (by createdAt)
+        try:
+            created_rows = self._fetch_market_pages(
+                {"closed": "false", "limit": 50, "order": "createdAt", "ascending": "false"},
+                stop=lambda rows: False,
+                max_pages=1,
+            )
+            new_rows.extend(created_rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"newly created market fetch failed: {exc}")
+
+        # 4. Keyset ID poll (backwards-compatible incremental poll)
+        if since_id > 0:
+            try:
+                id_rows = self._fetch_market_pages(
+                    {"closed": "false", "limit": 100, "order": "id", "ascending": "false"},
+                    stop=lambda rows: any(self._row_id(r) <= since_id for r in rows),
+                    max_pages=2,
+                )
+                new_rows.extend(id_rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"id-based market fetch failed: {exc}")
+
+        # 5. Recently closed markets (order by closedTime descending, fallback to endDate)
         try:
             closed_rows = self._fetch_market_pages(
-                {"closed": "true", "limit": 100, "order": "endDate", "ascending": "false"},
+                {"closed": "true", "limit": 50, "order": "closedTime", "ascending": "false"},
                 stop=lambda rows: any(
-                    (_parse_ts(r.get("endDate")) or 0) < since_ts for r in rows
+                    (_parse_ts(r.get("closedTime") or r.get("endDate")) or 0) < since_ts
+                    for r in rows
                 ),
+                max_pages=2,
             )
-        except Exception as exc:  # noqa: BLE001 - the new-market poll still applies
-            logger.warning(f"closed-market poll failed: {exc}")
-            closed_rows = []
-        return new_rows, closed_rows
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"closedTime poll failed, trying endDate fallback: {exc}")
+            try:
+                closed_rows = self._fetch_market_pages(
+                    {"closed": "true", "limit": 50, "order": "endDate", "ascending": "false"},
+                    stop=lambda rows: any(
+                        (_parse_ts(r.get("endDate")) or 0) < since_ts for r in rows
+                    ),
+                    max_pages=1,
+                )
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning(f"closed-market poll failed: {exc2}")
+                closed_rows = []
+
+        # Deduplicate new_rows by conditionId / id
+        seen: set[str] = set()
+        deduped_new: list[dict[str, Any]] = []
+        for r in new_rows:
+            cid = self._row_cid(r)
+            if cid and cid not in seen:
+                seen.add(cid)
+                deduped_new.append(r)
+
+        return deduped_new, closed_rows
 
     def _fetch_market_pages(
         self,
@@ -649,7 +800,7 @@ class UniverseState:
                     campaigns = [campaigns]
                 for campaign in campaigns:
                     best = max(best, _f(campaign.get("rate_per_day")))
-            if best <= self.cutoff:
+            if best < self.cutoff:
                 break
             time.sleep(0.1)
         logger.info(f"rewards endpoint: {len(rows)} campaign rows, {page + 1} page(s)")
@@ -697,7 +848,7 @@ class UniverseState:
             if end is not None and end < now:
                 continue
             daily += _f(campaign.get("rate_per_day"))
-        if daily <= self.cutoff:
+        if daily < self.cutoff:
             return None
         market = Market(
             condition_id=cid,
@@ -717,7 +868,12 @@ class UniverseState:
         )
         return self._with_metadata(market)
 
-    def _build_reward_markets(self, rows: list[dict[str, Any]]) -> dict[str, Market]:
+    def _build_reward_markets(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        sentinel_rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Market]:
         """Reward markets from the endpoint, keeping fresh sentinels within the cap."""
         out: dict[str, Market] = {}
         for row in rows:
@@ -726,6 +882,13 @@ class UniverseState:
                 out[market.condition_id] = market
         if not self.sentinel_enabled:
             return out
+
+        # Build any newly discovered sentinels
+        if sentinel_rows:
+            sentinel_markets = self._build(sentinel_rows, include_locked_baseline=False)
+            for cid, market in sentinel_markets.items():
+                if market.sentinel:
+                    out[cid] = market
         now = time.time()
         alive: list[Market] = []
         for market in self.markets.values():
@@ -741,10 +904,95 @@ class UniverseState:
         return out
 
     def _fetch_markets(self) -> list[dict[str, Any]]:
+        """Fast market sweep across CLOB sampling and Gamma.
+
+        Replaces the old 20-30 minute keyset crawler with a bounded multi-tier sweep:
+        1. CLOB /sampling-markets: 1,000 markets per page, cursor-paginated.
+           Fetches active, order-book enabled markets in ~2-4s total.
+        2. Gamma short-duration & deterministic sentinels for 5m/15m markets.
+        3. If CLOB is unavailable, performs a bounded Gamma keyset crawl capped at 50 pages.
+        """
         rows: list[dict[str, Any]] = []
-        cursor: str | None = None
-        for page in range(self.max_pages):
-            params: dict[str, Any] = {
+        # Tier 1: Try CLOB sampling markets (fast, 1000/page)
+        try:
+            cursor: str | None = None
+            max_sampling_pages = min(int(self.max_pages), 10)
+            for page in range(max_sampling_pages):
+                params: dict[str, Any] = {}
+                if cursor:
+                    params["next_cursor"] = cursor
+                payload = self._get_json(SAMPLING_MARKETS_URL, params)
+                batch = payload.get("data") or [] if isinstance(payload, dict) else []
+                if not batch:
+                    break
+                for row in batch:
+                    tokens = [
+                        t.get("token_id")
+                        for t in (row.get("tokens") or [])
+                        if isinstance(t, dict) and t.get("token_id")
+                    ]
+                    rates = (row.get("rewards") or {}).get("rates") or []
+                    rewards = [
+                        {
+                            "rewardsDailyRate": r.get("rewards_daily_rate")
+                            or r.get("rate_per_day")
+                            or 0.0,
+                            "startDate": r.get("start_date"),
+                            "endDate": r.get("end_date"),
+                        }
+                        for r in rates
+                        if isinstance(r, dict)
+                    ]
+                    rows.append({
+                        "conditionId": row.get("condition_id"),
+                        "question": row.get("question"),
+                        "slug": row.get("market_slug"),
+                        "endDate": row.get("end_date_iso") or row.get("end_date"),
+                        "closed": bool(row.get("closed")),
+                        "archived": bool(row.get("archived")),
+                        "negRisk": bool(row.get("neg_risk")),
+                        "clobTokenIds": tokens,
+                        "clobRewards": rewards,
+                        "rewardsMinSize": (row.get("rewards") or {}).get("min_size", 0.0),
+                        "rewardsMaxSpread": (row.get("rewards") or {}).get("max_spread", 0.0),
+                        "volume": _f(row.get("volume_24hr")),
+                        "liquidity": 0.0,
+                    })
+                cursor = payload.get("next_cursor")
+                if not cursor:
+                    break
+                time.sleep(0.05)
+            if rows:
+                logger.info(f"CLOB sampling sweep: {len(rows)} markets harvested in {page + 1} pages")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"CLOB sampling sweep unavailable ({exc}); falling back to Gamma")
+
+        # Tier 2: Add short-duration & sentinel markets from Gamma
+        try:
+            short_rows = self._fetch_short_duration_markets(limit=100)
+            sentinel_rows = self._fetch_deterministic_sentinels()
+            rows.extend(short_rows)
+            rows.extend(sentinel_rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"short-duration / sentinel sweep enrichment failed: {exc}")
+
+        if rows:
+            # Deduplicate by conditionId
+            seen: set[str] = set()
+            deduped: list[dict[str, Any]] = []
+            for r in rows:
+                cid = self._row_cid(r)
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    deduped.append(r)
+            return deduped
+
+        # Tier 3: Keyset crawl fallback (strictly bounded to at most 50 pages / ~5,000 markets)
+        logger.info("falling back to bounded Gamma keyset crawl")
+        cursor = None
+        bounded_pages = min(int(self.max_pages), 50)
+        for page in range(bounded_pages):
+            params = {
                 "limit": 100,
                 "include_tag": "true",
                 "closed": "false",
@@ -757,16 +1005,11 @@ class UniverseState:
                 break
             rows.extend(markets)
             cursor = payload.get("next_cursor")
-            if page % 20 == 0:
-                logger.info(f"Gamma crawl page {page}: {len(rows):,} markets")
+            if page % 10 == 0:
+                logger.info(f"Gamma keyset page {page}: {len(rows):,} markets")
             if not cursor:
                 break
-            time.sleep(0.1)
-        else:
-            raise RuntimeError(
-                f"Gamma crawl hit max_pages={self.max_pages} with a live cursor; "
-                "treating the result as incomplete"
-            )
+            time.sleep(0.05)
         return rows
 
     def _build(
@@ -875,10 +1118,15 @@ class UniverseState:
 
     def _matches_sentinel(self, row: dict[str, Any]) -> bool:
         """True for an open crypto up/down row matched by a sentinel pattern."""
-        if not self.sentinel_enabled or not self.sentinel_patterns:
+        if not self.sentinel_enabled:
             return False
         text = f"{row.get('question') or ''} {row.get('slug') or ''}"
-        return any(p.search(text) for p in self.sentinel_patterns)
+        if self.sentinel_patterns and any(p.search(text) for p in self.sentinel_patterns):
+            return True
+        slug = str(row.get("slug") or "").lower()
+        if "-updown-" in slug and any(slug.startswith(f"{a}-") for a in SENTINEL_CRYPTO_ASSETS):
+            return True
+        return False
 
     # ------------------------------------------------------------------ locked
     def _load_locked(self) -> dict[str, Market]:

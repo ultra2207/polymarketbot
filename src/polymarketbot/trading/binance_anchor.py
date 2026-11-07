@@ -24,9 +24,17 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+from polymarketbot.fees import FeeSchedule
 from polymarketbot.logs import get_logger
+
+if TYPE_CHECKING:
+    from polymarketbot.trading.as_inventory_engine import (
+        ASInventoryConfig,
+        ASQuoteDecision,
+        AvellanedaStoikovEngine,
+    )
 
 logger = get_logger("binance_anchor")
 
@@ -403,6 +411,7 @@ class BinanceAnchoredQuoter:
     def __init__(
         self,
         bs_engine: Optional[BlackScholesBinaryEngine] = None,
+        as_engine: Optional[Any] = None,
         max_pair_cost: float = 0.985,  # Locks in >= +1.5c margin per pair
         half_spread_cents: float = 1.5,
         default_ticket_size: float = 5.0,
@@ -415,6 +424,48 @@ class BinanceAnchoredQuoter:
         self.ticket_size = float(default_ticket_size)
         self.surge_threshold_bps = float(surge_threshold_bps)
         self.tick_size = float(tick_size)
+        self._as_engine = as_engine
+
+    @property
+    def as_engine(self) -> Any:
+        if self._as_engine is None:
+            from polymarketbot.trading.as_inventory_engine import (
+                ASInventoryConfig,
+                AvellanedaStoikovEngine,
+            )
+            margin = max(0.005, round(1.00 - self.max_pair_cost, 4))
+            self._as_engine = AvellanedaStoikovEngine(
+                ASInventoryConfig(
+                    target_pair_margin=margin,
+                    tick_size=self.tick_size,
+                    base_ticket_size=self.ticket_size,
+                    volatility_annual=self.bs_engine.sigma,
+                )
+            )
+        return self._as_engine
+
+    def evaluate_as_quotes(
+        self,
+        strike_k: float,
+        spot_s: float,
+        tau_seconds: float,
+        velocity_5s_bps: float = 0.0,
+        inventory_up: float = 0.0,
+        inventory_down: float = 0.0,
+        annualized_volatility: Optional[float] = None,
+        use_rewards: bool = True,
+    ) -> Any:
+        """Compute institutional Avellaneda-Stoikov & Gueant quotes anchored to Binance."""
+        vol = annualized_volatility or self.bs_engine.sigma
+        return self.as_engine.evaluate_from_spot_and_strike(
+            strike_k=strike_k,
+            spot_s=spot_s,
+            tau_seconds=tau_seconds,
+            inventory_yes=inventory_up,
+            inventory_no=inventory_down,
+            annualized_volatility=vol,
+            use_rewards_optimization=use_rewards,
+        )
 
     def evaluate_quotes(
         self,
@@ -540,16 +591,36 @@ class LifecycleExitOptimizer:
         gas_merge_usd: float = 0.015,
         gas_redeem_usd: float = 0.005,
         benchmark_daily_apr: float = 0.03,  # 3% daily opportunity cost benchmark
+        fee_rate: float = 0.07,
+        fee_exponent: float = 1.0,
+        fee_schedule: Optional[FeeSchedule] = None,
     ) -> None:
         self.gas_merge_usd = gas_merge_usd
         self.gas_redeem_usd = gas_redeem_usd
         self.benchmark_per_second = benchmark_daily_apr / 86400.0
+        self.fee_rate = fee_rate
+        self.fee_exponent = fee_exponent
+        self.fee_schedule = fee_schedule
 
     @staticmethod
-    def calculate_taker_fee(price: float, size_shares: float) -> float:
-        """Polymarket crypto fee formula: 0.07 * p * (1 - p) * shares."""
-        p = max(0.01, min(0.99, price))
-        return 0.07 * p * (1.0 - p) * size_shares
+    def calculate_taker_fee(
+        price: float,
+        size_shares: float,
+        fee_rate: float = 0.07,
+        fee_exponent: float = 1.0,
+        fee_schedule: Optional[FeeSchedule] = None,
+    ) -> float:
+        """Polymarket dynamic taker fee: shares * rate * (p * (1 - p)) ^ exponent."""
+        if fee_schedule is not None:
+            rate = fee_schedule.rate
+            exp = fee_schedule.exponent
+        else:
+            rate = fee_rate
+            exp = fee_exponent
+        if rate <= 0.0 or size_shares <= 0.0:
+            return 0.0
+        p = max(0.001, min(0.999, price))
+        return size_shares * rate * ((p * (1.0 - p)) ** exp)
 
     def compare_exit_pathways(
         self,
@@ -561,6 +632,9 @@ class LifecycleExitOptimizer:
         ask_down: float,
         tau_seconds: float,
         p_win_up: float = 0.50,
+        fee_rate: Optional[float] = None,
+        fee_exponent: Optional[float] = None,
+        fee_schedule: Optional[FeeSchedule] = None,
     ) -> ExitCostComparison:
         """Evaluate the friction and net cash payout of all 3 exit mechanics.
 
@@ -572,6 +646,10 @@ class LifecycleExitOptimizer:
         unbalanced_down = max(0.0, shares_down - complete_sets)
         total_shares = shares_up + shares_down
 
+        sched = fee_schedule or self.fee_schedule
+        f_rate = fee_rate if fee_rate is not None else self.fee_rate
+        f_exp = fee_exponent if fee_exponent is not None else self.fee_exponent
+
         capital_locked = (shares_up * bid_up) + (shares_down * bid_down)
         opportunity_cost = capital_locked * self.benchmark_per_second * max(0.0, tau_seconds)
 
@@ -579,6 +657,7 @@ class LifecycleExitOptimizer:
         # Pathway 1: EXPIRATION SETTLEMENT (Wait tau seconds)
         # -------------------------------------------------------------------------
         # Payout: 1.00 for winning side, 0.00 for losing side
+        # Zero CLOB taker fee, zero spread crossing loss; only Polygon redemption gas.
         expected_settlement_cash = (p_win_up * shares_up * 1.0) + ((1.0 - p_win_up) * shares_down * 1.0)
         cost_settlement = self.gas_redeem_usd + opportunity_cost
         net_settlement = expected_settlement_cash - self.gas_redeem_usd
@@ -592,10 +671,10 @@ class LifecycleExitOptimizer:
         taker_fee_merge = 0.0
         if unbalanced_up > 0:
             cost_to_complete = unbalanced_up * ask_down
-            taker_fee_merge = self.calculate_taker_fee(ask_down, unbalanced_up)
+            taker_fee_merge = self.calculate_taker_fee(ask_down, unbalanced_up, f_rate, f_exp, sched)
         elif unbalanced_down > 0:
             cost_to_complete = unbalanced_down * ask_up
-            taker_fee_merge = self.calculate_taker_fee(ask_up, unbalanced_down)
+            taker_fee_merge = self.calculate_taker_fee(ask_up, unbalanced_down, f_rate, f_exp, sched)
 
         total_sets_after_crossing = max(shares_up, shares_down)
         gross_merge_cash = total_sets_after_crossing * 1.0
@@ -606,8 +685,12 @@ class LifecycleExitOptimizer:
         # Pathway 3: CLOB MARKET SELL (Cross bid on all shares)
         # -------------------------------------------------------------------------
         gross_sell_cash = (shares_up * bid_up) + (shares_down * bid_down)
-        taker_fee_sell = self.calculate_taker_fee(bid_up, shares_up) + self.calculate_taker_fee(bid_down, shares_down)
+        taker_fee_sell = (
+            self.calculate_taker_fee(bid_up, shares_up, f_rate, f_exp, sched)
+            + self.calculate_taker_fee(bid_down, shares_down, f_rate, f_exp, sched)
+        )
         net_sell = gross_sell_cash - taker_fee_sell
+        cost_sell = taker_fee_sell + ((ask_up - bid_up) * shares_up * 0.5) + ((ask_down - bid_down) * shares_down * 0.5)
         cost_sell = taker_fee_sell + ((ask_up - bid_up) * shares_up * 0.5) + ((ask_down - bid_down) * shares_down * 0.5)
 
         # Compute savings

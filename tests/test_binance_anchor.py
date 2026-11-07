@@ -137,6 +137,23 @@ def test_binance_anchored_quoter_inventory_skew():
     assert skewed.target_bid_down >= neutral.target_bid_down
 
 
+def test_binance_anchored_quoter_evaluate_as_quotes():
+    quoter = BinanceAnchoredQuoter(max_pair_cost=0.985)
+    as_dec = quoter.evaluate_as_quotes(
+        strike_k=75000.0,
+        spot_s=75000.0,
+        tau_seconds=300.0,
+        inventory_up=15.0,
+        inventory_down=0.0,
+    )
+    assert as_dec.is_pair_arbitrage_guaranteed
+    assert as_dec.pair_bid_cost <= 0.985
+    assert as_dec.yes_quote.bid_price < as_dec.yes_quote.ask_price
+    assert as_dec.no_quote.bid_price < as_dec.no_quote.ask_price
+    # Up inventory (+15) -> YES bid is low, NO bid is elevated
+    assert as_dec.yes_quote.ask_size > as_dec.yes_quote.bid_size
+
+
 def test_lifecycle_exit_optimizer_short_dwell_recommends_settlement():
     optimizer = LifecycleExitOptimizer()
 

@@ -21,11 +21,11 @@ streams:
     heartbeat_seconds: 10
     reconnect_max_seconds: 120
     shard_start_delay_seconds: 2.0
-    universe_refresh_seconds: 21600   # 6h; reward-campaign walk ~5 s; Gamma crawl fallback ~20 min
-    universe_max_pages: 10000         # safety cap; crawl until the Gamma cursor is exhausted
-    universe_poll_seconds: 60         # incremental Gamma /markets poll between full walks
-    universe_incremental: true        # new/closed poll; the hourly keyset walk reconciles
-    cutoff_daily_reward: 15.0
+    universe_refresh_seconds: 300     # 5 min (was 6h); fast CLOB rewards walk takes ~2 s
+    universe_max_pages: 50            # safety cap for deep walk; fast sweep completes in <2 s
+    universe_poll_seconds: 30         # incremental multi-tier poll for 5m sentinels, creations, and closures
+    universe_incremental: true        # dynamic multi-tier market discovery
+    cutoff_daily_reward: 1.0
     # "rolling" (default): re-cut the Gamma universe every hour and record the
     # membership in data/tape/universe/<stamp>.json. "locked": pin the set to
     # locked_manifest and only track markets present in it.

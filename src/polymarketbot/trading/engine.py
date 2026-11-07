@@ -52,6 +52,7 @@ from polymarketbot.rewards.scoring import quadratic_order_score
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.models import RiskConfig
 from polymarketbot.trading.base import BaseMarketMakingEngine, PositionView
+from polymarketbot.execution import PreSignedOrderCache, SelfTradeGuard
 from polymarketbot.trading.client import (
     ClobAPIError,
     ClobAuthCredentials,
@@ -420,6 +421,13 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         # Clients
         self.clob_client = clob_client or LiveClobClient(dry_run=self.dry_run)
         self.ctf_client = ctf_client or PolygonCtfClient(dry_run=self.dry_run)
+
+        # Wire Self-Trade Prevention (Wash Trading Guard)
+        if self.clob_client.self_trade_guard is None:
+            self.clob_client.self_trade_guard = SelfTradeGuard()
+        self.clob_client.self_trade_guard.link_complementary_tokens(
+            self.asset_id_yes, self.asset_id_no
+        )
 
         # Settlement durability: the signed payload is stored in this engine's
         # database before it is broadcast, so a timed-out settlement survives a
