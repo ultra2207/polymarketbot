@@ -77,6 +77,9 @@ NEGRISK_CONVERT_SIGNATURE = "convertPositions(bytes32,uint256,uint256)"
 NEGRISK_MERGE_SIGNATURE = "mergePositions(bytes32,uint256)"
 CTF_MERGE_SIGNATURE = "mergePositions(address,bytes32,bytes32,uint256[],uint256)"
 CTF_SPLIT_SIGNATURE = "splitPosition(address,bytes32,bytes32,uint256[],uint256)"
+CTF_REDEEM_SIGNATURE = "redeemPositions(address,bytes32,bytes32,uint256[])"
+CTF_PAYOUT_DENOMINATOR_SIGNATURE = "payoutDenominator(bytes32)"
+CTF_PAYOUT_NUMERATOR_SIGNATURE = "payoutNumerators(bytes32,uint256)"
 CTF_BALANCE_SIGNATURE = "balanceOf(address,uint256)"
 IS_APPROVED_FOR_ALL_SIGNATURE = "isApprovedForAll(address,address)"
 TRANSFER_SIGNATURE = "Transfer(address,address,uint256)"
@@ -92,6 +95,9 @@ NEGRISK_CONVERT_SELECTOR = "c64748c4"       # convertPositions(bytes32,uint256,u
 NEGRISK_MERGE_SELECTOR = "b10c5c17"         # mergePositions(bytes32,uint256)
 CTF_MERGE_SELECTOR = "9e7212ad"             # mergePositions(address,bytes32,bytes32,uint256[],uint256)
 CTF_SPLIT_SELECTOR = "72ce4275"             # splitPosition(address,bytes32,bytes32,uint256[],uint256)
+CTF_REDEEM_SELECTOR = "01b7037c"            # redeemPositions(address,bytes32,bytes32,uint256[])
+CTF_PAYOUT_DENOMINATOR_SELECTOR = "dd34de67" # payoutDenominator(bytes32)
+CTF_PAYOUT_NUMERATOR_SELECTOR = "0504c814"   # payoutNumerators(bytes32,uint256)
 CTF_BALANCE_SELECTOR = "00fdd58e"           # balanceOf(address,uint256)
 IS_APPROVED_FOR_ALL_SELECTOR = "e985e9c5"   # isApprovedForAll(address,address)
 TRANSFER_TOPIC = keccak256(TRANSFER_SIGNATURE.encode("utf-8")).hex()
@@ -104,6 +110,9 @@ for _sig, _expected in (
     (NEGRISK_MERGE_SIGNATURE, NEGRISK_MERGE_SELECTOR),
     (CTF_MERGE_SIGNATURE, CTF_MERGE_SELECTOR),
     (CTF_SPLIT_SIGNATURE, CTF_SPLIT_SELECTOR),
+    (CTF_REDEEM_SIGNATURE, CTF_REDEEM_SELECTOR),
+    (CTF_PAYOUT_DENOMINATOR_SIGNATURE, CTF_PAYOUT_DENOMINATOR_SELECTOR),
+    (CTF_PAYOUT_NUMERATOR_SIGNATURE, CTF_PAYOUT_NUMERATOR_SELECTOR),
     (CTF_BALANCE_SIGNATURE, CTF_BALANCE_SELECTOR),
     (IS_APPROVED_FOR_ALL_SIGNATURE, IS_APPROVED_FOR_ALL_SELECTOR),
 ):
@@ -114,6 +123,7 @@ class SettlementRoute(str, Enum):
     """Which ledger a market's positions live on, and therefore how to settle."""
 
     CTF_MERGE = "ctf_merge"
+    CTF_REDEEM = "ctf_redeem"
     ROUTER_MERGE = "router_merge"
     NEGRISK_CONVERT = "negrisk_convert"
     NEGRISK_MERGE = "negrisk_merge"
@@ -343,6 +353,32 @@ def build_ctf_split(
     return "0x" + CTF_SPLIT_SELECTOR + words.hex()
 
 
+def build_ctf_redeem(
+    condition_id: str,
+    index_sets: Sequence[int] = (1, 2),
+    *,
+    collateral_token: str = USDC_E,
+    parent_collection_id: str = ZERO_BYTES32,
+) -> str:
+    """Calldata for CTF ``redeemPositions(address,bytes32,bytes32,uint256[])``.
+
+    Redeems winning positions on Polygon PoS ConditionalTokens contract.
+    Byte-for-byte compatible with ``PolygonCtfClient.encode_redeem_positions``.
+    """
+    if not index_sets:
+        raise ValueError("index_sets partition cannot be empty")
+    indices = [_word_uint(index, "index_set") for index in index_sets]
+    words = (
+        _word_address(collateral_token, "collateral_token")
+        + _word_bytes32(parent_collection_id, "parent_collection_id")
+        + _word_bytes32(condition_id, "condition_id")
+        + _word_uint(128, "indexSets head offset")  # 4 static words before the dynamic array
+        + _word_uint(len(indices), "indexSets length")
+        + b"".join(indices)
+    )
+    return "0x" + CTF_REDEEM_SELECTOR + words.hex()
+
+
 # ---------------------------------------------------------------------------
 # Route classification
 # ---------------------------------------------------------------------------
@@ -413,6 +449,27 @@ def classify_merge_route(meta: dict | None) -> SettlementRoute:
     if route is SettlementRoute.NEGRISK_CONVERT:
         return SettlementRoute.NEGRISK_MERGE
     return route
+
+
+def classify_redeem_route(meta: dict | None) -> SettlementRoute:
+    """Pick the *redemption* primitive for an expired/resolving market.
+
+    * ``version == "v2"`` -> ``ROUTER_MERGE`` (Router.redeem / merge).
+    * ``version == "v1"`` (binary or neg-risk) -> ``CTF_REDEEM``
+      (``ConditionalTokens.redeemPositions``).
+    * anything else -> ``UNSUPPORTED``.
+    """
+    if not meta:
+        return SettlementRoute.UNSUPPORTED
+
+    version = str(_meta_value(meta, "version", default="") or "").strip().lower()
+    if version == "v2":
+        return SettlementRoute.ROUTER_MERGE
+    if version == "v1":
+        return SettlementRoute.CTF_REDEEM
+
+    logger.warning(f"unsupported Gamma market version for settlement redemption: {version!r}")
+    return SettlementRoute.UNSUPPORTED
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +612,69 @@ def verify_route(
             if balance <= 0:
                 return False, f"holder has no CTF balance for token {token_id}"
         return True, "holder holds both CTF outcome tokens"
+
+    if selected is SettlementRoute.CTF_REDEEM:
+        try:
+            _word_bytes32(condition_id, "condition_id")
+        except ValueError as exc:
+            return False, str(exc)
+
+        # 1. On-Chain Resolution Check: payoutDenominator must be > 0
+        try:
+            denom_data = (
+                "0x"
+                + CTF_PAYOUT_DENOMINATOR_SELECTOR
+                + _word_bytes32(condition_id, "condition_id").hex()
+            )
+            payout_denom = _eth_call_uint(chain_client, CTF, denom_data)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"CTF payoutDenominator check failed: {exc}"
+
+        if payout_denom == 0:
+            return False, "condition has not been resolved on CTF (payoutDenominator == 0)"
+
+        # 2. Check token balances
+        token_ids: list[int] = []
+        clob_ids = (meta or {}).get("clob_token_ids")
+        if clob_ids:
+            try:
+                token_ids = [_token_id(token) for token in clob_ids][:2]
+            except (TypeError, ValueError) as exc:
+                return False, f"invalid clob_token_ids in metadata: {exc}"
+        if not token_ids:
+            try:
+                token_ids = [
+                    derive_ctf_position_id(condition_id, 1),
+                    derive_ctf_position_id(condition_id, 2),
+                ]
+            except ValueError as exc:
+                return False, str(exc)
+
+        total_balance = 0
+        winning_balance = 0
+        for idx, token_id in enumerate(token_ids):
+            try:
+                bal = _ctf_balance(chain_client, holder, token_id)
+                num_data = (
+                    "0x"
+                    + CTF_PAYOUT_NUMERATOR_SELECTOR
+                    + _word_bytes32(condition_id, "condition_id").hex()
+                    + _word_uint(idx, "outcome_index").hex()
+                )
+                num = _eth_call_uint(chain_client, CTF, num_data)
+            except Exception as exc:  # noqa: BLE001
+                return False, f"CTF balance/numerator check failed: {exc}"
+
+            total_balance += bal
+            if num > 0 and bal > 0:
+                winning_balance += bal
+
+        if total_balance <= 0:
+            return False, f"holder has no position balance for condition {condition_id}"
+        if winning_balance <= 0:
+            return False, "holder has position balance but winning outcome numerator is 0"
+
+        return True, "condition resolved on CTF and holder has redeemable winning balance"
 
     if selected in (
         SettlementRoute.NEGRISK_CONVERT,

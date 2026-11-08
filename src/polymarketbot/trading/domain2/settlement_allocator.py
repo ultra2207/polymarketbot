@@ -240,7 +240,7 @@ class MarginalSettlementAllocator:
         shs, cost, eff_px, marg_px, _, _ = cls.compute_shares_and_cost(candidate.ask_ladder, capital)
         gas = candidate.gas_usd if candidate.gas_usd is not None else DEFAULT_SETTLEMENT_GAS_USD
         gross_pnl = shs * 1.000 - cost
-        fee = shs * candidate.fee_rate * eff_px
+        fee = shs * candidate.fee_rate
         net_profit = gross_pnl - fee - gas
 
         arr = (net_profit / cost) * (SECONDS_PER_YEAR / candidate.target_settle_sec) if cost > 0 else 0.0

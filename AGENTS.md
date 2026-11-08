@@ -117,3 +117,32 @@ executing, not after it times out.**
   the same market are perfectly anti-correlated, not independent.
 - Optimisations are measured, not assumed. `GROUP BY ALL` over list columns made
   the PMXT reducer 65 % slower than the four subqueries it replaced.
+
+## Ground-Truth Protocol Re-baselining & Multi-Agent Audit Workflow
+
+- **No Simulated Market Assumptions (Option B Mandate).** All strategies must execute against
+  physical protocol realities:
+  - **Exact Smart Contract Interfaces:** ERC-1155 `ConditionalTokens` rules (`splitPosition`,
+    `mergePositions`, `redeemPositions`), exact UMA oracle resolution states (`umaResolutionStatus`,
+    `closed`, not ambiguous `resolvedBy` factory addresses).
+  - **Strict Fee & Rebate Modeling:** Taker fees must be tracked at exact entry ticks ($0.0022/share
+    at $0.940). Maker fee rebates must be credited upon fill.
+  - **Unified Mark-to-Par Accounting:** Net Equity = $\text{Cash} + \sum (\text{Shares} \times \text{ParValue}) - \text{FeesPaid}$.
+    Never record an unfinalized discounted win ($0.940$) as an equity drawdown simply because par redemption
+    is waiting on oracle finalization.
+  - **First-Principles Solvers:** Zero greedy heuristics or arbitrary caps. LP rewards must use KKT
+    water-filling convex optimization; CTF must use maker parity bundles; Settlement must use
+    hazard-rate / Bayesian survival horizon scans across the full active universe.
+
+- **Production Soak & 30-Minute Continuous Audit Cycle:**
+  1. The live paper trader daemon runs continuously with all 3 pillars active.
+  2. Every 30 minutes, perform a rigorous system audit by dispatching **3 dedicated subagents**:
+     - **Subagent 1 (Reward Harvester Auditor):** Inspects liquidity reward allocations, queue
+       priority decay, adverse selection fills, and marginal yield optimization.
+     - **Subagent 2 (Settlement Harvester Auditor):** Audits active horizons, pending par redemptions,
+       taker fee leakage, and capital turnover velocity across the 10,000+ market radar.
+     - **Subagent 3 (CTF Minter Auditor):** Checks maker parity quoting spreads ($\text{Bid}_A + \text{Bid}_B < 1.0$),
+       fill balance across legs, inventory skew, and merge efficiency.
+  3. All findings, detachments from reality, non-optimal code, and money left on the table are
+     logged, reported, and remediated immediately.
+

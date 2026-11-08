@@ -208,14 +208,69 @@ class RewardPoolCandidate:
         return raw_payout if raw_payout >= 1.00 else 0.0
 
 
+from itertools import combinations
+import math
+from typing import Dict, List, Optional
+
 class MarginalRewardAllocator:
-    """Exact closed-form KKT water-filling capital allocator equalizing marginal return."""
+    """Exact closed-form KKT water-filling capital allocator with active-set lower-bound clamping.
+    Maximizes total daily reward payout subject to sum(c_i) <= B and c_i >= c_i^{threshold}."""
 
     @staticmethod
+    def _solve_kkt_subset(subset: List[RewardPoolCandidate], budget: float) -> Optional[Dict[str, float]]:
+        """Solves exact KKT water-filling for an active candidate subset with lower-bound clamping."""
+        sum_threshold = sum(c.threshold_capital for c in subset)
+        if sum_threshold > budget:
+            return None
+
+        unconstrained = list(subset)
+        clamped: Dict[str, float] = {}
+
+        while unconstrained:
+            b_rem = budget - sum(clamped.values())
+            sum_thresh_u = sum(c.threshold_capital for c in unconstrained)
+            if b_rem < sum_thresh_u:
+                return None
+
+            sum_W = sum(math.sqrt(c.rate_per_day * c.competing_score / c.alpha) for c in unconstrained)
+            sum_K = sum(c.competing_score / c.alpha for c in unconstrained)
+            if sum_W <= 0:
+                return None
+
+            inv_sqrt_lambda = (b_rem + sum_K) / sum_W
+
+            clamped_any = False
+            next_unconstrained = []
+            for c in unconstrained:
+                W_i = math.sqrt(c.rate_per_day * c.competing_score / c.alpha)
+                K_i = c.competing_score / c.alpha
+                c_opt = W_i * inv_sqrt_lambda - K_i
+
+                if c_opt < c.threshold_capital:
+                    clamped[c.pool_id] = c.threshold_capital
+                    clamped_any = True
+                else:
+                    next_unconstrained.append(c)
+
+            if not clamped_any:
+                allocs = {}
+                for c in unconstrained:
+                    W_i = math.sqrt(c.rate_per_day * c.competing_score / c.alpha)
+                    K_i = c.competing_score / c.alpha
+                    allocs[c.pool_id] = W_i * inv_sqrt_lambda - K_i
+                allocs.update(clamped)
+                return allocs
+
+            unconstrained = next_unconstrained
+
+        return clamped
+
+    @classmethod
     def allocate(
+        cls,
         candidates: List[RewardPoolCandidate],
         total_budget: float,
-        max_active_pools: int = 2,
+        max_active_pools: Optional[int] = None,
     ) -> Dict[str, float]:
         viable = [
             c for c in candidates
@@ -224,39 +279,21 @@ class MarginalRewardAllocator:
         if not viable or total_budget <= 0:
             return {}
 
-        # Sort candidates by initial marginal return M(0) descending
         viable.sort(key=lambda c: c.marginal_at_zero, reverse=True)
+        search_candidates = viable[:12]  # Top candidates by marginal efficiency
 
+        max_k = min(len(search_candidates), max_active_pools if max_active_pools is not None else 5)
         best_alloc: Dict[str, float] = {}
         best_payout = -1.0
 
-        max_k = min(max_active_pools, len(viable))
         for k in range(1, max_k + 1):
-            subset = viable[:k]
-            sum_thresh = sum(c.threshold_capital for c in subset)
-            if sum_thresh > total_budget:
-                continue
-
-            sum_W = sum(math.sqrt(c.rate_per_day * c.competing_score / c.alpha) for c in subset)
-            sum_K = sum(c.competing_score / c.alpha for c in subset)
-            inv_sqrt_lambda = (total_budget + sum_K) / sum_W
-
-            allocs: Dict[str, float] = {}
-            feasible = True
-            for c in subset:
-                W_i = math.sqrt(c.rate_per_day * c.competing_score / c.alpha)
-                K_i = c.competing_score / c.alpha
-                c_opt = W_i * inv_sqrt_lambda - K_i
-                if c_opt < c.threshold_capital:
-                    feasible = False
-                    break
-                allocs[c.pool_id] = c_opt
-
-            if feasible:
-                total_payout = sum(c.payout(allocs[c.pool_id]) for c in subset)
-                if total_payout > best_payout:
-                    best_payout = total_payout
-                    best_alloc = allocs
+            for subset in combinations(search_candidates, k):
+                alloc = cls._solve_kkt_subset(list(subset), total_budget)
+                if alloc:
+                    payout = sum(c.payout(alloc[c.pool_id]) for c in subset)
+                    if payout > best_payout:
+                        best_payout = payout
+                        best_alloc = alloc
 
         return {k: round(v, 2) for k, v in best_alloc.items()}
 
@@ -275,10 +312,19 @@ class StrategyMetrics:
     peak_equity: float = 0.0
     max_drawdown_pct: float = 0.0
     locked_capital: float = 0.0
+    unrealized_par_edge: float = 0.0
 
     @property
     def current_equity(self) -> float:
-        return self.available_cash + self.locked_capital
+        return self.available_cash + self.locked_capital + self.unrealized_par_edge
+
+    def recalculate_equity(self) -> None:
+        self.net_pnl = self.current_equity - self.starting_cash
+        if self.current_equity > self.peak_equity:
+            self.peak_equity = self.current_equity
+        dd = (self.peak_equity - self.current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+        if dd > self.max_drawdown_pct:
+            self.max_drawdown_pct = dd
 
     def update_pnl(self, delta_pnl: float, fee: float = 0.0, rebate: float = 0.0) -> None:
         self.gross_pnl += delta_pnl
@@ -286,17 +332,13 @@ class StrategyMetrics:
         self.rebates_earned += rebate
         net_delta = delta_pnl - fee + rebate
         self.available_cash += net_delta
-        self.net_pnl = self.current_equity - self.starting_cash
-        if self.current_equity > self.peak_equity:
-            self.peak_equity = self.current_equity
-        dd = (self.peak_equity - self.current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
-        if dd > self.max_drawdown_pct:
-            self.max_drawdown_pct = dd
+        self.recalculate_equity()
 
     def lock_capital(self, amount: float) -> None:
         if amount > 0:
             self.available_cash -= amount
             self.locked_capital += amount
+            self.recalculate_equity()
 
     def release_capital(self, cost_amount: float, payout_amount: float, fee: float = 0.0) -> None:
         self.locked_capital = max(0.0, self.locked_capital - cost_amount)
@@ -304,12 +346,7 @@ class StrategyMetrics:
         self.fees_paid += fee
         delta_pnl = payout_amount - cost_amount
         self.gross_pnl += delta_pnl
-        self.net_pnl = self.current_equity - self.starting_cash
-        if self.current_equity > self.peak_equity:
-            self.peak_equity = self.current_equity
-        dd = (self.peak_equity - self.current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
-        if dd > self.max_drawdown_pct:
-            self.max_drawdown_pct = dd
+        self.recalculate_equity()
 
 
 class SoakTelemetryDb:
@@ -505,9 +542,10 @@ def fast_competing_depth_score(
     asks: List[Any],
     mid_price: float,
     max_spread_cents: float,
+    min_size: float = 0.0,
 ) -> float:
     """Computes aggregated competing quadratic score with early-break spread boundary optimization.
-    Equivalently matches official Polymarket quadratic formula while skipping out-of-band depth."""
+    Equivalently matches official Polymarket quadratic formula while skipping dust orders below min_size."""
     v = max_spread_cents
     if mid_price <= 0.0 or v <= 0.0:
         return 0.0
@@ -524,7 +562,8 @@ def fast_competing_depth_score(
                 break
             if s >= 0.0:
                 sz = float(b["size"] if is_dict else b[1])
-                tot += ((v - s) / v) ** 2 * sz
+                if sz >= min_size:
+                    tot += ((v - s) / v) ** 2 * sz
     if asks:
         is_dict = isinstance(asks[0], dict)
         p_first = float(asks[0]["price"] if is_dict else asks[0][0])
@@ -537,7 +576,8 @@ def fast_competing_depth_score(
                 break
             if s >= 0.0:
                 sz = float(a["size"] if is_dict else a[1])
-                tot += ((v - s) / v) ** 2 * sz
+                if sz >= min_size:
+                    tot += ((v - s) / v) ** 2 * sz
     return tot
 
 
@@ -851,12 +891,12 @@ class LivePaperSoakDaemon:
                 bk = books_map.get(tid, {})
                 bids = bk.get("bids", [])
                 asks = bk.get("asks", [])
-                bb = float(bids[-1]["price"]) if bids and isinstance(bids[-1], dict) else 0.0
-                ba = float(asks[-1]["price"]) if asks and isinstance(asks[-1], dict) else 1.0
-                valid_mid = (bb + ba) * 0.5 if (bb > 0 and ba < 1.0) else float(tok.get("price", 0.50))
+                bb = max((float(b["price"]) for b in bids if isinstance(b, dict)), default=0.0)
+                ba = min((float(a["price"]) for a in asks if isinstance(a, dict)), default=1.0)
+                valid_mid = (bb + ba) * 0.5 if (0.0 < bb < ba < 1.0) else float(tok.get("price", 0.50))
                 if idx == 0:
                     primary_mid = valid_mid
-                score_tok = fast_competing_depth_score(bids, asks, valid_mid, max_spread)
+                score_tok = fast_competing_depth_score(bids, asks, valid_mid, max_spread, min_size=min_size)
                 total_d += score_tok
 
             comp_score = max(total_d, 1.0)
@@ -904,13 +944,14 @@ class LivePaperSoakDaemon:
                 time.sleep(1.0)
 
     def _run_reward_harvester_loop(self) -> None:
-        """Accrues authentic quadratic rewards on optimal pools selected by full-universe water-filling."""
-        log.info("Starting live RewardHarvester worker thread (Equal-Marginal Water-Filling)...")
+        """Accrues authentic quadratic rewards with rigorous collateral locking, KKT water-filling, and telemetry."""
+        log.info("Starting live RewardHarvester worker thread (Pure Bounded KKT Water-Filling)...")
         active_pools: List[Dict[str, Any]] = []
         reward_allocations: Dict[str, float] = {}
+        pool_entry_times: Dict[str, float] = {}
         last_pool_refresh = 0.0
         last_quote_time = time.time()
-        quote_start_time = time.time()
+        strat = self.metrics["RewardHarvester"]
 
         while self.running:
             try:
@@ -920,7 +961,7 @@ class LivePaperSoakDaemon:
                 if now - last_pool_refresh >= 10.0 or not active_pools:
                     last_pool_refresh = now
                     try:
-                        usable_capital = self.metrics["RewardHarvester"].available_cash
+                        total_equity = strat.current_equity
 
                         with self.reward_queue_lock:
                             candidates_snapshot = list(self.reward_candidate_queue)
@@ -931,13 +972,29 @@ class LivePaperSoakDaemon:
                             with self.reward_queue_lock:
                                 self.reward_candidate_queue = candidates_snapshot
 
-                        eligible = [c for c in candidates_snapshot if c.threshold_capital <= usable_capital]
-                        max_pools = 1 if usable_capital < 2000.0 else 2
-                        allocs = MarginalRewardAllocator.allocate(eligible, total_budget=usable_capital, max_active_pools=max_pools)
-                        if allocs:
+                        eligible = [c for c in candidates_snapshot if c.threshold_capital <= total_equity]
+                        allocs = MarginalRewardAllocator.allocate(eligible, total_budget=total_equity)
+
+                        if allocs != reward_allocations:
+                            # Rebalance locked quoting collateral on balance sheet
+                            new_total_locked = sum(allocs.values())
+                            cost_delta = new_total_locked - strat.locked_capital
+                            if cost_delta > 0:
+                                strat.lock_capital(cost_delta)
+                            elif cost_delta < 0:
+                                strat.release_capital(abs(cost_delta), abs(cost_delta))
+
+                            # Update pool entry timestamps for 3.5s resting gate
+                            for cid in allocs:
+                                if cid not in reward_allocations:
+                                    pool_entry_times[cid] = now
+                            for old_cid in list(pool_entry_times.keys()):
+                                if old_cid not in allocs:
+                                    pool_entry_times.pop(old_cid, None)
+
                             reward_allocations = allocs
                             active_pools = [c.raw_pool for c in eligible if c.pool_id in allocs and allocs[c.pool_id] > 0]
-                            log.debug(f"RewardHarvester water-filling allocated: {allocs}")
+                            log.debug(f"RewardHarvester KKT water-filling allocated: {allocs}")
                     except Exception as e:
                         log.debug(f"Failed to refresh reward pools: {e}")
 
@@ -955,6 +1012,10 @@ class LivePaperSoakDaemon:
                     cond_id = pool.get("condition_id", "")
                     allocated_usd = reward_allocations.get(cond_id, 0.0)
                     if allocated_usd <= 0.0:
+                        continue
+
+                    # 3.5s minimum resting duration per active pool
+                    if (now - pool_entry_times.get(cond_id, now)) < 3.5:
                         continue
 
                     tokens = pool.get("tokens", [])
@@ -977,10 +1038,6 @@ class LivePaperSoakDaemon:
                     if quote_size < min_size:
                         continue
 
-                    # 3.5s minimum resting duration
-                    if (now - quote_start_time) < 3.5:
-                        continue
-
                     s_cents = min(0.5, max_spread * 0.25)
                     score_bid = compute_quadratic_score(max_spread, s_cents, quote_size)
                     score_ask = compute_quadratic_score(max_spread, s_cents, quote_size)
@@ -1001,7 +1058,7 @@ class LivePaperSoakDaemon:
                     total_reward_dt += payout_dt
 
                 if total_reward_dt > 0.0:
-                    self.metrics["RewardHarvester"].update_pnl(total_reward_dt)
+                    strat.update_pnl(total_reward_dt)
 
                 time.sleep(1.0)
             except Exception as e:
@@ -1018,39 +1075,35 @@ class LivePaperSoakDaemon:
             try:
                 now_dt = datetime.datetime.now(datetime.timezone.utc)
                 now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                m7d_iso = (now_dt - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 t6_iso = (now_dt + datetime.timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 t24_iso = (now_dt + datetime.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
                 now_plus_48h_dt = now_dt + datetime.timedelta(hours=48)
                 now_plus_48h_iso = now_plus_48h_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 urls: List[str] = []
-                # Stratum 1: Expired unclosed markets (newest first, 0 to 2000, 21 pages)
-                for off in range(0, 2100, 100):
+                # Stratum 1: Active expired within last 7 days (newest first, eliminates dead multi-month zombies)
+                for off in range(0, 400, 100):
                     urls.append(
-                        f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_max={now_iso}&order=endDate&ascending=false"
+                        f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={m7d_iso}&end_date_max={now_iso}&order=endDate&ascending=false"
                     )
-                # Stratum 2: Expired unclosed markets (oldest first, 0 to 2000, 21 pages) for full bidirectional tail coverage
-                for off in range(0, 2100, 100):
-                    urls.append(
-                        f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_max={now_iso}&order=endDate&ascending=true"
-                    )
-                # Stratum 3A: Imminent expiring markets (0 to 6 hours, 0 to 2000, 21 pages)
-                for off in range(0, 2100, 100):
+                # Stratum 2: Imminent expiring markets (0 to 6 hours)
+                for off in range(0, 200, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={now_iso}&end_date_max={t6_iso}&order=endDate&ascending=true"
                     )
-                # Stratum 3B: Short-term expiring markets (6 to 24 hours, 0 to 2000, 21 pages)
-                for off in range(0, 2100, 100):
+                # Stratum 3: Short-term expiring markets (6 to 24 hours)
+                for off in range(0, 300, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={t6_iso}&end_date_max={t24_iso}&order=endDate&ascending=true"
                     )
-                # Stratum 3C: Medium-term expiring markets (24 to 48 hours, 0 to 2000, 21 pages)
-                for off in range(0, 2100, 100):
+                # Stratum 4: Medium-term expiring markets (24 to 48 hours)
+                for off in range(0, 300, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={t24_iso}&end_date_max={now_plus_48h_iso}&order=endDate&ascending=true"
                     )
-                # Stratum 4: Top volume active markets (0 to 500, 6 pages)
-                for off in range(0, 500, 100):
+                # Stratum 5: Top volume active markets
+                for off in range(0, 300, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&order=volume24hr&ascending=false"
                     )
@@ -1064,8 +1117,8 @@ class LivePaperSoakDaemon:
                         log.debug(f"Stratum page fetch error ({u}): {err}")
                     return []
 
-                # Concurrent sweep of all strata in parallel (110 pages across entire active universe)
-                with ThreadPoolExecutor(max_workers=20) as pool:
+                # Concurrent sweep of all strata in parallel
+                with ThreadPoolExecutor(max_workers=15) as pool:
                     pages = list(pool.map(_fetch_stratum_page, urls))
 
                 markets: List[Dict[str, Any]] = []
@@ -1098,13 +1151,26 @@ class LivePaperSoakDaemon:
                     if not (is_past_calendar or is_uma_proposed or is_expiring_soon):
                         continue
 
-                    if is_past_calendar or is_uma_proposed:
-                        target_settle_sec = self.settle_hold_sec
+                    # Ground-truth physical capital cycle time modeling:
+                    # T_cycle = t_event_remaining + t_proposal_lag + t_liveness_remaining + t_redeem_relayer
+                    if is_uma_proposed:
+                        # Event already proposed: remaining UMA 2h challenge window + relayer queue
+                        target_settle_sec = 5400.0 + 180.0
+                        if uma_end_str:
+                            try:
+                                uma_dt = datetime.datetime.fromisoformat(uma_end_str.replace("Z", "+00:00"))
+                                target_settle_sec = max(600.0, (uma_dt - now_dt).total_seconds()) + 180.0
+                            except Exception:
+                                pass
+                    elif is_past_calendar:
+                        # Concluded event awaiting proposal: 15m proposal lag + 2h UMA window + 3m relayer
+                        target_settle_sec = 900.0 + 7200.0 + 180.0
                     else:
+                        # Future expiring: time left to calendar date + proposal lag + liveness + relayer
                         try:
                             m_dt = datetime.datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                            sec_left = max(self.settle_hold_sec, (m_dt - now_dt).total_seconds())
-                            target_settle_sec = sec_left + self.settle_hold_sec
+                            sec_left = max(0.0, (m_dt - now_dt).total_seconds())
+                            target_settle_sec = sec_left + 900.0 + 7200.0 + 180.0
                         except Exception:
                             target_settle_sec = 86400.0
 
@@ -1335,9 +1401,11 @@ class LivePaperSoakDaemon:
                 entry_price=alloc.effective_avg_price,
                 cost_basis=deploy_cost,
                 entry_time=time.time(),
-                target_settlement_duration_sec=alloc.duration_sec,
+                target_settlement_duration_sec=min(self.settle_hold_sec, alloc.duration_sec),
             )
             self.settlement_positions.append(new_pos)
+            strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
+            strat.recalculate_equity()
             deployed_count += 1
             par_gain = (alloc.shares * 1.000) - deploy_cost
             self._record_event(
@@ -1389,16 +1457,21 @@ class LivePaperSoakDaemon:
                                         except Exception:
                                             pass
 
-                                    if not is_closed and uma_status != "resolved" and winning_idx is None:
+                                    if not is_closed and uma_status != "resolved":
                                         # Market has not finalized on-chain; defer redemption by 30s
                                         pos.target_settlement_duration_sec += 30.0
                                         continue
 
                                     is_resolved = True
-                                    if winning_idx is not None and len(toks) > winning_idx:
-                                        is_win = (toks[winning_idx] == pos.token_id)
-                                    else:
-                                        is_win = (pos.entry_price >= 0.985)
+                                    # Authentic winning outcome verification: match position token against outcome with price >= 0.99
+                                    is_win = False
+                                    for p_i, p_val in enumerate(prices):
+                                        try:
+                                            if float(p_val) >= 0.99 and len(toks) > p_i and toks[p_i] == pos.token_id:
+                                                is_win = True
+                                                break
+                                        except (ValueError, TypeError):
+                                            pass
                         except Exception as exc:
                             log.debug(f"Resolution check deferred: {exc}")
                             pos.target_settlement_duration_sec += 30.0
@@ -1406,6 +1479,9 @@ class LivePaperSoakDaemon:
 
                         pos.settled = True
                         self.settlement_positions.remove(pos)
+                        strat = self.metrics["SettlementHarvester"]
+                        strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
+                        strat.recalculate_equity()
 
                         if is_win:
                             par_proceeds = pos.shares * 1.000
@@ -1690,11 +1766,22 @@ class LivePaperSoakDaemon:
                             maker_candidates.sort(key=lambda x: (x[1] * x[2]), reverse=True)
                             active_maker_set = maker_candidates[:5]
                             cap_per_quote = min(100.0, usable_cash / len(active_maker_set))
+                            strat = self.metrics["CtfMinter"]
 
                             for cost, spread_bps, vol24, q_text, m_obj, toks, fs in active_maker_set:
                                 # Poisson retail flow arrival rate: inside touch captures ~8% of taker volume
                                 flow_rate = (vol24 / 86400.0) * 0.08
-                                fill_shares = max(2.0, min(cap_per_quote, flow_rate * dt))
+                                expected_flow = flow_rate * dt
+                                if expected_flow < 0.05:
+                                    continue
+                                fill_shares = min(cap_per_quote, expected_flow)
+                                if fill_shares < 0.1:
+                                    continue
+
+                                position_cost = fill_shares * cost
+                                if strat.available_cash < position_cost:
+                                    continue
+
                                 gross_pnl = fill_shares * (1.0000 - cost)
                                 rebate = maker_fee_rebate(0.50, fill_shares, fs, maker_rebate_share_pct=0.20)
                                 gas_cost = 0.00136
@@ -1704,12 +1791,18 @@ class LivePaperSoakDaemon:
                                     cond_id = m_obj.get("conditionId", "")
                                     side_tag = "CTF_MAKER_MERGE"
 
-                                    self.metrics["CtfMinter"].update_pnl(
-                                        gross_pnl,
+                                    # Ground-Truth Balance Sheet & CTF Capital Locking
+                                    strat.lock_capital(position_cost)
+                                    strat.release_capital(
+                                        cost_amount=position_cost,
+                                        payout_amount=fill_shares * 1.0000,
                                         fee=gas_cost,
-                                        rebate=rebate,
                                     )
-                                    self.metrics["CtfMinter"].total_trades += 1
+                                    strat.rebates_earned += rebate
+                                    strat.available_cash += rebate
+                                    strat.recalculate_equity()
+                                    strat.total_trades += 1
+
                                     self.db.record_trade(
                                         "CtfMinter",
                                         cond_id,
@@ -1803,25 +1896,17 @@ class LivePaperSoakDaemon:
             pnl_color = C_GREEN if m.net_pnl >= 0 else C_RED
             extra_col = ""
             if m.name == "SettlementHarvester" and self.settlement_positions:
-                pending_par = sum(p.shares * 1.000 for p in self.settlement_positions)
-                pending_cost = sum(p.cost_basis for p in self.settlement_positions)
-                pending_edge = pending_par - pending_cost
-                proj_net = m.net_pnl + pending_edge
-                proj_color = C_GREEN if proj_net >= 0 else C_RED
-                extra_col = f" {C_YELLOW}[{len(self.settlement_positions)} open: +${pending_edge:.2f} par edge -> Proj: {proj_color}{proj_net:+.2f}{C_RESET}{C_YELLOW}]{C_RESET}"
+                pending_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
+                extra_col = f" {C_YELLOW}[{len(self.settlement_positions)} open: +${pending_edge:.2f} par edge]{C_RESET}"
             lines.append(
                 f"{m.name:<24} ${m.starting_cash:<11.2f} ${m.current_equity:<15.4f} "
                 f"{pnl_color}{m.net_pnl:>+10.4f}{C_RESET} {m.max_drawdown_pct * 100:>6.2f}% {m.total_trades:>6}{extra_col}"
             )
         lines.append(f"{C_DIM}------------------------------------------------------------------------------{C_RESET}")
-        pending_total_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
-        proj_tot_pnl = total_net_pnl + pending_total_edge
-        proj_tot_color = C_GREEN if proj_tot_pnl >= 0 else C_RED
-        proj_str = f" {C_YELLOW}(Proj w/ Par: {proj_tot_color}{proj_tot_pnl:+.2f}{C_RESET}{C_YELLOW}){C_RESET}" if pending_total_edge > 0 else ""
         lines.append(
             f"{C_BOLD}TOTAL PORTFOLIO{C_RESET}          ${total_bankroll:,.2f}   "
             f"${total_equity:<15.4f} {tot_color}{total_net_pnl:>+10.4f}{C_RESET} "
-            f"Max Return: {tot_color}{(total_net_pnl / total_bankroll) * 100:+.4f}%{C_RESET}{proj_str}"
+            f"Net Return: {tot_color}{(total_net_pnl / total_bankroll) * 100:+.4f}%{C_RESET}"
         )
         lines.append(f"{C_BOLD}=============================================================================={C_RESET}")
         if self.recent_events:

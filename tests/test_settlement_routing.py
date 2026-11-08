@@ -25,18 +25,23 @@ from polymarketbot.trading.settlement import (
     NEGRISK_MERGE_SELECTOR,
     ROUTER_MERGE_SELECTOR,
     ROUTER_REDEEM_SELECTOR,
+    CTF_REDEEM_SELECTOR,
+    CTF_PAYOUT_DENOMINATOR_SELECTOR,
+    CTF_PAYOUT_NUMERATOR_SELECTOR,
     ROUTER,
     IS_APPROVED_FOR_ALL_SELECTOR,
     SettlementRoute,
     USDC_E,
     amount_to_6dp,
     build_ctf_merge,
+    build_ctf_redeem,
     build_negrisk_convert,
     build_negrisk_merge,
     build_router_merge,
     build_router_redeem,
     classify_market,
     classify_merge_route,
+    classify_redeem_route,
     decode_erc20_transfer_total,
     derive_ctf_position_id,
     receipt_succeeded,
@@ -66,6 +71,31 @@ def test_selectors_are_independently_expected_hex():
     assert ROUTER_REDEEM_SELECTOR == "d217a3cc"       # redeem(bytes31,uint256,uint256)
     assert NEGRISK_CONVERT_SELECTOR == "c64748c4"     # convertPositions(bytes32,uint256,uint256)
     assert IS_APPROVED_FOR_ALL_SELECTOR == "e985e9c5" # isApprovedForAll(address,address)
+    assert CTF_REDEEM_SELECTOR == "01b7037c"          # redeemPositions(address,bytes32,bytes32,uint256[])
+    assert CTF_PAYOUT_DENOMINATOR_SELECTOR == "dd34de67" # payoutDenominator(bytes32)
+    assert CTF_PAYOUT_NUMERATOR_SELECTOR == "0504c814"   # payoutNumerators(bytes32,uint256)
+
+
+def test_ctf_redeem_calldata_matches_hand_computed_vector():
+    expected = (
+        "0x01b7037c"
+        + _addr_word(USDC_E)
+        + "00" * 32
+        + "44" * 32
+        + _word(128)                # offset to dynamic array
+        + _word(2)                  # length of array
+        + _word(1)                  # indexSet 1
+        + _word(2)                  # indexSet 2
+    )
+    assert build_ctf_redeem(COND_CTF, (1, 2)) == expected
+
+
+def test_classify_redeem_route():
+    assert classify_redeem_route({"version": "v2"}) is SettlementRoute.ROUTER_MERGE
+    assert classify_redeem_route({"version": "v1", "neg_risk": True}) is SettlementRoute.CTF_REDEEM
+    assert classify_redeem_route({"version": "v1", "neg_risk": False}) is SettlementRoute.CTF_REDEEM
+    assert classify_redeem_route({"version": "v3"}) is SettlementRoute.UNSUPPORTED
+    assert classify_redeem_route(None) is SettlementRoute.UNSUPPORTED
 
 
 def test_router_merge_calldata_matches_hand_computed_vector():
@@ -345,6 +375,49 @@ def test_verify_ctf_merge_rejects_empty_balance():
     )
     assert ok is False
     assert "no CTF balance" in reason
+
+
+def test_verify_ctf_redeem_requires_resolution_and_winning_balance():
+    # 1. Unresolved condition: payoutDenominator == 0
+    chain_unres = _FakeChain(value="0x" + _word(0))
+    ok, reason = verify_route(
+        SettlementRoute.CTF_REDEEM,
+        COND_CTF,
+        "0x" + "ab" * 20,
+        chain_unres,
+        meta={"clob_token_ids": ["123", "456"]},
+    )
+    assert ok is False
+    assert "payoutDenominator == 0" in reason
+
+    # 2. Resolved condition: payoutDenominator > 0 and winning balance > 0
+    class _DynamicChain:
+        def __init__(self):
+            self.calls = []
+
+        def eth_call(self, to: str, data: str, **_: object) -> str:
+            self.calls.append((to, data))
+            if CTF_PAYOUT_DENOMINATOR_SELECTOR in data:
+                return "0x" + _word(10**18)
+            if CTF_PAYOUT_NUMERATOR_SELECTOR in data:
+                # Outcome 0 wins with 10^18, Outcome 1 loses with 0
+                if data.endswith(_word(0)):
+                    return "0x" + _word(10**18)
+                return "0x" + _word(0)
+            if "00fdd58e" in data:  # balanceOf
+                return "0x" + _word(100_000_000)
+            return "0x" + _word(1)
+
+    dyn_chain = _DynamicChain()
+    ok, reason = verify_route(
+        SettlementRoute.CTF_REDEEM,
+        COND_CTF,
+        "0x" + "ab" * 20,
+        dyn_chain,
+        meta={"clob_token_ids": ["123", "456"]},
+    )
+    assert ok is True, reason
+    assert "redeemable winning balance" in reason
 
 
 def test_verify_route_turns_rpc_errors_into_reasons():
