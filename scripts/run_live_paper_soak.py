@@ -615,12 +615,14 @@ class LivePaperSoakDaemon:
         duration: Optional[float] = None,
         interval: float = 10.0,
         settle_hold_sec: float = 135.0,
+        enable_latency_sniper: bool = False,
     ) -> None:
         self.capital_per_strategy = capital_per_strategy
         self.vip_tier = vip_tier.lower()
         self.duration = duration
         self.interval = max(1.0, interval)
         self.settle_hold_sec = max(10.0, float(settle_hold_sec))
+        self.enable_latency_sniper = enable_latency_sniper
         self.running = False
         self.db = SoakTelemetryDb()
         self.start_time = 0.0
@@ -637,6 +639,10 @@ class LivePaperSoakDaemon:
             "SettlementHarvester": StrategyMetrics("SettlementHarvester", capital_per_strategy, capital_per_strategy, capital_per_strategy),
             "CtfMinter": StrategyMetrics("CtfMinter", capital_per_strategy, capital_per_strategy, capital_per_strategy),
         }
+        if self.enable_latency_sniper:
+            self.metrics["LatencySniper"] = StrategyMetrics(
+                "LatencySniper [BENCHED]", capital_per_strategy, capital_per_strategy, capital_per_strategy
+            )
 
         # Subsystems & State
         self.ctf_engine = CtfCrossSplitArbitrageEngine(
@@ -670,6 +676,12 @@ class LivePaperSoakDaemon:
             default_pol_usd_price=0.40,
             max_capital_per_market=capital_per_strategy * 0.40,
         )
+        if self.enable_latency_sniper:
+            self.presigned_cache = PreSignedOrderCache()
+            self.sniper_engine = BinanceLatencySniperEngine(
+                config=LatencySniperConfig(vip_tier=self.vip_tier, min_jump_bps=12.0),
+                presigned_cache=self.presigned_cache,
+            )
 
         # Network latency monitors
         self.last_clob_rtt_ms = 0.0
@@ -714,11 +726,14 @@ class LivePaperSoakDaemon:
             self.load_previous_state()
         self.running = True
         self.start_time = time.time()
+        active_count = len(self.metrics)
         log.info(
             f"Starting Live Paper Soak Daemon | Capital: ${self.capital_per_strategy * len(self.metrics):,.2f} "
             f"($1,000 x {len(self.metrics)}) | VIP Tier: {self.vip_tier.upper()} | "
             f"Update Interval: {self.interval:.1f}s"
         )
+        if not self.enable_latency_sniper:
+            log.info("Note: LatencySniper is BENCHED (23.9% ARR vs 2,554% 3-pillar ARR). Focus is 100% on Maker, Settlement & Parity.")
 
         # Pre-flight venue ping so initial render has live RTT instead of 0.0ms
         self._ping_venues()
@@ -736,6 +751,9 @@ class LivePaperSoakDaemon:
             threading.Thread(target=self._run_ctf_minter_loop, daemon=True, name="CtfMinterLoop"),
             threading.Thread(target=self._run_network_ping_loop, daemon=True, name="NetworkPingLoop"),
         ]
+        if self.enable_latency_sniper:
+            threads.append(threading.Thread(target=self._run_latency_sniper_loop, daemon=True, name="SniperLoop"))
+
         for t in threads:
             t.start()
 

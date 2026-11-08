@@ -16,10 +16,15 @@ import pytest
 from unittest.mock import MagicMock
 
 from polymarketbot.trading.liquidity_router import (
+    ActiveSettlementLoan,
     InterDomainLiquidityRouter,
     LiquidityRouterConfig,
+    MetaAllocationPlan,
+    MetaOptimizerCapitalRouter,
     SimpleCashInventoryManager,
-    ActiveSettlementLoan,
+    StrategyCapacityModel,
+    StrategyName,
+    get_default_strategy_models,
 )
 from polymarketbot.trading.domain2.types import (
     DiscountOpportunity,
@@ -460,4 +465,203 @@ def test_arr_calculation_edge_cases():
     # Inverted price (bid >= proposed) -> 0.0% ARR
     opp_inv = _create_opportunity("0xinv", hours_left=24.0, bid_price=1.005, proposed_price=1.0)
     assert router.compute_opportunity_arr(opp_inv) == 0.0
+
+
+def test_strategy_capacity_model_decay():
+    """Test StrategyCapacityModel diminishing returns and capacity limits."""
+    model = StrategyCapacityModel(
+        name="TestStrat",
+        base_marginal_apy=1000.0,
+        capacity_scale_usd=50_000.0,
+        decay_exponent=1.0,
+        max_capacity_usd=200_000.0,
+        is_active=True,
+    )
+
+    # At $0 capital: marginal APY equals base APY
+    assert model.marginal_apy(0.0) == 1000.0
+
+    # At K ($50k): marginal APY decays to exactly half (500%)
+    assert abs(model.marginal_apy(50_000.0) - 500.0) < 1e-4
+
+    # At $150k: decay = 1 + 3 = 4 -> marginal APY = 250%
+    assert abs(model.marginal_apy(150_000.0) - 250.0) < 1e-4
+
+    # At max capacity ($200k): marginal APY drops to 0.0
+    assert model.marginal_apy(200_000.0) == 0.0
+    assert model.marginal_apy(250_000.0) == 0.0
+
+    # When deactivated/benched: marginal APY drops to 0.0
+    model.is_active = False
+    assert model.marginal_apy(0.0) == 0.0
+    assert model.effective_apy(10_000.0) == 0.0
+
+
+def test_meta_optimizer_greedy_equimarginal_allocation():
+    """Test greedy equi-marginal allocation across small to mid capital tiers."""
+    optimizer = MetaOptimizerCapitalRouter()
+
+    # Tier 1: $1,000 deployment -> 100% to #1 (RewardHarvester)
+    plan_1k = optimizer.optimize(1_000.0)
+    assert plan_1k.allocations["RewardHarvester"].allocated_usd == 1000.0
+    assert plan_1k.allocations["RewardHarvester"].allocation_pct == 100.0
+    assert plan_1k.allocations["SettlementHarvester"].allocated_usd == 0.0
+    assert plan_1k.allocations["CtfSplitter"].allocated_usd == 0.0
+    assert plan_1k.allocations["LatencySniper"].allocated_usd == 0.0
+    assert plan_1k.blended_effective_apy > 15_000.0
+
+    # Tier 2: $100,000 deployment -> RewardHarvester marginal yield still beats #2
+    plan_100k = optimizer.optimize(100_000.0)
+    assert plan_100k.allocations["RewardHarvester"].allocated_usd == 100_000.0
+    assert plan_100k.allocations["RewardHarvester"].allocation_pct == 100.0
+    assert plan_100k.allocations["SettlementHarvester"].allocated_usd == 0.0
+
+    # Tier 3: $1,000,000 deployment -> Equi-marginal condition reached!
+    # RewardHarvester decays until its marginal APY matches SettlementHarvester (~1,041%)
+    plan_1m = optimizer.optimize(1_000_000.0)
+    rh_slice = plan_1m.allocations["RewardHarvester"]
+    sh_slice = plan_1m.allocations["SettlementHarvester"]
+    cs_slice = plan_1m.allocations["CtfSplitter"]
+
+    # Both RH and SH receive substantial capital
+    assert 400_000.0 < rh_slice.allocated_usd < 550_000.0
+    assert 450_000.0 < sh_slice.allocated_usd < 600_000.0
+    assert cs_slice.allocated_usd == 0.0  # CS base APY (581%) < 1,041%, receives $0
+
+    # The marginal APYs of RH and SH must be virtually identical (within 2% tolerance)
+    assert abs(rh_slice.marginal_apy - sh_slice.marginal_apy) < 5.0
+    assert 1030.0 < rh_slice.marginal_apy < 1055.0
+
+
+def test_meta_optimizer_macro_multi_million_allocation():
+    """Test $10,000,000 macro capital allocation across all strategies."""
+    optimizer = MetaOptimizerCapitalRouter()
+    plan_10m = optimizer.optimize(10_000_000.0)
+
+    rh_slice = plan_10m.allocations["RewardHarvester"]
+    sh_slice = plan_10m.allocations["SettlementHarvester"]
+    cs_slice = plan_10m.allocations["CtfSplitter"]
+    ls_slice = plan_10m.allocations["LatencySniper"]
+
+    # LatencySniper is benched -> receives exactly $0
+    assert ls_slice.allocated_usd == 0.0
+
+    # SettlementHarvester hits its hard capacity ceiling of $6,000,000
+    assert sh_slice.allocated_usd == 6_000_000.0
+    assert sh_slice.allocation_pct == 60.0
+    assert sh_slice.marginal_apy == 0.0
+
+    # Remaining $4,000,000 is distributed between RH and CS along the equi-marginal frontier
+    assert 1_000_000.0 < rh_slice.allocated_usd < 1_400_000.0
+    assert 2_600_000.0 < cs_slice.allocated_usd < 3_000_000.0
+
+    # RH and CS marginal APY must be equilibrated (within 2%)
+    assert abs(rh_slice.marginal_apy - cs_slice.marginal_apy) < 5.0
+    assert 375.0 < rh_slice.marginal_apy < 385.0
+
+    # Total deployed matches bankroll
+    total_deployed = sum(s.allocated_usd for s in plan_10m.allocations.values())
+    assert abs(total_deployed - 10_000_000.0) < 1.0
+
+    # Total profit exceeds $50M/year
+    assert plan_10m.total_annual_profit_usd > 50_000_000.0
+
+
+def test_meta_optimizer_optimality_vs_naive_equal_split():
+    """Prove mathematically that the meta-optimizer achieves strictly higher profit than naive equal splitting."""
+    optimizer = MetaOptimizerCapitalRouter()
+    total_cap = 1_000_000.0
+
+    # 1. Optimal equi-marginal plan
+    optimal_plan = optimizer.optimize(total_cap)
+
+    # 2. Naive equal 3-way split: $333,333.33 each
+    models = {m.name: m for m in get_default_strategy_models() if m.is_active}
+    naive_alloc = total_cap / len(models)
+    naive_profit = sum(m.cumulative_annual_profit_usd(naive_alloc) for m in models.values())
+
+    # The optimal allocation must generate strictly higher annual profit
+    assert optimal_plan.total_annual_profit_usd > naive_profit
+    profit_advantage = optimal_plan.total_annual_profit_usd - naive_profit
+    assert profit_advantage > 1_000_000.0  # Over $1M/year higher return from meta-optimization!
+
+
+def test_meta_optimizer_rebalance_delta():
+    """Test capital rebalance delta calculation with threshold gating."""
+    optimizer = MetaOptimizerCapitalRouter()
+
+    # Suppose current portfolio has $500k in RH and $500k in SH at $1M total
+    current = {
+        "RewardHarvester": 500_000.0,
+        "SettlementHarvester": 500_000.0,
+        "CtfSplitter": 0.0,
+    }
+    deltas = optimizer.rebalance_delta(current, total_equity=1_000_000.0, min_rebalance_pct=0.01)
+
+    # Optimal target is ~$478.5k RH and ~$521.5k SH
+    # Delta for RH: ~$478.5k - $500k = -$21.5k
+    # Delta for SH: ~$521.5k - $500k = +$21.5k
+    assert -23_000.0 < deltas["RewardHarvester"] < -20_000.0
+    assert 20_000.0 < deltas["SettlementHarvester"] < 23_000.0
+    assert deltas.get("CtfSplitter", 0.0) == 0.0
+
+    # With higher 5% threshold ($50k), small deltas are suppressed to prevent churn
+    suppressed_deltas = optimizer.rebalance_delta(current, total_equity=1_000_000.0, min_rebalance_pct=0.05)
+    assert suppressed_deltas["RewardHarvester"] == 0.0
+    assert suppressed_deltas["SettlementHarvester"] == 0.0
+
+
+def test_interdomain_router_meta_integration():
+    """Test InterDomainLiquidityRouter integrated with MetaOptimizerCapitalRouter."""
+    d1_manager = SimpleCashInventoryManager(initial_cash=5000.0)
+    router = InterDomainLiquidityRouter(domain1_engine=d1_manager)
+
+    # Router automatically initializes meta_optimizer
+    assert router.meta_optimizer is not None
+
+    # Compute optimal allocation from router
+    plan = router.compute_meta_optimal_allocation()
+    assert plan.total_capital_usd == 5000.0
+    assert plan.allocations["RewardHarvester"].allocated_usd == 5000.0
+
+    # Verify telemetry contains meta_optimal_plan
+    telemetry = router.get_telemetry()
+    assert "meta_optimal_plan" in telemetry
+    plan_dict = telemetry["meta_optimal_plan"]
+    assert plan_dict["total_capital_usd"] == 5000.0
+    assert "allocations" in plan_dict
+    assert "RewardHarvester" in plan_dict["allocations"]
+
+
+def test_meta_optimizer_equimarginal_optimality_vs_overallocating_high_average_strategy():
+    """Verify that stopping RewardHarvester at the equi-marginal frontier ($1.185M) produces strictly higher profit
+
+    than continuing to allocate to it based on its high historical average APY.
+    """
+    optimizer = MetaOptimizerCapitalRouter()
+    cap = 10_000_000.0
+
+    # 1. Optimal equi-marginal plan
+    optimal_plan = optimizer.optimize(cap)
+
+    # 2. Sub-optimal alternative: forcing RH to its $3M cap, leaving $6M to SH and only $1M to CS
+    models = {m.name: m for m in get_default_strategy_models() if m.is_active}
+    suboptimal_profit = (
+        models["RewardHarvester"].cumulative_annual_profit_usd(3_000_000.0)
+        + models["SettlementHarvester"].cumulative_annual_profit_usd(6_000_000.0)
+        + models["CtfSplitter"].cumulative_annual_profit_usd(1_000_000.0)
+    )
+
+    # The equi-marginal allocation achieves strictly higher annual profit ($73.78M vs $70.22M)
+    assert optimal_plan.total_annual_profit_usd > suboptimal_profit
+    diff = optimal_plan.total_annual_profit_usd - suboptimal_profit
+    assert diff > 3_000_000.0  # Over $3.55M/year higher profit from pure marginal routing!
+
+    # Verify optimal slices at $10M
+    assert optimal_plan.allocations["RewardHarvester"].allocated_usd == 1_185_000.0
+    assert optimal_plan.allocations["SettlementHarvester"].allocated_usd == 6_000_000.0
+    assert optimal_plan.allocations["CtfSplitter"].allocated_usd == 2_815_000.0
+
+
+
 
