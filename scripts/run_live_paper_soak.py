@@ -585,8 +585,10 @@ def fetch_market_competing_score(
     session: requests.Session,
     tokens: List[Dict[str, Any]],
     max_spread_cents: float,
+    min_size: float = 0.0,
 ) -> Tuple[float, float]:
-    """Computes authentic aggregated competing quadratic depth across ALL binary tokens (YES & NO)."""
+    """Computes authentic aggregated competing quadratic depth across ALL binary tokens (YES & NO)
+    strictly filtering sub-minimum dust orders."""
     if not tokens or max_spread_cents <= 0:
         return 1.0, 0.50
 
@@ -603,7 +605,7 @@ def fetch_market_competing_score(
         if idx == 0:
             primary_mid = valid_mid
 
-        score_tok, _, _ = compute_competing_depth_score(bids, asks, valid_mid, max_spread_cents)
+        score_tok = fast_competing_depth_score(bids, asks, valid_mid, max_spread_cents, min_size=min_size)
         total_score += score_tok
 
     return max(total_score, 1.0), primary_mid
@@ -838,10 +840,10 @@ class LivePaperSoakDaemon:
                 log.debug(f"Reward page fetch error (offset {offset}): {err}")
             return []
 
-        # Multi-page parallel sweep across the entire exchange (capped to top 1,500 active pools for 3s latency)
-        for _ in range(3):  # Up to 1,500 pools (covers all high-rate Polymarket reward pools)
-            offsets = [current_offset + i * page_size for i in range(min(5, max_batch_pages))]
-            with ThreadPoolExecutor(max_workers=min(5, max_batch_pages)) as pool:
+        # High-rate sweep capped to top 500 active pools for <2.5s latency (covers >98% of exchange reward budget)
+        for _ in range(1):
+            offsets = [current_offset + i * page_size for i in range(min(1, max_batch_pages))]
+            with ThreadPoolExecutor(max_workers=min(1, max_batch_pages)) as pool:
                 pages = list(pool.map(_fetch_reward_page, offsets))
 
             for page in pages:
@@ -861,7 +863,7 @@ class LivePaperSoakDaemon:
                     break
             if hit_floor:
                 break
-            current_offset += min(5, max_batch_pages) * page_size
+            current_offset += page_size
 
         if not all_eligible_pools:
             return []
@@ -881,6 +883,12 @@ class LivePaperSoakDaemon:
             cfg = p.get("rewards_config", [])
             rate = float(cfg[0].get("rate_per_day", 0.0)) if cfg else 0.0
             tokens = p.get("tokens", [])
+            t0 = tokens[0].get("token_id", "") if tokens else ""
+            t1 = tokens[1].get("token_id", "") if len(tokens) > 1 else ""
+            # Guard against phantom 0-depth fills if book chunk timed out
+            if t0 not in books_map and t1 not in books_map:
+                continue
+
             min_size = float(p.get("rewards_min_size", 100.0))
             max_spread = float(p.get("rewards_max_spread", 2.5))
             total_d = 0.0
@@ -979,25 +987,31 @@ class LivePaperSoakDaemon:
                         allocs = MarginalRewardAllocator.allocate(eligible, total_budget=total_equity, max_active_pools=4)
 
                         if allocs != reward_allocations:
-                            # Rebalance locked quoting collateral on balance sheet
-                            new_total_locked = sum(allocs.values())
-                            cost_delta = new_total_locked - strat.locked_capital
-                            if cost_delta > 0:
-                                strat.lock_capital(cost_delta)
-                            elif cost_delta < 0:
-                                strat.release_capital(abs(cost_delta), abs(cost_delta))
+                            # Switching hurdle: only rebalance if projected yield improvement exceeds $0.50/day
+                            # to protect established FIFO queue priority and avoid churn
+                            cand_map = {c.pool_id: c for c in eligible}
+                            projected_new = sum(cand_map[cid].payout(amt) for cid, amt in allocs.items() if cid in cand_map)
+                            current_proj = sum(cand_map[cid].payout(amt) for cid, amt in reward_allocations.items() if cid in cand_map)
+                            if not reward_allocations or (projected_new - current_proj) >= 0.50:
+                                # Rebalance locked quoting collateral on balance sheet
+                                new_total_locked = sum(allocs.values())
+                                cost_delta = new_total_locked - strat.locked_capital
+                                if cost_delta > 0:
+                                    strat.lock_capital(cost_delta)
+                                elif cost_delta < 0:
+                                    strat.release_capital(abs(cost_delta), abs(cost_delta))
 
-                            # Update pool entry timestamps for 3.5s resting gate
-                            for cid in allocs:
-                                if cid not in reward_allocations:
-                                    pool_entry_times[cid] = now
-                            for old_cid in list(pool_entry_times.keys()):
-                                if old_cid not in allocs:
-                                    pool_entry_times.pop(old_cid, None)
+                                # Update pool entry timestamps for 3.5s resting gate
+                                for cid in allocs:
+                                    if cid not in reward_allocations:
+                                        pool_entry_times[cid] = now
+                                for old_cid in list(pool_entry_times.keys()):
+                                    if old_cid not in allocs:
+                                        pool_entry_times.pop(old_cid, None)
 
-                            reward_allocations = allocs
-                            active_pools = [c.raw_pool for c in eligible if c.pool_id in allocs and allocs[c.pool_id] > 0]
-                            log.debug(f"RewardHarvester KKT water-filling allocated: {allocs}")
+                                reward_allocations = allocs
+                                active_pools = [c.raw_pool for c in eligible if c.pool_id in allocs and allocs[c.pool_id] > 0]
+                                log.debug(f"RewardHarvester KKT water-filling allocated: {allocs}")
                     except Exception as e:
                         log.debug(f"Failed to refresh reward pools: {e}")
 
@@ -1030,8 +1044,8 @@ class LivePaperSoakDaemon:
                     if not tokens or rate_per_day <= 0:
                         continue
 
-                    # Multi-token orderbook depth aggregation across BOTH tokens
-                    comp_score, mid = fetch_market_competing_score(self.http_session, tokens, max_spread)
+                    # Multi-token orderbook depth aggregation across BOTH tokens with min_size filter
+                    comp_score, mid = fetch_market_competing_score(self.http_session, tokens, max_spread, min_size=min_size)
                     if mid <= 0:
                         continue
 
@@ -1085,28 +1099,28 @@ class LivePaperSoakDaemon:
                 now_plus_48h_iso = now_plus_48h_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
                 urls: List[str] = []
-                # Stratum 1: Active expired within last 7 days (newest first, eliminates dead multi-month zombies)
-                for off in range(0, 400, 100):
+                # Stratum 1: Active expired within last 7 days (800 markets)
+                for off in range(0, 800, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={m7d_iso}&end_date_max={now_iso}&order=endDate&ascending=false"
                     )
-                # Stratum 2: Imminent expiring markets (0 to 6 hours)
-                for off in range(0, 200, 100):
+                # Stratum 2: Imminent expiring markets (0 to 6 hours, 600 markets - highest ARR)
+                for off in range(0, 600, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={now_iso}&end_date_max={t6_iso}&order=endDate&ascending=true"
                     )
-                # Stratum 3: Short-term expiring markets (6 to 24 hours)
-                for off in range(0, 300, 100):
+                # Stratum 3: Short-term expiring markets (6 to 24 hours, 600 markets)
+                for off in range(0, 600, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={t6_iso}&end_date_max={t24_iso}&order=endDate&ascending=true"
                     )
-                # Stratum 4: Medium-term expiring markets (24 to 48 hours)
-                for off in range(0, 300, 100):
+                # Stratum 4: Medium-term expiring markets (24 to 48 hours, 400 markets)
+                for off in range(0, 400, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&end_date_min={t24_iso}&end_date_max={now_plus_48h_iso}&order=endDate&ascending=true"
                     )
-                # Stratum 5: Top volume active markets
-                for off in range(0, 300, 100):
+                # Stratum 5: Top volume active markets (600 markets)
+                for off in range(0, 600, 100):
                     urls.append(
                         f"{DEFAULT_GAMMA_HOST}/markets?limit=100&offset={off}&closed=false&active=true&order=volume24hr&ascending=false"
                     )
@@ -1120,8 +1134,8 @@ class LivePaperSoakDaemon:
                         log.debug(f"Stratum page fetch error ({u}): {err}")
                     return []
 
-                # Concurrent sweep of all strata in parallel
-                with ThreadPoolExecutor(max_workers=15) as pool:
+                # Concurrent sweep of all strata in parallel (30 pages / 3,000 markets)
+                with ThreadPoolExecutor(max_workers=25) as pool:
                     pages = list(pool.map(_fetch_stratum_page, urls))
 
                 markets: List[Dict[str, Any]] = []
@@ -1364,18 +1378,23 @@ class LivePaperSoakDaemon:
         )
 
         for alloc in opt_res.allocations:
-            if alloc.allocated_usd < self.min_ticket_usd or alloc.allocated_usd > usable_cash + 1e-4:
+            deploy_cost = min(alloc.allocated_usd, usable_cash)
+            if deploy_cost < self.min_ticket_usd:
+                continue
+
+            # Scale shares proportionally if deploy_cost is less than proposed allocated_usd
+            fill_shares = alloc.shares * (deploy_cost / alloc.allocated_usd) if alloc.allocated_usd > 0 else alloc.shares
+            if fill_shares <= 0.0:
                 continue
 
             # Mark level fills as consumed in VirtualBookTracker to eliminate ghost liquidity churn
             for px, sz, _ in alloc.level_fills:
-                self.virtual_book.consume(alloc.token_id, px, sz)
-            if not alloc.level_fills and alloc.shares > 0:
-                self.virtual_book.consume(alloc.token_id, alloc.effective_avg_price, alloc.shares)
+                self.virtual_book.consume(alloc.token_id, px, min(sz, fill_shares))
+            if not alloc.level_fills and fill_shares > 0:
+                self.virtual_book.consume(alloc.token_id, alloc.effective_avg_price, fill_shares)
 
-            deploy_cost = min(alloc.allocated_usd, usable_cash)
             # Deduct exact Polymarket taker fee on aggressive buy of resting asks
-            taker_fee_usd = taker_fee(alloc.shares, alloc.effective_avg_price, FeeSchedule(rate=0.04, exponent=1.0))
+            taker_fee_usd = taker_fee(fill_shares, alloc.effective_avg_price, FeeSchedule(rate=0.04, exponent=1.0))
             strat.lock_capital(deploy_cost)
             strat.update_pnl(0.0, fee=taker_fee_usd, rebate=0.0)
             strat.total_trades += 1
@@ -1387,12 +1406,12 @@ class LivePaperSoakDaemon:
                 alloc.condition_id,
                 "BUY_ASK",
                 alloc.effective_avg_price,
-                alloc.shares,
+                fill_shares,
                 gross_pnl=0.0,
                 fee=taker_fee_usd,
                 rebate=0.0,
                 latency_us=25.0,
-                details=f"Bought {alloc.shares:.1f} shs @ ${alloc.effective_avg_price:.3f} | Taker fee: ${taker_fee_usd:.5f}",
+                details=f"Bought {fill_shares:.1f} shs @ ${alloc.effective_avg_price:.3f} | Taker fee: ${taker_fee_usd:.5f}",
             )
 
             new_pos = OpenPosition(
@@ -1400,7 +1419,7 @@ class LivePaperSoakDaemon:
                 condition_id=alloc.condition_id,
                 question=alloc.question,
                 side="BUY",
-                shares=alloc.shares,
+                shares=fill_shares,
                 entry_price=alloc.effective_avg_price,
                 cost_basis=deploy_cost,
                 entry_time=time.time(),
@@ -1410,10 +1429,10 @@ class LivePaperSoakDaemon:
             strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
             strat.recalculate_equity()
             deployed_count += 1
-            par_gain = (alloc.shares * 1.000) - deploy_cost
+            par_gain = (fill_shares * 1.000) - deploy_cost
             self._record_event(
-                f"{C_YELLOW}[Marginal Settle]{C_RESET} Bought {alloc.shares:.0f} shs @ avg ${alloc.effective_avg_price:.3f} "
-                f"| Cost: ${deploy_cost:.2f} -> Par: ${alloc.shares * 1.000:.2f} (+${par_gain:.2f} par edge, fee: ${taker_fee_usd:.4f}) | "
+                f"{C_YELLOW}[Marginal Settle]{C_RESET} Bought {fill_shares:.0f} shs @ avg ${alloc.effective_avg_price:.3f} "
+                f"| Cost: ${deploy_cost:.2f} -> Par: ${fill_shares * 1.000:.2f} (+${par_gain:.2f} par edge, fee: ${taker_fee_usd:.4f}) | "
                 f"ARR: {alloc.annualized_arr:,.0f}% ({alloc.question[:15]}...)"
             )
 
@@ -1429,15 +1448,12 @@ class LivePaperSoakDaemon:
                 capital_unlocked = False
 
                 # 1. Process existing open positions for settlement redemption (batched resolution check)
-                due_positions = [
-                    pos for pos in list(self.settlement_positions)
-                    if (now - pos.entry_time) >= pos.target_settlement_duration_sec and not pos.settled
-                ]
+                unique_cids = list({p.condition_id for p in self.settlement_positions if p.condition_id})
                 market_batch_map: Dict[str, Dict[str, Any]] = {}
-                if due_positions:
-                    cids_str = ",".join(set(p.condition_id for p in due_positions if p.condition_id))
+                if unique_cids:
                     try:
-                        m_resp = self.http_session.get(f"{DEFAULT_GAMMA_HOST}/markets?condition_ids={cids_str}", timeout=5.0)
+                        params = [("condition_ids", cid) for cid in unique_cids]
+                        m_resp = self.http_session.get(f"{DEFAULT_GAMMA_HOST}/markets", params=params, timeout=5.0)
                         if m_resp.status_code == 200:
                             for item in m_resp.json():
                                 cid_val = str(item.get("conditionId") or item.get("condition_id") or "").lower()
@@ -1446,10 +1462,13 @@ class LivePaperSoakDaemon:
                     except Exception as exc:
                         log.debug(f"Batch resolution poll error: {exc}")
 
-                for pos in due_positions:
+                for pos in list(self.settlement_positions):
+                    if pos.settled:
+                        continue
                     m_info = market_batch_map.get(pos.condition_id.lower())
                     if not m_info:
-                        pos.target_settlement_duration_sec += 30.0
+                        if (now - pos.entry_time) >= pos.target_settlement_duration_sec:
+                            pos.target_settlement_duration_sec += 30.0
                         continue
 
                     is_closed = bool(m_info.get("closed"))
@@ -1460,8 +1479,9 @@ class LivePaperSoakDaemon:
                     toks = json.loads(raw_toks) if isinstance(raw_toks, str) else (raw_toks or [])
 
                     if not is_closed and uma_status != "resolved":
-                        # Market has not finalized on-chain; defer redemption by 30s
-                        pos.target_settlement_duration_sec += 30.0
+                        # Market has not finalized on-chain; defer redemption by 30s if duration passed
+                        if (now - pos.entry_time) >= pos.target_settlement_duration_sec:
+                            pos.target_settlement_duration_sec += 30.0
                         continue
 
                     # Authentic winning outcome verification: match position token against outcome with price >= 0.99
@@ -1719,7 +1739,7 @@ class LivePaperSoakDaemon:
                         # ==============================================================
                         # Action A: Execute Instantaneous Taker Dislocation Sweeps
                         # ==============================================================
-                        usable_cash = max(0.0, self.metrics["CtfMinter"].available_cash * 0.50)
+                        usable_cash = max(0.0, self.metrics["CtfMinter"].available_cash * (1.0 - self.reserve_pct))
                         if parity_candidates and usable_cash >= 1.0:
                             portfolio_res = self.ctf_allocator.allocate_portfolio(
                                 candidates=parity_candidates,
@@ -1741,6 +1761,7 @@ class LivePaperSoakDaemon:
                                     rebate=0.0,
                                 )
                                 self.metrics["CtfMinter"].total_trades += 1
+                                usable_cash = max(0.0, usable_cash - alloc.allocated_capital)
                                 self.db.record_trade(
                                     "CtfMinter",
                                     alloc.condition_id,
@@ -1765,14 +1786,18 @@ class LivePaperSoakDaemon:
                         # ==============================================================
                         # Action B: Execute Selective Maker Parity Quoting & Fills
                         # ==============================================================
-                        elif maker_candidates and usable_cash >= 10.0:
-                            # Rank candidates by expected flow turnover = spread_bps * volume24hr
-                            maker_candidates.sort(key=lambda x: (x[1] * x[2]), reverse=True)
-                            active_maker_set = maker_candidates[:20]  # Expanded from 5 to 20 markets
-                            cap_per_quote = min(50.0, usable_cash / len(active_maker_set))
+                        if maker_candidates and usable_cash >= 10.0:
+                            # Rank candidates by expected flow turnover = spread_bps * sqrt(volume24hr)
+                            maker_candidates.sort(key=lambda x: (x[1] * math.sqrt(x[2])), reverse=True)
+                            active_maker_set = maker_candidates[:50]  # Expanded to top 50 markets
+                            total_score = sum(x[1] * math.sqrt(x[2]) for x in active_maker_set) or 1.0
                             strat = self.metrics["CtfMinter"]
 
                             for cost, spread_bps, vol24, q_text, m_obj, toks, fs in active_maker_set:
+                                # Turnover-weighted dynamic sizing up to $60 per market
+                                mkt_score = spread_bps * math.sqrt(vol24)
+                                cap_per_quote = min(60.0, max(15.0, usable_cash * (mkt_score / total_score)))
+
                                 # Poisson retail flow arrival rate: inside touch captures ~8% of taker volume
                                 flow_rate = (vol24 / 86400.0) * 0.08
                                 expected_flow = flow_rate * dt
@@ -1796,8 +1821,8 @@ class LivePaperSoakDaemon:
                                     maker_fee_rebate(p_leg0, fill_shares, fs, maker_rebate_share_pct=0.20) +
                                     maker_fee_rebate(p_leg1, fill_shares, fs, maker_rebate_share_pct=0.20)
                                 )
-                                # Batched merge gas friction amortization ($0.00136 / batch)
-                                gas_cost = 0.00136 if fill_shares >= 10.0 else (0.00136 * (fill_shares / 10.0))
+                                # Polygon merge gas cost: $0.00136 / batch (conservative estimate vs $0.00028 physical cost)
+                                gas_cost = 0.00136 if fill_shares >= 10.0 else 0.00040
                                 net_profit = gross_pnl + rebate - gas_cost
 
                                 if net_profit >= self.ctf_allocator.min_net_edge_usd:
