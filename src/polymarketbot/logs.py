@@ -21,11 +21,12 @@ Usage
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from datetime import timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -42,13 +43,17 @@ _SINKS: dict[str, list[int]] = {}
 _LOCK = threading.Lock()
 
 
-def get_logger(name: str, *, level: str = "INFO") -> Any:
+def get_logger(name: str, *, level: Optional[str] = None) -> Any:
     """A logger bound to one script name, writing to stderr and to disk.
 
     Repeated calls for the same name reuse the sinks. Calls for different names
     add their own filtered sinks, so modules sharing a process keep separate
     files and neither loses the other's output.
     """
+    effective_level = level or os.environ.get("LOG_LEVEL", "INFO")
+    rotation = os.environ.get("LOG_ROTATION", "10 MB")
+    retention = int(os.environ.get("LOG_RETENTION", "3"))
+
     with _LOCK:
         if name not in _SINKS:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,12 +65,13 @@ def get_logger(name: str, *, level: str = "INFO") -> Any:
             stderr_id = None
             if sys.stderr is not None:
                 stderr_id = logger.add(
-                    sys.stderr, level=level, format=_FORMAT, colorize=True,
+                    sys.stderr, level=effective_level, format=_FORMAT, colorize=True,
                     filter=only,
                 )
             file_id = logger.add(
-                path, level=level, format=_FORMAT, rotation="10 MB",
-                retention=5, encoding="utf-8", enqueue=True, filter=only,
+                path, level=effective_level, format=_FORMAT, rotation=rotation,
+                retention=retention, compression="gz", encoding="utf-8",
+                enqueue=True, filter=only,
             )
             _SINKS[name] = [sid for sid in (stderr_id, file_id) if sid is not None]
     return logger.bind(name=name)

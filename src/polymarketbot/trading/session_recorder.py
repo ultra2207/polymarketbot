@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import queue
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -150,7 +151,7 @@ class LiveSessionRecorder:
         chain_interval: float = 30.0,
         scoring_interval: float = 15.0,
         health_interval: float = 10.0,
-        flush_interval: float = 1.0,
+        flush_interval: float = 30.0,
         max_queue: int = 10_000,
         use_data_api: bool = True,
     ) -> None:
@@ -207,6 +208,15 @@ class LiveSessionRecorder:
         self._pending_tx: set[str] = set()
         self._user_ws_last_message_ts: Optional[float] = None
         self._last_orders: list[dict[str, Any]] = []
+
+        # Prune old live tape sessions to enforce disk storage boundaries
+        self._prune_old_sessions(out_root)
+
+    @staticmethod
+    def _prune_old_sessions(out_root: str | Path, max_sessions: int = 10, max_age_days: int = 14) -> None:
+        """Keep only recent sessions to prevent unbounded disk usage."""
+        from polymarketbot.storage import prune_directory
+        prune_directory(out_root, max_entries=max_sessions, max_age_days=max_age_days, marker_file="session.json")
 
     # ------------------------------------------------------------------ setup
     def _latest_public_run(self) -> Optional[str]:

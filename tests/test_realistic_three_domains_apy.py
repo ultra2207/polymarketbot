@@ -78,6 +78,9 @@ def test_calculate_risk_adjusted_metrics():
 
 def test_simulation_execution():
     """Verify that full historical simulation runs quickly and outputs expected structure."""
+    from pathlib import Path
+    if not Path("data/derived/uma/res_nov5.parquet").exists():
+        pytest.skip("Historical simulation tape data not present")
     res = run_realistic_three_domains_simulation()
     assert "metadata" in res
     assert "delusion_inventory_and_fixes" in res

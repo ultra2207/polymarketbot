@@ -51,6 +51,12 @@ from polymarketbot.trading.domain2.dynamic_sizer import (
     DynamicSizerConfig,
     StrikeDistanceMetrics,
 )
+from polymarketbot.trading.domain2.settlement_allocator import (
+    MarginalSettlementAllocator,
+    SettlementCandidate,
+    SettlementAllocation,
+    SettlementOptimizationResult,
+)
 
 __all__ = [
     "Domain2MarketState",
@@ -79,6 +85,10 @@ __all__ = [
     "DynamicPositionSizer",
     "DynamicSizerConfig",
     "StrikeDistanceMetrics",
+    "MarginalSettlementAllocator",
+    "SettlementCandidate",
+    "SettlementAllocation",
+    "SettlementOptimizationResult",
     "UMA_OO_V2",
     "CTF_CONTRACT",
     "TOPIC_PROPOSE_PRICE",

@@ -27,7 +27,7 @@ The Docker daemon (`dockerd`, `containerd`, shim processes, bridge networking, a
 
 ### The Native Solution: Astral `uv` + `systemd`
 - **Zero Daemon Overhead**: Standalone binary with 0 MB idle footprint.
-- **Fast, Frozen Builds**: `uv sync --frozen --no-dev` installs dependencies in seconds directly from `uv.lock`.
+- **Fast Builds & Upgrades**: `uv sync --upgrade --no-dev` installs and updates dependencies directly.
 - **Universal Architecture Support**: Native precompiled binaries for both **ARM64** (`aarch64` Ampere A1) and **x86_64** (Intel/AMD).
 - **Resource Hardening**: Process isolation managed directly by Linux `systemd`:
   - `MemoryHigh=1.2G`, `MemoryMax=1.5G`, `MemorySwapMax=0`
@@ -141,7 +141,7 @@ sudo bash deploy/deploy.sh
 4. **Installs Standalone Astral `uv`**: Fetches the official release directly into `/usr/local/bin/uv`.
 5. **Configures Sandboxed User**: Creates unprivileged service account `polymarketbot`.
 6. **Synchronizes Codebase**: Copies files cleanly to `/opt/polymarketbot`.
-7. **Builds Virtual Environment**: Runs `uv sync --frozen --no-dev` inside `/opt/polymarketbot`.
+7. **Builds Virtual Environment**: Runs `uv sync --no-dev` inside `/opt/polymarketbot`.
 8. **Hardens File Permissions**: Restricts access (`chmod 750 /opt/polymarketbot`, `chmod 600 /etc/polymarketbot/polymarketbot.env`).
 9. **Installs Systemd Service**: Copies `/opt/polymarketbot/deploy/polymarketbot.service` to `/etc/systemd/system/` and enables it at system boot.
 
@@ -212,9 +212,9 @@ sudo journalctl -u polymarketbot -f -o cat
 
 ### Selecting Execution Modes
 
-By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across all 4 production pillars ($1,000 each = $4,000 total):
+By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across the 3 active production pillars ($1,000 each = $3,000 total):
 ```ini
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
 ```
 
 ### Preflight Health Audit (Run before or after starting daemon):
@@ -232,8 +232,8 @@ Paste your override in the opened editor:
 ```ini
 [Service]
 ExecStart=
-# --- Option 1: 4-Strategy Live Paper Soak Daemon ($4,000 virtual capital) ---
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 4000
+# --- Option 1: 3-Strategy Live Paper Soak Daemon ($3,000 virtual capital) ---
+ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
 
 # --- Option 2: Preflight Verification Health Audit ---
 # ExecStart=/opt/polymarketbot/.venv/bin/python scripts/preflight_verification.py
@@ -265,7 +265,7 @@ systemd-cgtop
 ```bash
 cd /opt/polymarketbot
 sudo git pull origin master
-sudo -u polymarketbot uv sync --frozen --no-dev
+sudo -u polymarketbot uv sync --no-dev
 sudo systemctl restart polymarketbot
 ```
 

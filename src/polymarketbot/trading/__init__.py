@@ -47,6 +47,16 @@ from polymarketbot.trading.binance_anchor import (
     MarketHorizonInfo,
 )
 from polymarketbot.trading.ctf import MergeExecutionResult, PolygonCtfClient
+from polymarketbot.trading.ctf_allocator import (
+    ArbitrageDirection,
+    ExecutionMode,
+    MarginalCtfAllocator,
+    MarketAllocation,
+    ParityLegDepth,
+    ParityTranche,
+    PortfolioAllocationResult,
+    SingleMarketSweepResult,
+)
 from polymarketbot.trading.ctf_split_arbitrage import (
     CtfCrossSplitArbitrageEngine,
     CtfSplitArbConfig,
@@ -190,6 +200,15 @@ __all__ = [
     "LatencySniperEngine",
     "CtfSplitterEngine",
     "RewardHarvesterEngine",
+    # Marginal CTF Capital Allocator
+    "ArbitrageDirection",
+    "ExecutionMode",
+    "MarginalCtfAllocator",
+    "MarketAllocation",
+    "ParityLegDepth",
+    "ParityTranche",
+    "PortfolioAllocationResult",
+    "SingleMarketSweepResult",
 ]
 
 # Canonical Strategy Engine Aliases

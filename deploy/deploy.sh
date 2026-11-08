@@ -182,11 +182,11 @@ mkdir -p "$APP_DIR/data/processed"
 # ------------------------------------------------------------------------------
 # 6. Build Virtual Environment using 'uv sync'
 # ------------------------------------------------------------------------------
-log_step "6/8 Synchronizing Python virtualenv (uv sync --frozen --no-dev)..."
+log_step "6/8 Synchronizing Python virtualenv (uv sync --no-dev)..."
 
 cd "$APP_DIR"
-# Run uv sync as polymarketbot user or root
-uv sync --frozen --no-dev
+# Run uv sync as polymarketbot user or root (allows free upgrades without strict lock freeze)
+uv sync --no-dev
 
 log_info "Virtual environment successfully prepared at $APP_DIR/.venv"
 

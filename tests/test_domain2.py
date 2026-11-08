@@ -361,6 +361,9 @@ def test_ortools_allocator_mathematical_optimization():
 
 def test_harvester_universe_scan_and_optimal_execution():
     """Verify that harvester scans universe candidates and dispatches optimal portfolio."""
+    from pathlib import Path
+    if not Path("data/tape/manifest_current.json").exists():
+        pytest.skip("data/tape/manifest_current.json not found in workspace")
     clob_mock = MagicMock()
     clob_mock.place_order.return_value = OrderPlacementResult(
         success=True,

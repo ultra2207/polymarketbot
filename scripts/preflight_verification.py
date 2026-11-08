@@ -403,17 +403,27 @@ class PreflightAuditor:
             except Exception as e:
                 self.record(f"Directory Writable ({d})", "Phase 5", "FAIL", f"Permission denied: {e}")
 
-        # Verify SQLite initialization
+        # Verify SQLite initialization and disk space sentinel
+        from polymarketbot.storage import get_disk_status, tune_sqlite_connection
+        disk = get_disk_status()
+        if disk.is_safe:
+            self.record("Disk Space Capacity", "Phase 5", "PASS", f"{disk.free_gb:.1f} GB free ({disk.free_pct:.0f}% of {disk.total_gb:.1f} GB)")
+        elif not disk.is_critical:
+            self.record("Disk Space Capacity", "Phase 5", "WARN", f"Low storage: {disk.free_gb:.1f} GB free ({disk.free_pct:.0f}%)")
+        else:
+            self.record("Disk Space Capacity", "Phase 5", "FAIL", f"Critical low storage: {disk.free_gb:.1f} GB free")
+
         db_path = Path("data/paper_soak_telemetry.db")
         try:
             import sqlite3
             conn = sqlite3.connect(str(db_path))
+            tune_sqlite_connection(conn, auto_vacuum=True)
             cur = conn.cursor()
             cur.execute("CREATE TABLE IF NOT EXISTS _preflight_audit (id INTEGER PRIMARY KEY, ts REAL)")
             cur.execute("INSERT INTO _preflight_audit (ts) VALUES (?)", (time.time(),))
             conn.commit()
             conn.close()
-            self.record("SQLite Database Health", "Phase 5", "PASS", f"Initialized & verified {db_path}")
+            self.record("SQLite Database Health", "Phase 5", "PASS", f"Initialized & verified {db_path} (auto_vacuum=incremental)")
         except Exception as e:
             self.record("SQLite Database Health", "Phase 5", "FAIL", f"SQLite failure: {e}")
 
