@@ -694,10 +694,10 @@ class LivePaperSoakDaemon:
         self.reward_queue_lock = threading.Lock()
         self.virtual_book = VirtualBookTracker()
         self.queue_lock = threading.Lock()
-        self.target_settle_slots = 5
+        self.target_settle_slots = 6
         self.reserve_pct = 0.05        # 5% cash buffer ($50 on $1,000)
-        self.max_market_pct = 0.25     # Max 25% single market cap ($250 on $1,000)
-        self.min_ticket_usd = 25.0     # Minimum deployable tranche
+        self.max_market_pct = 0.18     # Max 18% single market cap ($180 on $1,000) across 6 slots
+        self.min_ticket_usd = 20.0     # Minimum deployable tranche
 
         # Mathematical Marginal Capital Allocator for Strategy 2
         self.settlement_allocator = MarginalSettlementAllocator(
@@ -838,10 +838,10 @@ class LivePaperSoakDaemon:
                 log.debug(f"Reward page fetch error (offset {offset}): {err}")
             return []
 
-        # Multi-page parallel sweep across the entire exchange
-        for _ in range(10):  # Up to 50,000 pools (covers all active Polymarket reward pools)
-            offsets = [current_offset + i * page_size for i in range(max_batch_pages)]
-            with ThreadPoolExecutor(max_workers=max_batch_pages) as pool:
+        # Multi-page parallel sweep across the entire exchange (capped to top 1,500 active pools for 3s latency)
+        for _ in range(3):  # Up to 1,500 pools (covers all high-rate Polymarket reward pools)
+            offsets = [current_offset + i * page_size for i in range(min(5, max_batch_pages))]
+            with ThreadPoolExecutor(max_workers=min(5, max_batch_pages)) as pool:
                 pages = list(pool.map(_fetch_reward_page, offsets))
 
             for page in pages:
@@ -861,7 +861,7 @@ class LivePaperSoakDaemon:
                     break
             if hit_floor:
                 break
-            current_offset += max_batch_pages * page_size
+            current_offset += min(5, max_batch_pages) * page_size
 
         if not all_eligible_pools:
             return []
@@ -898,6 +898,10 @@ class LivePaperSoakDaemon:
                     primary_mid = valid_mid
                 score_tok = fast_competing_depth_score(bids, asks, valid_mid, max_spread, min_size=min_size)
                 total_d += score_tok
+
+            # Toxicity & adverse selection gate: skip abandoned books where MMs pulled quotes (D < 10.0 and min_size >= 500)
+            if total_d < 10.0 and min_size >= 500.0:
+                continue
 
             comp_score = max(total_d, 1.0)
             cand = RewardPoolCandidate(
@@ -966,14 +970,13 @@ class LivePaperSoakDaemon:
                         with self.reward_queue_lock:
                             candidates_snapshot = list(self.reward_candidate_queue)
 
-                        # If radar hasn't populated yet (e.g. at boot), do immediate sweep
+                        # If radar hasn't populated yet, wait non-blocking for background radar sweep
                         if not candidates_snapshot:
-                            candidates_snapshot = self.scan_reward_universe(min_rate=1.00)
-                            with self.reward_queue_lock:
-                                self.reward_candidate_queue = candidates_snapshot
+                            time.sleep(1.0)
+                            continue
 
                         eligible = [c for c in candidates_snapshot if c.threshold_capital <= total_equity]
-                        allocs = MarginalRewardAllocator.allocate(eligible, total_budget=total_equity)
+                        allocs = MarginalRewardAllocator.allocate(eligible, total_budget=total_equity, max_active_pools=4)
 
                         if allocs != reward_allocations:
                             # Rebalance locked quoting collateral on balance sheet
@@ -1425,117 +1428,118 @@ class LivePaperSoakDaemon:
                 now = time.time()
                 capital_unlocked = False
 
-                # 1. Process existing open positions for settlement redemption
-                for pos in list(self.settlement_positions):
-                    holding_time = now - pos.entry_time
-                    if holding_time >= pos.target_settlement_duration_sec and not pos.settled:
-                        # Verify actual oracle resolution status via Gamma API
-                        is_resolved = False
-                        is_win = True
+                # 1. Process existing open positions for settlement redemption (batched resolution check)
+                due_positions = [
+                    pos for pos in list(self.settlement_positions)
+                    if (now - pos.entry_time) >= pos.target_settlement_duration_sec and not pos.settled
+                ]
+                market_batch_map: Dict[str, Dict[str, Any]] = {}
+                if due_positions:
+                    cids_str = ",".join(set(p.condition_id for p in due_positions if p.condition_id))
+                    try:
+                        m_resp = self.http_session.get(f"{DEFAULT_GAMMA_HOST}/markets?condition_ids={cids_str}", timeout=5.0)
+                        if m_resp.status_code == 200:
+                            for item in m_resp.json():
+                                cid_val = str(item.get("conditionId") or item.get("condition_id") or "").lower()
+                                if cid_val:
+                                    market_batch_map[cid_val] = item
+                    except Exception as exc:
+                        log.debug(f"Batch resolution poll error: {exc}")
+
+                for pos in due_positions:
+                    m_info = market_batch_map.get(pos.condition_id.lower())
+                    if not m_info:
+                        pos.target_settlement_duration_sec += 30.0
+                        continue
+
+                    is_closed = bool(m_info.get("closed"))
+                    uma_status = str(m_info.get("umaResolutionStatus") or "").lower()
+                    raw_prices = m_info.get("outcomePrices")
+                    prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
+                    raw_toks = m_info.get("clobTokenIds")
+                    toks = json.loads(raw_toks) if isinstance(raw_toks, str) else (raw_toks or [])
+
+                    if not is_closed and uma_status != "resolved":
+                        # Market has not finalized on-chain; defer redemption by 30s
+                        pos.target_settlement_duration_sec += 30.0
+                        continue
+
+                    # Authentic winning outcome verification: match position token against outcome with price >= 0.99
+                    is_win = False
+                    for p_i, p_val in enumerate(prices):
                         try:
-                            m_resp = self.http_session.get(
-                                f"{DEFAULT_GAMMA_HOST}/markets?condition_ids={pos.condition_id}",
-                                timeout=4.0,
-                            )
-                            if m_resp.status_code == 200:
-                                m_items = m_resp.json()
-                                if m_items:
-                                    m_info = m_items[0]
-                                    is_closed = bool(m_info.get("closed"))
-                                    uma_status = str(m_info.get("umaResolutionStatus") or "").lower()
-                                    raw_prices = m_info.get("outcomePrices")
-                                    prices = json.loads(raw_prices) if isinstance(raw_prices, str) else (raw_prices or [])
-                                    raw_toks = m_info.get("clobTokenIds")
-                                    toks = json.loads(raw_toks) if isinstance(raw_toks, str) else (raw_toks or [])
+                            if float(p_val) >= 0.99 and len(toks) > p_i and toks[p_i] == pos.token_id:
+                                is_win = True
+                                break
+                        except (ValueError, TypeError):
+                            pass
 
-                                    winning_idx = None
-                                    for p_i, p_val in enumerate(prices):
-                                        try:
-                                            if float(p_val) >= 0.99:
-                                                winning_idx = p_i
-                                                break
-                                        except Exception:
-                                            pass
+                    pos.settled = True
+                    self.settlement_positions.remove(pos)
+                    strat = self.metrics["SettlementHarvester"]
+                    strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
+                    strat.recalculate_equity()
 
-                                    if not is_closed and uma_status != "resolved":
-                                        # Market has not finalized on-chain; defer redemption by 30s
-                                        pos.target_settlement_duration_sec += 30.0
-                                        continue
+                    if is_win:
+                        unit_payout = 1.000
+                    else:
+                        tok_idx = toks.index(pos.token_id) if pos.token_id in toks else None
+                        unit_payout = float(prices[tok_idx]) if (tok_idx is not None and tok_idx < len(prices)) else 0.0
 
-                                    is_resolved = True
-                                    # Authentic winning outcome verification: match position token against outcome with price >= 0.99
-                                    is_win = False
-                                    for p_i, p_val in enumerate(prices):
-                                        try:
-                                            if float(p_val) >= 0.99 and len(toks) > p_i and toks[p_i] == pos.token_id:
-                                                is_win = True
-                                                break
-                                        except (ValueError, TypeError):
-                                            pass
-                        except Exception as exc:
-                            log.debug(f"Resolution check deferred: {exc}")
-                            pos.target_settlement_duration_sec += 30.0
-                            continue
+                    if unit_payout > 0.0:
+                        par_proceeds = pos.shares * unit_payout
+                        gross_pnl = par_proceeds - pos.cost_basis
+                        gas_fee = 0.00145
+                        net_pnl = gross_pnl - gas_fee
 
-                        pos.settled = True
-                        self.settlement_positions.remove(pos)
-                        strat = self.metrics["SettlementHarvester"]
-                        strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
-                        strat.recalculate_equity()
-
-                        if is_win:
-                            par_proceeds = pos.shares * 1.000
-                            gross_pnl = par_proceeds - pos.cost_basis
-                            gas_fee = 0.00145
-                            net_pnl = gross_pnl - gas_fee
-
-                            self.metrics["SettlementHarvester"].release_capital(
-                                cost_amount=pos.cost_basis,
-                                payout_amount=par_proceeds,
-                                fee=gas_fee,
-                            )
-                            self.metrics["SettlementHarvester"].total_trades += 1
-                            self.db.record_trade(
-                                "SettlementHarvester",
-                                pos.condition_id,
-                                "PAR_REDEEM",
-                                1.000,
-                                pos.shares,
-                                gross_pnl,
-                                fee=gas_fee,
-                                rebate=0.0,
-                                latency_us=18.0,
-                                details=f"Redeemed {pos.shares:.1f} shs @ par $1.000 (entry ${pos.entry_price:.3f}) | Gas: ${gas_fee:.5f}",
-                            )
-                            self._record_event(
-                                f"{C_CYAN}[Par Harvest]{C_RESET} Redeemed {pos.shares:.0f} shs @ $1.000 (entry ${pos.entry_price:.3f}) | Net: +${net_pnl:.4f}"
-                            )
-                        else:
-                            # Downside loss accounting when outcome resolves against position
-                            gross_pnl = -pos.cost_basis
-                            net_pnl = -pos.cost_basis
-                            self.metrics["SettlementHarvester"].release_capital(
-                                cost_amount=pos.cost_basis,
-                                payout_amount=0.0,
-                                fee=0.0,
-                            )
-                            self.metrics["SettlementHarvester"].total_trades += 1
-                            self.db.record_trade(
-                                "SettlementHarvester",
-                                pos.condition_id,
-                                "PAR_LOSS",
-                                0.0,
-                                pos.shares,
-                                gross_pnl,
-                                fee=0.0,
-                                rebate=0.0,
-                                latency_us=18.0,
-                                details=f"Outcome resolved against position! Loss: -${pos.cost_basis:.2f}",
-                            )
-                            self._record_event(
-                                f"{C_RED}[Par Loss]{C_RESET} Resolved against position! Net Loss: -${pos.cost_basis:.2f}"
-                            )
-
+                        self.metrics["SettlementHarvester"].release_capital(
+                            cost_amount=pos.cost_basis,
+                            payout_amount=par_proceeds,
+                            fee=gas_fee,
+                        )
+                        self.metrics["SettlementHarvester"].total_trades += 1
+                        side_tag = "PAR_REDEEM" if is_win else "PAR_REFUND"
+                        self.db.record_trade(
+                            "SettlementHarvester",
+                            pos.condition_id,
+                            side_tag,
+                            unit_payout,
+                            pos.shares,
+                            gross_pnl,
+                            fee=gas_fee,
+                            rebate=0.0,
+                            latency_us=18.0,
+                            details=f"Redeemed {pos.shares:.1f} shs @ par ${unit_payout:.3f} (entry ${pos.entry_price:.3f}) | Gas: ${gas_fee:.5f}",
+                        )
+                        self._record_event(
+                            f"{C_CYAN}[Par Harvest]{C_RESET} Redeemed {pos.shares:.0f} shs @ ${unit_payout:.3f} (entry ${pos.entry_price:.3f}) | Net: +${net_pnl:.4f}"
+                        )
+                        capital_unlocked = True
+                    else:
+                        # Downside loss accounting when outcome resolves against position
+                        gross_pnl = -pos.cost_basis
+                        net_pnl = -pos.cost_basis
+                        self.metrics["SettlementHarvester"].release_capital(
+                            cost_amount=pos.cost_basis,
+                            payout_amount=0.0,
+                            fee=0.0,
+                        )
+                        self.metrics["SettlementHarvester"].total_trades += 1
+                        self.db.record_trade(
+                            "SettlementHarvester",
+                            pos.condition_id,
+                            "PAR_LOSS",
+                            0.0,
+                            pos.shares,
+                            gross_pnl,
+                            fee=0.0,
+                            rebate=0.0,
+                            latency_us=18.0,
+                            details=f"Outcome resolved against position! Loss: -${pos.cost_basis:.2f}",
+                        )
+                        self._record_event(
+                            f"{C_RED}[Par Loss]{C_RESET} Resolved against position! Net Loss: -${pos.cost_basis:.2f}"
+                        )
                         capital_unlocked = True
 
                 # 2. Instantaneous non-stop redeployment into queued candidates
@@ -1764,27 +1768,36 @@ class LivePaperSoakDaemon:
                         elif maker_candidates and usable_cash >= 10.0:
                             # Rank candidates by expected flow turnover = spread_bps * volume24hr
                             maker_candidates.sort(key=lambda x: (x[1] * x[2]), reverse=True)
-                            active_maker_set = maker_candidates[:5]
-                            cap_per_quote = min(100.0, usable_cash / len(active_maker_set))
+                            active_maker_set = maker_candidates[:20]  # Expanded from 5 to 20 markets
+                            cap_per_quote = min(50.0, usable_cash / len(active_maker_set))
                             strat = self.metrics["CtfMinter"]
 
                             for cost, spread_bps, vol24, q_text, m_obj, toks, fs in active_maker_set:
                                 # Poisson retail flow arrival rate: inside touch captures ~8% of taker volume
                                 flow_rate = (vol24 / 86400.0) * 0.08
                                 expected_flow = flow_rate * dt
-                                if expected_flow < 0.05:
+                                # Truncation bug fix: allow active markets with vol24 >= $5,000 to trade
+                                if expected_flow < 0.005:
                                     continue
-                                fill_shares = min(cap_per_quote, expected_flow)
-                                if fill_shares < 0.1:
-                                    continue
+                                fill_shares = min(cap_per_quote, max(1.0, round(expected_flow, 2)))
 
                                 position_cost = fill_shares * cost
                                 if strat.available_cash < position_cost:
                                     continue
 
                                 gross_pnl = fill_shares * (1.0000 - cost)
-                                rebate = maker_fee_rebate(0.50, fill_shares, fs, maker_rebate_share_pct=0.20)
-                                gas_cost = 0.00136
+                                bk_0 = books.get(toks[0], {})
+                                bk_1 = books.get(toks[1], {})
+                                bids_0 = bk_0.get("bids", [])
+                                bids_1 = bk_1.get("bids", [])
+                                p_leg0 = float(bids_0[0]["price"]) if (bids_0 and isinstance(bids_0[0], dict)) else (cost * 0.5)
+                                p_leg1 = float(bids_1[0]["price"]) if (bids_1 and isinstance(bids_1[0], dict)) else (cost * 0.5)
+                                rebate = (
+                                    maker_fee_rebate(p_leg0, fill_shares, fs, maker_rebate_share_pct=0.20) +
+                                    maker_fee_rebate(p_leg1, fill_shares, fs, maker_rebate_share_pct=0.20)
+                                )
+                                # Batched merge gas friction amortization ($0.00136 / batch)
+                                gas_cost = 0.00136 if fill_shares >= 10.0 else (0.00136 * (fill_shares / 10.0))
                                 net_profit = gross_pnl + rebate - gas_cost
 
                                 if net_profit >= self.ctf_allocator.min_net_edge_usd:
