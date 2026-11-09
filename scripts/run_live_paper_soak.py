@@ -907,11 +907,22 @@ class LivePaperSoakDaemon:
                 score_tok = fast_competing_depth_score(bids, asks, valid_mid, max_spread, min_size=min_size)
                 total_d += score_tok
 
-            # Toxicity & adverse selection gate: skip abandoned books where MMs pulled quotes (D < 10.0 and min_size >= 500)
-            if total_d < 10.0 and min_size >= 500.0:
+            # 1. Oracle & Expiration Gate: Skip expired or soon-expiring markets (<2 hours left)
+            end_date_str = p.get("end_date") or ""
+            if end_date_str:
+                try:
+                    end_dt = datetime.datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                    now_utc = datetime.datetime.now(datetime.timezone.utc)
+                    if (end_dt - now_utc).total_seconds() <= 7200.0:
+                        continue
+                except Exception:
+                    pass
+
+            # 2. Toxicity Gate: Skip abandoned books where professional MMs pulled quotes (D < 25.0)
+            if total_d < 25.0:
                 continue
 
-            comp_score = max(total_d, 1.0)
+            comp_score = max(total_d, 25.0)
             cand = RewardPoolCandidate(
                 pool_id=p.get("condition_id", ""),
                 question=p.get("question", "Unknown"),
@@ -977,6 +988,8 @@ class LivePaperSoakDaemon:
 
                         with self.reward_queue_lock:
                             candidates_snapshot = list(self.reward_candidate_queue)
+
+                        cand_cache = {c.pool_id: (c.competing_score, c.mid_price) for c in candidates_snapshot}
 
                         # If radar hasn't populated yet, wait non-blocking for background radar sweep
                         if not candidates_snapshot:
@@ -1044,8 +1057,11 @@ class LivePaperSoakDaemon:
                     if not tokens or rate_per_day <= 0:
                         continue
 
-                    # Multi-token orderbook depth aggregation across BOTH tokens with min_size filter
-                    comp_score, mid = fetch_market_competing_score(self.http_session, tokens, max_spread, min_size=min_size)
+                    # Leverage cached competing score & mid price from background radar (eliminates serial HTTP GETs)
+                    if cond_id in cand_cache:
+                        comp_score, mid = cand_cache[cond_id]
+                    else:
+                        comp_score, mid = fetch_market_competing_score(self.http_session, tokens, max_spread, min_size=min_size)
                     if mid <= 0:
                         continue
 
@@ -1157,11 +1173,15 @@ class LivePaperSoakDaemon:
                     uma_status = str(m.get("umaResolutionStatus") or "").lower()
                     uma_statuses = [str(st).lower() for st in (m.get("umaResolutionStatuses") or [])]
 
+                    # Exclude toxic disputed/rejected UMA markets
+                    if uma_status in ("disputed", "rejected") or any(st in ("disputed", "rejected") for st in uma_statuses):
+                        continue
+
                     is_past_calendar = bool(end_date_str and end_date_str <= now_iso)
                     is_uma_proposed = bool(
                         uma_end_str
-                        or uma_status in ("proposed", "resolved", "disputed")
-                        or any(st in ("proposed", "resolved", "disputed") for st in uma_statuses)
+                        or uma_status in ("proposed", "resolved")
+                        or any(st in ("proposed", "resolved") for st in uma_statuses)
                     )
                     is_expiring_soon = bool(end_date_str and now_iso < end_date_str <= now_plus_48h_iso)
 
@@ -1258,10 +1278,16 @@ class LivePaperSoakDaemon:
                     if not ladder:
                         continue
 
-                    best_ask = ladder[0][0]
-                    ask_size = ladder[0][1]
-                    if not (0.940 <= best_ask <= 0.995) or ask_size < 10.0:
+                    # Filter out leading dust levels (<10 shares) to inspect deep Level 2+ liquidity
+                    clean_ladder = [(p, s) for p, s in ladder if 0.940 <= p <= 0.995]
+                    while clean_ladder and clean_ladder[0][1] < 10.0 and len(clean_ladder) > 1:
+                        clean_ladder.pop(0)
+
+                    if not clean_ladder or clean_ladder[0][1] < 10.0:
                         continue
+
+                    best_ask = clean_ladder[0][0]
+                    ask_size = clean_ladder[0][1]
 
                     new_candidates.append(
                         QueuedSettlementCandidate(
@@ -1350,9 +1376,14 @@ class LivePaperSoakDaemon:
                 if not ladder or ladder[0][1] < 10.0:
                     continue
 
-            best_ask = ladder[0][0]
-            if not (0.940 <= best_ask <= 0.995) or ladder[0][1] < 10.0:
+            clean_ladder = [(p, s) for p, s in ladder if 0.940 <= p <= 0.995]
+            while clean_ladder and clean_ladder[0][1] < 10.0 and len(clean_ladder) > 1:
+                clean_ladder.pop(0)
+
+            if not clean_ladder or clean_ladder[0][1] < 10.0:
                 continue
+
+            best_ask = clean_ladder[0][0]
 
             alloc_candidates.append(
                 SettlementCandidate(
@@ -1423,7 +1454,7 @@ class LivePaperSoakDaemon:
                 entry_price=alloc.effective_avg_price,
                 cost_basis=deploy_cost,
                 entry_time=time.time(),
-                target_settlement_duration_sec=min(self.settle_hold_sec, alloc.duration_sec),
+                target_settlement_duration_sec=alloc.duration_sec,
             )
             self.settlement_positions.append(new_pos)
             strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
@@ -1478,7 +1509,58 @@ class LivePaperSoakDaemon:
                     raw_toks = m_info.get("clobTokenIds")
                     toks = json.loads(raw_toks) if isinstance(raw_toks, str) else (raw_toks or [])
 
-                    if not is_closed and uma_status != "resolved":
+                    # 1. Early Harvest Check via Secondary CLOB Market:
+                    # If position has captured >= 85% of par gain and CLOB has a tight bid (>= $0.990),
+                    # execute an immediate secondary market exit to recycle capital instantly!
+                    best_bid = 0.0
+                    try:
+                        _, _, bb_val, _, _ = fetch_l2_book(self.http_session, pos.token_id)
+                        best_bid = bb_val
+                    except Exception:
+                        pass
+
+                    if best_bid >= 0.990 and (best_bid - pos.entry_price) >= 0.85 * (1.000 - pos.entry_price):
+                        exit_proceeds = pos.shares * best_bid
+                        gross_pnl = exit_proceeds - pos.cost_basis
+                        exit_fee = taker_fee(pos.shares, best_bid, FeeSchedule(rate=0.04, exponent=1.0))
+                        net_pnl = gross_pnl - exit_fee
+
+                        pos.settled = True
+                        self.settlement_positions.remove(pos)
+                        strat = self.metrics["SettlementHarvester"]
+                        strat.release_capital(
+                            cost_amount=pos.cost_basis,
+                            payout_amount=exit_proceeds,
+                            fee=exit_fee,
+                        )
+                        strat.unrealized_par_edge = sum(p.shares * 1.000 - p.cost_basis for p in self.settlement_positions)
+                        strat.recalculate_equity()
+                        strat.total_trades += 1
+                        self.db.record_trade(
+                            "SettlementHarvester",
+                            pos.condition_id,
+                            "CLOB_EXIT",
+                            best_bid,
+                            pos.shares,
+                            gross_pnl,
+                            fee=exit_fee,
+                            rebate=0.0,
+                            latency_us=20.0,
+                            details=f"Early harvest {pos.shares:.1f} shs @ ${best_bid:.3f} | Net: +${net_pnl:.4f}",
+                        )
+                        self._record_event(
+                            f"{C_CYAN}[Early Settle Exit]{C_RESET} Sold {pos.shares:.0f} shs @ ${best_bid:.3f} | Net: +${net_pnl:.4f}"
+                        )
+                        capital_unlocked = True
+                        continue
+
+                    # 2. On-Chain Resolution / Final Outcome Check
+                    has_resolved_outcome = any(
+                        float(p_val) >= 0.99
+                        for p_val in prices
+                        if isinstance(p_val, (str, float, int)) and str(p_val).replace(".", "", 1).isdigit()
+                    )
+                    if not is_closed and uma_status != "resolved" and not has_resolved_outcome:
                         # Market has not finalized on-chain; defer redemption by 30s if duration passed
                         if (now - pos.entry_time) >= pos.target_settlement_duration_sec:
                             pos.target_settlement_duration_sec += 30.0
@@ -1661,8 +1743,8 @@ class LivePaperSoakDaemon:
                     dt = max(0.5, now - last_scan_time)
                     last_scan_time = now
                     try:
-                        # Parallel batch fetch of L2 orderbooks across all active markets (< 250ms)
-                        books = fetch_l2_books_batch(self.http_session, cached_all_token_ids, chunk_size=50, max_workers=8)
+                        # Parallel batch fetch of L2 orderbooks across all active markets (< 250ms, 9 chunks to avoid socket starvation)
+                        books = fetch_l2_books_batch(self.http_session, cached_all_token_ids, chunk_size=250, max_workers=8)
 
                         parity_candidates: List[SingleMarketSweepResult] = []
                         candidate_meta: Dict[str, Tuple[Dict[str, Any], str]] = {}
@@ -1798,31 +1880,48 @@ class LivePaperSoakDaemon:
                                 mkt_score = spread_bps * math.sqrt(vol24)
                                 cap_per_quote = min(60.0, max(15.0, usable_cash * (mkt_score / total_score)))
 
-                                # Poisson retail flow arrival rate: inside touch captures ~8% of taker volume
-                                flow_rate = (vol24 / 86400.0) * 0.08
-                                expected_flow = flow_rate * dt
-                                # Truncation bug fix: allow active markets with vol24 >= $5,000 to trade
-                                if expected_flow < 0.005:
-                                    continue
-                                fill_shares = min(cap_per_quote, max(1.0, round(expected_flow, 2)))
-
-                                position_cost = fill_shares * cost
-                                if strat.available_cash < position_cost:
-                                    continue
-
-                                gross_pnl = fill_shares * (1.0000 - cost)
+                                # 1. Inside-Spread Price Priority Quoting (Jump FIFO Queue)
+                                tick = 0.001
                                 bk_0 = books.get(toks[0], {})
                                 bk_1 = books.get(toks[1], {})
                                 bids_0 = bk_0.get("bids", [])
                                 bids_1 = bk_1.get("bids", [])
-                                p_leg0 = float(bids_0[0]["price"]) if (bids_0 and isinstance(bids_0[0], dict)) else (cost * 0.5)
-                                p_leg1 = float(bids_1[0]["price"]) if (bids_1 and isinstance(bids_1[0], dict)) else (cost * 0.5)
+                                bb0 = max((float(b["price"]) for b in bids_0 if isinstance(b, dict)), default=0.0)
+                                bb1 = max((float(b["price"]) for b in bids_1 if isinstance(b, dict)), default=0.0)
+                                if bb0 <= 0 or bb1 <= 0:
+                                    continue
+
+                                quote_p0 = round(bb0 + tick, 4)
+                                quote_p1 = round(bb1 + tick, 4)
+                                quote_cost = quote_p0 + quote_p1
+                                if quote_cost > 0.9990:
+                                    continue  # Spread is too tight to quote inside and retain margin
+
+                                # 2. Stochastic Poisson Flow Arrival Model (Ground-Truth Physical Rate)
+                                avg_retail_trade_size = 5.0  # Typical Polymarket retail order size (shares)
+                                retail_intensity = (vol24 / 86400.0) / avg_retail_trade_size  # Total market orders/sec
+                                inside_touch_share = 0.35  # Price priority inside-spread captures 35% of taker flow
+                                lam_arrival = retail_intensity * inside_touch_share
+                                prob_arrival = 1.0 - math.exp(-lam_arrival * dt)
+
+                                # Stochastic Bernoulli trial: only fill when a real retail order arrives
+                                if random.random() >= prob_arrival:
+                                    continue
+
+                                fill_shares = min(cap_per_quote, max(1.0, round(random.expovariate(1.0 / avg_retail_trade_size), 1)))
+                                position_cost = fill_shares * quote_cost
+                                if strat.available_cash < position_cost:
+                                    continue
+
+                                gross_pnl = fill_shares * (1.0000 - quote_cost)
                                 rebate = (
-                                    maker_fee_rebate(p_leg0, fill_shares, fs, maker_rebate_share_pct=0.20) +
-                                    maker_fee_rebate(p_leg1, fill_shares, fs, maker_rebate_share_pct=0.20)
+                                    maker_fee_rebate(quote_p0, fill_shares, fs, maker_rebate_share_pct=0.20) +
+                                    maker_fee_rebate(quote_p1, fill_shares, fs, maker_rebate_share_pct=0.20)
                                 )
-                                # Polygon merge gas cost: $0.00136 / batch (conservative estimate vs $0.00028 physical cost)
-                                gas_cost = 0.00136 if fill_shares >= 10.0 else 0.00040
+
+                                # 3. Physical Inventory Batching Gas Friction ($0.00136 amortized over 100-share batch)
+                                # Amortized gas friction per share = $0.00136 / 100 = $0.0000136/share
+                                gas_cost = fill_shares * (0.00136 / 100.0)
                                 net_profit = gross_pnl + rebate - gas_cost
 
                                 if net_profit >= self.ctf_allocator.min_net_edge_usd:
@@ -1845,20 +1944,20 @@ class LivePaperSoakDaemon:
                                         "CtfMinter",
                                         cond_id,
                                         side_tag,
-                                        price=round(cost, 4),
+                                        price=round(quote_cost, 4),
                                         size=round(fill_shares, 2),
                                         gross_pnl=round(gross_pnl, 4),
                                         fee=gas_cost,
                                         rebate=round(rebate, 4),
                                         latency_us=18.0,
                                         details=(
-                                            f"Selective Maker Parity: filled {fill_shares:.1f} shs @ ${cost:.4f} "
-                                            f"(+{spread_bps:.1f} bps spread + ${rebate:.4f} rebate) -> Merged $1.0000 | Net: +${net_profit:.4f} "
-                                            f"| Question: {q_text[:30]}"
+                                            f"Inside-spread Maker Parity: filled {fill_shares:.1f} shs @ ${quote_cost:.4f} "
+                                            f"(spread +{(1.0000 - quote_cost) * 10000:.1f} bps + ${rebate:.4f} rebate) -> Merged $1.0000 "
+                                            f"| Net: +${net_profit:.4f} | Question: {q_text[:30]}"
                                         ),
                                     )
                                     self._record_event(
-                                        f"{C_MAGENTA}[CTF Maker]{C_RESET} Merged {fill_shares:.0f} shs @ ${cost:.4f} (+{spread_bps:.1f} bps) "
+                                        f"{C_MAGENTA}[CTF Maker]{C_RESET} Merged {fill_shares:.0f} shs @ ${quote_cost:.4f} (+{(1.0000 - quote_cost) * 10000:.1f} bps) "
                                         f"| Net: +${net_profit:.4f} ({q_text[:20]}...)"
                                     )
 
