@@ -455,63 +455,6 @@ class LiquidityRewardsAllocator:
             solver_name="KKT_WATER_FILLING",
         )
 
-    def _fallback_single_best(
-        self,
-        candidates: list[dict[str, Any]],
-        bankroll_usd: float,
-        usable_capital: float,
-        cash_reserve: float,
-    ) -> PortfolioAllocationResult:
-        if not candidates:
-            return PortfolioAllocationResult(
-                bankroll_usd=bankroll_usd,
-                usable_capital=usable_capital,
-                cash_reserve=cash_reserve,
-                total_allocated=0.0,
-                total_daily_payout=0.0,
-                total_monthly_payout=0.0,
-                portfolio_daily_roi_pct=0.0,
-                portfolio_monthly_roi_pct=0.0,
-                active_markets_count=0,
-                allocations=[],
-                solver_name="FALLBACK",
-            )
-        cand = candidates[0]
-        p = float(cand.get("daily_pool", cand.get("rate_per_day", 0.0)))
-        d = float(cand.get("competing_score", 3000.0))
-        alpha = self.calculate_alpha(float(cand.get("max_spread", 3.0)))
-        payout = self.evaluate_market_payout(usable_capital, p, d, alpha)
-        roi = (payout / usable_capital) * 100.0 if usable_capital > 0 else 0.0
-
-        alloc = MarketAllocation(
-            condition_id=cand.get("condition_id", ""),
-            question=cand.get("question", ""),
-            allocated_capital=round(usable_capital, 2),
-            quote_size=round(usable_capital / 1.0, 1),
-            daily_reward_payout=round(payout, 2),
-            daily_roi_pct=round(roi, 2),
-            min_floor_capital=round(self.calculate_min_floor_capital(p, d, alpha), 2),
-            clears_floor=payout >= 1.00,
-            daily_pool=round(p, 2),
-            competing_depth=round(d, 1),
-            mid_price=float(cand.get("real_mid", 0.50)),
-            tokens=cand.get("tokens", []),
-        )
-
-        return PortfolioAllocationResult(
-            bankroll_usd=round(bankroll_usd, 2),
-            usable_capital=round(usable_capital, 2),
-            cash_reserve=round(cash_reserve, 2),
-            total_allocated=round(usable_capital, 2),
-            total_daily_payout=round(payout, 2),
-            total_monthly_payout=round(payout * 30.0, 2),
-            portfolio_daily_roi_pct=round(roi, 2),
-            portfolio_monthly_roi_pct=round(roi * 30.0, 2),
-            active_markets_count=1,
-            allocations=[alloc],
-            solver_name="FALLBACK",
-        )
-
     def calculate_endogenous_reserve(
         self,
         allocations: list[dict[str, Any]],

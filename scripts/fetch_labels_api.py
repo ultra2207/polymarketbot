@@ -59,6 +59,8 @@ sys.path.insert(0, "src")
 import duckdb
 
 from polymarketbot.dataapi import DataAPIClient
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 PIT = OUT / "markets_pit.parquet"
@@ -193,7 +195,7 @@ def cross_check(con: duckdb.DuckDBPyConnection, n: int) -> int:
         USING SAMPLE {n} ROWS (reservoir, 42)
     """).fetchall()
     if not rows:
-        print("no chain-labelled markets to cross-check")
+        log.info("no chain-labelled markets to cross-check")
         return 1
 
     truth = {r[0]: r for r in rows}
@@ -220,23 +222,23 @@ def cross_check(con: duckdb.DuckDBPyConnection, n: int) -> int:
         if max(d0, d1) > 1e-9:
             worst.append((max(d0, d1), g["condition_id"], g["payout_0"], t[3]))
 
-    print(f"sampled {len(rows):,} chain-labelled conditions, api answered {compared:,}")
-    print(f"  api returned no data for {missing:,}")
+    log.info(f"sampled {len(rows):,} chain-labelled conditions, api answered {compared:,}")
+    log.info(f"  api returned no data for {missing:,}")
     if not compared:
-        print("FAIL: api returned nothing for the sample")
+        log.info("FAIL: api returned nothing for the sample")
         return 1
-    print(f"  payout_0 agree  {p0_ok:>6,}  ({100*p0_ok/compared:.2f} %)")
-    print(f"  payout_1 agree  {p1_ok:>6,}  ({100*p1_ok/compared:.2f} %)")
-    print(f"  is_void agree   {v_ok:>6,}  ({100*v_ok/compared:.2f} %)")
+    log.info(f"  payout_0 agree  {p0_ok:>6,}  ({100*p0_ok/compared:.2f} %)")
+    log.info(f"  payout_1 agree  {p1_ok:>6,}  ({100*p1_ok/compared:.2f} %)")
+    log.info(f"  is_void agree   {v_ok:>6,}  ({100*v_ok/compared:.2f} %)")
 
     worst.sort(reverse=True)
     for err, cid, api, chain in worst[:10]:
-        print(f"  MISMATCH {err:.4f}  {cid[:24]}… api={api} chain={chain}")
+        log.info(f"  MISMATCH {err:.4f}  {cid[:24]}… api={api} chain={chain}")
 
     if p0_ok / compared < 0.99:
-        print("\nFAIL: below 99 % agreement; api labels cannot stand in for payouts")
+        log.info("\nFAIL: below 99 % agreement; api labels cannot stand in for payouts")
         return 1
-    print("\nPASS: api final_price reproduces on-chain payout")
+    log.info("\nPASS: api final_price reproduces on-chain payout")
     return 0
 
 
@@ -247,7 +249,7 @@ def validate(con: duckdb.DuckDBPyConnection) -> int:
     forward-test labels are an assumption wearing a column name.
     """
     if not DEST.exists():
-        print(f"missing {DEST}; run the backfill first")
+        log.info(f"missing {DEST}; run the backfill first")
         return 1
     row = con.sql(f"""
         SELECT
@@ -265,17 +267,17 @@ def validate(con: duckdb.DuckDBPyConnection) -> int:
     """).fetchall()[0]
     overlap, r_ok, p0_ok, p1_ok, v_ok, nulls, max_err = row
     if not overlap:
-        print("no overlap with on-chain labels — nothing to validate")
+        log.info("no overlap with on-chain labels — nothing to validate")
         return 0
-    print(f"overlap with on-chain labels: {overlap:,} resolved conditions")
-    print(f"  resolved flag   {r_ok:>9,}  ({100*r_ok/overlap:.2f} %)")
-    print(f"  payout_0        {p0_ok:>9,}  ({100*p0_ok/overlap:.2f} %)   max |err| {max_err}")
-    print(f"  payout_1        {p1_ok:>9,}  ({100*p1_ok/overlap:.2f} %)")
-    print(f"  is_void         {v_ok:>9,}  ({100*v_ok/overlap:.2f} %)")
-    print(f"  api null, chain known: {nulls:,}")
+    log.info(f"overlap with on-chain labels: {overlap:,} resolved conditions")
+    log.info(f"  resolved flag   {r_ok:>9,}  ({100*r_ok/overlap:.2f} %)")
+    log.info(f"  payout_0        {p0_ok:>9,}  ({100*p0_ok/overlap:.2f} %)   max |err| {max_err}")
+    log.info(f"  payout_1        {p1_ok:>9,}  ({100*p1_ok/overlap:.2f} %)")
+    log.info(f"  is_void         {v_ok:>9,}  ({100*v_ok/overlap:.2f} %)")
+    log.info(f"  api null, chain known: {nulls:,}")
 
     if p0_ok / overlap < 0.99:
-        print("\nFAIL: payout agreement below 99 %; do not use api labels for 2026-05+")
+        log.info("\nFAIL: payout agreement below 99 %; do not use api labels for 2026-05+")
         for r in con.sql(f"""
             SELECT condition_id, a.payout_0, c.payout_0, a.payout_1, c.payout_1
             FROM read_parquet('{DEST.as_posix()}') a
@@ -283,9 +285,9 @@ def validate(con: duckdb.DuckDBPyConnection) -> int:
             WHERE c.resolved AND abs(a.payout_0 - c.payout_0) >= 1e-9
             ORDER BY abs(a.payout_0 - c.payout_0) DESC LIMIT 15
         """).fetchall():
-            print(f"  {r[0][:20]}… api=({r[1]}, {r[3]}) chain=({r[2]}, {r[4]})")
+            log.info(f"  {r[0][:20]}… api=({r[1]}, {r[3]}) chain=({r[2]}, {r[4]})")
         return 1
-    print("\nPASS: api payouts agree with on-chain for >= 99 % of the overlap")
+    log.info("\nPASS: api payouts agree with on-chain for >= 99 % of the overlap")
     return 0
 
 
@@ -306,7 +308,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not PIT.exists():
-        print(f"missing {PIT}; run scripts/build_universe.py first")
+        log.info(f"missing {PIT}; run scripts/build_universe.py first")
         return 1
 
     con = connect()
@@ -316,12 +318,12 @@ def main() -> int:
         return cross_check(con, args.cross_check)
 
     done = already_done()
-    print(f"journal: {len(done):,} conditions already done")
+    log.info(f"journal: {len(done):,} conditions already done")
     todo = candidates(con, done, args.since, args.limit or None)
-    print(f"to fetch: {len(todo):,} markets "
+    log.info(f"to fetch: {len(todo):,} markets "
           f"({(len(todo) + MARKETS_PER_CALL - 1) // MARKETS_PER_CALL:,} requests)")
     if not todo:
-        print("nothing to do")
+        log.info("nothing to do")
         return flush(con) and 0
 
     batches = [todo[i:i + MARKETS_PER_CALL] for i in range(0, len(todo), MARKETS_PER_CALL)]
@@ -338,7 +340,7 @@ def main() -> int:
                 except Exception as exc:  # noqa: BLE001 - one bad batch must not stop the run
                     failed += 1
                     if failed <= 5:
-                        print(f"  batch failed: {exc}")
+                        log.info(f"  batch failed: {exc}")
                     continue
                 with _LOCK:
                     for r in rows:
@@ -354,21 +356,21 @@ def main() -> int:
                     elapsed = time.time() - t0
                     rate = written / elapsed if elapsed else 0
                     eta = (len(batches) - written) / rate / 60 if rate else 0
-                    print(f"  {written:,}/{len(batches):,} batches  "
+                    log.info(f"  {written:,}/{len(batches):,} batches  "
                           f"{rows_out:,} labels  {rate:.1f} batch/s  eta {eta:.1f} min")
                 if args.max_seconds and time.time() - t0 >= args.max_seconds:
-                    print("  time limit reached; cancelling outstanding batches")
+                    log.info("  time limit reached; cancelling outstanding batches")
                     for f in futs:
                         f.cancel()
                     break
         except KeyboardInterrupt:
-            print("  interrupted; flushing what completed")
+            log.info("  interrupted; flushing what completed")
             for f in futs:
                 f.cancel()
 
     jf_total = flush(con)
-    print(f"\njournal rows in {DEST.name}: {jf_total:,}")
-    print(f"failed batches: {failed}")
+    log.info(f"\njournal rows in {DEST.name}: {jf_total:,}")
+    log.info(f"failed batches: {failed}")
     return validate(con)
 
 

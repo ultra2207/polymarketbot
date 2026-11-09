@@ -123,13 +123,13 @@ class PreflightAuditor:
             "SKIP": f"{C_DIM}[SKIP]{C_RESET}",
         }.get(status, f"[{status}]")
         lat_str = f" ({latency_ms:.1f}ms)" if latency_ms is not None else ""
-        print(f"  {prefix} {name:<42} : {details}{lat_str}")
+        log.info(f"  {prefix} {name:<42} : {details}{lat_str}")
 
     # ==========================================================================
     # Phase 1: Environment & Diagnostics Sanity Check
     # ==========================================================================
     def run_phase_1(self) -> None:
-        print(f"\n{C_BOLD}{C_CYAN}--- Phase 1: Environment, Network & Time-Drift Diagnostics ---{C_RESET}")
+        log.info(f"\n{C_BOLD}{C_CYAN}--- Phase 1: Environment, Network & Time-Drift Diagnostics ---{C_RESET}")
 
         # 1.1 Python & Platform
         py_ver = platform.python_version()
@@ -204,7 +204,7 @@ class PreflightAuditor:
     # Phase 2: On-Chain Balances & Approvals
     # ==========================================================================
     def run_phase_2(self) -> None:
-        print(f"\n{C_BOLD}{C_CYAN}--- Phase 2: On-Chain Balances & 5 Mandatory Approvals ---{C_RESET}")
+        log.info(f"\n{C_BOLD}{C_CYAN}--- Phase 2: On-Chain Balances & 5 Mandatory Approvals ---{C_RESET}")
 
         signer_addr = ""
         if self.creds.private_key:
@@ -302,7 +302,7 @@ class PreflightAuditor:
     # Phase 3: Safe Micro-Order Lifecycle (EIP-712 Order Placement & Cancel)
     # ==========================================================================
     def run_phase_3(self) -> None:
-        print(f"\n{C_BOLD}{C_CYAN}--- Phase 3: Safe Micro-Order Lifecycle (Place & Cancel) ---{C_RESET}")
+        log.info(f"\n{C_BOLD}{C_CYAN}--- Phase 3: Safe Micro-Order Lifecycle (Place & Cancel) ---{C_RESET}")
 
         if not self.test_order:
             self.record("Micro-Order Lifecycle", "Phase 3", "SKIP", "Skipped by default (pass --test-order to execute $0.05 test)")
@@ -364,7 +364,7 @@ class PreflightAuditor:
     # Phase 4: Complete-Set Mint & Merge Test (splitPosition / mergePositions)
     # ==========================================================================
     def run_phase_4(self) -> None:
-        print(f"\n{C_BOLD}{C_CYAN}--- Phase 4: Complete-Set Mint & Merge On-Chain Verification ---{C_RESET}")
+        log.info(f"\n{C_BOLD}{C_CYAN}--- Phase 4: Complete-Set Mint & Merge On-Chain Verification ---{C_RESET}")
 
         if not self.test_ctf:
             self.record("CTF Split/Merge Cycle", "Phase 4", "SKIP", "Skipped by default (pass --test-ctf to execute 1.0 set on-chain test)")
@@ -385,7 +385,7 @@ class PreflightAuditor:
     # Phase 5: SQLite Database & Storage Audit
     # ==========================================================================
     def run_phase_5(self) -> None:
-        print(f"\n{C_BOLD}{C_CYAN}--- Phase 5: SQLite Ledger Persistence & Storage Audit ---{C_RESET}")
+        log.info(f"\n{C_BOLD}{C_CYAN}--- Phase 5: SQLite Ledger Persistence & Storage Audit ---{C_RESET}")
 
         # Check directories exist and are writable
         dirs_to_check = [
@@ -474,9 +474,9 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON report")
     args = parser.parse_args()
 
-    print(f"\n{C_BOLD}=============================================================================={C_RESET}")
-    print(f"{C_BOLD}{C_GREEN} PolymarketBot Production Preflight Verification{C_RESET}")
-    print(f"{C_BOLD}=============================================================================={C_RESET}")
+    log.info(f"\n{C_BOLD}=============================================================================={C_RESET}")
+    log.info(f"{C_BOLD}{C_GREEN} PolymarketBot Production Preflight Verification{C_RESET}")
+    log.info(f"{C_BOLD}=============================================================================={C_RESET}")
 
     auditor = PreflightAuditor(test_order=args.test_order, test_ctf=args.test_ctf, strict=args.strict)
     auditor.run_phase_1()
@@ -487,7 +487,7 @@ def main() -> int:
 
     report = auditor.generate_report()
 
-    print(f"\n{C_BOLD}=============================================================================={C_RESET}")
+    log.info(f"\n{C_BOLD}=============================================================================={C_RESET}")
     if "CLEARED" in report.overall_status:
         color = C_GREEN
     elif "WARN" in report.overall_status:
@@ -495,12 +495,12 @@ def main() -> int:
     else:
         color = C_RED
 
-    print(f"Overall Status: {C_BOLD}{color}{report.overall_status}{C_RESET}")
-    print(f"Results: {C_GREEN}{report.passed_count} PASS{C_RESET} | {C_YELLOW}{report.warn_count} WARN{C_RESET} | {C_RED}{report.fail_count} FAIL{C_RESET} | {C_DIM}{report.skip_count} SKIP{C_RESET}")
-    print(f"==============================================================================\n")
+    log.info(f"Overall Status: {C_BOLD}{color}{report.overall_status}{C_RESET}")
+    log.info(f"Results: {C_GREEN}{report.passed_count} PASS{C_RESET} | {C_YELLOW}{report.warn_count} WARN{C_RESET} | {C_RED}{report.fail_count} FAIL{C_RESET} | {C_DIM}{report.skip_count} SKIP{C_RESET}")
+    log.info(f"==============================================================================\n")
 
     if args.json:
-        print(json.dumps(asdict(report), indent=2))
+        log.info(json.dumps(asdict(report), indent=2))
 
     if report.fail_count > 0 or (args.strict and report.warn_count > 0):
         return 1

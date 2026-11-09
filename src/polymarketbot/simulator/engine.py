@@ -24,7 +24,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from polymarketbot.fees import maker_fee_rebate, taker_fee
 from polymarketbot.logs import get_logger

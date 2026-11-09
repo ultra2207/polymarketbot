@@ -31,6 +31,8 @@ from polymarketbot.trading.latency_sniper import (
     calculate_taker_fee,
     get_vip_rebate_rate,
 )
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 # Load jump summary
 data_path = Path("data/derived/jump_clob_response_summary.json")
@@ -51,7 +53,7 @@ TIERS = [
 MIN_NET_EDGE_BPS = 15.0  # 15 bps minimum net hurdle
 MIN_NET_EDGE = MIN_NET_EDGE_BPS / 10000.0
 
-print(f"Loaded {len(jump_events)} major jump events.")
+log.info(f"Loaded {len(jump_events)} major jump events.")
 
 results_by_tier = []
 
@@ -137,15 +139,15 @@ for tier_name, rebate_rate in TIERS:
         "net_pnl_usd": round(total_net_pnl_usd, 2),
     })
 
-print("\n" + "=" * 95)
-print(f"{'VIP Tier':<22} | {'Rebate':<7} | {'Snipes':<7} | {'Rejected':<9} | {'Act %':<6} | {'Volume':<9} | {'Fees':<8} | {'Rebate $':<9} | {'Net PnL':<8}")
-print("-" * 95)
+log.info("\n" + "=" * 95)
+log.info(f"{'VIP Tier':<22} | {'Rebate':<7} | {'Snipes':<7} | {'Rejected':<9} | {'Act %':<6} | {'Volume':<9} | {'Fees':<8} | {'Rebate $':<9} | {'Net PnL':<8}")
+log.info("-" * 95)
 for r in results_by_tier:
-    print(f"{r['tier']:<22} | {r['rebate_pct']:>6} | {r['actionable_snipes']:>7} | {r['rejected_fee_drag']:>9} | {r['actionable_pct']:>5.1f}% | ${r['total_volume_usd']:>7.0f} | ${r['fees_paid_usd']:>6.2f} | ${r['rebates_earned_usd']:>7.2f} | ${r['net_pnl_usd']:>6.2f}")
-print("=" * 95)
+    log.info(f"{r['tier']:<22} | {r['rebate_pct']:>6} | {r['actionable_snipes']:>7} | {r['rejected_fee_drag']:>9} | {r['actionable_pct']:>5.1f}% | ${r['total_volume_usd']:>7.0f} | ${r['fees_paid_usd']:>6.2f} | ${r['rebates_earned_usd']:>7.2f} | ${r['net_pnl_usd']:>6.2f}")
+log.info("=" * 95)
 
 # Save JSON results
 out_path = Path("data/derived/latency_sniper_tier_actionability.json")
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump({"tiers": results_by_tier}, f, indent=2)
-print(f"\nSaved analysis to {out_path}")
+log.info(f"\nSaved analysis to {out_path}")

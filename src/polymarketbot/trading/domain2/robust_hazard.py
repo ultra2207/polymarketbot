@@ -551,3 +551,68 @@ class RobustHazardModel:
         p_win = 1.0 - h_robust
 
         return p_win, h_robust, hourly_vel
+
+    def settlement_horizon_sec(
+        self,
+        physical_cycle_sec: float,
+        category: str = "settlement",
+        is_disputed: bool = False,
+    ) -> float:
+        """Conservative calendar horizon for a settlement position to complete.
+
+        The base is the on-chain physical cycle (UMA liveness + relayer + redeem)
+        computed by ``calculate_physical_cycle_time``.  The horizon then adds the
+        Bayesian upper-95 category dispute hazard's expected DVM duration, and the
+        full DVM vote cycle when the market is already disputed.  This is the
+        "measured horizon": a position older than this has survived every modelled
+        on-chain path and is treated as unrecoverable.
+        """
+        upper_hazard = self.dispute_tracker.get_credible_upper_hazard(category)
+        contingency_sec = upper_hazard * DEFAULT_DVM_VOTE_DELAY_HOURS * 3600.0
+        if is_disputed:
+            contingency_sec += DEFAULT_DVM_VOTE_DELAY_HOURS * 3600.0
+        return float(max(1.0, float(physical_cycle_sec) + contingency_sec))
+
+
+@dataclass
+class SettlementSurvivalModel:
+    """Empirical survival horizon for settlement completion times.
+
+    Records observed entry -> redemption durations and returns the smallest
+    distribution-free upper-confidence bound on the 95th percentile of the
+    settlement-time distribution.  The bound is the ``ceil((n+1) * confidence)``
+    order statistic, which equals the sample maximum while n <= 58.  Before the
+    sample is large enough for that bound to have 95 % coverage (n >= 59, since
+    0.95 ** n <= 0.05), the on-chain physical-cycle prior is used instead, so the
+    horizon is never a fixed multiple of the current position's duration.
+    """
+
+    confidence: float = 0.95
+    _durations: List[float] = field(default_factory=list)
+
+    @property
+    def required_samples(self) -> int:
+        """Smallest n with P(no sample in the top (1-confidence) tail) <= 1-confidence."""
+        tail = max(1e-9, 1.0 - self.confidence)
+        return int(math.ceil(math.log(tail) / math.log(self.confidence)))
+
+    @property
+    def sample_size(self) -> int:
+        return len(self._durations)
+
+    def record(self, duration_sec: float) -> None:
+        """Record one observed entry -> resolution duration in seconds."""
+        value = float(duration_sec)
+        if math.isfinite(value) and value > 0.0:
+            self._durations.append(value)
+
+    def p95_horizon_sec(self, prior_sec: float) -> float:
+        """Measured p95 upper-confidence horizon, falling back to the physical prior."""
+        prior = float(max(1.0, prior_sec))
+        durations = sorted(self._durations)
+        n = len(durations)
+        if n < self.required_samples:
+            return prior
+        idx = int(math.ceil((n + 1) * self.confidence)) - 1
+        measured = durations[min(max(idx, 0), n - 1)]
+        return float(max(prior, measured))

@@ -30,6 +30,8 @@ sys.path.insert(0, "src")
 import requests
 
 from polymarketbot.net import install_doh_fallback
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/raw/docs")
 SITE = OUT / "site"
@@ -81,26 +83,26 @@ def main() -> int:
     if not full.exists() or full.stat().st_size < 100_000:
         r = _get(session, FULL)
         if r is None or r.status_code != 200:
-            print("could not fetch llms-full.txt", flush=True)
+            log.info("could not fetch llms-full.txt", )
         else:
             full.write_text(r.text, encoding="utf-8")
-            print(f"saved llms-full.txt ({len(r.content):,} bytes)", flush=True)
+            log.info(f"saved llms-full.txt ({len(r.content):,} bytes)", )
     else:
-        print(f"llms-full.txt already present ({full.stat().st_size:,} bytes)", flush=True)
+        log.info(f"llms-full.txt already present ({full.stat().st_size:,} bytes)", )
 
     # 2. the index and individual pages
     r = _get(session, INDEX)
     if r is None or r.status_code != 200:
-        print("could not fetch llms.txt", flush=True)
+        log.info("could not fetch llms.txt", )
         return 1
     (OUT / "llms.txt").write_text(r.text, encoding="utf-8")
 
     links = re.findall(r"\]\((https://docs\.polymarket\.com/[^)]+)\)", r.text)
     pages = sorted({u for u in links if u.endswith((".md", ".txt"))})
-    print(f"index lists {len(pages)} documents", flush=True)
+    log.info(f"index lists {len(pages)} documents", )
 
     todo = [u for u in pages if not local_path(u).exists()]
-    print(f"on disk already: {len(pages) - len(todo)}, to fetch: {len(todo)}", flush=True)
+    log.info(f"on disk already: {len(pages) - len(todo)}, to fetch: {len(todo)}", )
 
     # Project from measured throughput before committing (AGENTS.md rule).
     if todo:
@@ -109,8 +111,8 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             list(pool.map(lambda u: _get(_session(), u), probe))
         per_page = (time.time() - t0) / max(1, len(probe))
-        print(f"projection: ~{per_page:.2f}s/page -> "
-              f"~{len(todo) * per_page / 60:.1f} min for the rest", flush=True)
+        log.info(f"projection: ~{per_page:.2f}s/page -> "
+              f"~{len(todo) * per_page / 60:.1f} min for the rest", )
 
     manifest: list[dict] = []
     done = 0
@@ -121,7 +123,7 @@ def main() -> int:
             if time.time() - started > args.max_seconds:
                 for f in futures:
                     f.cancel()
-                print("  wall-clock budget reached; stopping", flush=True)
+                log.info("  wall-clock budget reached; stopping", )
                 break
             resp = fut.result()
             dest = local_path(url)
@@ -134,15 +136,15 @@ def main() -> int:
                              "status": 200})
             done += 1
             if done % 20 == 0:
-                print(f"  {done}/{len(todo)} pages ({time.time() - started:.0f}s)", flush=True)
+                log.info(f"  {done}/{len(todo)} pages ({time.time() - started:.0f}s)", )
 
     (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     files = list(SITE.rglob("*")) if SITE.exists() else []
     total = sum(f.stat().st_size for f in files if f.is_file())
-    print(f"\nmirrored {done} new pages; site/ holds {sum(1 for f in files if f.is_file())} files "
+    log.info(f"\nmirrored {done} new pages; site/ holds {sum(1 for f in files if f.is_file())} files "
           f"({total/1e6:.1f} MB); full bundle {full.stat().st_size/1e6:.2f} MB"
-          if full.exists() else f"\nmirrored {done} new pages", flush=True)
+          if full.exists() else f"\nmirrored {done} new pages", )
     return 0
 
 

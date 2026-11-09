@@ -37,6 +37,8 @@ sys.path.insert(0, "src")
 import duckdb
 
 from polymarketbot.gamma import GammaClient
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 PIT = OUT / "markets_pit.parquet"
@@ -156,16 +158,16 @@ def main() -> int:
     con = connect()
     done = existing(con)
     todo = candidates(con, done, args.limit or None)
-    print(f"already enriched: {len(done):,}   remaining: {len(todo):,}", flush=True)
+    log.info(f"already enriched: {len(done):,}   remaining: {len(todo):,}", )
     if not todo:
-        print("nothing to do")
+        log.info("nothing to do")
         return 0
 
     batches = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
     # Each worker sleeps so that workers / interval = target rate.
     per_client_interval = max(0.01, args.workers / args.target_rate)
-    print(f"{len(batches)} batches, {args.workers} workers, target {args.target_rate:.0f} req/s "
-          f"({per_client_interval:.2f}s/client)", flush=True)
+    log.info(f"{len(batches)} batches, {args.workers} workers, target {args.target_rate:.0f} req/s "
+          f"({per_client_interval:.2f}s/client)", )
 
     def client() -> GammaClient:
         if not hasattr(_TLS, "client"):
@@ -188,13 +190,13 @@ def main() -> int:
                 if time.time() - started > args.max_seconds:
                     for f in futures:
                         f.cancel()
-                    print("  wall-clock budget reached; stopping", flush=True)
+                    log.info("  wall-clock budget reached; stopping", )
                     break
                 completed += 1
                 try:
                     rows = fut.result()
                 except Exception as exc:  # noqa: BLE001
-                    print(f"  batch failed: {type(exc).__name__}: {str(exc)[:100]}", flush=True)
+                    log.info(f"  batch failed: {type(exc).__name__}: {str(exc)[:100]}", )
                     continue
                 with _WRITE_LOCK:
                     for row in rows:
@@ -206,14 +208,14 @@ def main() -> int:
                         elapsed = time.time() - started
                         rate = completed / max(elapsed, 1e-9)
                         eta = (len(batches) - completed) / max(rate, 1e-9)
-                        print(f"  {completed}/{len(batches)} batches, {written:,} rows, "
-                              f"{rate:.1f} batch/s, eta {eta/60:.1f} min", flush=True)
+                        log.info(f"  {completed}/{len(batches)} batches, {written:,} rows, "
+                              f"{rate:.1f} batch/s, eta {eta/60:.1f} min", )
     finally:
         fh.close()
 
     rows = flush_journal(con)
-    print(f"\nenriched {written:,} this run; {DEST} now holds {rows:,} rows "
-          f"in {time.time() - started:.0f}s", flush=True)
+    log.info(f"\nenriched {written:,} this run; {DEST} now holds {rows:,} rows "
+          f"in {time.time() - started:.0f}s", )
     return 0
 
 

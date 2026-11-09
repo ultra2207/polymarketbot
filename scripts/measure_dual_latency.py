@@ -5,6 +5,8 @@ import duckdb
 import pandas as pd
 from scripts.audit_domain3_l2_tape import audit_hour_slice, load_universe_metadata
 from dataclasses import asdict
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 c_map, ev_map = load_universe_metadata()
 anoms, _ = audit_hour_slice('data/tape/clob_events/date=2026-11-04/hour=00', c_map, ev_map)
@@ -37,10 +39,10 @@ for r in df.itertuples():
             })
 
 ldf = pd.DataFrame(dual_latencies)
-print(f"Dual fill count: {len(ldf)}")
-print("Inter-fill latency stats (delta_venue_ms):")
-print(ldf['delta_venue_ms'].describe())
-print("\nInter-fill latency stats (delta_recv_ms):")
-print(ldf['delta_recv_ms'].describe())
-print("\nSample records:")
-print(ldf.head(10))
+log.info(f"Dual fill count: {len(ldf)}")
+log.info("Inter-fill latency stats (delta_venue_ms):")
+log.info(ldf['delta_venue_ms'].describe())
+log.info("\nInter-fill latency stats (delta_recv_ms):")
+log.info(ldf['delta_recv_ms'].describe())
+log.info("\nSample records:")
+log.info(ldf.head(10))

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from loguru import logger
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 
 @dataclass
@@ -227,11 +229,11 @@ def main():
         max_markets=args.max_markets,
     )
 
-    print("\n" + "=" * 105)
-    print(f"OPTIMAL REWARD HARVESTING PORTFOLIO (Bankroll: ${args.bankroll:,.0f} | Target Markets: {args.max_markets})")
-    print("=" * 105)
-    print(f"{'Market':<35} | {'Size':<6} | {'Spread':<7} | {'Gross/d':<8} | {'Risk/d':<7} | {'Net/d':<7} | {'Ann ROI'}")
-    print("-" * 105)
+    log.info("\n" + "=" * 105)
+    log.info(f"OPTIMAL REWARD HARVESTING PORTFOLIO (Bankroll: ${args.bankroll:,.0f} | Target Markets: {args.max_markets})")
+    log.info("=" * 105)
+    log.info(f"{'Market':<35} | {'Size':<6} | {'Spread':<7} | {'Gross/d':<8} | {'Risk/d':<7} | {'Net/d':<7} | {'Ann ROI'}")
+    log.info("-" * 105)
     for a in opt["allocations"]:
         q = a["market"][:34]
         sz = f"{a['shares']:.0f}"
@@ -240,12 +242,12 @@ def main():
         rk = f"-${a['risk_penalty_usd']:.2f}"
         nt = f"${a['net_pnl_usd']:.2f}"
         roi = f"{a['annual_roi_pct']:,.1f}%"
-        print(f"{q:<35} | {sz:<6} | {spr:<7} | {gr:<8} | {rk:<7} | {nt:<7} | {roi}")
-    print("-" * 105)
-    print(f"TOTALS: Capital Used: ${opt['capital_allocated_usd']:,.0f} / ${opt['bankroll_usd']:,.0f} | "
+        log.info(f"{q:<35} | {sz:<6} | {spr:<7} | {gr:<8} | {rk:<7} | {nt:<7} | {roi}")
+    log.info("-" * 105)
+    log.info(f"TOTALS: Capital Used: ${opt['capital_allocated_usd']:,.0f} / ${opt['bankroll_usd']:,.0f} | "
           f"Gross: ${opt['total_gross_reward_daily']:.2f}/d | Net Profit: ${opt['total_net_daily_profit']:.2f}/d "
           f"({opt['portfolio_daily_roi_pct']:.2f}%/d -> {opt['portfolio_annual_roi_pct']:,.1f}% APR)")
-    print("=" * 105 + "\n")
+    log.info("=" * 105 + "\n")
 
     out_file = Path("data/processed/optimal_reward_portfolio.json")
     with open(out_file, "w", encoding="utf-8") as f:

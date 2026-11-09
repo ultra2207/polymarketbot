@@ -49,6 +49,8 @@ from rich.console import Console
 from rich.progress import (BarColumn, Progress, SpinnerColumn,
                            TaskProgressColumn, TextColumn, TimeElapsedColumn,
                            TimeRemainingColumn)
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TAPE = "data/raw/sii/trades.parquet"
@@ -102,7 +104,7 @@ def main() -> int:
         if m > 12:
             y, m = y + 1, 1
 
-    console.print(f"window {args.start} -> {args.end}: {len(months)} monthly chunks")
+    log.info(f"window {args.start} -> {args.end}: {len(months)} monthly chunks")
 
     con.execute(
         "CREATE OR REPLACE TEMP TABLE prof (wallet VARCHAR, fills BIGINT, "
@@ -150,7 +152,7 @@ def main() -> int:
             n = con.sql("SELECT count(*) FROM prof").fetchall()[0][0]
             bar.update(task, advance=1, description=f"{label} -> {n:,} wallet-months")
 
-    console.print("merging monthly rows ...")
+    log.info("merging monthly rows ...")
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE merged AS
         SELECT wallet, sum(fills) AS fills,
@@ -168,7 +170,7 @@ def main() -> int:
         SELECT wallet FROM merged ORDER BY volume DESC LIMIT {args.top_wallets}
     """)
     n_top = con.sql("SELECT count(*) FROM topw").fetchall()[0][0]
-    console.print(f"sketch pass and timing for the top {n_top:,} wallets by volume")
+    log.info(f"sketch pass and timing for the top {n_top:,} wallets by volume")
 
     # Sketch aggregates only over the top slice: ~2k groups instead of ~200k, which is
     # the difference between a few MB and a few GB of per-group state.
@@ -281,41 +283,41 @@ def main() -> int:
 
     total = con.sql("SELECT count(*) FROM final").fetchall()[0][0]
     vol = con.sql("SELECT sum(volume) FROM final").fetchall()[0][0] or 0
-    print(f"\nwallets profiled: {total:,}  covering ${vol/1e9:.2f} B of volume")
-    print("markets = distinct markets in the busiest month (lower bound); "
+    log.info(f"\nwallets profiled: {total:,}  covering ${vol/1e9:.2f} B of volume")
+    log.info("markets = distinct markets in the busiest month (lower bound); "
           "medians are approx_quantile")
 
-    print(f"\n{'role mix':10} {'wallets':>8} {'volume $m':>10} {'med notional':>13} "
+    log.info(f"\n{'role mix':10} {'wallets':>8} {'volume $m':>10} {'med notional':>13} "
           f"{'med markets':>12}")
     for rm, nm, v, mn, mm in con.sql("""
         SELECT role_mix, count(*), sum(volume)/1e6, median(median_notional),
                median(markets_busiest_month)
         FROM final GROUP BY 1 ORDER BY 3 DESC
     """).fetchall():
-        print(f"{rm:10} {nm:>8,} {v:>10,.0f} {mn:>13,.0f} {mm:>12,.0f}")
+        log.info(f"{rm:10} {nm:>8,} {v:>10,.0f} {mn:>13,.0f} {mm:>12,.0f}")
 
-    print(f"\n{'rhythm':10} {'wallets':>8} {'volume $m':>10} {'med gap s':>10}")
+    log.info(f"\n{'rhythm':10} {'wallets':>8} {'volume $m':>10} {'med gap s':>10}")
     for rh, nm, v, mg in con.sql("""
         SELECT rhythm, count(*), sum(volume)/1e6, median(median_gap_s)
         FROM final GROUP BY 1 ORDER BY 3 DESC
     """).fetchall():
-        print(f"{rh:10} {nm:>8,} {v:>10,.0f} {mg or 0:>10,.0f}")
+        log.info(f"{rh:10} {nm:>8,} {v:>10,.0f} {mg or 0:>10,.0f}")
 
-    print("\ntop 12 wallets by volume:")
-    print(f"  {'maker%':>7} {'vol $m':>8} {'notional':>9} {'markets':>8} "
+    log.info("\ntop 12 wallets by volume:")
+    log.info(f"  {'maker%':>7} {'vol $m':>8} {'notional':>9} {'markets':>8} "
           f"{'gap s':>8} {'rhythm':>10}")
     for ms, v, mn, mk, gp, rh in con.sql("""
         SELECT maker_share*100, volume/1e6, median_notional, markets_busiest_month,
                median_gap_s, rhythm
         FROM final ORDER BY volume DESC LIMIT 12
     """).fetchall():
-        print(f"  {ms:>6.0f}% {v:>8,.1f} {mn:>9,.0f} {mk:>8,.0f} "
+        log.info(f"  {ms:>6.0f}% {v:>8,.1f} {mn:>9,.0f} {mk:>8,.0f} "
               f"{gp or 0:>8,.0f} {rh:>10}")
 
     big = con.sql("""
         SELECT count(*), sum(volume)/1e6 FROM final WHERE median_notional >= 1000
     """).fetchall()[0]
-    print(f"\nwallets whose MEDIAN fill is >= $1,000: {big[0]:,} "
+    log.info(f"\nwallets whose MEDIAN fill is >= $1,000: {big[0]:,} "
           f"(${big[1]:,.0f} M of volume) - not competitors at our size")
     return 0
 

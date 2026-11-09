@@ -32,6 +32,8 @@ import duckdb
 import requests
 
 from polymarketbot.universe.categories import classify
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 PIT = OUT / "markets_pit.parquet"
@@ -90,17 +92,17 @@ def main() -> int:
     con = connect()
     done = existing_ids(con)
     todo = candidate_ids(con, done)
-    print(f"already enriched: {len(done):,}   remaining: {len(todo):,}", flush=True)
+    log.info(f"already enriched: {len(done):,}   remaining: {len(todo):,}", )
 
     if not todo:
-        print("nothing to do")
+        log.info("nothing to do")
         return 0
 
     batches = [todo[i:i + args.batch] for i in range(0, len(todo), args.batch)]
     if args.limit_batches:
         batches = batches[: args.limit_batches]
 
-    print(f"projection: {len(batches)} batches x ~0.5 s = ~{len(batches) * 0.5 / 60:.1f} min", flush=True)
+    log.info(f"projection: {len(batches)} batches x ~0.5 s = ~{len(batches) * 0.5 / 60:.1f} min", )
     session = requests.Session()
     session.headers["User-Agent"] = "polymarketbot-research/0.1"
 
@@ -113,11 +115,11 @@ def main() -> int:
     with JOURNAL.open(mode, encoding="utf-8") as fh:
         for n, batch in enumerate(batches, 1):
             if time.time() - started > args.max_seconds:
-                print(f"  wall-clock budget reached after {n - 1} batches")
+                log.info(f"  wall-clock budget reached after {n - 1} batches")
                 break
             markets = fetch_batch(session, batch)
             if markets is None:
-                print(f"  batch {n}: fetch failed, skipping")
+                log.info(f"  batch {n}: fetch failed, skipping")
                 continue
             for m in markets:
                 tags = [t.get("label") or "" for t in (m.get("tags") or [])]
@@ -133,11 +135,11 @@ def main() -> int:
                 }) + "\n")
                 written += 1
             if n % 25 == 0:
-                print(f"  {n}/{len(batches)} batches, {written:,} rows, "
+                log.info(f"  {n}/{len(batches)} batches, {written:,} rows, "
                       f"{improved:,} improved, {time.time() - started:.0f}s",
-                      flush=True)
+                      )
 
-    print(f"\nfetched {written:,} markets, {improved:,} moved out of 'other' "
+    log.info(f"\nfetched {written:,} markets, {improved:,} moved out of 'other' "
           f"({100 * improved / max(1, written):.1f}%) in {time.time() - started:.0f}s")
 
     if JOURNAL.exists():
@@ -152,7 +154,7 @@ def main() -> int:
         """)
         JOURNAL.unlink(missing_ok=True)
         n = con.sql(f"SELECT count(*) FROM read_parquet('{OVERRIDES.as_posix()}')").fetchall()[0][0]
-        print(f"wrote {OVERRIDES} ({n:,} overrides)")
+        log.info(f"wrote {OVERRIDES} ({n:,} overrides)")
     return 0
 
 

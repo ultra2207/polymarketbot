@@ -191,7 +191,7 @@ def main() -> int:
 
     text = "\n".join(out)
     OUT.write_text(text, encoding="utf-8")
-    print(text)
+    log.info(text)
     return 0
 
 

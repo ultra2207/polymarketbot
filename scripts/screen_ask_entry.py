@@ -52,6 +52,8 @@ from polymarketbot.logs import IST
 import duckdb
 
 from polymarketbot.fees import schedule_at
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 BUCKETS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 0.35),
@@ -172,7 +174,7 @@ def score(con: duckdb.DuckDBPyConnection, dest: Path) -> None:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print(f"\n{'price':>12} {'markets':>8} {'mean px':>8} {'payout':>7} "
+    log.info(f"\n{'price':>12} {'markets':>8} {'mean px':>8} {'payout':>7} "
           f"{'fee':>7} {'net edge':>9} {'±se':>7} {'t':>6} {'ask size':>9}")
     for lo, hi, n, px, pay, fee, edge, se, size in con.sql("""
         SELECT lo, hi, count(*) n,
@@ -182,13 +184,13 @@ def score(con: duckdb.DuckDBPyConnection, dest: Path) -> None:
         FROM market_level GROUP BY 1,2 ORDER BY 1
     """).fetchall():
         t = edge / se if se else float("nan")
-        print(f"  [{lo:.2f},{hi:.2f}) {n:>8,} {px:>8.3f} {pay:>7.3f} "
+        log.info(f"  [{lo:.2f},{hi:.2f}) {n:>8,} {px:>8.3f} {pay:>7.3f} "
               f"{fee*100:>6.2f}% {edge:>+9.4f} {se:>7.4f} {t:>6.1f} {size:>9,.0f}")
 
     total = con.sql("""
         SELECT count(DISTINCT condition_id) FROM scored
     """).fetchall()[0][0]
-    print(f"\nobservations: {con.sql('SELECT count(*) FROM scored').fetchall()[0][0]:,}"
+    log.info(f"\nobservations: {con.sql('SELECT count(*) FROM scored').fetchall()[0][0]:,}"
           f" across {total:,} markets")
 
 
@@ -203,18 +205,18 @@ def main() -> int:
     book_root = Path(args.book_dir)
     parts = sorted(book_root.rglob("books.parquet"))
     if not parts:
-        print(f"no reduced book partitions under {book_root}")
+        log.info(f"no reduced book partitions under {book_root}")
         return 1
-    print(f"book partitions: {len(parts):,}")
+    log.info(f"book partitions: {len(parts):,}")
 
     glob = f"{(book_root / '**' / 'books.parquet').as_posix()}"
     con = connect()
     t0 = datetime.now(IST)
     build_entries(con, glob, args.entry_max_hours, args.entry_min_hours)
     n = con.sql("SELECT count(*) FROM entries").fetchall()[0][0]
-    print(f"entry observations: {n:,}  ({datetime.now(IST)-t0})")
+    log.info(f"entry observations: {n:,}  ({datetime.now(IST)-t0})")
     if n == 0:
-        print("no markets resolved inside the book window - the block is too short "
+        log.info("no markets resolved inside the book window - the block is too short "
               "or no market both traded and resolved with a snapshot 6-24 h before "
               "resolution")
         return 1

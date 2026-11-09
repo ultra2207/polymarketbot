@@ -270,7 +270,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     lines.append("  * the reward is not in the net; a single-sided quote is divided by 3")
     lines.append("    inside 0.10-0.90 and scores zero outside it (Polymarket docs).")
     text = "\n".join(lines)
-    print(text)
+    log.info(text)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     keys = [

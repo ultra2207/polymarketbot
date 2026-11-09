@@ -31,6 +31,7 @@ import argparse
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CACHE = "data/processed/wallet_token/*.parquet"
 LABELS = "data/processed/market_labels.parquet"
@@ -88,8 +89,8 @@ def main() -> None:
     """)
     logger.info(f"  buys in scope: {con.sql('SELECT count(*) FROM b').fetchall()[0][0]:,}")
 
-    print("\n=== at the same price, does the top decile pick better outcomes? ===")
-    print("  price bucket   top: payout  entry   edge  |  rest: payout  entry   edge  |  gap")
+    log.info("\n=== at the same price, does the top decile pick better outcomes? ===")
+    log.info("  price bucket   top: payout  entry   edge  |  rest: payout  entry   edge  |  gap")
     for r in con.sql("""
         SELECT bucket,
                sum(payout * bs) FILTER (WHERE dec = 1)  / nullif(sum(bs) FILTER (WHERE dec = 1),0),
@@ -104,13 +105,13 @@ def main() -> None:
     """).fetchall():
         gap = (r[1] - r[4]) if r[1] is not None and r[4] is not None else None
         if gap is None:
-            print(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%   insufficient")
+            log.info(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%   insufficient")
             continue
-        print(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%   "
+        log.info(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%   "
               f"{r[1]:>6.3f}  {r[2]:>6.3f}  {r[3]:>+6.3f}  |  "
               f"{r[4]:>6.3f}  {r[5]:>6.3f}  {r[6]:>+6.3f}  |  {gap:>+6.3f}")
 
-    print("\n=== summary: edge per share, decomposed ===")
+    log.info("\n=== summary: edge per share, decomposed ===")
     r = con.sql("""
         SELECT
           (sum(payout * bs) FILTER (WHERE dec = 1) - sum(bc) FILTER (WHERE dec = 1))
@@ -121,8 +122,8 @@ def main() -> None:
           count(*) FILTER (WHERE dec > 1) AS rest_positions
         FROM b
     """).fetchall()[0]
-    print(f"  total edge per share bought: top {r[0]:+.4f}, rest {r[1]:+.4f}")
-    print(f"  positions: top {r[2]:,}, rest {r[3]:,}")
+    log.info(f"  total edge per share bought: top {r[0]:+.4f}, rest {r[1]:+.4f}")
+    log.info(f"  positions: top {r[2]:,}, rest {r[3]:,}")
 
 
 if __name__ == "__main__":

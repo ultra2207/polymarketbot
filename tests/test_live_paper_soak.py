@@ -102,16 +102,17 @@ def test_settlement_harvester_marginal_pipeline_deploy(tmp_path: Path, monkeypat
     )
     daemon.candidate_queue = [cand1, cand2]
 
-    # Mock fetch_l2_book to return ladder from candidate
-    def mock_fetch_l2_book(session, token_id):
-        if token_id == "tok1":
-            return [], [{"price": "0.960", "size": "200.0"}], 0.950, 0.960, 0.955
-        elif token_id == "tok2":
-            return [], [{"price": "0.985", "size": "200.0"}], 0.980, 0.985, 0.9825
-        return [], [], 0.0, 1.0, 0.50
+    # Mock the atomic batch book helper to return the candidate ladders.
+    def mock_fetch_l2_books_batch(session, token_ids, *args, **kwargs):
+        books = {}
+        if "tok1" in token_ids:
+            books["tok1"] = {"asset_id": "tok1", "asks": [{"price": "0.960", "size": "200.0"}]}
+        if "tok2" in token_ids:
+            books["tok2"] = {"asset_id": "tok2", "asks": [{"price": "0.985", "size": "200.0"}]}
+        return books
 
     import scripts.run_live_paper_soak as soak_mod
-    monkeypatch.setattr(soak_mod, "fetch_l2_book", mock_fetch_l2_book)
+    monkeypatch.setattr(soak_mod, "fetch_l2_books_batch", mock_fetch_l2_books_batch)
 
     deployed = daemon._deploy_pipeline_capital()
     assert deployed >= 1
@@ -137,18 +138,22 @@ def test_preflight_auditor_local_sanity() -> None:
 def test_settlement_radar_multi_stratum_paginated_scanner(tmp_path: Path, monkeypatch) -> None:
     """Verify that multi-stratum radar discovers targets across offsets, enforces Oracle gate, and uses batch CLOB."""
     from scripts.run_live_paper_soak import LivePaperSoakDaemon, SoakTelemetryDb, DEFAULT_GAMMA_HOST, DEFAULT_CLOB_HOST
+    from datetime import datetime, timezone, timedelta
     import json
 
     daemon = LivePaperSoakDaemon(capital_per_strategy=1000.0, vip_tier="none", duration=0.1)
     daemon.db = SoakTelemetryDb(tmp_path / "test_radar.db")
 
+    # 10 minutes past the calendar end is inside the measured settlement horizon.
+    expired_iso = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     # Mock markets
     mock_markets_page_0 = [
-        # Target 1: Will FC Utrecht win on 2026-11-08? (Expired, 0.96 ask)
+        # Target 1: FC Utrecht (expired 10m ago, 0.96 ask)
         {
             "conditionId": "0xUTR_COND",
             "question": "Will FC Utrecht win on 2026-11-08?",
-            "endDate": "2026-11-08T19:00:00Z",
+            "endDate": expired_iso,
             "outcomePrices": json.dumps(["0.04", "0.96"]),
             "clobTokenIds": json.dumps(["tok_utr_0", "tok_utr_1"]),
         },
@@ -163,19 +168,19 @@ def test_settlement_radar_multi_stratum_paginated_scanner(tmp_path: Path, monkey
     ]
 
     mock_markets_page_100 = [
-        # Target 2: Browns vs. Saints: O/U 42.5 (Expired, 0.96 ask)
+        # Target 2: Browns vs. Saints: O/U 42.5 (expired 10m ago, 0.96 ask)
         {
             "conditionId": "0xBR_COND",
             "question": "Browns vs. Saints: O/U 42.5",
-            "endDate": "2026-11-08T18:00:00Z",
+            "endDate": expired_iso,
             "outcomePrices": json.dumps(["0.04", "0.96"]),
             "clobTokenIds": json.dumps(["tok_br_0", "tok_br_1"]),
         },
-        # Target 3: Lions vs. Dolphins: O/U 48.5 (Expired, 0.977 ask)
+        # Target 3: Lions vs. Dolphins: O/U 48.5 (expired 10m ago, 0.977 ask)
         {
             "conditionId": "0xLIO_COND",
             "question": "Lions vs. Dolphins: O/U 48.5",
-            "endDate": "2026-11-08T18:00:00Z",
+            "endDate": expired_iso,
             "outcomePrices": json.dumps(["0.023", "0.977"]),
             "clobTokenIds": json.dumps(["tok_lio_0", "tok_lio_1"]),
         },
@@ -197,6 +202,12 @@ def test_settlement_radar_multi_stratum_paginated_scanner(tmp_path: Path, monkey
 
         def json(self):
             return self._data
+
+    # Gamma rows carry the outcome names and venue minimum order size; the radar
+    # now validates both, so add them to the fixture rows.
+    for _m in mock_markets_page_0 + mock_markets_page_100:
+        _m.setdefault("outcomes", json.dumps(["No", "Yes"]))
+        _m.setdefault("orderMinSize", 5)
 
     def mock_get(url, *args, **kwargs):
         if "offset=0" in url and "order=volume24hr" in url:
@@ -269,9 +280,101 @@ def test_settlement_radar_multi_stratum_paginated_scanner(tmp_path: Path, monkey
     # Verify unexpired non-UMA market was rejected
     assert "0xUNEXPIRED_COND" not in q_map
 
-    # Verify ordering by annualized ARR: 0.960 has higher ARR than 0.977 and 0.980
-    assert queued[0].best_ask == 0.960
-    assert queued[-1].best_ask == 0.980
+    # No fixture is a final 0/1 outcome, so all are priced at their own implied
+    # outcome probability net of hazard: none has a positive par edge. A closed
+    # or proposed 0.98 market is still unresolved.
+    assert all(c.annualized_arr <= 0.0 for c in queued)
+    assert all(c.p_win <= c.best_ask + 1e-9 for c in queued)
+
+
+def test_settlement_radar_unresolved_market_uses_outcome_probability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A 0.51 unresolved market must use P(outcome wins), not P(market resolves)."""
+    from scripts.run_live_paper_soak import (
+        LivePaperSoakDaemon,
+        SoakTelemetryDb,
+        SettlementCandidate,
+        DEFAULT_GAMMA_HOST,
+        DEFAULT_CLOB_HOST,
+    )
+    from datetime import datetime, timezone, timedelta
+    import json
+
+    daemon = LivePaperSoakDaemon(capital_per_strategy=1000.0, vip_tier="none", duration=0.1)
+    daemon.db = SoakTelemetryDb(tmp_path / "test_radar_unresolved.db")
+
+    end_10m = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    market = {
+        "conditionId": "0xLIMA_COND",
+        "question": "Lima: Gonzalo Bueno vs Thiago Seyboth Wild",
+        "endDate": end_10m,
+        "outcomePrices": json.dumps(["0.49", "0.51"]),
+        "clobTokenIds": json.dumps(["tok_lima_0", "tok_lima_1"]),
+        "outcomes": json.dumps(["No", "Yes"]),
+        "orderMinSize": 5,
+        # Closed for trading but NOT resolved: 0.49/0.51 is still an
+        # unresolved outcome, so it must not be treated as a certain win.
+        "closed": True,
+    }
+
+    class MockResponse:
+        def __init__(self, data, status_code=200):
+            self._data = data
+            self.status_code = status_code
+
+        def json(self):
+            return self._data
+
+    def mock_get(url, *args, **kwargs):
+        if "offset=0" in url and "order=volume24hr" in url:
+            return MockResponse([market])
+        return MockResponse([])
+
+    def mock_post(url, *args, **kwargs):
+        payload = kwargs.get("json", [])
+        books = []
+        for item in payload:
+            if item.get("token_id") == "tok_lima_1":
+                books.append({
+                    "asset_id": "tok_lima_1",
+                    "bids": [{"price": "0.50", "size": "2000"}],
+                    "asks": [{"price": "0.51", "size": "2000"}],
+                })
+        return MockResponse(books)
+
+    monkeypatch.setattr(daemon.http_session, "get", mock_get)
+    monkeypatch.setattr(daemon.http_session, "post", mock_post)
+
+    daemon.running = True
+    radar_thread = threading.Thread(target=daemon._run_settlement_radar_thread, daemon=True)
+    radar_thread.start()
+    time.sleep(0.6)
+    daemon.running = False
+    radar_thread.join(timeout=2.0)
+
+    with daemon.queue_lock:
+        queued = list(daemon.candidate_queue)
+    cand = next((c for c in queued if c.condition_id == "0xLIMA_COND"), None)
+    assert cand is not None, "unresolved past-calendar market should still be queued"
+    # 0.51 outcome probability (minus the measured dispute hazard), NOT ~0.997
+    assert cand.p_win < 0.60, f"p_win must reflect the outcome, got {cand.p_win}"
+
+    # With p_win=0.51 the allocator has no positive expected edge at a 0.51 ask.
+    settlement_cand = SettlementCandidate(
+        condition_id=cand.condition_id,
+        token_id=cand.token_id,
+        question=cand.question,
+        target_settle_sec=cand.target_settle_sec,
+        ask_ladder=cand.ask_ladder,
+        fee_schedule=cand.fee_schedule,
+        p_win=cand.p_win,
+        min_order_shares=cand.min_order_shares,
+        category=cand.category,
+    )
+    res = daemon.settlement_allocator.allocate([settlement_cand], usable_capital=1000.0)
+    assert res.active_markets_count == 0
+    assert res.total_allocated_usd == 0.0
 
 
 def test_virtual_book_tracker_ghost_liquidity_elimination() -> None:
@@ -341,6 +444,10 @@ def test_settlement_radar_next_48h_expiring_markets(tmp_path: Path, monkeypatch)
         def json(self):
             return self._data
 
+    for _m in mock_markets_48h:
+        _m.setdefault("outcomes", json.dumps(["No", "Yes"]))
+        _m.setdefault("orderMinSize", 5)
+
     def mock_get(url, *args, **kwargs):
         if "end_date_min" in url:
             return MockResponse(mock_markets_48h)
@@ -378,10 +485,15 @@ def test_settlement_radar_next_48h_expiring_markets(tmp_path: Path, monkeypatch)
     assert c.condition_id == "0x12H_COND"
     assert c.best_ask == 0.960
     assert c.ask_size == 500.0
-    # Target settle duration should be approximately 12 hours (43,200s + 135s settle hold)
-    assert 40000.0 < c.target_settle_sec < 45000.0
-    # Annualized ARR should reflect the 12-hour holding period (~3000% ARR)
-    assert c.annualized_arr > 20.0
+    # Target settle duration is the 12h time-to-resolution plus the on-chain
+    # UMA/relayer/redeem cycle (~2.45h), not a fixed hold constant.
+    assert 50000.0 < c.target_settle_sec < 55000.0
+    # Unresolved in-play market: p_win is P(this outcome wins), not P(the market
+    # resolves). At ask == p_est there is no positive par edge, so it is queued
+    # but must not be funded.
+    assert c.p_win < 1.0
+    assert c.p_win <= c.best_ask
+    assert c.annualized_arr <= 0.0
 
 
 
@@ -442,11 +554,13 @@ def test_reward_universe_scanner_multipage_and_upper_bounding(tmp_path: Path, mo
 
     def mock_get(url, *args, **kwargs):
         if "rewards/markets/multi" in url:
-            if "next_cursor=MA==" in url:  # offset 0
-                return MockResponse({"data": page_0})
-            elif "next_cursor=NTAw" in url:  # offset 500
-                return MockResponse({"data": page_1})
-            return MockResponse({"data": []})
+            # The scanner derives the base64 cursor from the numeric offset:
+            # "NTAw" == 500. Page 0 is short but carries a non-terminal cursor;
+            # the scanner must follow it instead of treating the short page as
+            # the end of the universe.
+            if "next_cursor=NTAw" in url:
+                return MockResponse({"data": page_1, "next_cursor": "LTE="})
+            return MockResponse({"data": page_0, "next_cursor": "PAGE_2"})
         return MockResponse([], status_code=404)
 
     def mock_post(url, *args, **kwargs):
@@ -469,7 +583,7 @@ def test_reward_universe_scanner_multipage_and_upper_bounding(tmp_path: Path, mo
     monkeypatch.setattr(daemon.http_session, "get", mock_get)
     monkeypatch.setattr(daemon.http_session, "post", mock_post)
 
-    candidates = daemon.scan_reward_universe(min_rate=1.00, page_size=500, max_batch_pages=2)
+    candidates = daemon.scan_reward_universe(min_rate=1.00, page_size=500)
 
     # Subfloor pool (rate 0.50) must be excluded; 3 valid pools remain
     assert len(candidates) == 3
@@ -511,8 +625,8 @@ def test_reward_radar_to_harvester_thread_integration(tmp_path: Path, monkeypatc
             return self._data
 
     def mock_get(url, *args, **kwargs):
-        if "rewards/markets/multi" in url and "next_cursor=MA==" in url:
-            return MockResp({"data": mock_pool})
+        if "rewards/markets/multi" in url:
+            return MockResp({"data": mock_pool, "next_cursor": "LTE="})
         return MockResp({"data": []})
 
     def mock_post(url, *args, **kwargs):
@@ -522,7 +636,7 @@ def test_reward_radar_to_harvester_thread_integration(tmp_path: Path, monkeypatc
     monkeypatch.setattr(daemon.http_session, "get", mock_get)
     monkeypatch.setattr(daemon.http_session, "post", mock_post)
 
-    candidates = daemon.scan_reward_universe(min_rate=1.00, page_size=500, max_batch_pages=1)
+    candidates = daemon.scan_reward_universe(min_rate=1.00, page_size=500)
     assert len(candidates) == 1
     assert candidates[0].pool_id == "0xPRIME_COND"
 
@@ -530,7 +644,7 @@ def test_reward_radar_to_harvester_thread_integration(tmp_path: Path, monkeypatc
         daemon.reward_candidate_queue = candidates
 
     # Verify Harvester allocation using MarginalRewardAllocator
-    allocs = MarginalRewardAllocator.allocate(candidates, total_budget=1000.0, max_active_pools=1)
+    allocs = MarginalRewardAllocator.allocate(candidates, total_budget=1000.0)
     assert "0xPRIME_COND" in allocs
     assert allocs["0xPRIME_COND"] == 1000.0
 
@@ -583,13 +697,22 @@ def test_ctf_minter_multi_offset_universe_and_arbitrage_execution(tmp_path: Path
 
     def mock_get(url, *args, **kwargs):
         if DEFAULT_GAMMA_HOST in url:
-            if "offset=0" in url and "order=volume24hr" in url:
-                return MockResp([m_mint])
-            elif "offset=100" in url and "order=volume24hr" in url:
-                return MockResp([m_merge])
-            elif "order=liquidity" in url:
-                return MockResp([m_pinned])
+            # Full-universe discovery now uses stable id ordering. Page 0 holds
+            # the three fixtures; every later page is short/empty so discovery stops.
+            if "order=id" in url and "offset=0" in url:
+                return MockResp([m_mint, m_merge, m_pinned])
             return MockResp([])
+        if "data-api.polymarket.com/v2/trades" in url:
+            # Measured taker-flow tape: SELL prints drive the empirical fill-size
+            # model and the measured seller-initiated share.
+            return MockResp({
+                "data": [
+                    {"side": "SELL", "size": 10.0, "price": 0.5},
+                    {"side": "SELL", "size": 20.0, "price": 0.5},
+                    {"side": "SELL", "size": 5.0, "price": 0.5},
+                    {"side": "BUY", "size": 15.0, "price": 0.5},
+                ]
+            })
         return MockResp([], status_code=404)
 
     def mock_post(url, *args, **kwargs):
@@ -613,6 +736,14 @@ def test_ctf_minter_multi_offset_universe_and_arbitrage_execution(tmp_path: Path
 
     monkeypatch.setattr(daemon.http_session, "get", mock_get)
     monkeypatch.setattr(daemon.http_session, "post", mock_post)
+    monkeypatch.setattr(daemon.ctf_http_session, "get", mock_get)
+    monkeypatch.setattr(daemon.ctf_http_session, "post", mock_post)
+
+    # Gas/POL are measured from venue oracles at refresh time; serve deterministic
+    # measured values so the test does not depend on external network latency.
+    import polymarketbot.trading.ctf as ctf_oracle
+    monkeypatch.setattr(ctf_oracle, "get_dynamic_gas_price_gwei", lambda *a, **k: 40.0)
+    monkeypatch.setattr(ctf_oracle, "get_dynamic_pol_usd_price", lambda *a, **k: 0.092)
 
     # Launch CtfMinter thread for 0.4s and stop
     daemon.running = True
@@ -640,8 +771,57 @@ def test_ctf_minter_multi_offset_universe_and_arbitrage_execution(tmp_path: Path
     assert "CTF_MERGE_REDEEM" in sides
 
 
+def test_gamma_universe_pagination_422_is_end_not_failure() -> None:
+    """422 at a non-zero offset is end-of-universe; pages read before it are kept."""
+    import re
+    from scripts.run_live_paper_soak import _paginate_gamma_universe
+
+    class _Resp:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def __init__(self):
+            self.offsets = []
+
+        def get(self, url, *args, **kwargs):
+            offset = int(re.search(r"offset=(\d+)", url).group(1))
+            self.offsets.append(offset)
+            if offset >= 2300:
+                return _Resp(422, {"error": "offset too large"})
+            return _Resp(200, [{"id": str(offset + i)} for i in range(100)])
+
+    session = _Session()
+    markets, pages, reason = _paginate_gamma_universe(
+        session, page_size=100, wave=8, is_running=lambda: True
+    )
+
+    assert markets is not None
+    assert len(markets) == 2300
+    assert pages == 24
+    assert "end_of_universe" in reason and "2300" in reason
+    assert 2300 in session.offsets
+
+    # A failure before any successful page is still a failed refresh.
+    class _FailSession:
+        def get(self, url, *args, **kwargs):
+            return _Resp(500, [])
+
+    failed_markets, _, failed_reason = _paginate_gamma_universe(
+        _FailSession(), page_size=100, wave=8, is_running=lambda: True
+    )
+    assert failed_markets is None
+    assert failed_reason == "failure_before_first_page"
+
+
 def test_settlement_radar_multi_stratum_uncapped_coverage(tmp_path: Path, monkeypatch) -> None:
-    """Verify that SettlementHarvester radar probes all time strata up to offset 2000 without 1000 cap."""
+    """Full pagination walks every stratum past the old fixed 800/600/400 caps."""
+    import re as _re
+
     daemon = LivePaperSoakDaemon(capital_per_strategy=1000.0, vip_tier="none", duration=0.1)
     daemon.db = SoakTelemetryDb(tmp_path / "soak_test_strata.db")
 
@@ -657,23 +837,28 @@ def test_settlement_radar_multi_stratum_uncapped_coverage(tmp_path: Path, monkey
 
     def mock_get(url, *args, **kwargs):
         probed_urls.append(url)
-        return MockResponse([])
+        match = _re.search(r"[?&]offset=(\d+)", url)
+        offset = int(match.group(1)) if match else 0
+        if offset >= 2400:
+            return MockResponse([])  # short page terminates the stratum
+        return MockResponse([{"conditionId": f"0x{offset}_{i}"} for i in range(100)])
 
     monkeypatch.setattr(daemon.http_session, "get", mock_get)
 
     daemon.running = True
     radar_thread = threading.Thread(target=daemon._run_settlement_radar_thread, daemon=True)
     radar_thread.start()
-    time.sleep(0.3)
+    time.sleep(1.0)
     daemon.running = False
-    radar_thread.join(timeout=1.0)
+    radar_thread.join(timeout=2.0)
 
-    # Verify that multi-stratum generation generated all 111 URLs
-    assert len(probed_urls) >= 110, f"Expected >= 110 stratum URLs, got {len(probed_urls)}"
-
-    # Verify that offset=2000 is reached across all strata (no 1000 cap)
-    offsets_2000 = [u for u in probed_urls if "offset=2000" in u]
-    assert len(offsets_2000) == 5, f"Expected 5 strata with offset=2000, got {len(offsets_2000)}"
+    # Five strata, each paginated through the old caps and past offset 2000
+    # until the short page: no fixed 800/600/400 market caps.
+    hits_2000 = [u for u in probed_urls if "offset=2000" in u]
+    hits_2400 = [u for u in probed_urls if "offset=2400" in u]
+    assert len(hits_2000) == 5, f"Expected 5 strata at offset=2000, got {len(hits_2000)}"
+    assert len(hits_2400) == 5, f"Expected 5 strata at offset=2400, got {len(hits_2400)}"
+    assert len(probed_urls) >= 5 * 25, f"Expected >= 125 pages, got {len(probed_urls)}"
 
     # Verify presence of all sub-horizon slices (0-6h, 6-24h, 24-48h)
     assert any("end_date_min=" in u and "end_date_max=" in u for u in probed_urls)

@@ -47,7 +47,7 @@ def main() -> int:
     os.chdir(REPO_ROOT)
     install_doh_fallback()
     stats = refresh(args.manifest, args.out, limit=args.limit or None)
-    print(
+    log.info(
         f"ids={stats['ids']} rows={stats['rows']} "
         f"written={stats['written']} manifest_updated={stats['applied']}"
     )

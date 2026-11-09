@@ -1,6 +1,8 @@
 """Inspect active BTC November 6 barrier markets."""
 import json
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 with open("data/derived/btc_tokens_map.json", "r", encoding="utf-8") as f:
     btc_map = json.load(f)
@@ -11,9 +13,9 @@ for t, info in btc_map.items():
     if "above $7" in q or "above $8" in q or "above $76" in q or "above $78" in q or "above $80" in q:
         target_tokens[t] = q
 
-print(f"Found {len(target_tokens)} target tokens:")
+log.info(f"Found {len(target_tokens)} target tokens:")
 for t, q in target_tokens.items():
-    print(f"  {t}: {q}")
+    log.info(f"  {t}: {q}")
 
 con = duckdb.connect()
 con.execute("SET threads=2")
@@ -34,8 +36,8 @@ query = f"""
     GROUP BY asset_id
 """
 res = con.execute(query).df()
-print("\nActivity in hour 15 for target tokens:")
+log.info("\nActivity in hour 15 for target tokens:")
 for _, row in res.iterrows():
     aid = row["asset_id"]
     q = target_tokens.get(aid, aid)
-    print(f"Token: {aid[:15]}... ({q[:40]}) -> Updates: {row['updates']}, Avg Spread: {row['avg_spread']:.3f}, Max Size: {row['max_size']}, Avg Size: {row['avg_size']:.1f}")
+    log.info(f"Token: {aid[:15]}... ({q[:40]}) -> Updates: {row['updates']}, Avg Spread: {row['avg_spread']:.3f}, Max Size: {row['max_size']}, Avg Size: {row['avg_size']:.1f}")

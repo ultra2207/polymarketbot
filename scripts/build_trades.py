@@ -50,6 +50,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 RAW = Path("data/raw/sii/trades.parquet")
 OUT = Path("data/processed/trades")
@@ -131,12 +133,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if not RAW.exists():
-        print(f"missing {RAW}")
+        log.info(f"missing {RAW}")
         return 1
 
     con = connect()
     todo = args.months or months(con)
-    print(f"{len(todo)} month(s)\n")
+    log.info(f"{len(todo)} month(s)\n")
 
     total = 0
     t_all = time.time()
@@ -144,10 +146,10 @@ def main() -> int:
         t0 = time.time()
         n, size = build(con, m, args.force)
         total += n
-        print(f"  [{i}/{len(todo)}] {m}  {n:>12,} fills  {size/1e9:>6.2f} GB  "
+        log.info(f"  [{i}/{len(todo)}] {m}  {n:>12,} fills  {size/1e9:>6.2f} GB  "
               f"{time.time()-t0:>6.1f}s")
 
-    print(f"\n{total:,} fills  {(time.time()-t_all)/60:.1f} min")
+    log.info(f"\n{total:,} fills  {(time.time()-t_all)/60:.1f} min")
     return 0
 
 

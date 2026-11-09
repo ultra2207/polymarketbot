@@ -373,7 +373,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     horizons = [int(x) for x in str(args.horizons).split(",") if x.strip()]
-    print(
+    log.info(
         build_report(
             Path(args.tape),
             Path(args.snapshot),

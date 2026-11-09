@@ -23,16 +23,16 @@ install_doh_fallback()
 
 def print_leaderboard(markets: list[dict[str, Any]], bankroll: float) -> None:
     """Print high-density terminal leaderboard."""
-    print("\n" + "=" * 135)
-    print(f"  POLYMARKET OPTIMAL LIQUIDITY REWARDS LEADERBOARD | BANKROLL: ${bankroll:.2f} USDC")
-    print("  (Audited against live L2 order book depth with strict $1.00 daily payout floor enforcement)")
-    print("=" * 135)
+    logger.info("\n" + "=" * 135)
+    logger.info(f"  POLYMARKET OPTIMAL LIQUIDITY REWARDS LEADERBOARD | BANKROLL: ${bankroll:.2f} USDC")
+    logger.info("  (Audited against live L2 order book depth with strict $1.00 daily payout floor enforcement)")
+    logger.info("=" * 135)
     header = (
         f"{'Rank':<4} | {'Market Question':<45} | {'Pool/d':<8} | {'Mid':<5} | "
         f"{'Comp Depth':<11} | {'Quote':<8} | {'Real Pay/d':<11} | {'Daily ROI':<10} | {'Floor Status'}"
     )
-    print(header)
-    print("-" * 135)
+    logger.info(header)
+    logger.info("-" * 135)
 
     for idx, m in enumerate(markets, 1):
         q = m["question"][:43]
@@ -43,9 +43,9 @@ def print_leaderboard(markets: list[dict[str, Any]], bankroll: float) -> None:
         pay = f"${m['real_daily_payout']:.2f}/d"
         roi = f"+{m['daily_roi_pct']:.1f}%"
         status = "PASSED (Floor Cleared)" if m["clears_floor"] else f"FAILED (${m['raw_daily_payout']:.2f}/d)"
-        print(f"{idx:<4} | {q:<45} | {pool:<8} | {mid:<5} | {depth:<11} | {q_sz:<8} | {pay:<11} | {roi:<10} | {status}")
+        logger.info(f"{idx:<4} | {q:<45} | {pool:<8} | {mid:<5} | {depth:<11} | {q_sz:<8} | {pay:<11} | {roi:<10} | {status}")
 
-    print("=" * 135 + "\n")
+    logger.info("=" * 135 + "\n")
 
 
 def main() -> None:
@@ -62,17 +62,17 @@ def main() -> None:
     )
 
     if not results:
-        print("No qualifying markets found matching safety criteria.")
+        logger.info("No qualifying markets found matching safety criteria.")
         sys.exit(1)
 
     print_leaderboard(results, args.bankroll)
 
     best = results[0]
-    print(f"[*] Optimal Market Selected: {best['question']}")
-    print(f"    Condition ID:    {best['condition_id']}")
-    print(f"    Daily Reward:    ${best['daily_pool']:,.2f}/day")
-    print(f"    Expected Payout: ${best['real_daily_payout']:.2f}/day (+{best['daily_roi_pct']:.1f}%/day ROI)")
-    print(f"    Quote Sizing:    {best['quote_size']:.1f} shares @ mid {best['real_mid']:.3f}\n")
+    logger.info(f"[*] Optimal Market Selected: {best['question']}")
+    logger.info(f"    Condition ID:    {best['condition_id']}")
+    logger.info(f"    Daily Reward:    ${best['daily_pool']:,.2f}/day")
+    logger.info(f"    Expected Payout: ${best['real_daily_payout']:.2f}/day (+{best['daily_roi_pct']:.1f}%/day ROI)")
+    logger.info(f"    Quote Sizing:    {best['quote_size']:.1f} shares @ mid {best['real_mid']:.3f}\n")
 
 
 if __name__ == "__main__":

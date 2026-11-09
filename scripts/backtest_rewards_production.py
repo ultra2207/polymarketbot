@@ -19,7 +19,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.rewards import (
@@ -224,10 +224,10 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
     )
     divider = "-" * len(header)
 
-    print("\n" + "=" * len(header))
-    print(title)
-    print(header)
-    print(divider)
+    log.info("\n" + "=" * len(header))
+    log.info(title)
+    log.info(header)
+    log.info(divider)
 
     total_cap = 0.0
     total_rew = 0.0
@@ -259,19 +259,19 @@ def print_summary_table(results: List[Dict[str, Any]]) -> None:
         total_net += r["actual_net_revenue_usd"]
         total_merged += r["total_complete_sets_merged_usd"]
 
-        print(
+        log.info(
             f"{q:<28} | {cap:<8} | {rew:<11} | {spr:<11} | {adv:<11} | {dec:<11} | {gas:<9} | {net:<14} | {ret:<10} | {mrg:<10}"
         )
 
-    print(divider)
+    log.info(divider)
     tot_ret = (total_net / total_cap) * 100.0 if total_cap > 0 else 0.0
-    print(
+    log.info(
         f"{'PORTFOLIO TOTAL (' + str(len(results)) + ' mkts)':<28} | "
         f"${total_cap:,.0f} | ${total_rew:,.2f} | ${total_spr:,.2f} | "
         f"-${total_adv:,.2f} | -${total_dec:,.2f} | -${total_gas:,.2f} | ${total_net:,.2f} | "
         f"{tot_ret:,.1f}% | ${total_merged:,.0f}"
     )
-    print("=" * len(header) + "\n")
+    log.info("=" * len(header) + "\n")
 
 
 def main() -> int:

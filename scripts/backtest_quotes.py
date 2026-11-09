@@ -818,7 +818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list:
-        print(epilog)
+        log.info(epilog)
         return 0
 
     started = time.time()
@@ -892,14 +892,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         min_fills=args.min_fills,
         tick_source=tick_source,
     )
-    print(text)
+    log.info(text)
 
     if result["rows"]:
-        print("")
-        print(f"per-fill rows ({min(args.limit_rows, len(result['rows']))} of {len(result['rows'])}):")
-        print("      side     price    shares      fill_ts        gross     markout         net")
+        log.info("")
+        log.info(f"per-fill rows ({min(args.limit_rows, len(result['rows']))} of {len(result['rows'])}):")
+        log.info("      side     price    shares      fill_ts        gross     markout         net")
         for row in result["rows"][: args.limit_rows]:
-            print(
+            log.info(
                 f"  {row['side']:>5}  {row['quote_price']:.4f}  {row['shares']:8.2f}"
                 f"  {_utc(row['fill_ts_ns'])}"
                 f"  {_fmt(row['gross_spread'], dp=4, width=9)}"
@@ -910,9 +910,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.no_write:
         stem = f"quote_backtest_{date}T{hour}_{asset}"
         parquet_path, text_path = write_outputs(result["rows"], Path(args.out), stem, text)
-        print("")
-        print(f"wrote {parquet_path} ({len(result['rows'])} rows)")
-        print(f"wrote {text_path}")
+        log.info("")
+        log.info(f"wrote {parquet_path} ({len(result['rows'])} rows)")
+        log.info(f"wrote {text_path}")
     log.info(f"done in {time.time() - started:.1f}s")
     return 0
 

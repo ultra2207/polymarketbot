@@ -1,6 +1,8 @@
 """Inspect top of book depth in dollars on Polymarket BTC books."""
 import json
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 con = duckdb.connect()
 con.execute("SET threads=2")
@@ -27,6 +29,6 @@ for _, row in res.iterrows():
     bid_depth_usd = sum(float(b["price"]) * float(b["size"]) for b in top_bids)
     ask_depth_usd = sum(float(a["price"]) * float(a["size"]) for a in top_asks)
     
-    print(f"\nMarket: {q[:55]}")
-    print(f"  Top 3 Bids: {top_bids} -> Depth: ${bid_depth_usd:.2f}")
-    print(f"  Top 3 Asks: {top_asks} -> Depth: ${ask_depth_usd:.2f}")
+    log.info(f"\nMarket: {q[:55]}")
+    log.info(f"  Top 3 Bids: {top_bids} -> Depth: ${bid_depth_usd:.2f}")
+    log.info(f"  Top 3 Asks: {top_asks} -> Depth: ${ask_depth_usd:.2f}")

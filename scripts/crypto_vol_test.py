@@ -9,6 +9,10 @@ import math
 
 import duckdb
 
+from polymarketbot.logs import get_logger
+
+log = get_logger(__name__)
+
 QUERIES = {}
 
 con = duckdb.connect()
@@ -39,7 +43,7 @@ SELECT minute_ms,
          * sqrt(525600.0) AS sigma_15m
 FROM vol
 """)
-print("vol minutes:", con.sql("SELECT count(*) FROM rvol").fetchall()[0][0])
+log.info('{!s} {!s}', "vol minutes:", con.sql("SELECT count(*) FROM rvol").fetchall()[0][0])
 
 # ---- 2. markets and outcomes ----------------------------------------------
 con.execute("""
@@ -51,7 +55,7 @@ WHERE h.crypto='BTC' AND h.timeframe='15-minute'
   AND h.start_ts IS NOT NULL AND h.end_ts IS NOT NULL
   AND l.resolved AND NOT coalesce(l.is_void,false)
 """)
-print("markets with outcome:", con.sql("SELECT count(*) FROM mk").fetchall()[0][0])
+log.info('{!s} {!s}', "markets with outcome:", con.sql("SELECT count(*) FROM mk").fetchall()[0][0])
 
 # ---- 3. spot at market start ----------------------------------------------
 con.execute("""
@@ -64,7 +68,7 @@ CREATE OR REPLACE TEMP TABLE mk0 AS
 SELECT mk.*, s.price AS spot_0
 FROM mk ASOF LEFT JOIN spot s ON s.ts_ms <= mk.start_ts*1000
 """)
-print("with spot_0:", con.sql("SELECT count(*) FROM mk0 WHERE spot_0 IS NOT NULL").fetchall()[0][0])
+log.info('{!s} {!s}', "with spot_0:", con.sql("SELECT count(*) FROM mk0 WHERE spot_0 IS NOT NULL").fetchall()[0][0])
 
 # ---- 4. join price path + spot + vol --------------------------------------
 con.execute("""
@@ -77,7 +81,7 @@ JOIN mk0 m USING(market_id)
 ASOF LEFT JOIN spot s ON s.ts_ms <= p.timestamp*1000
 ASOF LEFT JOIN rvol v ON v.minute_ms <= (p.timestamp//60)*60000
 """)
-print("joined rows:", con.sql("SELECT count(*) FROM j WHERE spot_0 IS NOT NULL AND spot_t IS NOT NULL").fetchall()[0][0])
+log.info('{!s} {!s}', "joined rows:", con.sql("SELECT count(*) FROM j WHERE spot_0 IS NOT NULL AND spot_t IS NOT NULL").fetchall()[0][0])
 
 rows = con.sql("""
 SELECT timestamp, end_ts, spot_0, spot_t, up_price, down_price, sigma_1h, sigma_15m, payout
@@ -85,7 +89,7 @@ FROM j
 WHERE spot_0 IS NOT NULL AND spot_t IS NOT NULL AND up_price>0 AND up_price<1
   AND sigma_1h IS NOT NULL AND sigma_1h>0.05 AND sigma_1h<5
 """).fetchall()
-print("analysis rows:", f"{len(rows):,}")
+log.info('{!s} {!s}', "analysis rows:", f"{len(rows):,}")
 
 
 def norm_cdf(x):
@@ -139,7 +143,7 @@ for ts, end_ts, s0, st, up_px, dn_px, s1h, s15, payout in rows:
         sig_impl = logratio / (zi * horizon) if zi != 0 else float('nan')
         recs.append((tau, float(up_px), float(dn_px), float(payout), model, sigma, sig_impl, tag))
 
-print("model records:", f"{len(recs):,}")
+log.info('{!s} {!s}', "model records:", f"{len(recs):,}")
 
 import statistics
 
@@ -169,29 +173,29 @@ for tag in ('1h', '15m'):
         continue
     edge_m = sum(r[3]-r[4] for r in sub)/len(sub)
     edge_k = sum(r[3]-r[1] for r in sub)/len(sub)
-    print(f"\n=== sigma={tag}: n={len(sub):,} ===")
-    print(f"  mean  market - model      {sum(r[1]-r[4] for r in sub)/len(sub):+.4f}")
-    print(f"  mean  outcome - model     {edge_m:+.4f}")
-    print(f"  mean  outcome - market    {edge_k:+.4f}")
-    print(f"  Spearman(market-model, outcome-model) {spearman([r[1]-r[4] for r in sub],[r[3]-r[4] for r in sub]):+.4f}")
+    log.info(f"\n=== sigma={tag}: n={len(sub):,} ===")
+    log.info(f"  mean  market - model      {sum(r[1]-r[4] for r in sub)/len(sub):+.4f}")
+    log.info(f"  mean  outcome - model     {edge_m:+.4f}")
+    log.info(f"  mean  outcome - market    {edge_k:+.4f}")
+    log.info(f"  Spearman(market-model, outcome-model) {spearman([r[1]-r[4] for r in sub],[r[3]-r[4] for r in sub]):+.4f}")
 
     # edge when the model disagrees with the market
-    print("\n  |model-market| >=   n        outcome-market edge   t-stat")
+    log.info("\n  |model-market| >=   n        outcome-market edge   t-stat")
     for th in (0.02, 0.05, 0.10, 0.15, 0.20):
         pos = [r for r in sub if r[4]-r[1] >= th]
         neg = [r for r in sub if r[1]-r[4] >= th]
         if len(pos) > 30:
             m = sum(r[3]-r[4] for r in pos)/len(pos)
             sd = statistics.pstdev([r[3]-r[4] for r in pos]) or 1e-9
-            print(f"    model>market {th:.2f}  {len(pos):>8,}   {m:+.4f}   {m/(sd/math.sqrt(len(pos))):+.1f}")
+            log.info(f"    model>market {th:.2f}  {len(pos):>8,}   {m:+.4f}   {m/(sd/math.sqrt(len(pos))):+.1f}")
         if len(neg) > 30:
             m = sum((1-r[3])-r[2] for r in neg)/len(neg)
             sd = statistics.pstdev([(1-r[3])-r[2] for r in neg]) or 1e-9
-            print(f"    market>model {th:.2f}  {len(neg):>8,}   {m:+.4f}   {m/(sd/math.sqrt(len(neg))):+.1f}")
+            log.info(f"    market>model {th:.2f}  {len(neg):>8,}   {m:+.4f}   {m/(sd/math.sqrt(len(neg))):+.1f}")
 
     # implied vol vs realised
     iv = [r[6] for r in sub if r[6] is not None and not math.isnan(r[6]) and 0.01 < r[6] < 20]
     if iv:
-        print(f"\n  implied vol: median {statistics.median(iv):.3f}  mean {sum(iv)/len(iv):.3f}  n={len(iv):,}")
+        log.info(f"\n  implied vol: median {statistics.median(iv):.3f}  mean {sum(iv)/len(iv):.3f}  n={len(iv):,}")
         rv = [r[5] for r in sub]
-        print(f"  realised vol: median {statistics.median(rv):.3f}")
+        log.info(f"  realised vol: median {statistics.median(rv):.3f}")

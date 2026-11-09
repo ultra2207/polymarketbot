@@ -37,6 +37,8 @@ from pathlib import Path
 
 import requests
 from tqdm import tqdm
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 SII = "https://huggingface.co/datasets/SII-WANGZJ/Polymarket_data/resolve/main"
 DOME = (
@@ -112,7 +114,7 @@ def plan_core(dest: Path, session: requests.Session) -> list[Item]:
     for name, url in specs:
         probe = head(session, url)
         if probe is None:
-            print(f"  ! could not probe {name} (network or missing)")
+            log.info(f"  ! could not probe {name} (network or missing)")
             continue
         size, etag = probe
         items.append(Item(name=name, url=url, dest=dest / name, size=size, etag=etag))
@@ -127,7 +129,7 @@ def plan_pmxt(
     workers: int,
 ) -> list[Item]:
     stamps = hourly_stamps(start, end)
-    print(f"  probing {len(stamps):,} PMXT hourly files ...")
+    log.info(f"  probing {len(stamps):,} PMXT hourly files ...")
     items: list[Item] = []
 
     def probe(stamp: str) -> Item | None:
@@ -154,7 +156,7 @@ def plan_pmxt(
     items.sort(key=lambda i: i.name)
     missing = len(stamps) - len(items)
     if missing:
-        print(f"  ! {missing:,} hours returned 404 (recorded as absent)")
+        log.info(f"  ! {missing:,} hours returned 404 (recorded as absent)")
     return items
 
 
@@ -183,7 +185,7 @@ def download(
     previous = manifest.get(item.name, {})
     if already_complete(item):
         if previous.get("etag") and item.etag and previous["etag"] != item.etag:
-            print(
+            log.info(
                 f"\n  ~ {item.name}: upstream ETag changed since last download "
                 f"({previous['etag']} -> {item.etag}). Keeping local copy; use --force to refresh."
             )
@@ -192,7 +194,7 @@ def download(
         resume = item.part.stat().st_size if item.part.exists() else 0
         if previous.get("etag") and item.etag and previous["etag"] != item.etag:
             # upstream changed under a partial file: never stitch two versions together
-            print(f"\n  ~ {item.name}: ETag changed, discarding partial download")
+            log.info(f"\n  ~ {item.name}: ETag changed, discarding partial download")
             item.part.unlink(missing_ok=True)
             resume = 0
         if item.size is not None and resume > item.size:
@@ -231,7 +233,7 @@ def download(
                 resume = item.part.stat().st_size if item.part.exists() else 0
                 if attempt == RETRIES - 1:
                     item.status = "failed"
-                    print(f"\n  ! {item.name}: {type(exc).__name__}: {exc}")
+                    log.info(f"\n  ! {item.name}: {type(exc).__name__}: {exc}")
                 else:
                     time.sleep(min(2**attempt, 60))
 
@@ -270,7 +272,7 @@ def human(n: float | None) -> str:
 
 
 def print_plan(items: list[Item], dest: Path) -> tuple[int, int]:
-    print(f"\n{len(items)} files -> {dest}\n")
+    log.info(f"\n{len(items)} files -> {dest}\n")
     total = 0
     present = 0
     for item in items:
@@ -282,10 +284,10 @@ def print_plan(items: list[Item], dest: Path) -> tuple[int, int]:
             flag = "part"
         else:
             flag = "new "
-        print(f"  [{flag}] {human(item.size):>10}  {item.name}")
-    print(f"\n  total {human(total)}   present {human(present)}   to fetch {human(total - present)}")
+        log.info(f"  [{flag}] {human(item.size):>10}  {item.name}")
+    log.info(f"\n  total {human(total)}   present {human(present)}   to fetch {human(total - present)}")
     free = shutil.disk_usage(dest).free
-    print(f"  free on destination: {human(free)}")
+    log.info(f"  free on destination: {human(free)}")
     return total, present
 
 
@@ -329,19 +331,19 @@ def main() -> int:
             path = dest / name
             expected = meta.get("bytes")
             if not path.exists():
-                print(f"  missing  {name}")
+                log.info(f"  missing  {name}")
                 bad += 1
             elif expected is not None and path.stat().st_size != expected:
-                print(f"  sizemis  {name}: {path.stat().st_size:,} != {expected:,}")
+                log.info(f"  sizemis  {name}: {path.stat().st_size:,} != {expected:,}")
                 bad += 1
-        print(f"\n{'OK' if bad == 0 else f'{bad} problems'}")
+        log.info(f"\n{'OK' if bad == 0 else f'{bad} problems'}")
         return 0 if bad == 0 else 1
 
     session = requests.Session()
     want_pmxt = args.pmxt or args.all or args.only == "pmxt"
     want_core = not args.only or args.only == "core"
 
-    print("planning ...")
+    log.info("planning ...")
     items: list[Item] = []
     if want_core:
         items += plan_core(dest, session)
@@ -349,34 +351,34 @@ def main() -> int:
         start = datetime.fromisoformat(args.pmxt_start).replace(tzinfo=timezone.utc)
         end = datetime.fromisoformat(args.pmxt_end).replace(tzinfo=timezone.utc)
         if end < start:
-            print("  ! --pmxt-end is before --pmxt-start")
+            log.info("  ! --pmxt-end is before --pmxt-start")
             return 2
         items += plan_pmxt(dest, session, start, end, min(args.parallel * 4, 16))
 
     if not items:
-        print("nothing to do")
+        log.info("nothing to do")
         return 1
 
     total, present = print_plan(items, dest)
     free = shutil.disk_usage(dest).free
     needed = total - present
     if free < needed + DISK_HEADROOM_GB * 1024**3:
-        print(
+        log.info(
             f"\n  ! not enough disk: need {human(needed + DISK_HEADROOM_GB * 1024**3)}, "
             f"have {human(free)}. Aborting."
         )
         return 2
 
     if args.dry_run:
-        print("\n  dry run - nothing downloaded")
+        log.info("\n  dry run - nothing downloaded")
         return 0
 
     if not args.yes:
-        print(f"\n  about to fetch {human(needed)}. Ctrl-C to abort.")
+        log.info(f"\n  about to fetch {human(needed)}. Ctrl-C to abort.")
         try:
             input("  press Enter to continue ... ")
         except (EOFError, KeyboardInterrupt):
-            print("\n  aborted")
+            log.info("\n  aborted")
             return 130
 
     lock = threading.Lock()
@@ -409,7 +411,7 @@ def main() -> int:
             for item in items:
                 download(item, session, bar, manifest, lock)
     except KeyboardInterrupt:
-        print("\n\n  interrupted - partial files kept as .part, re-run to resume")
+        log.info("\n\n  interrupted - partial files kept as .part, re-run to resume")
     finally:
         bar.close()
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
@@ -417,20 +419,20 @@ def main() -> int:
     elapsed = time.time() - started
     done = sum(1 for i in items if i.status in ("done", "skipped"))
     failed = [i for i in items if i.status == "failed"]
-    print(f"\n  {done}/{len(items)} files complete in {elapsed / 60:.1f} min")
+    log.info(f"\n  {done}/{len(items)} files complete in {elapsed / 60:.1f} min")
     if failed:
-        print(f"  {len(failed)} failed - re-run the same command to resume:")
+        log.info(f"  {len(failed)} failed - re-run the same command to resume:")
         for item in failed[:10]:
-            print(f"    {item.name}")
+            log.info(f"    {item.name}")
 
     if args.hash:
-        print("\n  hashing ...")
+        log.info("\n  hashing ...")
         for item in items:
             if item.status in ("done", "skipped"):
                 digest = sha256_of(item.dest)
                 with lock:
                     manifest[item.name]["sha256"] = digest
-                print(f"    {digest[:16]}...  {item.name}")
+                log.info(f"    {digest[:16]}...  {item.name}")
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
     return 0 if not failed else 1

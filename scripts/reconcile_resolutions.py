@@ -33,6 +33,8 @@ from pathlib import Path
 
 import duckdb
 import requests
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 LABELS = OUT / "market_labels.parquet"
@@ -94,7 +96,7 @@ def sample(con: duckdb.DuckDBPyConnection, n: int) -> list[dict]:
     rows: list[dict] = []
     for name, sql in groups.items():
         got = con.sql(sql).fetchall()
-        print(f"  sampled {len(got):>3}  {name}")
+        log.info(f"  sampled {len(got):>3}  {name}")
         for cid, grp, chain_p0, sii_p0 in got:
             rows.append({"condition_id": cid, "group": grp,
                          "chain_p0": chain_p0, "sii_p0": sii_p0})
@@ -130,7 +132,7 @@ def get(path: str, params: dict, attempts: int = 6) -> dict | None:
         except Exception as exc:  # noqa: BLE001
             last = exc
             time.sleep(0.7 * (i + 1))
-    print(f"    ! {path} {params} failed: {type(last).__name__}: {last}")
+    log.info(f"    ! {path} {params} failed: {type(last).__name__}: {last}")
     return None
 
 
@@ -198,10 +200,10 @@ def main() -> int:
     args = ap.parse_args()
 
     con = connect()
-    print("sampling:")
+    log.info("sampling:")
     rows = sample(con, args.n)
 
-    print(f"\nfetching {len(rows)} markets from {API} ...")
+    log.info(f"\nfetching {len(rows)} markets from {API} ...")
     done = 0
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -210,30 +212,30 @@ def main() -> int:
             results.append(fut.result())
             done += 1
             if done % 25 == 0 or done == len(rows):
-                print(f"  {done}/{len(rows)}")
+                log.info(f"  {done}/{len(rows)}")
 
     summary = summarise(results)
 
-    print("\nreconciliation:")
-    print(f"  {'group':22} {'sampled':>8} {'answered':>9} {'chain':>12} {'sii':>12} {'resolutions':>14}")
+    log.info("\nreconciliation:")
+    log.info(f"  {'group':22} {'sampled':>8} {'answered':>9} {'chain':>12} {'sii':>12} {'resolutions':>14}")
     for grp, s in summary.items():
         def fmt(m, c):
             return f"{m}/{c}" if c else "-"
-        print(f"  {grp:22} {s['sampled']:>8} {s['api_answered']:>9} "
+        log.info(f"  {grp:22} {s['sampled']:>8} {s['api_answered']:>9} "
               f"{fmt(s['chain_vs_api_match'], s['chain_vs_api_checked']):>12} "
               f"{fmt(s['sii_vs_api_match'], s['sii_vs_api_checked']):>12} "
               f"{fmt(s['res_vs_api_match'], s['res_vs_api_checked']):>14}")
 
-    print("\nworst disagreements:")
+    log.info("\nworst disagreements:")
     bad = [r for r in results
            if close(r["chain_p0"], r["api_final_p0"]) is False
            or close(r["sii_p0"], r["api_final_p0"]) is False
            or close(r["api_res_p0"], r["api_final_p0"]) is False]
     for r in bad[:12]:
-        print(f"  {r['condition_id'][:12]} {r['group']:18} "
+        log.info(f"  {r['condition_id'][:12]} {r['group']:18} "
               f"chain={r['chain_p0']} sii={r['sii_p0']} res={r['api_res_p0']} api={r['api_final_p0']}")
     if not bad:
-        print("  none")
+        log.info("  none")
 
     OUT.mkdir(parents=True, exist_ok=True)
     jsonl = OUT / "resolution_reconciliation.jsonl"
@@ -247,7 +249,7 @@ def main() -> int:
     """)
     jsonl.unlink(missing_ok=True)
     (OUT / "resolution_reconciliation.json").write_text(json.dumps(summary, indent=2))
-    print(f"\nwrote {OUT / 'resolution_reconciliation.parquet'}")
+    log.info(f"\nwrote {OUT / 'resolution_reconciliation.parquet'}")
     return 0
 
 

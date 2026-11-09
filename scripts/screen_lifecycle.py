@@ -34,6 +34,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 
@@ -77,13 +79,13 @@ def main() -> int:
     """)
 
     n = con.sql("SELECT count(*) FROM obs").fetchall()[0][0]
-    print(f"observations with resolvable age: {n:,}")
+    log.info(f"observations with resolvable age: {n:,}")
     if n == 0:
-        print("no rows joined - check created_at/end_date formats")
+        log.info("no rows joined - check created_at/end_date formats")
         return 1
 
     neg = con.sql("SELECT count(*) FROM obs WHERE age_hours < 0").fetchall()[0][0]
-    print(f"   of which age < 0 (end before creation, dropped): {neg:,}")
+    log.info(f"   of which age < 0 (end before creation, dropped): {neg:,}")
 
     con.execute("""
         CREATE OR REPLACE TEMP TABLE binned AS
@@ -113,7 +115,7 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print(f"\n{'age at entry':12} {'markets':>8} {'mean px':>8} {'payout':>7} "
+    log.info(f"\n{'age at entry':12} {'markets':>8} {'mean px':>8} {'payout':>7} "
           f"{'calib gap':>10} {'±se':>7} {'net edge':>9} {'±se':>7} {'med life':>9}")
     for bin_, n_m, px, pay, gap, gse, net, nse, life in con.sql("""
         SELECT age_bin, count(*), avg(px), avg(pay),
@@ -126,7 +128,7 @@ def main() -> int:
         ORDER BY CASE age_bin WHEN '< 1 d' THEN 1 WHEN '1-3 d' THEN 2
                               WHEN '3-7 d' THEN 3 WHEN '7-30 d' THEN 4 ELSE 5 END
     """).fetchall():
-        print(f"{bin_:12} {n_m:>8,} {px:>8.3f} {pay:>7.3f} {gap:>+10.4f} "
+        log.info(f"{bin_:12} {n_m:>8,} {px:>8.3f} {pay:>7.3f} {gap:>+10.4f} "
               f"{gse:>7.4f} {net:>+9.4f} {nse:>7.4f} {life:>9,.0f}")
 
     # Two questions, both required before this is interesting:
@@ -142,17 +144,17 @@ def main() -> int:
     deltas = [gaps[i + 1] - gaps[i] for i in range(len(gaps) - 1)]
     monotone = all(d <= 0 for d in deltas) or all(d >= 0 for d in deltas)
     best = max(gaps)
-    print(f"\nmonotone in age: {monotone} (deltas {['%+.4f' % d for d in deltas]})")
-    print(f"largest gap {best:+.4f} vs taker half-spread {args.half_spread:.4f}")
+    log.info(f"\nmonotone in age: {monotone} (deltas {['%+.4f' % d for d in deltas]})")
+    log.info(f"largest gap {best:+.4f} vs taker half-spread {args.half_spread:.4f}")
 
     if best < args.half_spread:
-        print("=> DEAD: every age bin sits inside the ~1c taker half-spread. "
+        log.info("=> DEAD: every age bin sits inside the ~1c taker half-spread. "
               "Age does not predict a tradable error.")
     elif not monotone:
-        print("=> NOT AN AGE EFFECT: the gap is non-monotone, so it is a composition "
+        log.info("=> NOT AN AGE EFFECT: the gap is non-monotone, so it is a composition "
               "artefact of which markets live in each bucket, not a lifecycle signal.")
     else:
-        print("=> candidate: monotone and above cost - check spreads before believing it")
+        log.info("=> candidate: monotone and above cost - check spreads before believing it")
     return 0
 
 

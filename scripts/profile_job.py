@@ -36,14 +36,16 @@ import time
 from pathlib import Path
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 
 def profile_script(path: Path, top: int) -> int:
     if not path.exists():
-        print(f"no such file: {path}")
+        log.info(f"no such file: {path}")
         return 1
 
-    print(f"profiling {path} ...")
+    log.info(f"profiling {path} ...")
     profiler = cProfile.Profile()
     started = time.perf_counter()
     try:
@@ -51,7 +53,7 @@ def profile_script(path: Path, top: int) -> int:
         runpy.run_path(str(path), run_name="__main__")
     except SystemExit as exc:
         if exc.code not in (0, None):
-            print(f"script exited with {exc.code}")
+            log.info(f"script exited with {exc.code}")
     finally:
         profiler.disable()
     elapsed = time.perf_counter() - started
@@ -60,15 +62,15 @@ def profile_script(path: Path, top: int) -> int:
     stats = pstats.Stats(profiler, stream=stream)
     stats.sort_stats("cumulative")
 
-    print(f"\nwall time: {elapsed:.2f}s")
-    print("\ntop by cumulative time:")
+    log.info(f"\nwall time: {elapsed:.2f}s")
+    log.info("\ntop by cumulative time:")
     stats.print_stats(top)
-    print(stream.getvalue())
+    log.info(stream.getvalue())
 
     stream = io.StringIO()
     pstats.Stats(profiler, stream=stream).sort_stats("tottime").print_stats(top)
-    print("\ntop by own time (where the CPU actually is):")
-    print(stream.getvalue())
+    log.info("\ntop by own time (where the CPU actually is):")
+    log.info(stream.getvalue())
     return 0
 
 
@@ -77,7 +79,7 @@ def profile_sql(query: str) -> int:
     con.execute("SET threads = 8")
     con.execute("SET memory_limit = '6GB'")
 
-    print("EXPLAIN ANALYZE:\n")
+    log.info("EXPLAIN ANALYZE:\n")
     started = time.perf_counter()
     rows = con.sql(f"EXPLAIN ANALYZE {query}").fetchall()
     elapsed = time.perf_counter() - started
@@ -86,10 +88,10 @@ def profile_sql(query: str) -> int:
     # DuckDB prints a plan tree; surface the timing lines.
     for line in text.splitlines():
         if any(k in line for k in ("Total Time", "└─", "├─", "Rows", "cost")):
-            print(line)
+            log.info(line)
 
-    print(f"\nwall time: {elapsed:.2f}s")
-    print("\nfull plan saved to data/processed/_last_plan.txt")
+    log.info(f"\nwall time: {elapsed:.2f}s")
+    log.info("\nfull plan saved to data/processed/_last_plan.txt")
     Path("data/processed").mkdir(parents=True, exist_ok=True)
     Path("data/processed/_last_plan.txt").write_text(text, encoding="utf-8")
     return 0

@@ -29,6 +29,8 @@ import duckdb
 import numpy as np
 import pyarrow.parquet as pq
 from datetime import datetime, timezone
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SESSION_ROOT = REPO_ROOT / "data" / "live_tape"
@@ -325,9 +327,9 @@ def main() -> int:
     json_path = Path(args.json_output) if args.json_output else REPO_ROOT / "data" / "derived" / "live_join" / f"{root.name}.json"
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
-    print(json.dumps(report, indent=1, default=str))
-    print(f"report -> {report_path}")
-    print(f"json   -> {json_path}")
+    log.info(json.dumps(report, indent=1, default=str))
+    log.info(f"report -> {report_path}")
+    log.info(f"json   -> {json_path}")
     return 0
 
 

@@ -801,7 +801,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     panel = read_panel(args.out)
     if panel is None:
-        print("no aligned rows written; nothing to report")
+        log.info("no aligned rows written; nothing to report")
         return 0
     summary = analyse(panel)
     first = datetime.fromtimestamp(
@@ -815,7 +815,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"{last:%Y-%m-%dT%H:%M:%SZ}",
     )
     text = format_report(summary, window)
-    print(text)
+    log.info(text)
     log.info(
         "panel rows={} pairs={}", summary["rows"], summary["pairs_with_data"]
     )

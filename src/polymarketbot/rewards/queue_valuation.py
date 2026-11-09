@@ -28,6 +28,140 @@ from polymarketbot.logs import get_logger
 
 logger = get_logger("queue_valuation")
 
+YEAR_SECONDS = 365.25 * 86_400.0
+
+
+@dataclass
+class QueueParameterFit:
+    """Live-fitted inputs for :class:`QueuePriorityValuationModel`.
+
+    Every parameter is an EWMA of a measured sample; no queue-model default is
+    used when a measurement or a live proxy exists. The fitter consumes
+    successive L2 snapshots (trade/turnover rate, queue cancellation, price
+    impact, realized volatility) and the allocator's measured marginal return
+    (capital hurdle). ``build_model`` returns the fitted model plus a source map
+    so callers can log exactly which values were measured, proxied, or missing.
+    """
+
+    trade_rate_shares_sec: Optional[float] = None
+    cancel_intensity_per_sec: Optional[float] = None
+    kyle_lambda: Optional[float] = None
+    volatility_annualized: Optional[float] = None
+    capital_hurdle_annual: Optional[float] = None
+    var_per_second: Optional[float] = None
+    samples: int = 0
+
+    def set_capital_hurdle(self, annual_rate: float) -> None:
+        """Set the measured opportunity cost of capital (annualised)."""
+        if annual_rate is not None and annual_rate >= 0.0:
+            self.capital_hurdle_annual = float(annual_rate)
+
+    def observe_sweep(
+        self,
+        *,
+        dt: float,
+        trade_rate_sample: Optional[float],
+        cancelled_shares: float,
+        previous_depth: float,
+        abs_mid_change: float,
+        abs_signed_flow_shares: float,
+        var_per_second_sample: Optional[float],
+    ) -> None:
+        """Fold one full radar-sweep interval into the EWMA estimates.
+
+        Inputs are aggregated across the universe once per sweep, not once per
+        token, so the EWMA adapts over time rather than being frozen by the
+        thousands of tokens in the first sweep.
+        """
+        if dt <= 0.0:
+            return
+        self.samples += 1
+        alpha = 2.0 / (self.samples + 1.0)
+
+        def ewma(old: Optional[float], new: float) -> float:
+            return new if old is None else (1.0 - alpha) * old + alpha * new
+
+        if trade_rate_sample is not None and trade_rate_sample > 0.0:
+            self.trade_rate_shares_sec = ewma(self.trade_rate_shares_sec, float(trade_rate_sample))
+        if previous_depth > 0.0:
+            cancel = max(0.0, cancelled_shares) / previous_depth / dt
+            self.cancel_intensity_per_sec = ewma(self.cancel_intensity_per_sec, cancel)
+        if abs_signed_flow_shares > 0.0:
+            impact_per_1000 = abs_mid_change / max(1e-9, abs_signed_flow_shares / 1000.0)
+            self.kyle_lambda = ewma(self.kyle_lambda, impact_per_1000)
+        if var_per_second_sample is not None and var_per_second_sample > 0.0:
+            self.var_per_second = ewma(self.var_per_second, var_per_second_sample)
+            self.volatility_annualized = math.sqrt(self.var_per_second * YEAR_SECONDS)
+
+    def build_model(
+        self,
+        proxies: Dict[str, float],
+    ) -> Tuple[Optional["QueuePriorityValuationModel"], Dict[str, Any]]:
+        """Construct the model from measurements, falling back to live proxies.
+
+        Returns ``(model, sources)``. ``model`` is ``None`` only when a required
+        parameter has neither a measurement nor a live proxy, in which case the
+        caller must not silently substitute a hardcoded default.
+        """
+        sources: Dict[str, Any] = {}
+        values: Dict[str, Optional[float]] = {}
+
+        def pick(
+            name: str,
+            measured: Optional[float],
+            proxy: Optional[float],
+            allow_zero: bool = False,
+        ) -> Optional[float]:
+            if measured is not None and (measured > 0.0 or (allow_zero and measured == 0.0)):
+                sources[name] = "measured"
+                return float(measured)
+            if proxy is not None and proxy > 0.0:
+                sources[name] = "live_proxy"
+                return float(proxy)
+            sources[name] = "unavailable"
+            return None
+
+        values["trade_arrival_rate_shares_sec"] = pick(
+            "trade_arrival_rate_shares_sec",
+            self.trade_rate_shares_sec,
+            proxies.get("trade_rate_shares_sec"),
+        )
+        values["cancellation_rate_intensity"] = pick(
+            "cancellation_rate_intensity",
+            self.cancel_intensity_per_sec,
+            proxies.get("cancel_intensity_per_sec"),
+        )
+        values["volatility_annualized"] = pick(
+            "volatility_annualized",
+            self.volatility_annualized,
+            proxies.get("volatility_annualized"),
+        )
+        values["annual_capital_hurdle_rate"] = pick(
+            "annual_capital_hurdle_rate",
+            self.capital_hurdle_annual,
+            proxies.get("capital_hurdle_annual"),
+            allow_zero=True,
+        )
+        kyle = self.kyle_lambda
+        if kyle is None:
+            kyle = proxies.get("kyle_lambda")
+            sources["kyle_lambda"] = "live_proxy" if kyle is not None else "unavailable"
+        else:
+            sources["kyle_lambda"] = "measured"
+        values["kyle_lambda"] = kyle
+
+        if any(v is None for v in values.values()):
+            return None, {"sources": sources, "values": values, "samples": self.samples}
+
+        model = QueuePriorityValuationModel(
+            trade_arrival_rate_shares_sec=float(values["trade_arrival_rate_shares_sec"]),
+            cancellation_rate_intensity=float(values["cancellation_rate_intensity"]),
+            kyle_lambda=float(values["kyle_lambda"]),
+            volatility_annualized=float(values["volatility_annualized"]),
+            annual_capital_hurdle_rate=float(values["annual_capital_hurdle_rate"]),
+        )
+        return model, {"sources": sources, "values": values, "samples": self.samples}
+
 
 # ============================================================================
 # 1. POLYGON POS GAS & SMART CONTRACT PROFILE
@@ -316,16 +450,22 @@ class CapitalMigrationEngine:
         queue_ahead_ask: float,
         half_spread_cents: float,
         mid_price: float = 0.50,
+        queue_model: Optional[QueuePriorityValuationModel] = None,
     ) -> float:
-        """Value of FIFO queue priority surrendered upon cancellation."""
-        val_bid = self.queue_model.evaluate_queue_value(
+        """Value of FIFO queue priority surrendered upon cancellation.
+
+        ``queue_model`` lets the caller inject a model fitted from measured
+        microstructure instead of the constructor default.
+        """
+        model = queue_model or self.queue_model
+        val_bid = model.evaluate_queue_value(
             quote_size=resting_bid_size,
             queue_ahead=queue_ahead_bid,
             half_spread_cents=half_spread_cents,
             token_mid_price=mid_price,
         ).net_queue_value_usd
 
-        val_ask = self.queue_model.evaluate_queue_value(
+        val_ask = model.evaluate_queue_value(
             quote_size=resting_ask_size,
             queue_ahead=queue_ahead_ask,
             half_spread_cents=half_spread_cents,

@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         f"sign p50={local['p50_ms']:.3f} ms p99={local['p99_ms']:.3f} ms; "
         f"CLOB min rtt={min_rtt_ms:.1f} ms; path upper={upper:.1f} ms -> {out}"
     )
-    print(json.dumps(result, indent=1))
+    log.info(json.dumps(result, indent=1))
     return 0
 
 

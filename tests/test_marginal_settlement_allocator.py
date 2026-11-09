@@ -116,12 +116,7 @@ def test_velocity_favors_short_duration():
 
 def test_water_filling_equalizes_marginal_velocity():
     """Verify that water-filling allocates capital such that marginal velocity is balanced across markets."""
-    allocator = MarginalSettlementAllocator(
-        min_ticket_usd=25.0,
-        max_market_pct=0.60,
-        max_open_slots=2,
-        solver_backend="water_filling",
-    )
+    allocator = MarginalSettlementAllocator(solver_backend="water_filling")
 
     # Market A: fast duration (60s), 2 levels:
     # Level 0: 0.960 (100 shs = $96) -> vel = (0.04/0.96)*(31536000/60) = 21,900
@@ -147,7 +142,7 @@ def test_water_filling_equalizes_marginal_velocity():
     # Budget $150:
     # First: Cand A Level 0 ($96, vel 21,900)
     # Next: remaining $54 goes to Cand B Level 0 (vel 10,950 > Cand A Level 1 vel 10,726.5)!
-    res = allocator.allocate([cand_a, cand_b], usable_capital=150.0, bankroll_usd=500.0)
+    res = allocator.allocate([cand_a, cand_b], usable_capital=150.0)
 
     alloc_map = {a.condition_id: a for a in res.allocations}
     assert "0xA" in alloc_map
@@ -160,12 +155,7 @@ def test_water_filling_equalizes_marginal_velocity():
 
 def test_marginal_strictly_beats_uniform_tranche_sizing():
     """Prove that Marginal Allocation strictly dominates uniform tranche sizing in ARR and net profit."""
-    allocator = MarginalSettlementAllocator(
-        min_ticket_usd=25.0,
-        max_market_pct=0.50,
-        max_open_slots=5,
-        solver_backend="auto",
-    )
+    allocator = MarginalSettlementAllocator(solver_backend="auto")
 
     # 3 candidates with varying discount and duration
     candidates = [
@@ -195,27 +185,32 @@ def test_marginal_strictly_beats_uniform_tranche_sizing():
         ),
     ]
 
-    # Usable capital $500, Bankroll $1000, 5 open slots
-    # Uniform sizing allocates min(500/5, 1000*0.5, 500) = $100 per slot
-    # Uniform gives $100 to Cand 1, $100 to Cand 2, $100 to Cand 3 (Total = $300, leaving $200 unallocated or dilute)
-    # Marginal allocation gives $288 to Cand 1 (full capacity!), $212 to Cand 2, $0 to Cand 3
-    comparison = allocator.compare_with_uniform(
-        candidates=candidates,
-        usable_capital=500.0,
-        bankroll_usd=1000.0,
-        open_slots=5,
-    )
+    # Uniform baseline: equal tranche per market from the same $500 budget.
+    uniform_alloc = 0.0
+    uniform_profit = 0.0
+    uniform_arr_numerator = 0.0
+    slot_alloc = 500.0 / len(candidates)
+    for cand in candidates:
+        deploy = min(slot_alloc, cand.total_depth_usd)
+        shs, cost, _eff, _marg, _lvls, fills = MarginalSettlementAllocator.compute_shares_and_cost(
+            cand.ask_ladder, deploy
+        )
+        net = cand.p_win * shs - cost - cand.fee_for_fills(fills) - cand.gas_usd
+        uniform_alloc += cost
+        uniform_profit += net
+        uniform_arr_numerator += (net / cost) * (SECONDS_PER_YEAR / cand.target_settle_sec) * cost
 
-    marg_arr = comparison["marginal"]["portfolio_arr"]
-    unif_arr = comparison["uniform"]["portfolio_arr"]
-    marg_profit = comparison["marginal"]["net_profit_usd"]
-    unif_profit = comparison["uniform"]["net_profit_usd"]
+    uniform_arr = uniform_arr_numerator / uniform_alloc if uniform_alloc > 0 else 0.0
+
+    res = allocator.allocate(candidates, usable_capital=500.0)
+    marg_arr = res.expected_portfolio_arr
+    marg_profit = res.expected_portfolio_profit_usd
 
     # Marginal allocation must produce strictly higher ARR and net profit
-    assert marg_arr > unif_arr
-    assert marg_profit > unif_profit
-    assert comparison["marginal_vs_uniform_arr_ratio"] > 1.20
-    assert comparison["marginal_vs_uniform_profit_ratio"] > 1.20
+    assert marg_arr > uniform_arr
+    assert marg_profit > uniform_profit
+    assert marg_arr / uniform_arr > 1.20
+    assert marg_profit / uniform_profit > 1.20
 
 
 def test_scip_and_water_filling_parity():
@@ -237,11 +232,11 @@ def test_scip_and_water_filling_parity():
         ),
     ]
 
-    alloc_scip = MarginalSettlementAllocator(min_ticket_usd=25.0, max_market_pct=0.50, solver_backend="scip")
-    alloc_wf = MarginalSettlementAllocator(min_ticket_usd=25.0, max_market_pct=0.50, solver_backend="water_filling")
+    alloc_scip = MarginalSettlementAllocator(solver_backend="scip")
+    alloc_wf = MarginalSettlementAllocator(solver_backend="water_filling")
 
-    res_scip = alloc_scip.allocate(candidates, usable_capital=300.0, bankroll_usd=1000.0)
-    res_wf = alloc_wf.allocate(candidates, usable_capital=300.0, bankroll_usd=1000.0)
+    res_scip = alloc_scip.allocate(candidates, usable_capital=300.0)
+    res_wf = alloc_wf.allocate(candidates, usable_capital=300.0)
 
     assert res_scip.active_markets_count == res_wf.active_markets_count
     # Total allocated should match within rounding tolerance
@@ -251,29 +246,44 @@ def test_scip_and_water_filling_parity():
 
 
 def test_constraints_and_edge_cases():
-    """Verify constraint handling: ticket floor, zero budget, empty candidates, and slot limits."""
-    allocator = MarginalSettlementAllocator(
-        min_ticket_usd=25.0,
-        max_market_pct=0.25,
-        max_open_slots=2,
-    )
+    """Verify venue-minimum, zero budget, empty candidates, and ladder-depth-only caps."""
+    allocator = MarginalSettlementAllocator()
 
     # Empty candidate list
-    res_empty = allocator.allocate([], usable_capital=500.0, bankroll_usd=1000.0)
+    res_empty = allocator.allocate([], usable_capital=500.0)
     assert res_empty.active_markets_count == 0
     assert res_empty.total_allocated_usd == 0.0
 
-    # Usable capital below minimum ticket
-    cand = SettlementCandidate(
+    # A venue minimum order of 20 shares costs $19.20 at 0.960, so $15 is
+    # below the executable minimum and must be pruned, not rounded up.
+    cand_min = SettlementCandidate(
         condition_id="0xC",
         token_id="t",
         question="Q",
         target_settle_sec=100.0,
         ask_ladder=[(0.960, 50.0)],
+        min_order_shares=20.0,
     )
-    res_low = allocator.allocate([cand], usable_capital=15.0, bankroll_usd=1000.0)
+    res_low = allocator.allocate([cand_min], usable_capital=15.0)
     assert res_low.active_markets_count == 0
 
-    # Max single-market cap respected: 25% of $1,000 = $250 max
-    res_cap = allocator.allocate([cand], usable_capital=500.0, bankroll_usd=1000.0)
-    assert res_cap.total_allocated_usd <= 250.0
+    # There is no bankroll-percentage cap: the entire real ladder depth is the
+    # only per-market bound ($48 here).
+    res_full = allocator.allocate([cand_min], usable_capital=500.0)
+    assert abs(res_full.total_allocated_usd - 48.0) < 0.51
+
+
+def test_negative_survival_edge_is_not_funded():
+    """A candidate whose survival probability is below its ask plus fees gets zero capital."""
+    allocator = MarginalSettlementAllocator(solver_backend="water_filling")
+    cand = SettlementCandidate(
+        condition_id="0xHAZARD",
+        token_id="t",
+        question="Hazardous outcome",
+        target_settle_sec=600.0,
+        ask_ladder=[(0.960, 100.0)],
+        p_win=0.95,  # 5% hazard exceeds the 4% discount
+    )
+    res = allocator.allocate([cand], usable_capital=100.0)
+    assert res.total_allocated_usd == 0.0
+    assert res.active_markets_count == 0

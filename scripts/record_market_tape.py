@@ -78,7 +78,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     files = [p for p in recorder.output_files() if p.exists()]
     for path in files:
-        print(path)
+        log.info(path)
     if not files:
         log.warning("No tape file was written (no book samples captured)")
         return 1

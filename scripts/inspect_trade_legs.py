@@ -5,6 +5,8 @@ import duckdb
 import pandas as pd
 from scripts.audit_domain3_l2_tape import audit_hour_slice, load_universe_metadata
 from dataclasses import asdict
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 c_map, ev_map = load_universe_metadata()
 anoms, _ = audit_hour_slice('data/tape/clob_events/date=2026-11-04/hour=00', c_map, ev_map)
@@ -30,11 +32,11 @@ for r in df.itertuples():
                 one_leg_traded += 1
                 trade_details.append({"type": "one_leg", "cid": r.condition_id, "n_trades": len(sub), "spread": r.gross_spread, "dur_ms": r.duration_venue_ms, "assets": list(traded_assets)})
 
-print(f"Total anomalies matched with trades: {len(trade_details)}")
-print(f"Both legs traded (matched complete pair fill): {both_legs_traded}")
-print(f"ONLY ONE leg traded (naked single-leg fill / snipe!): {one_leg_traded}")
+log.info(f"Total anomalies matched with trades: {len(trade_details)}")
+log.info(f"Both legs traded (matched complete pair fill): {both_legs_traded}")
+log.info(f"ONLY ONE leg traded (naked single-leg fill / snipe!): {one_leg_traded}")
 
 if trade_details:
     tdf = pd.DataFrame(trade_details)
-    print("\nSummary by trade type:")
-    print(tdf.groupby("type")[["spread", "dur_ms", "n_trades"]].describe())
+    log.info("\nSummary by trade type:")
+    log.info(tdf.groupby("type")[["spread", "dur_ms", "n_trades"]].describe())

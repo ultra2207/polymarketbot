@@ -332,8 +332,8 @@ if __name__ == "__main__":
     test_hour = "data/tape/clob_events/date=2026-11-04/hour=00"
     logger.info(f"--- Running small-slice verification on {test_hour} ---")
     anoms, metrics = audit_hour_slice(test_hour, c_map, ev_map)
-    print("Metrics:", json.dumps(metrics, indent=2))
+    logger.info('{!s} {!s}', "Metrics:", json.dumps(metrics, indent=2))
     if anoms:
         df = pd.DataFrame([asdict(a) for a in anoms])
-        print("\nSummary of Anomalies:")
-        print(df[["market_type", "gross_spread", "total_taker_fee", "net_spread", "duration_recv_ms", "duration_venue_ms", "is_phantom_serialization"]].describe())
+        logger.info("\nSummary of Anomalies:")
+        logger.info(df[["market_type", "gross_spread", "total_taker_fee", "net_spread", "duration_recv_ms", "duration_venue_ms", "is_phantom_serialization"]].describe())

@@ -45,6 +45,8 @@ import duckdb  # noqa: E402
 import requests  # noqa: E402
 
 from polymarketbot.logs import IST, get_logger  # noqa: E402
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 DEFAULT_TABLE = "clob_events"
@@ -334,7 +336,7 @@ def _fmt_ts(ns: int | None) -> str:
 
 def print_summary(rows: list[dict[str, Any]], root: Path) -> None:
     if not rows:
-        print(f"no parquet tables under {root}")
+        log.info(f"no parquet tables under {root}")
         return
     headers = ["table", "parts", "rows", "assets", "min recv (UTC)", "max recv (UTC)", "gaps"]
     body = [
@@ -350,10 +352,10 @@ def print_summary(rows: list[dict[str, Any]], root: Path) -> None:
         for row in rows
     ]
     widths = [max(len(h), *(len(line[i]) for line in body)) for i, h in enumerate(headers)]
-    print("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
-    print("  ".join("-" * width for width in widths))
+    log.info("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    log.info("  ".join("-" * width for width in widths))
     for line in body:
-        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(line)))
+        log.info("  ".join(value.ljust(widths[i]) for i, value in enumerate(line)))
 
 
 def print_replay(
@@ -365,44 +367,44 @@ def print_replay(
     events: list[dict[str, Any]],
     state: BookState,
 ) -> None:
-    print(f"table        {table}")
-    print(f"asset        {asset}")
-    print(f"hour         {hour}")
-    print(f"rows read    {len(events):,} (limit {limit:,})")
-    print(f"snapshots    {state.snapshots:,} book events")
-    print(
+    log.info(f"table        {table}")
+    log.info(f"asset        {asset}")
+    log.info(f"hour         {hour}")
+    log.info(f"rows read    {len(events):,} (limit {limit:,})")
+    log.info(f"snapshots    {state.snapshots:,} book events")
+    log.info(
         f"changes      {state.changes_applied:,} applied, {state.changes_ignored:,} ignored, "
         f"{state.changes_other_asset:,} for the complement token"
     )
-    print(
+    log.info(
         "event types  "
         + ", ".join(f"{name or '<null>'}={count:,}" for name, count in state.event_types.most_common())
     )
-    print(f"best bid     {state.best_bid if state.best_bid is not None else '-'}  ({len(state.bids)} levels)")
-    print(f"best ask     {state.best_ask if state.best_ask is not None else '-'}  ({len(state.asks)} levels)")
+    log.info(f"best bid     {state.best_bid if state.best_bid is not None else '-'}  ({len(state.bids)} levels)")
+    log.info(f"best ask     {state.best_ask if state.best_ask is not None else '-'}  ({len(state.asks)} levels)")
     if (
         state.best_bid is not None
         and state.best_ask is not None
         and state.best_bid >= state.best_ask
     ):
-        print(
+        log.info(
             "warning      crossed book (best bid >= best ask); a price_change row may "
             "carry both outcome tokens' changes"
         )
-    print(f"gaps         {state.gaps:,}")
+    log.info(f"gaps         {state.gaps:,}")
 
 
 def print_rest_check(state: BookState, payload: dict[str, Any], findings: list[str]) -> None:
     rest_bids = _levels(payload.get("bids"))
     rest_asks = _levels(payload.get("asks"))
-    print("rest check")
-    print(f"  rest best bid  {max(rest_bids) if rest_bids else '-'}  ({len(rest_bids)} levels)")
-    print(f"  rest best ask  {min(rest_asks) if rest_asks else '-'}  ({len(rest_asks)} levels)")
+    log.info("rest check")
+    log.info(f"  rest best bid  {max(rest_bids) if rest_bids else '-'}  ({len(rest_bids)} levels)")
+    log.info(f"  rest best ask  {min(rest_asks) if rest_asks else '-'}  ({len(rest_asks)} levels)")
     if findings:
         for finding in findings:
-            print(f"  DIFF {finding}")
+            log.info(f"  DIFF {finding}")
     else:
-        print("  match")
+        log.info("  match")
 
 
 # ------------------------------------------------------------------------- cli
@@ -446,10 +448,10 @@ def main(argv: list[str] | None = None) -> int:
 
         table = args.table or DEFAULT_TABLE
         if not args.asset or not args.hour:
-            print("replay needs --asset and --hour (YYYYMMDDTHH), or pass --summary", file=sys.stderr)
+            log.error("replay needs --asset and --hour (YYYYMMDDTHH), or pass --summary", )
             return 2
         if args.limit <= 0:
-            print("--limit must be positive", file=sys.stderr)
+            log.error("--limit must be positive", )
             return 2
 
         events = load_events(
@@ -476,11 +478,11 @@ def main(argv: list[str] | None = None) -> int:
                 print_rest_check(state, payload, compare_books(state, payload))
             except Exception as exc:  # noqa: BLE001 - report only, never fail
                 log.warning(f"REST book check failed for {args.asset}: {exc}")
-                print(f"rest check failed: {exc}")
+                log.info(f"rest check failed: {exc}")
         return 0
     except (FileNotFoundError, ValueError, duckdb.Error) as exc:
         log.error(f"tape validation failed: {exc}")
-        print(f"error: {exc}", file=sys.stderr)
+        log.error(f"error: {exc}", )
         return 1
     finally:
         con.close()

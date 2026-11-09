@@ -998,7 +998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_text(text + "\n", encoding="utf-8")
 
-    print(text)
+    log.info(text)
     log.info(f"wrote {n:,} conditions to {out} and {csv_path}; summary {summary}")
     return 0
 

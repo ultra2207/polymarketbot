@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 RAW = Path("data/raw")
 OUT = Path("data/processed")
@@ -150,11 +152,11 @@ def run_month(year: int, month: int, per_month: int, timeout_s: float) -> dict:
     try:
         moose = run_with_timeout(con, moose_counts, timeout_s)
     except TimeoutError:
-        print(f"  {label}: TIMEOUT after {timeout_s:.0f}s (skipped)")
+        log.info(f"  {label}: TIMEOUT after {timeout_s:.0f}s (skipped)")
         return {"month": label, "sampled": len(hashes), "skipped": "timeout",
                 "seconds": round(time.time() - t0, 1)}
     except Exception as exc:  # noqa: BLE001
-        print(f"  {label}: FAILED {type(exc).__name__}: {str(exc)[:120]}")
+        log.info(f"  {label}: FAILED {type(exc).__name__}: {str(exc)[:120]}")
         return {"month": label, "sampled": len(hashes), "skipped": f"{type(exc).__name__}"}
 
     pairs = [(h, sii.get(h, 0), moose.get(h, 0)) for h in hashes]
@@ -163,7 +165,7 @@ def run_month(year: int, month: int, per_month: int, timeout_s: float) -> dict:
     total_moose = sum(b for _, _, b in pairs)
     missing = sum(1 for _, a, b in pairs if b == 0 and a > 0)
 
-    print(f"  {label}: {len(hashes):>3} tx  exact {exact:>3}/{len(hashes):<3}  "
+    log.info(f"  {label}: {len(hashes):>3} tx  exact {exact:>3}/{len(hashes):<3}  "
           f"fills sii={total_sii:>5} moose={total_moose:>5}  missing={missing:>2}  "
           f"({time.time() - t0:.1f}s)")
 
@@ -187,7 +189,7 @@ def main() -> int:
         y, m = spec.strip().split("-")
         months.append((int(y), int(m)))
 
-    print(f"cross-checking {len(months)} months x <= {args.per_month} transactions "
+    log.info(f"cross-checking {len(months)} months x <= {args.per_month} transactions "
           f"(timeout {args.timeout:.0f}s/query)\n")
 
     results = [run_month(y, m, args.per_month, args.timeout) for y, m in months]
@@ -216,15 +218,15 @@ def main() -> int:
         "per_month": results,
     }
 
-    print(f"\nTOTAL: {tot_exact}/{tot_tx} transactions exact "
+    log.info(f"\nTOTAL: {tot_exact}/{tot_tx} transactions exact "
           f"({summary['exact_pct']}%), fills {tot_sii} vs {tot_moose} "
           f"(diff {pct:.4f}%)")
     if mismatched:
-        print("first mismatches (tx, sii, moose):")
+        log.info("first mismatches (tx, sii, moose):")
         for row in mismatched[:10]:
-            print("  ", row[0][:14], row[1], row[2])
+            log.info('{!s} {!s} {!s} {!s}', "  ", row[0][:14], row[1], row[2])
     else:
-        print("no per-transaction fill-count mismatches")
+        log.info("no per-transaction fill-count mismatches")
 
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "indexer_crosscheck.json").write_text(json.dumps(summary, indent=2))
@@ -243,7 +245,7 @@ def main() -> int:
         """)
         jsonl.unlink(missing_ok=True)
 
-    print(f"wrote {OUT / 'indexer_crosscheck.json'}")
+    log.info(f"wrote {OUT / 'indexer_crosscheck.json'}")
     return 0
 
 

@@ -1,5 +1,7 @@
 """Check clock_offset stream statistics."""
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 con = duckdb.connect()
 df = con.execute("""
@@ -15,4 +17,4 @@ df = con.execute("""
     FROM read_parquet('data/tape/clock_offset/date=2026-11-05/hour=15/*.parquet')
     GROUP BY stream, host
 """).df()
-print(df.to_string())
+log.info(df.to_string())

@@ -612,7 +612,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     lines.append("    excluded mean says whether it did or merely reduced sample size.")
 
     text = "\n".join(lines)
-    print(text)
+    log.info(text)
 
     if not args.no_write:
         import pyarrow as pa

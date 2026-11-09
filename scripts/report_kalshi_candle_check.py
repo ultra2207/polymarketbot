@@ -660,7 +660,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     verdict, _strong = h7_verdict(records)
     write_parquet(records, args.out)
     text = format_report(records, summary, verdict)
-    print(text)
+    log.info(text)
     log.info(
         f"wrote {len(records)} pair rows to {args.out} "
         f"(evaluated={summary['pairs_evaluated']}, excluded={summary['pairs_excluded']})"

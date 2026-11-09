@@ -33,6 +33,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TAPE = "data/raw/sii/trades.parquet"
@@ -76,8 +78,8 @@ def main() -> int:
         WHERE resolved AND NOT coalesce(is_void, FALSE)
           AND payout_1 IS NOT NULL AND token2 IS NOT NULL
     """)
-    print(f"resolved tokens: {con.sql('SELECT count(*) FROM mk').fetchall()[0][0]:,}",
-          flush=True)
+    log.info(f"resolved tokens: {con.sql('SELECT count(*) FROM mk').fetchall()[0][0]:,}",
+          )
 
     # Nearest print to each lead, tolerance scaled so thin markets still match.
     con.execute(f"""
@@ -110,8 +112,8 @@ def main() -> int:
         )
         SELECT condition_id, token_id, payout, k, price FROM nearest WHERE rn = 1
     """)
-    print(f"lead observations: {con.sql('SELECT count(*) FROM at_lead').fetchall()[0][0]:,}",
-          flush=True)
+    log.info(f"lead observations: {con.sql('SELECT count(*) FROM at_lead').fetchall()[0][0]:,}",
+          )
 
     con.execute("""
         CREATE OR REPLACE TEMP TABLE wide AS
@@ -137,9 +139,9 @@ def main() -> int:
           AND p24 IS NOT NULL AND p6 IS NOT NULL
     """)
     n = con.sql("SELECT count(*) FROM drift").fetchall()[0][0]
-    print(f"tokens with all four leads: {n:,}\n", flush=True)
+    log.info(f"tokens with all four leads: {n:,}\n", )
     if n == 0:
-        print("no token printed at every lead - widen the tolerances")
+        log.info("no token printed at every lead - widen the tolerances")
         return 1
 
     dest = Path(args.dest)
@@ -149,7 +151,7 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print(f"{'p168 bucket':12} {'markets':>8} {'168->72':>9} {'72->24':>9} "
+    log.info(f"{'p168 bucket':12} {'markets':>8} {'168->72':>9} {'72->24':>9} "
           f"{'24->6':>9} {'168->6':>9} {'payout':>7}")
     for b, nm, d1, d2, d3, dt, pay in con.sql("""
         SELECT bucket, count(*),
@@ -157,10 +159,10 @@ def main() -> int:
                avg(payout)
         FROM drift GROUP BY 1 ORDER BY 1
     """).fetchall():
-        print(f"{b:12} {nm:>8,} {d1:>+9.4f} {d2:>+9.4f} {d3:>+9.4f} {dt:>+9.4f} {pay:>7.3f}")
+        log.info(f"{b:12} {nm:>8,} {d1:>+9.4f} {d2:>+9.4f} {d3:>+9.4f} {dt:>+9.4f} {pay:>7.3f}")
 
     # Per-bucket test: drift must beat TWO crossings (in and out), and be significant.
-    print(f"\n{'p168 bucket':12} {'n':>6} {'168->6':>9} {'±se':>7} {'t':>7} {'cost':>7}")
+    log.info(f"\n{'p168 bucket':12} {'n':>6} {'168->6':>9} {'±se':>7} {'t':>7} {'cost':>7}")
     verdicts = []
     for b, nm, d, se in con.sql("""
         SELECT bucket, count(*), avg(p6 - p168),
@@ -171,21 +173,21 @@ def main() -> int:
         cost = 2 * args.half_spread
         ok = abs(d) > cost and abs(t) > 3
         verdicts.append((b, nm, d, t, ok))
-        print(f"{b:12} {nm:>6,} {d:>+9.4f} {se:>7.4f} {t:>7.1f} "
+        log.info(f"{b:12} {nm:>6,} {d:>+9.4f} {se:>7.4f} {t:>7.1f} "
               f"{'beats' if abs(d) > cost else 'inside':>7}")
 
     wins = [v for v in verdicts if v[4]]
-    print(f"\nbuckets where drift beats two crossings and |t| > 3: {len(wins)}/{len(verdicts)}")
+    log.info(f"\nbuckets where drift beats two crossings and |t| > 3: {len(wins)}/{len(verdicts)}")
     if wins:
         n_all = con.sql("SELECT count(*) FROM mk").fetchall()[0][0]
-        print(f"=> CANDIDATE. Selection caveat: {n:,} of {n_all:,} resolved tokens "
+        log.info(f"=> CANDIDATE. Selection caveat: {n:,} of {n_all:,} resolved tokens "
               f"({100*n/max(n_all,1):.2f} %) printed at all four leads, so this describes "
               "long-lived, heavily traded markets rather than a random sample. It also "
               "contradicts A1, which found the level dead after costs, so the status is "
               "'unresolved': the confirming test must buy at the ask at 168 h and sell at "
               "the bid at 6 h, not use traded prices.")
     else:
-        print("=> dead: no bucket's drift beats the cost of capturing it")
+        log.info("=> dead: no bucket's drift beats the cost of capturing it")
     return 0
 
 

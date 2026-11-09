@@ -66,6 +66,8 @@ sys.path.insert(0, "src")
 import duckdb
 import requests
 from tqdm import tqdm
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 PMXT = "https://r2v2.pmxt.dev/polymarket_orderbook_{stamp}.parquet"
 OUT = Path("data/processed/pmxt_reduced")
@@ -446,35 +448,35 @@ def main() -> int:
         # never be deleted by this script.
         root = Path(args.dir)
         if not root.exists():
-            print(f"missing {root}")
+            log.info(f"missing {root}")
             return 1
         files = sorted(root.rglob("polymarket_orderbook_*.parquet"))
         if not files:
-            print(f"no hour files under {root}")
+            log.info(f"no hour files under {root}")
             return 1
         for f in files:
             stamp = f.stem.replace("polymarket_orderbook_", "")
             try:
                 when = datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
             except ValueError:
-                print(f"  skipping unparseable name: {f.name}")
+                log.info(f"  skipping unparseable name: {f.name}")
                 continue
             part = dest_root / f"dt={when:%Y-%m-%d}" / f"hour={when:%H}" / "books.parquet"
             if args.skip_existing and part.exists():
                 continue
             sources.append((when, f))
-        print(f"local hours to reduce: {len(sources):,} "
+        log.info(f"local hours to reduce: {len(sources):,} "
               f"(of {len(files):,} on disk)")
     elif args.file:
         f = Path(args.file)
         if not f.exists():
-            print(f"missing {f}")
+            log.info(f"missing {f}")
             return 1
         stamp = f.stem.replace("polymarket_orderbook_", "")
         sources.append((datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc), f))
     else:
         if not args.start:
-            print("pass --file or --start")
+            log.info("pass --file or --start")
             return 1
         # Download INSIDE the processing loop, one hour at a time. Fetching the
         # whole batch up front would hold every raw file on disk simultaneously
@@ -493,7 +495,7 @@ def main() -> int:
             sources.append((when, local))
             pending[local] = stamp
         if skipped:
-            print(f"  resuming: {skipped:,} hours already reduced", flush=True)
+            log.info(f"  resuming: {skipped:,} hours already reduced", )
 
     total_rows = 0
     t_start = time.time()
@@ -534,9 +536,9 @@ def main() -> int:
     bar.close()
     if sources:
         elapsed = time.time() - t_start
-        print(f"\n{len(sources)} hour(s) in {elapsed/60:.1f} min — "
+        log.info(f"\n{len(sources)} hour(s) in {elapsed/60:.1f} min — "
               f"{total_rows:,} rows, {elapsed/len(sources):.1f}s/hour")
-        print(f"extrapolated to 2,861 hours: "
+        log.info(f"extrapolated to 2,861 hours: "
               f"{elapsed/len(sources)*2861/3600:.1f} h compute")
     return 0
 

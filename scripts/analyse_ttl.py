@@ -28,6 +28,7 @@ import argparse
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 POSITIONS = "data/processed/positions/*.parquet"
 TTL_LABELS = ["<1h", "1-6h", "6-24h", "1-3d", "3-7d", "7-30d", ">30d", "unknown"]
@@ -75,18 +76,18 @@ def main() -> None:
         GROUP BY 1, 2, 3
     """)
 
-    print("\n=== where do the two groups sit in time-to-resolution? (share of bought shares) ===")
-    print("  ttl bucket      top share%   rest share%")
+    log.info("\n=== where do the two groups sit in time-to-resolution? (share of bought shares) ===")
+    log.info("  ttl bucket      top share%   rest share%")
     for r in con.execute("""
         SELECT tb,
                100.0 * sum(bs) FILTER (WHERE top=1) / sum(sum(bs) FILTER (WHERE top=1)) OVER (),
                100.0 * sum(bs) FILTER (WHERE top=0) / sum(sum(bs) FILTER (WHERE top=0)) OVER ()
         FROM agg GROUP BY tb ORDER BY tb
     """).fetchall():
-        print(f"  {TTL_LABELS[r[0]]:<12} {r[1]:>11.1f}   {r[2]:>11.1f}")
+        log.info(f"  {TTL_LABELS[r[0]]:<12} {r[1]:>11.1f}   {r[2]:>11.1f}")
 
-    print("\n=== edge within each ttl bucket (all price buckets) ===")
-    print("  ttl bucket    top edge | rest edge |     gap")
+    log.info("\n=== edge within each ttl bucket (all price buckets) ===")
+    log.info("  ttl bucket    top edge | rest edge |     gap")
     for r in con.execute("""
         SELECT tb,
                (sum(payout_bs) FILTER (WHERE top=1) - sum(bc) FILTER (WHERE top=1))
@@ -97,10 +98,10 @@ def main() -> None:
     """).fetchall():
         if r[1] is None or r[2] is None:
             continue
-        print(f"  {TTL_LABELS[r[0]]:<12} {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}")
+        log.info(f"  {TTL_LABELS[r[0]]:<12} {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}")
 
-    print("\n=== the 70-85 % price band only, by ttl bucket ===")
-    print("  ttl bucket    top edge | rest edge |     gap   top pos")
+    log.info("\n=== the 70-85 % price band only, by ttl bucket ===")
+    log.info("  ttl bucket    top edge | rest edge |     gap   top pos")
     for r in con.execute("""
         SELECT tb,
                (sum(payout_bs) FILTER (WHERE top=1) - sum(bc) FILTER (WHERE top=1))
@@ -112,7 +113,7 @@ def main() -> None:
     """).fetchall():
         if r[1] is None or r[2] is None:
             continue
-        print(f"  {TTL_LABELS[r[0]]:<12} {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}  {r[3]:>9,}")
+        log.info(f"  {TTL_LABELS[r[0]]:<12} {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}  {r[3]:>9,}")
 
 
 if __name__ == "__main__":

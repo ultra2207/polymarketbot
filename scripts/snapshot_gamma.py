@@ -36,6 +36,8 @@ import duckdb
 import requests
 
 from polymarketbot.net import DEFAULT_HOSTS, install_doh_fallback, warm
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 GAMMA = "https://gamma-api.polymarket.com/markets/keyset"
 OUT = Path("data/raw/gamma")
@@ -71,7 +73,7 @@ def main() -> int:
     args = ap.parse_args()
 
     install_doh_fallback()
-    print("resolved:", warm(DEFAULT_HOSTS))
+    log.info('{!s} {!s}', "resolved:", warm(DEFAULT_HOSTS))
 
     session = requests.Session()
     session.headers["User-Agent"] = "polymarketbot-research/0.1"
@@ -86,7 +88,7 @@ def main() -> int:
             params["after_cursor"] = cursor
         payload = fetch_page(session, params)
         if payload is None:
-            print(f"  page {page}: failed, stopping")
+            log.info(f"  page {page}: failed, stopping")
             break
         markets = payload.get("markets") or []
         if not markets:
@@ -115,12 +117,12 @@ def main() -> int:
             rows.append(rec)
         cursor = payload.get("next_cursor")
         if page % 10 == 0:
-            print(f"  page {page}: {len(rows):,} markets", flush=True)
+            log.info(f"  page {page}: {len(rows):,} markets", )
         if not cursor:
             break
 
     if not rows:
-        print("no rows fetched")
+        log.info("no rows fetched")
         return 1
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -139,7 +141,7 @@ def main() -> int:
     jsonl.unlink(missing_ok=True)
 
     n = con.sql(f"SELECT count(*) FROM read_parquet('{dest.as_posix()}')").fetchall()[0][0]
-    print(f"\nwrote {dest}  ({n:,} markets, closed={args.closed})")
+    log.info(f"\nwrote {dest}  ({n:,} markets, closed={args.closed})")
     return 0
 
 

@@ -16,6 +16,8 @@ import sys
 from polymarketbot.net import install_doh_fallback
 from polymarketbot.rewards.allocator import LiquidityRewardsAllocator
 from polymarketbot.rewards.scanner import find_optimal_lp_markets
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,7 +57,7 @@ def main() -> int:
     args = parse_args()
     install_doh_fallback()
 
-    print(f"\nScanning live Polymarket universe for candidates (Bankroll: ${args.bankroll:,.2f})...")
+    log.info(f"\nScanning live Polymarket universe for candidates (Bankroll: ${args.bankroll:,.2f})...")
     candidates = find_optimal_lp_markets(
         bankroll_usd=args.bankroll,
         min_days_to_expiry=7.0,
@@ -65,7 +67,7 @@ def main() -> int:
     )
 
     if not candidates:
-        print("No viable reward market candidates found.")
+        log.info("No viable reward market candidates found.")
         return 1
 
     allocator = LiquidityRewardsAllocator(
@@ -80,23 +82,23 @@ def main() -> int:
         spread_offset_cents=args.spread_offset,
     )
 
-    print("\n" + "=" * 115)
-    print(f"  POLYMARKET MATHEMATICAL PORTFOLIO ALLOCATION STATEMENT | SOLVER: {res.solver_name}")
-    print("=" * 115)
-    print(f"  Total Bankroll:       ${res.bankroll_usd:>10,.2f} USDC")
-    print(f"  Allocated Capital:    ${res.total_allocated:>10,.2f} USDC (Active Quoting)")
-    print(f"  Cash Reserve Buffer:  ${res.cash_reserve:>10,.2f} USDC (Synthetic Hedging)")
-    print(f"  Active Markets:       {res.active_markets_count:>10} markets")
-    print(f"  Total Daily Payout:   ${res.total_daily_payout:>10,.2f} / day")
-    print(f"  Total Monthly Payout: ${res.total_monthly_payout:>10,.2f} / month")
-    print(f"  Portfolio Daily ROI:  +{res.portfolio_daily_roi_pct:>9.2f}% / day")
-    print(f"  Portfolio Monthly ROI:+{res.portfolio_monthly_roi_pct:>9.2f}% / month")
-    print("-" * 115)
+    log.info("\n" + "=" * 115)
+    log.info(f"  POLYMARKET MATHEMATICAL PORTFOLIO ALLOCATION STATEMENT | SOLVER: {res.solver_name}")
+    log.info("=" * 115)
+    log.info(f"  Total Bankroll:       ${res.bankroll_usd:>10,.2f} USDC")
+    log.info(f"  Allocated Capital:    ${res.total_allocated:>10,.2f} USDC (Active Quoting)")
+    log.info(f"  Cash Reserve Buffer:  ${res.cash_reserve:>10,.2f} USDC (Synthetic Hedging)")
+    log.info(f"  Active Markets:       {res.active_markets_count:>10} markets")
+    log.info(f"  Total Daily Payout:   ${res.total_daily_payout:>10,.2f} / day")
+    log.info(f"  Total Monthly Payout: ${res.total_monthly_payout:>10,.2f} / month")
+    log.info(f"  Portfolio Daily ROI:  +{res.portfolio_daily_roi_pct:>9.2f}% / day")
+    log.info(f"  Portfolio Monthly ROI:+{res.portfolio_monthly_roi_pct:>9.2f}% / month")
+    log.info("-" * 115)
 
-    print(f"{'#':<3} | {'Market Question':<45} | {'Allocated $':<12} | {'Quote Size':<10} | {'Daily Pay':<11} | {'Daily ROI':<9} | {'Floor $':<8}")
-    print("-" * 115)
+    log.info(f"{'#':<3} | {'Market Question':<45} | {'Allocated $':<12} | {'Quote Size':<10} | {'Daily Pay':<11} | {'Daily ROI':<9} | {'Floor $':<8}")
+    log.info("-" * 115)
     for i, a in enumerate(res.allocations, 1):
-        print(
+        log.info(
             f"{i:<3} | "
             f"{a.question[:45]:<45} | "
             f"${a.allocated_capital:>10,.2f} | "
@@ -105,7 +107,7 @@ def main() -> int:
             f"+{a.daily_roi_pct:>6.1f}% | "
             f"${a.min_floor_capital:>6,.2f}"
         )
-    print("=" * 115 + "\n")
+    log.info("=" * 115 + "\n")
     return 0
 
 

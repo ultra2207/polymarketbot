@@ -31,6 +31,8 @@ sys.path.insert(0, "src")
 import duckdb
 
 from polymarketbot.dataapi import DataAPIClient
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 PIT = OUT / "markets_pit.parquet"
@@ -57,7 +59,7 @@ def main() -> int:
         ORDER BY md5(condition_id)
         LIMIT {args.n}
     """).fetchall()
-    print(f"sampled {len(markets):,} closed markets created after 2026-05-01", flush=True)
+    log.info(f"sampled {len(markets):,} closed markets created after 2026-05-01", )
     if not markets:
         return 1
 
@@ -111,11 +113,11 @@ def main() -> int:
             if time.time() - started > args.max_seconds:
                 for f in futures:
                     f.cancel()
-                print("  budget reached", flush=True)
+                log.info("  budget reached", )
                 break
             rows.append(fut.result())
             if len(rows) % 100 == 0:
-                print(f"  {len(rows)}/{len(markets)}, {time.time()-started:.0f}s", flush=True)
+                log.info(f"  {len(rows)}/{len(markets)}, {time.time()-started:.0f}s", )
 
     jsonl = OUT / "_resolution_timing.jsonl"
     with jsonl.open("w", encoding="utf-8") as fh:
@@ -128,9 +130,9 @@ def main() -> int:
     """)
     jsonl.unlink(missing_ok=True)
 
-    print(f"\nwrote {DEST} ({len(rows):,} rows)")
-    print("\nresolution fields present:")
-    print(con.sql(f"""
+    log.info(f"\nwrote {DEST} ({len(rows):,} rows)")
+    log.info("\nresolution fields present:")
+    log.info(con.sql(f"""
         SELECT count(*) n,
                count(status) with_status,
                count(resolved_ts) with_resolved_ts,
@@ -139,7 +141,7 @@ def main() -> int:
         FROM read_parquet('{DEST.as_posix()}')
     """).fetchall()[0])
 
-    print("\nresolution lag (resolved_ts - end_date), hours, where both exist:")
+    log.info("\nresolution lag (resolved_ts - end_date), hours, where both exist:")
     for r in con.sql(f"""
         SELECT category, count(*) n,
                round(median((resolved_ts - epoch(TRY_CAST(end_date AS TIMESTAMPTZ)))/3600.0), 2) med_h,
@@ -148,9 +150,9 @@ def main() -> int:
         WHERE resolved_ts IS NOT NULL AND end_date IS NOT NULL
         GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:12} n={r[1]:>4}  median={r[2]:>8} h  p90={r[3]:>8} h")
+        log.info(f"  {r[0]:12} n={r[1]:>4}  median={r[2]:>8} h  p90={r[3]:>8} h")
 
-    print("\ndisputes by category:")
+    log.info("\ndisputes by category:")
     for r in con.sql(f"""
         SELECT category, count(*) n,
                count(*) FILTER (WHERE was_disputed) disputed,
@@ -158,7 +160,7 @@ def main() -> int:
         FROM read_parquet('{DEST.as_posix()}')
         GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:12} n={r[1]:>4}  disputed={r[2]:>3}  {r[3]}%")
+        log.info(f"  {r[0]:12} n={r[1]:>4}  disputed={r[2]:>3}  {r[3]}%")
     return 0
 
 

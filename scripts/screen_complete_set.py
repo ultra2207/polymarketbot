@@ -44,6 +44,8 @@ from polymarketbot.logs import IST
 import duckdb
 
 from polymarketbot.fees import schedule_at
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TAPE = "data/raw/sii/trades.parquet"
@@ -78,8 +80,8 @@ def main() -> int:
     lo, hi = epoch(args.start), epoch(args.end)
     con = connect()
 
-    print(f"scanning {args.start} -> {args.end} "
-          f"(min_usd={args.min_usd}, band={args.min_price})", flush=True)
+    log.info(f"scanning {args.start} -> {args.end} "
+          f"(min_usd={args.min_usd}, band={args.min_price})", )
 
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE cell AS
@@ -111,9 +113,9 @@ def main() -> int:
     """)
 
     n_cell = con.sql("SELECT count(*) FROM cell").fetchall()[0][0]
-    print(f"quoteable minute-cells: {n_cell:,}", flush=True)
+    log.info(f"quoteable minute-cells: {n_cell:,}", )
     if n_cell == 0:
-        print("nothing passed the size and price filters")
+        log.info("nothing passed the size and price filters")
         return 1
 
     # Fee per leg, from the market's own schedule.
@@ -179,8 +181,8 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print()
-    print(f"{'category':22} {'cells':>9} {'net>0':>8} {'net>min':>8} "
+    log.info("")
+    log.info(f"{'category':22} {'cells':>9} {'net>0':>8} {'net>min':>8} "
           f"{'best net':>9} {'med usd':>9}")
     for cat, cells, pos, over_min, best, usd in con.sql(f"""
         SELECT s.category, count(*),
@@ -189,7 +191,7 @@ def main() -> int:
                max(s.net), median(s.usd_total)
         FROM scored s GROUP BY 1 ORDER BY count(*) DESC
     """).fetchall():
-        print(f"{cat:22} {cells:>9,} {pos:>8,} {over_min:>8,} {best:>9.4f} {usd:>9,.0f}")
+        log.info(f"{cat:22} {cells:>9,} {pos:>8,} {over_min:>8,} {best:>9.4f} {usd:>9,.0f}")
 
     summary = con.sql(f"""
         SELECT count(*) n_runs, sum(minutes) mins,
@@ -197,17 +199,17 @@ def main() -> int:
                median(minutes) med_len
         FROM runs WHERE minutes >= 2
     """).fetchall()[0]
-    print(f"\nruns lasting >= 2 consecutive minutes: {summary[0]:,} "
+    log.info(f"\nruns lasting >= 2 consecutive minutes: {summary[0]:,} "
           f"(longest {summary[2] or 0} min, median {summary[3] or 0:.0f} min)")
 
-    print("\ntop candidates by net edge:")
+    log.info("\ntop candidates by net edge:")
     for cid, m, net, mins, usd, cat in con.sql(f"""
         SELECT s.condition_id, s.m, s.net, r.minutes, s.usd_total, s.category
         FROM scored s LEFT JOIN runs r ON r.condition_id = s.condition_id
         WHERE s.net > {args.min_net} ORDER BY s.net DESC LIMIT 12
     """).fetchall():
         ts = datetime.fromtimestamp(m * 60, tz=IST).strftime("%Y-%m-%d %H:%M")
-        print(f"  {ts} {cat[:16]:16} net={net:+.4f} run={mins} min  "
+        log.info(f"  {ts} {cat[:16]:16} net={net:+.4f} run={mins} min  "
               f"usd={usd:>7,.0f}  {cid[:14]}…")
     return 0
 

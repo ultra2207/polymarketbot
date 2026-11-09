@@ -22,6 +22,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 from polymarketbot.db import connect
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TRADES = Path("data/raw/sii/trades.parquet")
@@ -31,9 +33,9 @@ DEST = OUT / "market_trade_stats.parquet"
 def main() -> int:
     con = connect(threads=12, memory_limit="8GB")
 
-    print("aggregating 1.27 B fills by condition_id ...", flush=True)
-    print("  (no distinct-counts here: they turn a 4 M-group aggregation into a")
-    print("   per-group hash set over 1.27 B rows and effectively hang)", flush=True)
+    log.info("aggregating 1.27 B fills by condition_id ...", )
+    log.info("  (no distinct-counts here: they turn a 4 M-group aggregation into a")
+    log.info("   per-group hash set over 1.27 B rows and effectively hang)", )
     con.execute(f"""
         COPY (
             SELECT
@@ -52,7 +54,7 @@ def main() -> int:
     """)
 
     n = con.sql(f"SELECT count(*) FROM read_parquet('{DEST.as_posix()}')").fetchall()[0][0]
-    print(f"wrote {DEST}  ({n:,} conditions)")
+    log.info(f"wrote {DEST}  ({n:,} conditions)")
 
     row = con.sql(f"""
         SELECT
@@ -62,9 +64,9 @@ def main() -> int:
             count(*) FILTER (WHERE v1_fills > 0 AND v2_fills = 0) v1_only
         FROM read_parquet('{DEST.as_posix()}')
     """).fetchall()[0]
-    print(f"  v1 only      {row[3]:>10,}")
-    print(f"  v2 only      {row[2]:>10,}")
-    print(f"  mixed        {row[1]:>10,}")
+    log.info(f"  v1 only      {row[3]:>10,}")
+    log.info(f"  v2 only      {row[2]:>10,}")
+    log.info(f"  mixed        {row[1]:>10,}")
     return 0
 
 if __name__ == "__main__":

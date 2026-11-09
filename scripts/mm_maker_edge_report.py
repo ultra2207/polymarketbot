@@ -8,6 +8,8 @@ Reads data/processed/mm/agg_*.parquet and prints:
 from __future__ import annotations
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 AGG = "data/processed/mm/agg_*.parquet"
 
@@ -15,10 +17,10 @@ AGG = "data/processed/mm/agg_*.parquet"
 def table(con, sql: str, title: str) -> None:
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.execute(sql).description]
-    print(f"\n== {title}")
-    print(" | ".join(cols))
+    log.info(f"\n== {title}")
+    log.info(" | ".join(cols))
     for r in rows:
-        print(" | ".join("" if v is None else
+        log.info(" | ".join("" if v is None else
                          (f"{v:,.2f}" if isinstance(v, float) else str(v))
                          for v in r))
 

@@ -22,6 +22,8 @@ from urllib.parse import urlparse
 
 import requests
 import websockets
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 TARGET_HOSTS = {
     "CLOB REST": "https://clob.polymarket.com",
@@ -113,58 +115,58 @@ async def measure_websocket(ws_url: str, ping_samples: int = 15) -> Tuple[float,
 
 def print_stats(name: str, values: List[float], unit: str = "ms"):
     if not values:
-        print(f"  {name:<30} : No successful samples")
+        log.info(f"  {name:<30} : No successful samples")
         return
     min_v = min(values)
     med_v = statistics.median(values)
     avg_v = statistics.mean(values)
     max_v = max(values)
     p95_v = sorted(values)[int(len(values) * 0.95)] if len(values) >= 5 else max_v
-    print(
+    log.info(
         f"  {name:<30} : min={min_v:6.2f}{unit} | med={med_v:6.2f}{unit} | "
         f"avg={avg_v:6.2f}{unit} | p95={p95_v:6.2f}{unit} | max={max_v:6.2f}{unit}"
     )
 
 
 def main():
-    print("=" * 80)
-    print(" POLYMARKET AWS DUBLIN LATENCY BENCHMARK ")
-    print("=" * 80)
+    log.info("=" * 80)
+    log.info(" POLYMARKET AWS DUBLIN LATENCY BENCHMARK ")
+    log.info("=" * 80)
 
     # 1. DNS Resolution
-    print("\n[1] DNS Resolution Latency (5 iterations):")
+    log.info("\n[1] DNS Resolution Latency (5 iterations):")
     for host in ["clob.polymarket.com", "ws-subscriptions-clob.polymarket.com", "gamma-api.polymarket.com"]:
         rtts = measure_dns(host)
         print_stats(host, rtts)
 
     # 2. TCP & TLS Handshake
-    print("\n[2] TCP Connect & TLS 1.3 Handshake Latency (5 connections):")
+    log.info("\n[2] TCP Connect & TLS 1.3 Handshake Latency (5 connections):")
     for host in ["clob.polymarket.com", "ws-subscriptions-clob.polymarket.com"]:
         tcp, tls = measure_tcp_tls(host)
         print_stats(f"{host} (TCP)", tcp)
         print_stats(f"{host} (TLS)", tls)
 
     # 3. HTTP REST Latency (Cold vs Warm Keep-Alive)
-    print("\n[3] HTTP REST Round-Trip Latency (15 samples each over Keep-Alive):")
+    log.info("\n[3] HTTP REST Round-Trip Latency (15 samples each over Keep-Alive):")
     for label, url in TARGET_HOSTS.items():
         try:
             cold, warm = measure_http_rest(url, warm_samples=15)
-            print(f"\n  -- {label} ({url}) --")
-            print(f"  {'Cold Start (Connect + TLS + RTT)':<30} : {cold:6.2f}ms")
+            log.info(f"\n  -- {label} ({url}) --")
+            log.info(f"  {'Cold Start (Connect + TLS + RTT)':<30} : {cold:6.2f}ms")
             print_stats("Warm Keep-Alive RTT", warm)
         except Exception as e:
-            print(f"  {label:<30} : Failed ({e})")
+            log.info(f"  {label:<30} : Failed ({e})")
 
     # 4. WebSocket Handshake & Frame Ping/Pong
-    print("\n[4] WebSocket Streaming Latency (ws-subscriptions-clob):")
+    log.info("\n[4] WebSocket Streaming Latency (ws-subscriptions-clob):")
     try:
         ws_conn, ws_pings = asyncio.run(measure_websocket(WS_URL, ping_samples=15))
-        print(f"  {'WS Handshake & Upgrade':<30} : {ws_conn:6.2f}ms")
+        log.info(f"  {'WS Handshake & Upgrade':<30} : {ws_conn:6.2f}ms")
         print_stats("WS Protocol Ping/Pong RTT", ws_pings)
     except Exception as e:
-        print(f"  WebSocket Test Failed: {e}")
+        log.info(f"  WebSocket Test Failed: {e}")
 
-    print("\n" + "=" * 80)
+    log.info("\n" + "=" * 80)
 
 
 if __name__ == "__main__":

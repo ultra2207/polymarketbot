@@ -46,6 +46,8 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import pandas as pd
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 TAPE = Path("data/tape")
 DERIVED = Path("data/derived")
@@ -143,10 +145,10 @@ def rank_conditions(day: str, hours: list[str]) -> tuple[Counter, Counter, dict[
         if got != expected:
             raise SystemExit(f"{part}: read {got} rows, metadata promised {expected}")
         per_hour[part.name] = {"rows": got, "expected": expected, "best_bid_ask": bba}
-        print(f"  {part.name}: expected {expected:,} rows, read {got:,}; "
+        log.info(f"  {part.name}: expected {expected:,} rows, read {got:,}; "
               f"best_bid_ask rows {bba:,}")
     total = sum(v["rows"] for v in per_hour.values())
-    print(f"  six-hour window: {total:,} rows, {len(events):,} conditions with an event")
+    log.info(f"  six-hour window: {total:,} rows, {len(events):,} conditions with an event")
     return events, snapshots, per_hour
 
 
@@ -160,7 +162,7 @@ def load_universe() -> dict[str, dict]:
         for m in payload.get("markets", []):
             # later snapshots win: they carry the freshest end_date / tokens
             markets[m["condition_id"]] = m
-    print(f"  universe union: {len(markets):,} conditions over {len(list(UNIVERSE_DIR.glob('*.json')))} snapshots")
+    log.info(f"  universe union: {len(markets):,} conditions over {len(list(UNIVERSE_DIR.glob('*.json')))} snapshots")
     return markets
 
 
@@ -200,7 +202,7 @@ def load_kalshi_catalog(day: str) -> list[dict]:
             t = pq.read_table(f, columns=["ticker", "title"]).to_pandas()
             for row in t.drop_duplicates("ticker").itertuples(index=False):
                 add(row.ticker, row.title, None, None, None)
-    print(f"  kalshi catalog: {len(catalog):,} distinct tickers")
+    log.info(f"  kalshi catalog: {len(catalog):,} distinct tickers")
     return list(catalog.values())
 
 
@@ -610,11 +612,11 @@ def main() -> int:
     args = ap.parse_args()
     hours = [h.strip() for h in args.hours.split(",") if h.strip()]
 
-    print(f"[1/5] ranking conditions in {len(hours)} hour partitions of {args.date}")
+    log.info(f"[1/5] ranking conditions in {len(hours)} hour partitions of {args.date}")
     events, snapshots, per_hour = rank_conditions(args.date, hours)
     ranked = events.most_common(args.top)
     top_ids = [c for c, _ in ranked]
-    print(f"  top {len(top_ids)}: >= {ranked[-1][1]:,} events; "
+    log.info(f"  top {len(top_ids)}: >= {ranked[-1][1]:,} events; "
           f"{sum(1 for _, n in ranked if n >= args.min_events)} at or above {args.min_events}")
 
     # A collector outage that stops best_bid_ask for a whole hour would turn
@@ -626,17 +628,17 @@ def main() -> int:
                    if per_hour[f"hour={h}"]["best_bid_ask"] >= max(100, 0.05 * typical)]
     outage_hours = [h for h in hours if h not in stale_hours]
     if outage_hours:
-        print(f"  best_bid_ask outage in hours {outage_hours}: excluded from the staleness sample")
+        log.info(f"  best_bid_ask outage in hours {outage_hours}: excluded from the staleness sample")
 
-    print("[2/5] metadata from the universe snapshots")
+    log.info("[2/5] metadata from the universe snapshots")
     universe = load_universe()
     missing = [c for c in top_ids if c not in universe]
-    print(f"  metadata found for {len(top_ids) - len(missing)}/{len(top_ids)}"
+    log.info(f"  metadata found for {len(top_ids) - len(missing)}/{len(top_ids)}"
           + (f"; missing {len(missing)}" if missing else ""))
 
-    print("[3/5] matching against the Kalshi catalog")
+    log.info("[3/5] matching against the Kalshi catalog")
     catalog = load_kalshi_catalog(args.date)
-    print(f"  catalog window scan done")
+    log.info(f"  catalog window scan done")
     rows = []
     unmatched = []
     for cond, n in ranked:
@@ -674,9 +676,9 @@ def main() -> int:
             "pm_book_snapshots_6h": int(snapshots.get(cond, 0)),
         })
     frame = pd.DataFrame(rows)
-    print(f"  matched {len(frame)}/{len(top_ids)} conditions; {len(unmatched)} without a defensible counterpart")
+    log.info(f"  matched {len(frame)}/{len(top_ids)} conditions; {len(unmatched)} without a defensible counterpart")
 
-    print("[4/5] measuring book events and PM-mid staleness")
+    log.info("[4/5] measuring book events and PM-mid staleness")
     match_ids = set(frame["polymarket_condition_id"]) if len(frame) else set()
     recount = book_events_per_condition(args.date, hours, match_ids) if match_ids else Counter()
     if match_ids and recount != Counter({r["polymarket_condition_id"]: r["pm_events_6h"] for r in rows}):
@@ -687,50 +689,50 @@ def main() -> int:
     frame["pm_staleness_median_s"] = [stale.get(t, {}).get("median") for t in frame["kalshi_ticker"]]
     frame["pm_staleness_p90_s"] = [stale.get(t, {}).get("p90") for t in frame["kalshi_ticker"]]
 
-    print("[5/5] writing artifacts")
+    log.info("[5/5] writing artifacts")
     frame = frame.reindex(columns=V2_COLUMNS + NEW_COLUMNS + MEASURE_COLUMNS)
     frame = frame.sort_values("pm_events_6h", ascending=False)
     frame.reindex(columns=V2_COLUMNS + NEW_COLUMNS).to_parquet(OUT_PARQUET, index=False)
-    print(f"  wrote {OUT_PARQUET} ({len(frame)} rows, "
+    log.info(f"  wrote {OUT_PARQUET} ({len(frame)} rows, "
           f"{len(V2_COLUMNS + NEW_COLUMNS)} columns)")
 
     qualified = frame[frame["pm_events_6h"] >= args.min_events]
-    print("\n=== deliverable ===")
-    print(f"ranked            {len(top_ids)}")
-    print(f"matched           {len(frame)}")
-    print(f"qualified (>= {args.min_events} events) {len(qualified)}")
-    print(f"with kalshi books {int(frame['kalshi_has_books'].sum())}")
+    log.info("\n=== deliverable ===")
+    log.info(f"ranked            {len(top_ids)}")
+    log.info(f"matched           {len(frame)}")
+    log.info(f"qualified (>= {args.min_events} events) {len(qualified)}")
+    log.info(f"with kalshi books {int(frame['kalshi_has_books'].sum())}")
     ev = frame["pm_events_6h"]
-    print(f"events per matched condition: min {ev.min():.0f}, p25 {ev.quantile(.25):.0f}, "
+    log.info(f"events per matched condition: min {ev.min():.0f}, p25 {ev.quantile(.25):.0f}, "
           f"median {ev.median():.0f}, p75 {ev.quantile(.75):.0f}, p90 {ev.quantile(.9):.0f}, max {ev.max():.0f}")
     buckets = [(args.min_events, 500), (500, 1000), (1000, 5000), (5000, 10**9)]
     for lo, hi in buckets:
         n = int(((ev >= lo) & (ev < hi)).sum())
-        print(f"  events {lo:,}-{hi:,}: {n}")
+        log.info(f"  events {lo:,}-{hi:,}: {n}")
     with_books = frame[frame["kalshi_has_books"]]
     if len(with_books):
         all_med = with_books["pm_staleness_median_s"].dropna()
         all_p90 = with_books["pm_staleness_p90_s"].dropna()
         pooled = stale.get("__pooled__", {})
-        print(f"PM-mid staleness (pooled over {pooled.get('n', 0):,} aligned snapshots): "
+        log.info(f"PM-mid staleness (pooled over {pooled.get('n', 0):,} aligned snapshots): "
               f"median {pooled.get('median', float('nan')):.0f}s, p90 {pooled.get('p90', float('nan')):.0f}s, "
               f"within 60s {100 * pooled.get('aligned_60s', 0):.1f}%")
-        print(f"PM-mid staleness (per-condition medians): min {all_med.min():.0f}s, "
+        log.info(f"PM-mid staleness (per-condition medians): min {all_med.min():.0f}s, "
               f"median {all_med.median():.0f}s, p90 {all_med.quantile(0.9):.0f}s, max {all_med.max():.0f}s")
-        print(f"PM-mid staleness (per-condition p90s):    min {all_p90.min():.0f}s, "
+        log.info(f"PM-mid staleness (per-condition p90s):    min {all_p90.min():.0f}s, "
               f"median {all_p90.median():.0f}s, p90 {all_p90.quantile(0.9):.0f}s, max {all_p90.max():.0f}s")
         for lo, hi in [(0, 60), (60, 300), (300, 900), (900, 3600), (3600, 10**9)]:
             n = int(((all_med >= lo) & (all_med < hi)).sum())
-            print(f"  per-condition median staleness {lo}-{hi}s: {n}")
+            log.info(f"  per-condition median staleness {lo}-{hi}s: {n}")
 
-    print("\n=== markdown (doc table) ===")
-    print("| PM question | Kalshi ticker | events 6h | median gap | p90 gap | conf | rule |")
-    print("|---|---|---:|---:|---:|---:|---|")
+    log.info("\n=== markdown (doc table) ===")
+    log.info("| PM question | Kalshi ticker | events 6h | median gap | p90 gap | conf | rule |")
+    log.info("|---|---|---:|---:|---:|---:|---|")
     for r in frame.itertuples(index=False):
         med = "-" if pd.isna(r.pm_staleness_median_s) else f"{r.pm_staleness_median_s:.0f}s"
         p90 = "-" if pd.isna(r.pm_staleness_p90_s) else f"{r.pm_staleness_p90_s:.0f}s"
         q = r.polymarket_question.replace("|", "/")
-        print(f"| {q} | `{r.kalshi_ticker}` | {r.pm_events_6h:,} | {med} | {p90} | "
+        log.info(f"| {q} | `{r.kalshi_ticker}` | {r.pm_events_6h:,} | {med} | {p90} | "
               f"{r.confidence:.2f} | {r.match_method} |")
     return 0
 

@@ -5,6 +5,8 @@ import duckdb
 import pandas as pd
 from scripts.audit_domain3_l2_tape import load_universe_metadata
 from collections import defaultdict
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 c_map, ev_map = load_universe_metadata()
 multi_events = {ev: cids for ev, cids in ev_map.items() if len(cids) >= 3}
@@ -51,16 +53,16 @@ for r in df.itertuples(index=False):
                     })
 
 df_sub = pd.DataFrame(sub1_events)
-print("Sub-1.00 multi-outcome events found:", len(df_sub))
+log.info('{!s} {!s}', "Sub-1.00 multi-outcome events found:", len(df_sub))
 if len(df_sub) > 0:
-    print(df_sub[['event_id', 'legs', 'ask_sum', 'venue_ts_ms']].head(10))
+    log.info(df_sub[['event_id', 'legs', 'ask_sum', 'venue_ts_ms']].head(10))
     sample = sub1_events[0]
     ev_info = c_map.get(list(sample["legs_detail"].keys())[0], {})
-    print("\nSample Event:", sample["event_id"], "Title:", ev_info.get("event_title"))
-    print("Legs:", sample["legs_detail"])
+    log.info('{!s} {!s} {!s} {!s}', "\nSample Event:", sample["event_id"], "Title:", ev_info.get("event_title"))
+    log.info('{!s} {!s}', "Legs:", sample["legs_detail"])
     
     # Calculate duration of these sub-1.00 episodes
     # Find how long the sum stayed < 1.00
     first_ts = df_sub['recv_ts_ns'].min()
     last_ts = df_sub['recv_ts_ns'].max()
-    print(f"\nTime span between first and last sub-1.00 observation: {(last_ts - first_ts)/1e6:.2f} ms")
+    log.info(f"\nTime span between first and last sub-1.00 observation: {(last_ts - first_ts)/1e6:.2f} ms")

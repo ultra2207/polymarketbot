@@ -1,5 +1,7 @@
 """Trace Jump 6 reaction."""
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 con = duckdb.connect()
 con.execute("SET threads=2")
@@ -9,17 +11,17 @@ token = '11255488849546644254354790673642069285217958901940891326853725963505566
 ts_start = 1793894003000
 ts_end = 1793894015000
 
-print("=== BINANCE BTC-USDT TICKS IN WINDOW ===")
+log.info("=== BINANCE BTC-USDT TICKS IN WINDOW ===")
 bn_ticks = con.execute(f"""
     SELECT venue_ts_ms, (bid + ask) / 2.0 as mid, bid, ask
     FROM read_parquet('data/tape/binance_bbo/date=2026-11-05/hour=15/*.parquet')
     WHERE symbol = 'BTCUSDT' AND venue_ts_ms BETWEEN {ts_start} AND {ts_end}
     ORDER BY venue_ts_ms
 """).df()
-print(f"Total Binance ticks: {len(bn_ticks)}")
-print(bn_ticks.iloc[::max(1, len(bn_ticks)//8)].to_string())
+log.info(f"Total Binance ticks: {len(bn_ticks)}")
+log.info(bn_ticks.iloc[::max(1, len(bn_ticks)//8)].to_string())
 
-print("\n=== POLYMARKET QUOTE UPDATES FOR BTC $82k IN SAME WINDOW ===")
+log.info("\n=== POLYMARKET QUOTE UPDATES FOR BTC $82k IN SAME WINDOW ===")
 pm_quotes = con.execute(f"""
     WITH raw_e AS (
         SELECT venue_ts_ms, recv_ts_ns, price_changes
@@ -34,15 +36,15 @@ pm_quotes = con.execute(f"""
     SELECT * FROM u
     ORDER BY venue_ts_ms, recv_ts_ns
 """).df()
-print(f"Total Polymarket quote updates: {len(pm_quotes)}")
+log.info(f"Total Polymarket quote updates: {len(pm_quotes)}")
 if len(pm_quotes) > 0:
-    print(pm_quotes.iloc[::max(1, len(pm_quotes)//10)].to_string())
+    log.info(pm_quotes.iloc[::max(1, len(pm_quotes)//10)].to_string())
 
-print("\n=== POLYMARKET TRADES IN SAME WINDOW ===")
+log.info("\n=== POLYMARKET TRADES IN SAME WINDOW ===")
 pm_trades = con.execute(f"""
     SELECT venue_ts_ms, recv_ts_ns, side, price, size
     FROM read_parquet('data/tape/clob_trades/date=2026-11-05/hour=15/*.parquet')
     WHERE asset_id = '{token}'
       AND venue_ts_ms BETWEEN {ts_start} AND {ts_end}
 """).df()
-print(f"Total Polymarket trades: {len(pm_trades)}")
+log.info(f"Total Polymarket trades: {len(pm_trades)}")

@@ -80,7 +80,7 @@ class CtfSplitArbConfig:
     vip_tier: str = "bronze"             # none, bronze, silver, gold, platinum, diamond, obsidian
     gas_units_split: int = TYPICAL_SPLIT_GAS_UNITS
     default_gas_price_gwei: float = 40.0
-    default_pol_usd_price: float = 0.40
+    default_pol_usd_price: float = 0.092  # measured POL/USD baseline (live oracle preferred)
     collateral_token: str = DEFAULT_COLLATERAL_USDC
     ctf_contract: str = CTF_CONTRACT_POLYGON
     parent_collection_id: str = ZERO_BYTES32
@@ -224,7 +224,7 @@ class CtfSplitExecutionResult:
 def estimate_polygon_eip1559_gas_usd(
     gas_units: int = TYPICAL_SPLIT_GAS_UNITS,
     gas_price_gwei: float = 40.0,
-    pol_usd_price: float = 0.40,
+    pol_usd_price: float = 0.092,
 ) -> float:
     """Calculate exact on-chain Polygon PoS EIP-1559 gas cost in USD.
 
@@ -335,12 +335,15 @@ class CtfCrossSplitArbitrageEngine:
             try:
                 gwei = float(self.ctf_client.get_dynamic_gas_price_gwei())
             except Exception as exc:  # noqa: BLE001
-                logger.debug(f"Gas oracle query failed, using default: {exc}")
+                logger.warning(
+                    "CTF split gas oracle query failed; using measured venue fallback: %s", exc
+                )
                 gwei = self.config.default_gas_price_gwei
         else:
             gwei = self.config.default_gas_price_gwei
 
-        # POL price in USD
+        # POL price in USD: use the measured baseline unless a caller supplies
+        # the live oracle value (the soak measures it once per refresh).
         if pol_usd_price is not None:
             px = pol_usd_price
         else:

@@ -10,6 +10,8 @@ import math
 import statistics
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 con = duckdb.connect()
 con.execute("SET threads=8")
@@ -53,7 +55,7 @@ CREATE OR REPLACE TEMP TABLE mk0 AS
 SELECT mk.*, s.price AS spot_0
 FROM mk ASOF LEFT JOIN spot s ON s.ts_ms <= (mk.end_ts-900)*1000
 """)
-print("markets:", con.sql("SELECT count(*), count(spot_0) FROM mk0").fetchall()[0])
+log.info('{!s} {!s}', "markets:", con.sql("SELECT count(*), count(spot_0) FROM mk0").fetchall()[0])
 
 # --- ticks inside the window, joined to spot and vol -----------------------
 con.execute("""
@@ -71,7 +73,7 @@ r = con.sql("""
 SELECT count(*), count(spot_0), count(spot_t), count(s60),
        count(*) FILTER (WHERE outcome='Up'), count(*) FILTER (WHERE outcome='Down')
 FROM t""").fetchall()[0]
-print(f"window ticks: {r[0]:,}  spot0 {r[1]:,}  spot_t {r[2]:,}  vol {r[3]:,}  Up {r[4]:,} Down {r[5]:,}")
+log.info(f"window ticks: {r[0]:,}  spot0 {r[1]:,}  spot_t {r[2]:,}  vol {r[3]:,}  Up {r[4]:,} Down {r[5]:,}")
 
 rows = con.sql("""
 SELECT ts, end_ts, spot_0, spot_t, price, outcome, payout, s60, s15, size_usdc
@@ -79,7 +81,7 @@ FROM t
 WHERE spot_0 IS NOT NULL AND spot_t IS NOT NULL AND s60 IS NOT NULL
   AND s60 BETWEEN 0.05 AND 5 AND price>0 AND price<1 AND spot_0>0 AND spot_t>0
 """).fetchall()
-print("analysis ticks:", f"{len(rows):,}")
+log.info('{!s} {!s}', "analysis ticks:", f"{len(rows):,}")
 
 
 def norm_cdf(x):
@@ -101,7 +103,7 @@ for ts, end_ts, s0, st, px, outcome, payout, s60, s15, usd in rows:
         model = model_up if outcome == 'Up' else 1-model_up
         realised = out_up if outcome == 'Up' else 1-out_up
         recs.append((tau, float(px), model, realised, sigma, tag, float(usd)))
-print("records:", f"{len(recs):,}")
+log.info('{!s} {!s}', "records:", f"{len(recs):,}")
 
 
 def spearman(xs, ys):
@@ -125,11 +127,11 @@ def spearman(xs, ys):
 
 for tag in ('60m', '15m'):
     sub = [r for r in recs if r[5] == tag]
-    print(f"\n=== sigma={tag}  n={len(sub):,} ===")
-    print(f"  mean price {sum(r[1] for r in sub)/len(sub):.4f}   mean model {sum(r[2] for r in sub)/len(sub):.4f}   mean realised {sum(r[3] for r in sub)/len(sub):.4f}")
-    print(f"  edge vs price   {(sum(r[3] for r in sub)-sum(r[1] for r in sub))/len(sub):+.4f}")
-    print(f"  Spearman(model-price, realised-price) {spearman([r[2]-r[1] for r in sub],[r[3]-r[1] for r in sub]):+.4f}")
-    print("\n  disagreement   n         edge         t")
+    log.info(f"\n=== sigma={tag}  n={len(sub):,} ===")
+    log.info(f"  mean price {sum(r[1] for r in sub)/len(sub):.4f}   mean model {sum(r[2] for r in sub)/len(sub):.4f}   mean realised {sum(r[3] for r in sub)/len(sub):.4f}")
+    log.info(f"  edge vs price   {(sum(r[3] for r in sub)-sum(r[1] for r in sub))/len(sub):+.4f}")
+    log.info(f"  Spearman(model-price, realised-price) {spearman([r[2]-r[1] for r in sub],[r[3]-r[1] for r in sub]):+.4f}")
+    log.info("\n  disagreement   n         edge         t")
     for th in (0.02, 0.05, 0.10, 0.15):
         for name, sel in (("model>mkt", [r for r in sub if r[2]-r[1] >= th]),
                           ("mkt>model", [r for r in sub if r[1]-r[2] >= th])):
@@ -137,4 +139,4 @@ for tag in ('60m', '15m'):
                 continue
             e = [r[3]-r[1] for r in sel]
             m = sum(e)/len(e); sd = statistics.pstdev(e) or 1e-9
-            print(f"  {name} {th:.2f}   {len(sel):>8,}   {m:+.4f}   {m/(sd/math.sqrt(len(e))):+.1f}")
+            log.info(f"  {name} {th:.2f}   {len(sel):>8,}   {m:+.4f}   {m/(sd/math.sqrt(len(e))):+.1f}")

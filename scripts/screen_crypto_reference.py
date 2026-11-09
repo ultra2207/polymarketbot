@@ -37,6 +37,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 KLINES = "data/raw/binance/klines/**/*.parquet"
@@ -63,7 +65,7 @@ def main() -> int:
     con = connect()
     off = args.entry_offset_hours
     if not Path("data/raw/binance/klines").exists():
-        print("no klines on disk - run scripts/fetch_binance_klines.py first")
+        log.info("no klines on disk - run scripts/fetch_binance_klines.py first")
         return 1
 
     con.execute("""
@@ -73,7 +75,7 @@ def main() -> int:
                           hive_partitioning=true)
     """)
     k = con.sql("SELECT count(*) FROM kl").fetchall()[0][0]
-    print(f"klines on disk: {k:,} minutes", flush=True)
+    log.info(f"klines on disk: {k:,} minutes", )
 
     con.execute("""
         CREATE OR REPLACE TEMP TABLE mk AS
@@ -110,9 +112,9 @@ def main() -> int:
           AND mk.end_ts IS NOT NULL
     """)
     n = con.sql("SELECT count(*) FROM base").fetchall()[0][0]
-    print(f"markets with a strike, an entry price and a symbol: {n:,}", flush=True)
+    log.info(f"markets with a strike, an entry price and a symbol: {n:,}", )
     if n == 0:
-        print("nothing joined - check the kline coverage window against entry times")
+        log.info("nothing joined - check the kline coverage window against entry times")
         return 1
 
     # ASOF join: last bar at or before the entry instant. No future data by construction.
@@ -131,9 +133,9 @@ def main() -> int:
         WHERE k.close IS NOT NULL
     """)
     n2 = con.sql("SELECT count(*) FROM with_ref").fetchall()[0][0]
-    print(f"matched to a reference bar: {n2:,}", flush=True)
+    log.info(f"matched to a reference bar: {n2:,}", )
     if n2 == 0:
-        print("no reference bars matched - check that kline coverage reaches the entry times")
+        log.info("no reference bars matched - check that kline coverage reaches the entry times")
         return 1
 
     dest = Path(args.dest)
@@ -155,7 +157,7 @@ def main() -> int:
         FROM with_ref
     """)
 
-    print(f"\n{'distance':12} {'markets':>8} {'mean px':>8} {'payout':>7} "
+    log.info(f"\n{'distance':12} {'markets':>8} {'mean px':>8} {'payout':>7} "
           f"{'gap':>8} {'±se':>7} {'t':>6}")
     for b, nm, px, pay, gap, se in con.sql("""
         SELECT dist_bin, count(*), avg(price), avg(payout),
@@ -165,7 +167,7 @@ def main() -> int:
         ORDER BY min(distance)
     """).fetchall():
         t = gap / se if se else float("nan")
-        print(f"{b:12} {nm:>8,} {px:>8.3f} {pay:>7.3f} {gap:>+8.4f} {se:>7.4f} {t:>6.1f}")
+        log.info(f"{b:12} {nm:>8,} {px:>8.3f} {pay:>7.3f} {gap:>+8.4f} {se:>7.4f} {t:>6.1f}")
 
     # The question that matters: does conditioning on distance beat the price itself?
     brier = con.sql("""
@@ -174,9 +176,9 @@ def main() -> int:
                    * (CASE WHEN distance > 0 THEN 1.0 ELSE 0.0 END - payout))
         FROM with_ref
     """).fetchall()[0]
-    print(f"\nBrier: market price {brier[0]:.5f} vs a naive 'is it already past the strike' "
+    log.info(f"\nBrier: market price {brier[0]:.5f} vs a naive 'is it already past the strike' "
           f"rule {brier[1]:.5f}")
-    print("(the naive rule ignores time-to-resolution and volatility entirely, so beating it "
+    log.info("(the naive rule ignores time-to-resolution and volatility entirely, so beating it "
           "is a low bar; the point is how far behind it the price is)")
     return 0
 

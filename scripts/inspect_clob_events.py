@@ -1,5 +1,7 @@
 """Inspect schema and event types in clob_events."""
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 con = duckdb.connect()
 con.execute("SET threads=2")
@@ -9,14 +11,14 @@ res = con.execute("""
     FROM read_parquet('data/tape/clob_events/date=2026-11-05/hour=15/*.parquet')
     GROUP BY event_type
 """).df()
-print("Event types in hour=15:")
-print(res)
+log.info("Event types in hour=15:")
+log.info(res)
 
 sample = con.execute("""
     SELECT *
     FROM read_parquet('data/tape/clob_events/date=2026-11-05/hour=15/*.parquet')
     LIMIT 3
 """).df()
-print("\nSample columns:")
+log.info("\nSample columns:")
 for col in sample.columns:
-    print(f"  {col}: {type(sample[col].iloc[0])} -> {sample[col].iloc[0]}")
+    log.info(f"  {col}: {type(sample[col].iloc[0])} -> {sample[col].iloc[0]}")

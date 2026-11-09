@@ -19,6 +19,8 @@ Reads the cube built by build_cube.py (33 MB), so it runs in well under a second
 from __future__ import annotations
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CUBE = "data/processed/cube.parquet"
 
@@ -28,18 +30,18 @@ def main() -> None:
     con.execute("SET threads=4")
     con.execute(f"CREATE OR REPLACE VIEW c AS SELECT * FROM read_parquet('{CUBE}')")
 
-    print("=== maker share of bought volume, by group (0 = pure taker, 9 = pure maker) ===")
-    print("  mbucket   top %vol   rest %vol")
+    log.info("=== maker share of bought volume, by group (0 = pure taker, 9 = pure maker) ===")
+    log.info("  mbucket   top %vol   rest %vol")
     for r in con.execute("""
         SELECT mbucket,
                100.0 * sum(bs) FILTER (WHERE dec = 1) / sum(sum(bs) FILTER (WHERE dec = 1)) OVER (),
                100.0 * sum(bs) FILTER (WHERE dec > 1) / sum(sum(bs) FILTER (WHERE dec > 1)) OVER ()
         FROM c WHERE mbucket >= 0 GROUP BY mbucket ORDER BY mbucket
     """).fetchall():
-        print(f"  {r[0]:>7}   {r[1]:>7.1f}   {r[2]:>8.1f}")
+        log.info(f"  {r[0]:>7}   {r[1]:>7.1f}   {r[2]:>8.1f}")
 
-    print("\n=== edge per share bought, by maker share (all prices) ===")
-    print("  mbucket   top edge | rest edge |     gap     top shares $m")
+    log.info("\n=== edge per share bought, by maker share (all prices) ===")
+    log.info("  mbucket   top edge | rest edge |     gap     top shares $m")
     for r in con.execute("""
         SELECT mbucket,
                (sum(payout_bs) FILTER (WHERE dec = 1) - sum(bc) FILTER (WHERE dec = 1))
@@ -52,10 +54,10 @@ def main() -> None:
     """).fetchall():
         if r[1] is None or r[2] is None:
             continue
-        print(f"  {r[0]:>7}   {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}   {r[3]:>10,.0f}")
+        log.info(f"  {r[0]:>7}   {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}   {r[3]:>10,.0f}")
 
-    print("\n=== the same inside the 70-85 % band (where the gap is largest) ===")
-    print("  mbucket   top edge | rest edge |     gap     top shares $m")
+    log.info("\n=== the same inside the 70-85 % band (where the gap is largest) ===")
+    log.info("  mbucket   top edge | rest edge |     gap     top shares $m")
     for r in con.execute("""
         SELECT mbucket,
                (sum(payout_bs) FILTER (WHERE dec = 1) - sum(bc) FILTER (WHERE dec = 1))
@@ -68,9 +70,9 @@ def main() -> None:
     """).fetchall():
         if r[1] is None or r[2] is None:
             continue
-        print(f"  {r[0]:>7}   {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}   {r[3]:>10,.0f}")
+        log.info(f"  {r[0]:>7}   {r[1]:>+8.4f} | {r[2]:>+9.4f} | {r[1]-r[2]:>+8.4f}   {r[3]:>10,.0f}")
 
-    print("\n=== decomposition of the top decile's total edge by role ===")
+    log.info("\n=== decomposition of the top decile's total edge by role ===")
     for r in con.execute("""
         SELECT
           CASE WHEN mbucket >= 7 THEN 'maker-heavy (70-100%)'
@@ -82,7 +84,7 @@ def main() -> None:
         FROM c WHERE dec = 1 AND outcome >= 0 AND mbucket >= 0
         GROUP BY role ORDER BY edge_m DESC
     """).fetchall():
-        print(f"  {r[0]:<24} edge ${r[1]:>+8.2f} m   on ${r[2]:>9,.0f} m bought")
+        log.info(f"  {r[0]:<24} edge ${r[1]:>+8.2f} m   on ${r[2]:>9,.0f} m bought")
 
 
 if __name__ == "__main__":

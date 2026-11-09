@@ -35,6 +35,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 
@@ -106,10 +108,10 @@ def main() -> int:
     n_tok = con.sql(
         f"SELECT count(*) FROM tok t JOIN fam f USING (family) "
         f"WHERE f.n >= {args.min_family}").fetchall()[0][0]
-    print(f"families with >= {args.min_family} resolved instances: {n_fam:,}")
-    print(f"token-observations inside them: {n_tok:,}")
+    log.info(f"families with >= {args.min_family} resolved instances: {n_fam:,}")
+    log.info(f"token-observations inside them: {n_tok:,}")
     if n_fam == 0:
-        print("no recurring families found; the slug suffix rules need widening")
+        log.info("no recurring families found; the slug suffix rules need widening")
         return 1
 
     con.execute("""
@@ -124,9 +126,9 @@ def main() -> int:
 
     n_cmp = con.sql("SELECT count(*) FROM cmp").fetchall()[0][0]
     if n_cmp == 0:
-        print("no overlap between family tokens and entry-priced tokens")
+        log.info("no overlap between family tokens and entry-priced tokens")
         return 1
-    print(f"compared against an observed entry price: {n_cmp:,}\n")
+    log.info(f"compared against an observed entry price: {n_cmp:,}\n")
 
     n, bp, bb, bl, dev = con.sql("""
         SELECT count(*),
@@ -137,13 +139,13 @@ def main() -> int:
                avg(abs(base_rate - price))
         FROM cmp
     """).fetchall()[0]
-    print(f"{'forecaster':22} {'Brier':>9}")
-    print(f"{'market price':22} {bp:>9.5f}")
-    print(f"{'family base rate':22} {bb:>9.5f}")
-    print(f"{'50/50 blend':22} {bl:>9.5f}")
-    print(f"\nmean |base_rate - price| = {dev:.4f} "
+    log.info(f"{'forecaster':22} {'Brier':>9}")
+    log.info(f"{'market price':22} {bp:>9.5f}")
+    log.info(f"{'family base rate':22} {bb:>9.5f}")
+    log.info(f"{'50/50 blend':22} {bl:>9.5f}")
+    log.info(f"\nmean |base_rate - price| = {dev:.4f} "
           f"({dev*100:.1f} c/share, against a ~2 c round trip)")
-    print(f"=> {'base rate WINS' if bb < bp else 'market price wins'}")
+    log.info(f"=> {'base rate WINS' if bb < bp else 'market price wins'}")
 
     con.execute("""
         CREATE OR REPLACE TEMP TABLE fam_stats AS
@@ -165,15 +167,15 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print("\nlargest base-rate deviations (families with >= 20 priced instances):")
-    print(f"{'family':50} {'base':>6} {'price':>6} {'gap':>7} {'t':>6}")
+    log.info("\nlargest base-rate deviations (families with >= 20 priced instances):")
+    log.info(f"{'family':50} {'base':>6} {'price':>6} {'gap':>7} {'t':>6}")
     for famname, br, mp, gap, se in con.sql("""
         SELECT family, base_rate, mean_price, mean_gap, gap_se
         FROM fam_stats ORDER BY abs(mean_gap) DESC LIMIT 20
     """).fetchall():
         t = gap / se if se else float("nan")
-        print(f"  {str(famname)[:48]:48} {br:>6.3f} {mp:>6.3f} {gap:>+7.4f} {t:>6.1f}")
-    print(f"\nwrote {dest / 'base_rate_families.parquet'}")
+        log.info(f"  {str(famname)[:48]:48} {br:>6.3f} {mp:>6.3f} {gap:>+7.4f} {t:>6.1f}")
+    log.info(f"\nwrote {dest / 'base_rate_families.parquet'}")
     return 0
 
 

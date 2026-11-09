@@ -76,7 +76,7 @@ def main():
         json.dump(summary, f, indent=2)
         
     logger.info("Saved summary to data/derived/domain3_tape_audit_summary.json")
-    print(json.dumps(summary, indent=2))
+    logger.info(json.dumps(summary, indent=2))
 
 if __name__ == "__main__":
     main()

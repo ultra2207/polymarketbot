@@ -777,7 +777,7 @@ def scan(
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_text(text, encoding="utf-8")
     log.info(f"wrote {len(records):,} buckets to {out} and summary to {summary}")
-    print(text)
+    log.info(text)
     return {
         "records": len(records),
         "flagged": sum(1 for r in records if r["flagged"]),

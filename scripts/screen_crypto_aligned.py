@@ -33,6 +33,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TAPE = "data/raw/sii/trades.parquet"
@@ -92,7 +94,7 @@ def main() -> int:
         WHERE symbol IS NOT NULL AND strike IS NOT NULL AND strike > 0
     """)
     n = con.sql("SELECT count(*) FROM mk2").fetchall()[0][0]
-    print(f"crypto above markets: {n:,}", flush=True)
+    log.info(f"crypto above markets: {n:,}", )
 
     # Market price: last taker BUY inside a narrow window before the lead.
     con.execute(f"""
@@ -113,9 +115,9 @@ def main() -> int:
         FROM t WHERE rn = 1 AND usd_amount >= {args.min_usd}
     """)
     m = con.sql("SELECT count(*) FROM px").fetchall()[0][0]
-    print(f"markets with a qualifying print: {m:,}", flush=True)
+    log.info(f"markets with a qualifying print: {m:,}", )
     if m == 0:
-        print("no prints inside the window - widen --window-minutes")
+        log.info("no prints inside the window - widen --window-minutes")
         return 1
 
     # Reference at that exact second: the last kline at or before the print.
@@ -137,7 +139,7 @@ def main() -> int:
         WHERE k.close IS NOT NULL
     """)
     a = con.sql("SELECT count(*) FROM aligned").fetchall()[0][0]
-    print(f"matched to a kline: {a:,}", flush=True)
+    log.info(f"matched to a kline: {a:,}", )
     if a == 0:
         return 1
 
@@ -149,7 +151,7 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print(f"\n{'distance':12} {'markets':>8} {'mkt px':>8} {'payout':>7} "
+    log.info(f"\n{'distance':12} {'markets':>8} {'mkt px':>8} {'payout':>7} "
           f"{'gap':>8} {'±se':>7} {'t':>6}")
     for b, nm, p_, pay, gap, se in con.sql("""
         SELECT CASE WHEN distance < -0.10 THEN '< -10%'
@@ -163,12 +165,12 @@ def main() -> int:
         FROM aligned GROUP BY 1 ORDER BY min(distance)
     """).fetchall():
         t = gap / se if se else float("nan")
-        print(f"{b:12} {nm:>8,} {p_:>8.3f} {pay:>7.3f} {gap:>+8.4f} {se:>7.4f} {t:>6.1f}")
+        log.info(f"{b:12} {nm:>8,} {p_:>8.3f} {pay:>7.3f} {gap:>+8.4f} {se:>7.4f} {t:>6.1f}")
 
     overall = con.sql("""
         SELECT avg((price - payout) * (price - payout)) FROM aligned
     """).fetchall()[0]
-    print(f"\nBrier (market price): {overall[0]:.5f} on {a:,} aligned observations")
+    log.info(f"\nBrier (market price): {overall[0]:.5f} on {a:,} aligned observations")
     return 0
 
 

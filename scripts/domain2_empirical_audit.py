@@ -246,4 +246,4 @@ def run_audit() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     rep = run_audit()
-    print(json.dumps(rep, indent=2))
+    logger.info(json.dumps(rep, indent=2))

@@ -26,6 +26,8 @@ sys.path.insert(0, "src")
 import duckdb
 
 from polymarketbot.fees import era_schedule, taker_fee
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 META = OUT / "market_metadata_gamma.parquet"
@@ -47,7 +49,7 @@ def _curve(p: float) -> str:
 
 def main() -> int:
     if not META.exists():
-        print(f"missing {META}; run scripts/enrich_market_metadata.py first")
+        log.info(f"missing {META}; run scripts/enrich_market_metadata.py first")
         return 1
 
     con = duckdb.connect()
@@ -62,7 +64,7 @@ def main() -> int:
         WHERE m.fee_rate IS NOT NULL
     """).fetchall()
     if not pairs:
-        print("no per-market fee schedules yet")
+        log.info("no per-market fee schedules yet")
         return 1
 
     # era fallback for each distinct (category, month)
@@ -103,11 +105,11 @@ def main() -> int:
         FROM j
     """).fetchall()[0]
 
-    print(f"markets with a per-market schedule: {total:,}")
-    print(f"fallback agreement:  rate {100*rate_ok/total:6.2f}%   "
+    log.info(f"markets with a per-market schedule: {total:,}")
+    log.info(f"fallback agreement:  rate {100*rate_ok/total:6.2f}%   "
           f"exponent {100*exp_ok/total:6.2f}%   rebate {100*reb_ok/total:6.2f}%\n")
 
-    print("worst 15 category/month cells by mean peak error (fee per 100 shares):")
+    log.info("worst 15 category/month cells by mean peak error (fee per 100 shares):")
     rows = con.sql(f"""
         SELECT category, month, count(*) n,
                100.0 * count(*) FILTER (WHERE abs(g_rate - e_rate) < 1e-9) / count(*) rate_pct,
@@ -119,13 +121,13 @@ def main() -> int:
                      - {FEE_AT.format(rate='e_rate', curve=_curve(0.5), exp='e_exp')})) max_err
         FROM j GROUP BY 1, 2 ORDER BY mean_err DESC LIMIT 15
     """).fetchall()
-    print(f"  {'category':12} {'month':8} {'n':>7} {'rate':>6} {'exp':>6} {'rebate':>7} "
+    log.info(f"  {'category':12} {'month':8} {'n':>7} {'rate':>6} {'exp':>6} {'rebate':>7} "
           f"{'mean_err':>9} {'max_err':>8}")
     for cat, month, n, rp, ep, rbp, mean_err, max_err in rows:
-        print(f"  {cat:12} {month:8} {n:>7,} {rp:>5.0f}% {ep:>5.0f}% {rbp:>6.0f}% "
+        log.info(f"  {cat:12} {month:8} {n:>7,} {rp:>5.0f}% {ep:>5.0f}% {rbp:>6.0f}% "
               f"{mean_err:>9.4f} {max_err:>8.4f}")
 
-    print("\nlargest single-market fallback errors (fee per 100 shares at p=0.5):")
+    log.info("\nlargest single-market fallback errors (fee per 100 shares at p=0.5):")
     for cat, month, ftype, err, g, e in con.sql(f"""
         SELECT category, month, fee_type,
                abs({FEE_AT.format(rate='g_rate', curve=_curve(0.5), exp='g_exp')}
@@ -133,10 +135,10 @@ def main() -> int:
                (g_rate, g_exp, g_rebate) AS gamma, (e_rate, e_exp, e_rebate) AS era
         FROM j ORDER BY err DESC LIMIT 10
     """).fetchall():
-        print(f"  {err:8.4f}  {cat:11} {month} {str(ftype):22} gamma={g} era={e}")
+        log.info(f"  {err:8.4f}  {cat:11} {month} {str(ftype):22} gamma={g} era={e}")
 
     # Away from the peak the exponent matters less; the rate still dominates.
-    print("\nby fee_type, mean absolute fallback error at p=0.5 and p=0.1:")
+    log.info("\nby fee_type, mean absolute fallback error at p=0.5 and p=0.1:")
     for ftype, n, e50, e10 in con.sql(f"""
         SELECT fee_type, count(*) n,
                avg(abs({FEE_AT.format(rate='g_rate', curve=_curve(0.5), exp='g_exp')}
@@ -145,11 +147,11 @@ def main() -> int:
                      - {FEE_AT.format(rate='e_rate', curve=_curve(0.1), exp='e_exp')}))
         FROM j GROUP BY 1 ORDER BY 2 DESC
     """).fetchall():
-        print(f"  {str(ftype):24} n={n:>8,}  p=0.5 {e50:7.4f}  p=0.1 {e10:7.4f}")
+        log.info(f"  {str(ftype):24} n={n:>8,}  p=0.5 {e50:7.4f}  p=0.1 {e10:7.4f}")
 
     # Sanity: the published peak for a crypto 15-min market is 1.56% of notional.
     peak = taker_fee(100, 0.5, era_schedule("crypto", "2026-02-01"))
-    print(f"\ncrypto era fallback at 2026-02, 100 shares at p=0.5: {peak:.4f} USDC")
+    log.info(f"\ncrypto era fallback at 2026-02, 100 shares at p=0.5: {peak:.4f} USDC")
     return 0
 
 

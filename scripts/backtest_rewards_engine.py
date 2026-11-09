@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Dict, List
 
 from loguru import logger
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CATEGORY_REGIMES = {
     "politics": {
@@ -365,9 +367,9 @@ def main():
 
     logger.info(f"Backtest complete. Results written to {out_path}")
 
-    print("\n" + "=" * 115)
-    print(f"{'Market':<35} | {'Rate':<7} | {'Cap ($)':<8} | {'Rew ($)':<8} | {'Adv ($)':<8} | {'Spr ($)':<8} | {'Net ($/d)':<9} | {'Ann ROI':<9}")
-    print("-" * 115)
+    log.info("\n" + "=" * 115)
+    log.info(f"{'Market':<35} | {'Rate':<7} | {'Cap ($)':<8} | {'Rew ($)':<8} | {'Adv ($)':<8} | {'Spr ($)':<8} | {'Net ($/d)':<9} | {'Ann ROI':<9}")
+    log.info("-" * 115)
     for r in sorted(sim_results, key=lambda x: x["avg_daily_net_pnl"], reverse=True):
         q = r["question"][:34]
         rate = f"${r['daily_rate']:,.0f}"
@@ -377,8 +379,8 @@ def main():
         spr = f"${r['avg_daily_spread_pnl']:,.2f}"
         net = f"${r['avg_daily_net_pnl']:,.2f}"
         roi = f"{r['annual_roi_pct']:,.1f}%"
-        print(f"{q:<35} | {rate:<7} | {cap:<8} | {rew:<8} | {adv:<8} | {spr:<8} | {net:<9} | {roi:<9}")
-    print("=" * 115 + "\n")
+        log.info(f"{q:<35} | {rate:<7} | {cap:<8} | {rew:<8} | {adv:<8} | {spr:<8} | {net:<9} | {roi:<9}")
+    log.info("=" * 115 + "\n")
     return 0
 
 

@@ -38,6 +38,8 @@ import duckdb
 
 from polymarketbot.dataapi import DataAPIClient
 from polymarketbot.wallets import classify_archetype as classify
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 DEST = OUT / "wallet_cohort.parquet"
@@ -64,7 +66,7 @@ def main() -> int:
     client = DataAPIClient(min_interval_s=0.05)
     started = time.time()
 
-    print("fetching boards ...", flush=True)
+    log.info("fetching boards ...", )
     board: dict[str, dict] = {}
 
     for row in client.leaderboard(limit=100, max_pages=args.leaderboard_pages):
@@ -93,7 +95,7 @@ def main() -> int:
         board[w]["sources"].add("biggest_winners")
 
     wallets = list(board.values())[: args.max_wallets]
-    print(f"board wallets: {len(board):,}; fetching stats for {len(wallets):,}", flush=True)
+    log.info(f"board wallets: {len(board):,}; fetching stats for {len(wallets):,}", )
 
     def enrich(w: dict) -> dict:
         c = DataAPIClient(min_interval_s=0.05)
@@ -118,14 +120,14 @@ def main() -> int:
             if time.time() - started > args.max_seconds:
                 for f in futures:
                     f.cancel()
-                print("  wall-clock budget reached", flush=True)
+                log.info("  wall-clock budget reached", )
                 break
             rows.append(fut.result())
             if len(rows) % 25 == 0:
-                print(f"  {len(rows)}/{len(wallets)} wallets, {time.time()-started:.0f}s", flush=True)
+                log.info(f"  {len(rows)}/{len(wallets)} wallets, {time.time()-started:.0f}s", )
 
     if not rows:
-        print("no rows")
+        log.info("no rows")
         return 1
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -141,15 +143,15 @@ def main() -> int:
     """)
     jsonl.unlink(missing_ok=True)
 
-    print(f"\nwrote {DEST} ({len(rows):,} wallets)", flush=True)
-    print("\narchetypes:")
+    log.info(f"\nwrote {DEST} ({len(rows):,} wallets)", )
+    log.info("\narchetypes:")
     for r in con.sql(f"""
         SELECT archetype, count(*) n, round(sum(realized_pnl),0) pnl
         FROM read_parquet('{DEST.as_posix()}') GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:20} {r[1]:>4}  ${r[2]:>12,.0f}")
+        log.info(f"  {r[0]:20} {r[1]:>4}  ${r[2]:>12,.0f}")
 
-    print("\ntop by realized PnL:")
+    log.info("\ntop by realized PnL:")
     for r in con.sql(f"""
         SELECT wallet, archetype, leaderboard_rank, round(realized_pnl,0),
                round(realized_market_pnl,0), round(maker_rebate,0), round(realized_lp_pnl,0),
@@ -157,7 +159,7 @@ def main() -> int:
         FROM read_parquet('{DEST.as_posix()}')
         ORDER BY realized_pnl DESC NULLS LAST LIMIT 10
     """).fetchall():
-        print(f"  {r[0][:12]} {r[1]:18} rank={str(r[2]):>4} pnl=${r[3]:>10,.0f} "
+        log.info(f"  {r[0][:12]} {r[1]:18} rank={str(r[2]):>4} pnl=${r[3]:>10,.0f} "
               f"market=${r[4]:>10,.0f} rebate=${r[5]:>7,.0f} lp=${r[6]:>7,.0f} trades={r[7]}")
     return 0
 

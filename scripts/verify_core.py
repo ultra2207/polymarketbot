@@ -25,6 +25,8 @@ from pathlib import Path
 import duckdb
 
 from polymarketbot.logs import IST
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 RAW = Path("data/raw")
 TRADES = RAW / "sii/trades.parquet"
@@ -46,7 +48,7 @@ REPORT: dict = {}
 
 
 def section(title: str) -> None:
-    print(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
+    log.info(f"\n{'=' * 72}\n{title}\n{'=' * 72}")
 
 
 def check_files() -> None:
@@ -60,7 +62,7 @@ def check_files() -> None:
         size = path.stat().st_size if exists else None
         expected = (manifest.get(name) or {}).get("bytes")
         ok = exists and (expected is None or size == expected)
-        print(f"  {'OK ' if ok else 'BAD'} {name:45} {size:>14,} bytes")
+        log.info(f"  {'OK ' if ok else 'BAD'} {name:45} {size:>14,} bytes")
         out[name] = {"bytes": size, "manifest_bytes": expected, "ok": bool(ok)}
     REPORT["files"] = out
 
@@ -89,7 +91,7 @@ def parquet_meta(con: duckdb.DuckDBPyConnection) -> None:
             f"SELECT num_rows, num_row_groups FROM parquet_file_metadata('{path}')"
         ).fetchall()[0]
         ok = rows == want
-        print(f"  {'OK ' if ok else 'BAD'} {rel:45} {rows:>14,} rows  ({groups:,} groups)")
+        log.info(f"  {'OK ' if ok else 'BAD'} {rel:45} {rows:>14,} rows  ({groups:,} groups)")
         out[rel] = {"rows": rows, "expected": want, "ok": bool(ok)}
     REPORT["row_counts"] = out
 
@@ -121,14 +123,14 @@ def profile_trades(con: duckdb.DuckDBPyConnection) -> None:
     n, first_epoch, last_epoch, nulls, bad_price, nonpos_usd, self_trades, summary = row
     first_ts = datetime.fromtimestamp(first_epoch, IST)
     last_ts = datetime.fromtimestamp(last_epoch, IST)
-    print(f"  rows                 {n:,}")
-    print(f"  first timestamp      {first_ts}")
-    print(f"  last timestamp       {last_ts}")
-    print(f"  null price/amount    {nulls:,}")
-    print(f"  price outside [0,1]  {bad_price:,}")
-    print(f"  usd_amount == 0      {nonpos_usd:,}  (zero-size fills; filter these out)")
-    print(f"  maker == taker       {self_trades:,}")
-    print(f"  taker-summary events {summary:,}  (should be 0)")
+    log.info(f"  rows                 {n:,}")
+    log.info(f"  first timestamp      {first_ts}")
+    log.info(f"  last timestamp       {last_ts}")
+    log.info(f"  null price/amount    {nulls:,}")
+    log.info(f"  price outside [0,1]  {bad_price:,}")
+    log.info(f"  usd_amount == 0      {nonpos_usd:,}  (zero-size fills; filter these out)")
+    log.info(f"  maker == taker       {self_trades:,}")
+    log.info(f"  taker-summary events {summary:,}  (should be 0)")
     REPORT["trades"] = {
         "rows": n,
         "first_ts": str(first_ts),
@@ -147,13 +149,13 @@ def profile_trades(con: duckdb.DuckDBPyConnection) -> None:
                         THEN 1 ELSE 0 END) AS v2_hint
         FROM t GROUP BY 1 ORDER BY n DESC
     """).fetchall()
-    print("\n  contracts:")
+    log.info("\n  contracts:")
     REPORT["contracts"] = []
     for name, cnt, _ in contracts:
-        print(f"    {name:28} {cnt:>14,}")
+        log.info(f"    {name:28} {cnt:>14,}")
         REPORT["contracts"].append({"contract": name, "rows": cnt})
 
-    print("\n  duplicate check on one week (2026-03-01 .. 2026-03-07):")
+    log.info("\n  duplicate check on one week (2026-03-01 .. 2026-03-07):")
     dup = con.sql("""
         SELECT count(*) AS dup_groups, sum(c - 1) AS extra_rows
         FROM (
@@ -165,10 +167,10 @@ def profile_trades(con: duckdb.DuckDBPyConnection) -> None:
             HAVING count(*) > 1
         )
     """).fetchall()[0]
-    print(f"    duplicate (tx,log_index) groups: {dup[0]:,}  extra rows: {dup[1] or 0:,}")
+    log.info(f"    duplicate (tx,log_index) groups: {dup[0]:,}  extra rows: {dup[1] or 0:,}")
     REPORT["duplicates_week"] = {"groups": dup[0], "extra_rows": dup[1] or 0}
 
-    print(f"\n  (profile took {time.time() - t0:.1f}s)")
+    log.info(f"\n  (profile took {time.time() - t0:.1f}s)")
 
 
 def profile_markets(con: duckdb.DuckDBPyConnection) -> None:
@@ -188,12 +190,12 @@ def profile_markets(con: duckdb.DuckDBPyConnection) -> None:
         FROM m
     """).fetchall()[0]
 
-    print(f"  markets              {row[0]:,}")
-    print(f"  created range        {row[1]}  ->  {row[2]}")
-    print(f"  null end_date        {row[3]:,}")
-    print(f"  null outcome_prices  {row[4]:,}")
-    print(f"  zero volume          {row[5]:,}")
-    print(f"  neg_risk             {row[6]:,}")
+    log.info(f"  markets              {row[0]:,}")
+    log.info(f"  created range        {row[1]}  ->  {row[2]}")
+    log.info(f"  null end_date        {row[3]:,}")
+    log.info(f"  null outcome_prices  {row[4]:,}")
+    log.info(f"  zero volume          {row[5]:,}")
+    log.info(f"  neg_risk             {row[6]:,}")
     REPORT["markets"] = {
         "rows": row[0],
         "first_created": str(row[1]),
@@ -204,21 +206,21 @@ def profile_markets(con: duckdb.DuckDBPyConnection) -> None:
         "neg_risk": row[6],
     }
 
-    print("\n  resolution encoding (top 6):")
+    log.info("\n  resolution encoding (top 6):")
     rows = con.sql("""
         SELECT outcome_prices, count(*) n FROM m GROUP BY 1 ORDER BY n DESC LIMIT 6
     """).fetchall()
     for val, n in rows:
-        print(f"    {str(val)[:34]:36} {n:>10,}")
+        log.info(f"    {str(val)[:34]:36} {n:>10,}")
 
 
 def cross_index(con: duckdb.DuckDBPyConnection) -> None:
     section("5. cross-indexer spot check (SII vs moose-code, 2026-03-02)")
     try:
         cols = [d[0] for d in con.sql(f"SELECT * FROM read_parquet('{MOOSE}') LIMIT 0").description]
-        print(f"  moose columns: {', '.join(cols)}")
+        log.info(f"  moose columns: {', '.join(cols)}")
     except Exception as exc:  # noqa: BLE001
-        print(f"  ! could not read moose: {type(exc).__name__}: {exc}")
+        log.info(f"  ! could not read moose: {type(exc).__name__}: {exc}")
         REPORT["cross_index"] = {"error": str(exc)}
         return
 
@@ -259,9 +261,9 @@ def cross_index(con: duckdb.DuckDBPyConnection) -> None:
         exact = sum(1 for h in hashes if sii.get(h, 0) == moose.get(h, 0))
         total_sii = sum(sii.get(h, 0) for h in hashes)
         total_moose = sum(moose.get(h, 0) for h in hashes)
-        print(f"  sampled transactions: {len(hashes)}")
-        print(f"  exact per-tx fill-count match: {exact}/{len(hashes)}")
-        print(f"  total fills: sii={total_sii}  moose={total_moose}")
+        log.info(f"  sampled transactions: {len(hashes)}")
+        log.info(f"  exact per-tx fill-count match: {exact}/{len(hashes)}")
+        log.info(f"  total fills: sii={total_sii}  moose={total_moose}")
         REPORT["cross_index"] = {
             "sampled": len(hashes),
             "exact_matches": exact,
@@ -269,13 +271,13 @@ def cross_index(con: duckdb.DuckDBPyConnection) -> None:
             "total_moose": total_moose,
         }
     except Exception as exc:  # noqa: BLE001
-        print(f"  ! cross-check failed: {type(exc).__name__}: {exc}")
+        log.info(f"  ! cross-check failed: {type(exc).__name__}: {exc}")
         REPORT["cross_index"] = {"error": str(exc)}
 
 
 def main() -> int:
     if not TRADES.exists():
-        print(f"missing {TRADES} — run scripts/download.py first")
+        log.info(f"missing {TRADES} — run scripts/download.py first")
         return 1
 
     check_files()
@@ -287,7 +289,7 @@ def main() -> int:
 
     out = RAW / "verify_report.json"
     out.write_text(json.dumps(REPORT, indent=2, default=str))
-    print(f"\nreport written to {out}")
+    log.info(f"\nreport written to {out}")
     return 0
 
 

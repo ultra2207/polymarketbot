@@ -1,5 +1,7 @@
 """Check trades for the high-update BTC $82k market in hour 15."""
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 con = duckdb.connect()
 con.execute("SET threads=2")
@@ -18,6 +20,6 @@ df = con.execute(f"""
     ORDER BY venue_ts_ms
 """).df()
 
-print(f"Total trades in hour 15 for BTC $82k Nov 6: {len(df)}")
+log.info(f"Total trades in hour 15 for BTC $82k Nov 6: {len(df)}")
 if len(df) > 0:
-    print(df.to_string())
+    log.info(df.to_string())

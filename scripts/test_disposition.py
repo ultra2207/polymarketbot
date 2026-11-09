@@ -34,6 +34,7 @@ import argparse
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CACHE = "data/processed/wallet_token/*.parquet"
 LABELS = "data/processed/market_labels.parquet"
@@ -101,8 +102,8 @@ def main() -> None:
         logger.warning("no qualifying positions")
         return
 
-    print("\n=== within a partially exited position: is the sold part the winner? ===")
-    print("  closed_pnl / open_pnl      positions     closed $m     open $m")
+    log.info("\n=== within a partially exited position: is the sold part the winner? ===")
+    log.info("  closed_pnl / open_pnl      positions     closed $m     open $m")
     for r in con.sql("""
         SELECT CASE WHEN closed > 0 AND open <= 0 THEN 'sold win, held loss'
                     WHEN closed > 0 AND open > 0  THEN 'sold win, held win'
@@ -115,9 +116,9 @@ def main() -> None:
             FROM pos
         ) GROUP BY kind ORDER BY count(*) DESC
     """).fetchall():
-        print(f"  {r[0]:<24} {r[1]:>9,}   {r[2]:>+10.2f}   {r[3]:>+10.2f}")
+        log.info(f"  {r[0]:<24} {r[1]:>9,}   {r[2]:>+10.2f}   {r[3]:>+10.2f}")
 
-    print("\n=== exit timing: do they sell into profit? ===")
+    log.info("\n=== exit timing: do they sell into profit? ===")
     r = con.sql("""
         SELECT 100.0 * count(*) FILTER (WHERE vsell > vbuy) / count(*) AS exit_in_profit_pct,
                100.0 * count(*) FILTER (WHERE payout > vbuy)  / count(*) AS would_hold_be_profit_pct,
@@ -125,12 +126,12 @@ def main() -> None:
                avg(payout - vbuy) AS mean_hold_gain
         FROM pos
     """).fetchall()[0]
-    print(f"  exits taken at sell>buy:        {r[0]:>6.1f} %")
-    print(f"  same positions would have won:  {r[1]:>6.1f} % (if held to resolution)")
-    print(f"  mean gain at exit:              {r[2]:>+8.4f} per share")
-    print(f"  mean gain if held:              {r[3]:>+8.4f} per share")
+    log.info(f"  exits taken at sell>buy:        {r[0]:>6.1f} %")
+    log.info(f"  same positions would have won:  {r[1]:>6.1f} % (if held to resolution)")
+    log.info(f"  mean gain at exit:              {r[2]:>+8.4f} per share")
+    log.info(f"  mean gain if held:              {r[3]:>+8.4f} per share")
 
-    print("\n=== the pure holding set: bought, never sold ===")
+    log.info("\n=== the pure holding set: bought, never sold ===")
     r = con.sql("""
         SELECT count(*),
                100.0 * count(*) FILTER (WHERE p.payout > pr.bc/nullif(pr.bs,0)) / count(*),
@@ -139,12 +140,12 @@ def main() -> None:
         JOIN payout p ON p.asset_id = pr.asset_id
         WHERE pr.ss = 0 AND pr.bs > 0
     """).fetchall()[0]
-    print(f"  positions held to resolution: {r[0]:,}")
-    print(f"  of those, profitable:         {r[1]:.1f} %")
-    print(f"  total PnL on them:            ${r[2]:+,.2f} m")
+    log.info(f"  positions held to resolution: {r[0]:,}")
+    log.info(f"  of those, profitable:         {r[1]:.1f} %")
+    log.info(f"  total PnL on them:            ${r[2]:+,.2f} m")
 
-    print("\n=== conditional on the outcome: do winners get closed and losers held? ===")
-    print("  outcome if held   positions    closed%   mean frac closed   pnl if held $m")
+    log.info("\n=== conditional on the outcome: do winners get closed and losers held? ===")
+    log.info("  outcome if held   positions    closed%   mean frac closed   pnl if held $m")
     for r in con.sql("""
         SELECT CASE WHEN payout > vbuy THEN 'would win' ELSE 'would lose' END AS outcome,
                count(*),
@@ -158,19 +159,19 @@ def main() -> None:
             WHERE pr.bs > 0
         ) GROUP BY outcome ORDER BY outcome
     """).fetchall():
-        print(f"  {r[0]:<16} {r[1]:>11,}   {r[2]:>6.1f}   {r[3]:>16.3f}   {r[4]:>+13.2f}")
+        log.info(f"  {r[0]:<16} {r[1]:>11,}   {r[2]:>6.1f}   {r[3]:>16.3f}   {r[4]:>+13.2f}")
 
-    print("\n=== of the exits they do take, how many are at a loss? ===")
+    log.info("\n=== of the exits they do take, how many are at a loss? ===")
     r = con.sql("""
         SELECT 100.0 * count(*) FILTER (WHERE vsell < vbuy) / count(*)
         FROM (SELECT pr.ss, pr.sc / nullif(pr.ss,0) AS vsell, pr.bc / nullif(pr.bs,0) AS vbuy
               FROM pr JOIN top_w ON top_w.wallet = pr.wallet
               WHERE pr.ss > 0 AND pr.bs > 0)
     """).fetchall()[0]
-    print(f"  exits taken at a loss: {r[0]:.1f} %")
+    log.info(f"  exits taken at a loss: {r[0]:.1f} %")
 
-    print("\n=== never-sold positions: size distribution (dust or conviction?) ===")
-    print("  notional          positions    avg $      total PnL $m")
+    log.info("\n=== never-sold positions: size distribution (dust or conviction?) ===")
+    log.info("  notional          positions    avg $      total PnL $m")
     labels = ["<$1", "$1-10", "$10-100", "$100-1k", "$1k-10k",
               "$10k-100k", "$100k-1M", "$1M-10M", "$10M+"]
     for r in con.sql("""
@@ -186,7 +187,7 @@ def main() -> None:
             WHERE pr.ss = 0 AND pr.bs > 0
         ) GROUP BY b ORDER BY b
     """).fetchall():
-        print(f"  {labels[r[0]]:<12} {r[1]:>12,}   {r[2]:>8.2f}   {r[3]:>+12.2f}")
+        log.info(f"  {labels[r[0]]:<12} {r[1]:>12,}   {r[2]:>8.2f}   {r[3]:>+12.2f}")
 
 
 if __name__ == "__main__":

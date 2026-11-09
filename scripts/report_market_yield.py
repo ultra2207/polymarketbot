@@ -28,6 +28,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from polymarketbot.logs import IST
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 MIN_FILLS_FOR_NET = 2
 MIN_REBALANCES_FOR_NET = 1
@@ -252,10 +254,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     db_path = Path(args.db)
     if not db_path.exists():
-        print(f"database not found: {db_path}", file=sys.stderr)
+        log.error(f"database not found: {db_path}", )
         return 2
     tape_dir = Path(args.tape) if args.tape else None
-    print(build_report(db_path, tape_dir))
+    log.info(build_report(db_path, tape_dir))
     return 0
 
 

@@ -1041,7 +1041,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         lags_out=args.lags_out,
         summary_out=args.summary_out,
     )
-    print(text)
+    log.info(text)
     return 0
 
 

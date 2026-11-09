@@ -819,10 +819,10 @@ if __name__ == "__main__":
     t0 = time.time()
     res = run_four_strategies_paper_trading(vip_tier=args.vip_tier)
     t_elapsed = time.time() - t0
-    print(f"\nExecution finished in {t_elapsed:.2f} seconds.")
-    print("=" * 80)
-    print(f"{'Strategy':<22} | {'Net PnL ($)':<11} | {'Daily (%)':<9} | {'Monthly APY':<11} | {'Yearly ARR':<10} | {'Max DD (%)':<10} | {'Sharpe':<6}")
-    print("-" * 80)
+    logger.info(f"\nExecution finished in {t_elapsed:.2f} seconds.")
+    logger.info("=" * 80)
+    logger.info(f"{'Strategy':<22} | {'Net PnL ($)':<11} | {'Daily (%)':<9} | {'Monthly APY':<11} | {'Yearly ARR':<10} | {'Max DD (%)':<10} | {'Sharpe':<6}")
+    logger.info("-" * 80)
     for k, m in res["performance_metrics"].items():
-        print(f"{m['strategy_name']:<22} | ${m['net_pnl_usd']:>9.2f} | {m['daily_return_pct']:>8.3f}% | {m['monthly_compounding_apy_pct']:>10.2f}% | {m['yearly_capacity_constrained_apy_pct']:>9.2f}% | {m['max_drawdown_pct']:>9.3f}% | {m['annualized_sharpe']:>6.2f}")
-    print("=" * 80)
+        logger.info(f"{m['strategy_name']:<22} | ${m['net_pnl_usd']:>9.2f} | {m['daily_return_pct']:>8.3f}% | {m['monthly_compounding_apy_pct']:>10.2f}% | {m['yearly_capacity_constrained_apy_pct']:>9.2f}% | {m['max_drawdown_pct']:>9.3f}% | {m['annualized_sharpe']:>6.2f}")
+    logger.info("=" * 80)

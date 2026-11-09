@@ -10,6 +10,10 @@ from collections import defaultdict
 
 import duckdb
 
+from polymarketbot.logs import get_logger
+
+log = get_logger(__name__)
+
 con = duckdb.connect()
 con.execute("SET threads=8"); con.execute("SET memory_limit='10GB'")
 con.execute("SET temp_directory='data/tmp_duck'")
@@ -43,7 +47,7 @@ WHERE k.timestamp_ms/1000.0 >= m.end_ts-900 AND k.timestamp_ms/1000.0 < m.end_ts
   AND v.s60 BETWEEN 0.05 AND 5
 ORDER BY k.market_id, k.outcome, k.timestamp_ms
 """).fetchall()
-print("ticks:", f"{len(rows):,}")
+log.info('{!s} {!s}', "ticks:", f"{len(rows):,}")
 
 YEAR = 31_536_000.0
 def ncdf(x): return 0.5*(1+math.erf(x/math.sqrt(2)))
@@ -71,7 +75,7 @@ for key, seq in tok.items():
         model = mu if key[1] == 'Up' else 1-mu
         realised = float(payout) if key[1] == 'Up' else 1-float(payout)
         records.append((model-px, px2-px, dt, tau, px, realised, model))
-print("records:", f"{len(records):,}")
+log.info('{!s} {!s}', "records:", f"{len(records):,}")
 
 
 def corr(xs, ys):
@@ -81,18 +85,18 @@ def corr(xs, ys):
     return num/(dx*dy) if dx and dy else float('nan')
 
 
-print("\n=== does the deviation predict the NEXT price change? ===")
+log.info("\n=== does the deviation predict the NEXT price change? ===")
 for lo, hi, label in ((0, 1, '<=1s'), (1, 5, '1-5s'), (5, 30, '5-30s'), (30, 120, '30-120s')):
     sub = [r for r in records if lo < r[2] <= hi]
     if len(sub) < 500:
         continue
     xs = [r[0] for r in sub]; ys = [r[1] for r in sub]
     m = sum(ys)/len(ys)
-    print(f"  dt {label:<8} n={len(sub):>9,}  corr(dev, dP)={corr(xs, ys):+.4f}  mean dP={m:+.5f}  "
+    log.info(f"  dt {label:<8} n={len(sub):>9,}  corr(dev, dP)={corr(xs, ys):+.4f}  mean dP={m:+.5f}  "
           f"mean dev={sum(xs)/len(xs):+.4f}")
 
-print("\n=== if we could trade the deviation: edge of buying the model's side ===")
-print("  threshold   n          edge      t")
+log.info("\n=== if we could trade the deviation: edge of buying the model's side ===")
+log.info("  threshold   n          edge      t")
 import statistics
 for th in (0.02, 0.05, 0.10):
     sel = [r for r in records if abs(r[0]) >= th]
@@ -106,4 +110,4 @@ for th in (0.02, 0.05, 0.10):
         else:
             edge.append((1-realised) - (1-px))
     m = sum(edge)/len(edge); sd = statistics.pstdev(edge) or 1e-9
-    print(f"  {th:>9.2f}  {len(sel):>9,}   {m:+.4f}   {m/(sd/math.sqrt(len(edge))):+.1f}")
+    log.info(f"  {th:>9.2f}  {len(sel):>9,}   {m:+.4f}   {m/(sd/math.sqrt(len(edge))):+.1f}")

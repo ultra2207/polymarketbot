@@ -33,6 +33,8 @@ sys.path.insert(0, "src")
 import duckdb
 
 from polymarketbot.db import connect as _connect
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 RAW = Path("data/raw")
 OUT = Path("data/processed")
@@ -86,7 +88,7 @@ def build_chain_labels(con: duckdb.DuckDBPyConnection) -> None:
         ) TO '{dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
     n = con.sql(f"SELECT count(*) FROM read_parquet('{dest.as_posix()}')").fetchall()[0][0]
-    print(f"wrote {dest}  ({n:,} conditions)")
+    log.info(f"wrote {dest}  ({n:,} conditions)")
 
 
 def build_market_labels(con: duckdb.DuckDBPyConnection) -> None:
@@ -170,13 +172,13 @@ def build_market_labels(con: duckdb.DuckDBPyConnection) -> None:
         ) TO '{dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
     n = con.sql(f"SELECT count(*) FROM read_parquet('{dest.as_posix()}')").fetchall()[0][0]
-    print(f"wrote {dest}  ({n:,} markets)")
+    log.info(f"wrote {dest}  ({n:,} markets)")
 
 
 def report(con: duckdb.DuckDBPyConnection) -> None:
     src = (OUT / "market_labels.parquet").as_posix()
-    print("\nlabel availability by creation month:")
-    print(f"  {'month':8} {'markets':>10} {'chain':>10} {'missing':>10} {'resolved':>10} {'void':>8}")
+    log.info("\nlabel availability by creation month:")
+    log.info(f"  {'month':8} {'markets':>10} {'chain':>10} {'missing':>10} {'resolved':>10} {'void':>8}")
     for row in con.sql(f"""
         SELECT strftime(created_at, '%Y-%m') mo,
                count(*) n,
@@ -188,9 +190,9 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
         WHERE created_at >= TIMESTAMPTZ '2025-10-01'
         GROUP BY 1 ORDER BY 1
     """).fetchall():
-        print(f"  {row[0]:8} {row[1]:>10,} {row[2]:>10,} {row[3]:>10,} {row[4]:>10,} {row[5]:>8,}")
+        log.info(f"  {row[0]:8} {row[1]:>10,} {row[2]:>10,} {row[3]:>10,} {row[4]:>10,} {row[5]:>8,}")
 
-    print("\nforward-test window (2026-06-01 .. 2026-08-10), markets with volume > 0:")
+    log.info("\nforward-test window (2026-06-01 .. 2026-08-10), markets with volume > 0:")
     row = con.sql(f"""
         SELECT count(*) n,
                count(*) FILTER (WHERE resolved) resolved,
@@ -200,9 +202,9 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
           AND created_at <  TIMESTAMPTZ '2026-08-11'
           AND volume > 0
     """).fetchall()[0]
-    print(f"  markets={row[0]:,}  resolved={row[1]:,}  missing_label={row[2]:,}")
+    log.info(f"  markets={row[0]:,}  resolved={row[1]:,}  missing_label={row[2]:,}")
 
-    print("\ntradable universe proxy (closed, volume > 0) with/without label:")
+    log.info("\ntradable universe proxy (closed, volume > 0) with/without label:")
     row = con.sql(f"""
         SELECT count(*) n,
                count(*) FILTER (WHERE resolved) resolved,
@@ -210,7 +212,7 @@ def report(con: duckdb.DuckDBPyConnection) -> None:
         FROM read_parquet('{src}')
         WHERE closed = 1 AND volume > 0
     """).fetchall()[0]
-    print(f"  n={row[0]:,}  resolved={row[1]:,}  voids={row[2]:,}")
+    log.info(f"  n={row[0]:,}  resolved={row[1]:,}  voids={row[2]:,}")
 
 
 def main() -> int:

@@ -345,7 +345,7 @@ def main():
     # Print summary table
     summary_df = pd.DataFrame(results)
     logger.info("\n" + "=" * 100 + "\nDOMAIN 2 EXECUTION REGIMES BACKTEST RESULTS (INITIAL CAPITAL: $10,000 USDC)\n" + "=" * 100)
-    print("\n" + summary_df[['regime', 'net_pnl', 'realized_arr_pct', 'realized_apy_pct', 'max_dd_pct', 'reversal_count', 'capital_lost_reversals', 'capital_turnover_turns_per_day', 'realized_sharpe', 'calmar_ratio']].to_string(index=False))
+    logger.info("\n" + summary_df[['regime', 'net_pnl', 'realized_arr_pct', 'realized_apy_pct', 'max_dd_pct', 'reversal_count', 'capital_lost_reversals', 'capital_turnover_turns_per_day', 'realized_sharpe', 'calmar_ratio']].to_string(index=False))
 
     # Save to JSON
     out_dir = Path("data/derived/uma")

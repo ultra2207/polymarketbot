@@ -21,6 +21,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 from polymarketbot.db import connect
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 DOME = Path("data/raw/dome/dome_polymarket_2025-10_2026-03.parquet")
@@ -31,7 +33,7 @@ def main() -> int:
     con = connect(threads=12, memory_limit="8GB")
 
     t0 = time.time()
-    print("aggregating Dome tick sizes (339 M rows) ...")
+    log.info("aggregating Dome tick sizes (339 M rows) ...")
     con.execute(f"""
         COPY (
             SELECT
@@ -48,7 +50,7 @@ def main() -> int:
         SELECT count(*) n, count(*) FILTER (WHERE n_tick_sizes > 1) multi
         FROM read_parquet('{DEST.as_posix()}')
     """).fetchall()[0]
-    print(f"wrote {DEST}  ({row[0]:,} markets, {row[1]:,} with mixed ticks) in {elapsed:.1f}s")
+    log.info(f"wrote {DEST}  ({row[0]:,} markets, {row[1]:,} with mixed ticks) in {elapsed:.1f}s")
     return 0
 
 

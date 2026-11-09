@@ -14,6 +14,7 @@ import collections
 import threading
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import orjson

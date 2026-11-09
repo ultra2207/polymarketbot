@@ -10,6 +10,8 @@ Reads the cube (81 MB) so it runs in about a second.
 from __future__ import annotations
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CUBE = "data/processed/cube.parquet"
 CATS = {0: "other", 1: "crypto", 2: "sports", 3: "weather", 4: "politics",
@@ -32,8 +34,8 @@ def main() -> None:
         FROM c WHERE dec = 1 AND outcome >= 0 AND mbucket >= 0
     """)
 
-    print("=== taker vs maker edge, by category ===")
-    print("  category       taker edge   volume $m |  maker edge   volume $m")
+    log.info("=== taker vs maker edge, by category ===")
+    log.info("  category       taker edge   volume $m |  maker edge   volume $m")
     for r in con.execute("""
         SELECT coalesce(cat,0),
                (sum(payout_bs) FILTER (WHERE role='taker') - sum(bc) FILTER (WHERE role='taker'))
@@ -46,11 +48,11 @@ def main() -> None:
     """).fetchall():
         if r[1] is None:
             continue
-        print(f"  {CATS.get(r[0], '?'):<12}  {r[1]:>+9.4f}  {r[2]:>9,.0f} | "
+        log.info(f"  {CATS.get(r[0], '?'):<12}  {r[1]:>+9.4f}  {r[2]:>9,.0f} | "
               f"{r[3]:>+10.4f}  {r[4]:>9,.0f}" if r[3] is not None else "")
 
-    print("\n=== taker calibration by price band (does payout exceed price?) ===")
-    print("  price band   volume $m   payout   entry    edge")
+    log.info("\n=== taker calibration by price band (does payout exceed price?) ===")
+    log.info("  price band   volume $m   payout   entry    edge")
     for r in con.execute("""
         SELECT pbucket, sum(bc)/1e6,
                sum(payout_bs)/nullif(sum(bs),0),
@@ -60,18 +62,18 @@ def main() -> None:
     """).fetchall():
         if r[3] is None:
             continue
-        print(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%  {r[1]:>9,.0f}  {r[2]:>6.3f}  {r[3]:>6.3f}  {r[4]:>+7.4f}")
+        log.info(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%  {r[1]:>9,.0f}  {r[2]:>6.3f}  {r[3]:>6.3f}  {r[4]:>+7.4f}")
 
-    print("\n=== taker edge by time-to-resolution ===")
-    print("  ttl          volume $m    edge")
+    log.info("\n=== taker edge by time-to-resolution ===")
+    log.info("  ttl          volume $m    edge")
     for r in con.execute("""
         SELECT tbucket, sum(bc)/1e6, (sum(payout_bs)-sum(bc))/nullif(sum(bs),0)
         FROM t WHERE role='taker' GROUP BY tbucket ORDER BY tbucket
     """).fetchall():
-        print(f"  {TTLS[r[0]]:<10}  {r[1]:>9,.0f}  {r[2]:>+8.4f}")
+        log.info(f"  {TTLS[r[0]]:<10}  {r[1]:>9,.0f}  {r[2]:>+8.4f}")
 
-    print("\n=== the largest positive cells (cat x price band), taker only ===")
-    print("  category     band       volume $m    payout   entry     edge")
+    log.info("\n=== the largest positive cells (cat x price band), taker only ===")
+    log.info("  category     band       volume $m    payout   entry     edge")
     for r in con.execute("""
         SELECT cat, pbucket, sum(bc)/1e6,
                sum(payout_bs)/nullif(sum(bs),0),
@@ -81,11 +83,11 @@ def main() -> None:
         GROUP BY 1, 2 HAVING sum(bc) > 5e7
         ORDER BY (sum(payout_bs)-sum(bc))/nullif(sum(bs),0) DESC LIMIT 12
     """).fetchall():
-        print(f"  {CATS.get(r[0],'?'):<12} {r[1]*5:>3}-{r[1]*5+5:<3}%  {r[2]:>9,.0f}   "
+        log.info(f"  {CATS.get(r[0],'?'):<12} {r[1]*5:>3}-{r[1]*5+5:<3}%  {r[2]:>9,.0f}   "
               f"{r[3]:>6.3f}  {r[4]:>6.3f}  {r[5]:>+8.4f}")
 
-    print("\n=== the largest negative cells (cat x price band), maker only ===")
-    print("  category     band       volume $m    payout   entry     edge")
+    log.info("\n=== the largest negative cells (cat x price band), maker only ===")
+    log.info("  category     band       volume $m    payout   entry     edge")
     for r in con.execute("""
         SELECT cat, pbucket, sum(bc)/1e6,
                sum(payout_bs)/nullif(sum(bs),0),
@@ -95,7 +97,7 @@ def main() -> None:
         GROUP BY 1, 2 HAVING sum(bc) > 5e7
         ORDER BY (sum(payout_bs)-sum(bc))/nullif(sum(bs),0) ASC LIMIT 12
     """).fetchall():
-        print(f"  {CATS.get(r[0],'?'):<12} {r[1]*5:>3}-{r[1]*5+5:<3}%  {r[2]:>9,.0f}   "
+        log.info(f"  {CATS.get(r[0],'?'):<12} {r[1]*5:>3}-{r[1]*5+5:<3}%  {r[2]:>9,.0f}   "
               f"{r[3]:>6.3f}  {r[4]:>6.3f}  {r[5]:>+8.4f}")
 
 

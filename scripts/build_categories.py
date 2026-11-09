@@ -15,6 +15,8 @@ sys.path.insert(0, "src")
 
 from polymarketbot.db import connect
 from polymarketbot.universe.categories import sql_case
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 SRC = OUT / "market_labels.parquet"
@@ -80,10 +82,10 @@ def main() -> int:
     """)
 
     n = con.sql(f"SELECT count(*) FROM read_parquet('{DEST.as_posix()}')").fetchall()[0][0]
-    print(f"wrote {DEST} ({n:,} markets)\n")
+    log.info(f"wrote {DEST} ({n:,} markets)\n")
 
-    print("all markets, by count and volume:")
-    print(f"  {'category':12} {'markets':>10} {'share':>7} {'volume $B':>10} {'vol share':>10}")
+    log.info("all markets, by count and volume:")
+    log.info(f"  {'category':12} {'markets':>10} {'share':>7} {'volume $B':>10} {'vol share':>10}")
     rows = con.sql(f"""
         WITH t AS (SELECT count(*) n, sum(volume) v FROM read_parquet('{DEST.as_posix()}'))
         SELECT category, count(*) n, sum(volume) v,
@@ -93,18 +95,18 @@ def main() -> int:
         GROUP BY 1 ORDER BY n DESC
     """).fetchall()
     for cat, cnt, vol, pc, pv in rows:
-        print(f"  {cat:12} {cnt:>10,} {pc:>6.1f}% {vol/1e9:>10.2f} {pv:>9.1f}%")
+        log.info(f"  {cat:12} {cnt:>10,} {pc:>6.1f}% {vol/1e9:>10.2f} {pv:>9.1f}%")
 
-    print("\ncategory source:")
+    log.info("\ncategory source:")
     for r in con.sql(f"""
         SELECT category_source, count(*) n,
                round(100.0*count(*)/(SELECT count(*) FROM read_parquet('{DEST.as_posix()}')),1) pct
         FROM read_parquet('{DEST.as_posix()}') GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:12} {r[1]:>10,}  {r[2]:>5.1f}%")
+        log.info(f"  {r[0]:12} {r[1]:>10,}  {r[2]:>5.1f}%")
 
-    print("\ntradable universe proxy (closed, volume > 0):")
-    print(f"  {'category':12} {'markets':>10} {'share':>7} {'volume $B':>10} {'vol share':>10}")
+    log.info("\ntradable universe proxy (closed, volume > 0):")
+    log.info(f"  {'category':12} {'markets':>10} {'share':>7} {'volume $B':>10} {'vol share':>10}")
     rows = con.sql(f"""
         WITH u AS (
             SELECT category, count(*) n, sum(volume) v
@@ -115,9 +117,9 @@ def main() -> int:
         FROM u ORDER BY n DESC
     """).fetchall()
     for cat, cnt, vol, pc, pv in rows:
-        print(f"  {cat:12} {cnt:>10,} {pc:>6.1f}% {vol/1e9:>10.2f} {pv:>9.1f}%")
+        log.info(f"  {cat:12} {cnt:>10,} {pc:>6.1f}% {vol/1e9:>10.2f} {pv:>9.1f}%")
 
-    print("\n'other' share by year (tradable proxy):")
+    log.info("\n'other' share by year (tradable proxy):")
     for r in con.sql(f"""
         SELECT date_part('year', created_at) yr, count(*) n,
                round(100.0*count(*) FILTER (WHERE category='other')/count(*),1) other_pct
@@ -125,16 +127,16 @@ def main() -> int:
         WHERE closed=1 AND volume>0
         GROUP BY 1 ORDER BY 1
     """).fetchall():
-        print(f"  {int(r[0])}  markets={r[1]:>9,}  other={r[2]:>5.1f}%")
+        log.info(f"  {int(r[0])}  markets={r[1]:>9,}  other={r[2]:>5.1f}%")
 
-    print("\nlargest 'other' families (event_slug prefix):")
+    log.info("\nlargest 'other' families (event_slug prefix):")
     for r in con.sql(f"""
         SELECT split_part(event_slug,'-',1) pref, count(*) n, round(sum(volume)/1e9,2) v
         FROM read_parquet('{DEST.as_posix()}')
         WHERE category='other' AND closed=1 AND volume>0 AND event_slug IS NOT NULL
         GROUP BY 1 ORDER BY n DESC LIMIT 15
     """).fetchall():
-        print(f"  {r[0]:18} {r[1]:>8,}  ${r[2]:>6.2f}B")
+        log.info(f"  {r[0]:18} {r[1]:>8,}  ${r[2]:>6.2f}B")
     return 0
 
 

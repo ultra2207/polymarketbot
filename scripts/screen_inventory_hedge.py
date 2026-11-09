@@ -343,13 +343,13 @@ def main() -> int:
         ("live15", "RANGE"),
     ]
 
-    print(f"\n=== cap {args.cap:,.0f} shares ===")
-    print("| cap policy | fills | shares | no-hedge gross | no-hedge net | complement net | perp gross | perp net | peak |inv| | mean |inv| |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    log.info(f"\n=== cap {args.cap:,.0f} shares ===")
+    log.info("| cap policy | fills | shares | no-hedge gross | no-hedge net | complement net | perp gross | perp net | peak |inv| | mean |inv| |")
+    log.info("|---|---|---|---|---|---|---|---|---|---|")
     for name, part in policies:
         p = cap_policy(con, name, part, args.cap)
         s = report(con, p, gamma, sched.rate, sched.exponent, sched.rebate_rate)
-        print(f"| {name} | {s['fills']:,} | {s['shares']:,.0f} | ${s['pnl_none']:+,.2f} | "
+        log.info(f"| {name} | {s['fills']:,} | {s['shares']:,.0f} | ${s['pnl_none']:+,.2f} | "
               f"${s['pnl_none'] + s['rebate']:+,.2f} | ${s['comp_net']:+,.2f} | "
               f"${s['perp_gross']:+,.2f} | ${s['perp_net']:+,.2f} | "
               f"{s['inv_peak']:,.0f} | {s['inv_mean']:,.0f} |")
@@ -366,16 +366,16 @@ def main() -> int:
     p_unc = cap_policy(con, "uncapped", "PARTITION BY token_id", 1e15)
     u = report(con, p_unc, gamma, sched.rate, sched.exponent, sched.rebate_rate)
     sh = u['shares']
-    print("\n=== uncapped (all admissible fills) ===")
-    print("| variant | fills | shares | PnL/wk | PnL/share | peak inv |")
-    print("|---|---|---|---|---|---|")
+    log.info("\n=== uncapped (all admissible fills) ===")
+    log.info("| variant | fills | shares | PnL/wk | PnL/share | peak inv |")
+    log.info("|---|---|---|---|---|---|")
     for lbl, v in (("no hedge, gross", u['pnl_none']),
                    ("no hedge, + rebate", u['pnl_none'] + u['rebate']),
                    ("complement, gross", u['comp_lock']),
                    ("complement, net of hedge fee", u['comp_net']),
                    ("perp, gross", u['perp_gross']),
                    ("perp, net of Binance fee", u['perp_net'])):
-        print(f"| {lbl} | {u['fills']:,} | {sh:,.0f} | ${v:+,.2f} | {100*v/sh:+.3f}c | {u['inv_peak']:,.0f} |")
+        log.info(f"| {lbl} | {u['fills']:,} | {sh:,.0f} | ${v:+,.2f} | {100*v/sh:+.3f}c | {u['inv_peak']:,.0f} |")
     log.info("uncapped: shares {:.0f} nohedge ${:+.2f} (+rebate ${:+.2f} = ${:+.2f}) comp lock ${:+.2f} "
              "hedgefee ${:+.2f} comp net ${:+.2f} perp gross ${:+.2f} binance ${:+.2f} perp net ${:+.2f} "
              "edge@touch {:.4f}c/share",
@@ -384,14 +384,14 @@ def main() -> int:
              100 * u['edge'] / sh)
 
     # ---- per-share decomposition --------------------------------------------
-    print("\nper-share decomposition (uncapped):")
-    print(f"  half-spread earned at touch      {100*u['edge']/sh:+.4f}c")
-    print(f"  carried markout (no hedge)       {100*u['pnl_none']/sh:+.4f}c")
-    print(f"  complement lock cost             {100*u['comp_lock']/sh:+.4f}c")
-    print(f"  hedge-leg taker fee              {-100*u['comp_fee']/sh:+.4f}c")
-    print(f"  maker rebate credit              {100*u['rebate']/sh:+.4f}c")
-    print(f"  perp delta PnL (gross)           {100*(u['perp_gross']-u['pnl_none'])/sh:+.4f}c")
-    print(f"  perp fee (Binance)               {-100*u['perp_fee']/sh:+.4f}c")
+    log.info("\nper-share decomposition (uncapped):")
+    log.info(f"  half-spread earned at touch      {100*u['edge']/sh:+.4f}c")
+    log.info(f"  carried markout (no hedge)       {100*u['pnl_none']/sh:+.4f}c")
+    log.info(f"  complement lock cost             {100*u['comp_lock']/sh:+.4f}c")
+    log.info(f"  hedge-leg taker fee              {-100*u['comp_fee']/sh:+.4f}c")
+    log.info(f"  maker rebate credit              {100*u['rebate']/sh:+.4f}c")
+    log.info(f"  perp delta PnL (gross)           {100*(u['perp_gross']-u['pnl_none'])/sh:+.4f}c")
+    log.info(f"  perp fee (Binance)               {-100*u['perp_fee']/sh:+.4f}c")
 
     # ---- hold to settlement ---------------------------------------------------
     dres = con.sql(
@@ -407,15 +407,15 @@ def main() -> int:
              "mean gap={:+.4f} sd(gap)={:.2f}c",
              f"{dres[0]:,}", dres[1], dres[2], dres[3], dres[4], dres[5])
 
-    print("\n=== held to settlement (same admissible sets) ===")
-    print("| cap policy | fills | shares | no-hedge gross | no-hedge + rebate | complement net | perp gross | perp net | perp notional | peak |inv| |")
-    print("|---|---|---|---|---|---|---|---|---|---|")
+    log.info("\n=== held to settlement (same admissible sets) ===")
+    log.info("| cap policy | fills | shares | no-hedge gross | no-hedge + rebate | complement net | perp gross | perp net | perp notional | peak |inv| |")
+    log.info("|---|---|---|---|---|---|---|---|---|---|")
     rows = []
     for name, part in policies:
         p = cap_policy(con, name, part, args.cap)
         z = report_settle(con, p, gamma_res, sched.rate, sched.exponent, sched.rebate_rate)
         rows.append((name, z))
-        print(f"| {name} | {z['fills']:,} | {z['shares']:,.0f} | ${z['pnl_none']:+,.2f} | "
+        log.info(f"| {name} | {z['fills']:,} | {z['shares']:,.0f} | ${z['pnl_none']:+,.2f} | "
               f"${z['pnl_none'] + z['rebate']:+,.2f} | ${z['comp_net']:+,.2f} | "
               f"${z['perp_gross']:+,.2f} | ${z['perp_net']:+,.2f} | "
               f"${z['perp_notional']:,.0f} | {z['inv_peak']:,.0f} |")
@@ -473,7 +473,7 @@ def main() -> int:
     ).fetchall()[0]
     log.info("cluster [portfolio cap, settlement]: markets {} {:.4f}c +- {:.4f} (t={:+.2f})",
              gc[0], 100*gc[1], 100*gc[2], gc[1]/gc[2])
-    print(f"  [portfolio cap, settlement] markets {gc[0]}: {100*gc[1]:+.3f}c +- {100*gc[2]:.3f} "
+    log.info(f"  [portfolio cap, settlement] markets {gc[0]}: {100*gc[1]:+.3f}c +- {100*gc[2]:.3f} "
           f"(t={gc[1]/gc[2]:+.2f})")
 
     # concentration of the headline number
@@ -494,20 +494,20 @@ def main() -> int:
     log.info("concentration: {} markets, 60s total ${:+.2f} (top-5 ${:+.2f} = {:.0%}), "
              "settle total ${:+.2f}, sd(per-market) ${:,.2f}",
              conc[0], conc[1], conc[3], conc[4], conc[2], conc[5])
-    print(f"\nconcentration: {conc[0]} markets, 60s total ${conc[1]:+.2f}; top 5 markets "
+    log.info(f"\nconcentration: {conc[0]} markets, 60s total ${conc[1]:+.2f}; top 5 markets "
           f"${conc[3]:+.2f} ({conc[4]:.0%}); sd per market ${conc[5]:,.2f}")
 
-    print("\n=== cluster-robust (per market, cents/share, t = mean/SE) ===")
-    print(f"  markets {g60[0]}  60s markout {100*g60[1]:+.3f}c +- {100*g60[2]:.3f} (t={g60[1]/g60[2]:+.2f})"
+    log.info("\n=== cluster-robust (per market, cents/share, t = mean/SE) ===")
+    log.info(f"  markets {g60[0]}  60s markout {100*g60[1]:+.3f}c +- {100*g60[2]:.3f} (t={g60[1]/g60[2]:+.2f})"
           f"   perp leg {100*g60[3]:+.3f}c +- {100*g60[4]:.3f}")
-    print(f"  settlement  {100*gset[1]:+.3f}c +- {100*gset[2]:.3f} (t={gset[1]/gset[2]:+.2f})"
+    log.info(f"  settlement  {100*gset[1]:+.3f}c +- {100*gset[2]:.3f} (t={gset[1]/gset[2]:+.2f})"
           f"   perp leg {100*gset[3]:+.3f}c +- {100*gset[4]:.3f}")
     log.info("clustered: markets {} 60s {:.4f}c +- {:.4f} (t={:+.2f}) | settle {:.4f}c +- {:.4f} (t={:+.2f})",
              g60[0], 100*g60[1], 100*g60[2], g60[1]/g60[2],
              100*gset[1], 100*gset[2], gset[1]/gset[2])
 
     # ---- inventory path ------------------------------------------------------
-    print("\n=== inventory path, portfolio-capped book (end-of-day net shares) ===")
+    log.info("\n=== inventory path, portfolio-capped book (end-of-day net shares) ===")
     q = f"""
     WITH p AS (SELECT * FROM path_portfolio),
     net AS (
@@ -520,9 +520,9 @@ def main() -> int:
     SELECT * FROM last ORDER BY d
     """
     for x in con.sql(q).fetchall():
-        print(f"  {x[0]}  net {x[3]:+,.0f} shares  (intraday {x[2]:+,.0f} .. {x[1]:+,.0f})")
+        log.info(f"  {x[0]}  net {x[3]:+,.0f} shares  (intraday {x[2]:+,.0f} .. {x[1]:+,.0f})")
 
-    print("\n=== inventory path, uncapped book ===")
+    log.info("\n=== inventory path, uncapped book ===")
     q2 = f"""
     WITH net AS (
       SELECT strftime(to_timestamp(timestamp), '%Y-%m-%d') d,
@@ -533,7 +533,7 @@ def main() -> int:
     SELECT d, max(pos), min(pos), last(pos ORDER BY d) FROM net GROUP BY d ORDER BY d
     """
     for x in con.sql(q2).fetchall():
-        print(f"  {x[0]}  net {x[3]:+,.0f} shares  (intraday {x[2]:+,.0f} .. {x[1]:+,.0f})")
+        log.info(f"  {x[0]}  net {x[3]:+,.0f} shares  (intraday {x[2]:+,.0f} .. {x[1]:+,.0f})")
 
     # ---- break-even hedge cost ----------------------------------------------
     # 1) complement: the max extra per-share cost it can absorb before going negative
@@ -548,10 +548,10 @@ def main() -> int:
              "(avg ${:,.2f}/fill); perp net=0 at {:.2f}bps/side, parity with no-hedge at {:.2f}bps/side",
              100 * be_comp, perp_notional_total, perp_notional_total / u['fills'],
              be_perp_zero, be_perp_parity)
-    print(f"\nbreak-even complement extra cost: {100*be_comp:+.4f}c/share "
+    log.info(f"\nbreak-even complement extra cost: {100*be_comp:+.4f}c/share "
           f"(it locks {100*u['comp_net']/sh:+.4f}c after the hedge fee)")
-    print(f"perp notional traded: ${perp_notional_total:,.0f} (${perp_notional_total/u['fills']:,.2f}/fill)")
-    print(f"break-even Binance fee: net=0 at {be_perp_zero:.2f} bps/side, "
+    log.info(f"perp notional traded: ${perp_notional_total:,.0f} (${perp_notional_total/u['fills']:,.2f}/fill)")
+    log.info(f"break-even Binance fee: net=0 at {be_perp_zero:.2f} bps/side, "
           f"parity with holding at {be_perp_parity:.2f} bps/side")
     return 0
 

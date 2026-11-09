@@ -37,6 +37,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TAPE = "data/raw/sii/trades.parquet"
@@ -97,7 +99,7 @@ def main() -> int:
     """)
     n_mk = con.sql("SELECT count(*) FROM ladder").fetchall()[0][0]
     n_ev = con.sql("SELECT count(DISTINCT event_id) FROM ladder").fetchall()[0][0]
-    print(f"ladder legs: {n_mk:,} across {n_ev:,} events", flush=True)
+    log.info(f"ladder legs: {n_mk:,} across {n_ev:,} events", )
 
     # One price per leg, inside a single hour, 24-23 h before end_date.
     con.execute(f"""
@@ -120,9 +122,9 @@ def main() -> int:
     """)
 
     n_px = con.sql("SELECT count(*) FROM px").fetchall()[0][0]
-    print(f"legs priced in the common hour with >= ${args.min_usd:.0f}: {n_px:,}", flush=True)
+    log.info(f"legs priced in the common hour with >= ${args.min_usd:.0f}: {n_px:,}", )
     if n_px < 3:
-        print("too few priced legs inside the common hour")
+        log.info("too few priced legs inside the common hour")
         return 1
 
     # A violation is an adjacent pair where the higher strike is priced higher.
@@ -156,20 +158,20 @@ def main() -> int:
         FROM pairs
     """).fetchall()[0]
     n_ev_priced, n_pairs, n_viol, n_ev_viol, worst, mean_worst = tot
-    print(f"\nevents with >= 3 priced legs: {n_ev_priced:,}")
-    print(f"adjacent strike pairs:        {n_pairs:,}")
-    print(f"inversions > {args.tick:.2f}:            {n_viol:,} "
+    log.info(f"\nevents with >= 3 priced legs: {n_ev_priced:,}")
+    log.info(f"adjacent strike pairs:        {n_pairs:,}")
+    log.info(f"inversions > {args.tick:.2f}:            {n_viol:,} "
           f"({100 * n_viol / max(n_pairs, 1):.2f} % of pairs)")
-    print(f"events containing one:        {n_ev_viol:,} "
+    log.info(f"events containing one:        {n_ev_viol:,} "
           f"({100 * n_ev_viol / max(n_ev_priced, 1):.1f} %)")
-    print(f"worst inversion:              {worst:.4f}  "
+    log.info(f"worst inversion:              {worst:.4f}  "
           f"(mean of worst-per-event {mean_worst or 0:.4f})")
 
     if n_viol == 0:
-        print("\n=> DEAD: no inversion exceeds one tick on a simultaneous, buyable quote")
+        log.info("\n=> DEAD: no inversion exceeds one tick on a simultaneous, buyable quote")
         return 0
 
-    print("\nlargest inversions:")
+    log.info("\nlargest inversions:")
     for ev, s_lo, s_hi, p_lo, p_hi, inv in con.sql("""
         WITH o AS (
             SELECT event_id, strike, price,
@@ -180,9 +182,9 @@ def main() -> int:
         SELECT event_id, strike, s_hi, price, p_hi, p_hi - price
         FROM o WHERE p_hi - price > ? ORDER BY 6 DESC LIMIT 10
     """, [args.tick]).fetchall():
-        print(f"  event={str(ev)[:12]} strikes {s_lo:>10,.2f} -> {s_hi:>10,.2f}  "
+        log.info(f"  event={str(ev)[:12]} strikes {s_lo:>10,.2f} -> {s_hi:>10,.2f}  "
               f"prices {p_lo:.3f} -> {p_hi:.3f}  inversion {inv:+.4f}")
-    print("\nNote: an inversion is only tradable if the pair can be bought against the "
+    log.info("\nNote: an inversion is only tradable if the pair can be bought against the "
           "rest of the ladder at size; that needs resting depth, i.e. the book.")
     return 0
 

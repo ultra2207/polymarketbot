@@ -961,15 +961,18 @@ if __name__ == "__main__":
     for cap in test_tiers:
         plan = optimizer.optimize(cap, steps=args.steps)
         if args.json:
-            print(json.dumps(plan.to_dict(), indent=2))
+            logger.info(json.dumps(plan.to_dict(), indent=2))
         else:
-            print("\n" + "=" * 80)
-            print(f"META-OPTIMIZER ALLOCATION: ${plan.total_capital_usd:,.2f} USD")
-            print("=" * 80)
-            print(f"{'Strategy':<22} {'Allocated USD':>14} {'Share':>8} {'Marginal APY':>14} {'Effective APY':>15} {'Annual Profit':>15}")
-            print("-" * 80)
+            lines = [
+                "",
+                "=" * 80,
+                f"META-OPTIMIZER ALLOCATION: ${plan.total_capital_usd:,.2f} USD",
+                "=" * 80,
+                f"{'Strategy':<22} {'Allocated USD':>14} {'Share':>8} {'Marginal APY':>14} {'Effective APY':>15} {'Annual Profit':>15}",
+                "-" * 80,
+            ]
             for strat_name, s in plan.allocations.items():
-                print(
+                lines.append(
                     f"{strat_name:<22} "
                     f"${s.allocated_usd:>13,.2f} "
                     f"{s.allocation_pct:>7.1f}% "
@@ -977,8 +980,8 @@ if __name__ == "__main__":
                     f"{s.effective_apy:>14.2f}% "
                     f"${s.cumulative_annual_profit_usd:>14,.2f}"
                 )
-            print("-" * 80)
-            print(
+            lines.append("-" * 80)
+            lines.append(
                 f"{'PORTFOLIO TOTAL':<22} "
                 f"${plan.total_capital_usd:>13,.2f} "
                 f"{'100.0%':>8} "
@@ -986,7 +989,8 @@ if __name__ == "__main__":
                 f"{plan.blended_effective_apy:>14.2f}% "
                 f"${plan.total_annual_profit_usd:>14,.2f}"
             )
-            print(f"  * Daily Run-Rate Profit : ${plan.daily_profit_usd:,.2f} / day")
-            print(f"  * Monthly Run-Rate      : ${plan.monthly_profit_usd:,.2f} / month")
-            print(f"  * Compounded ARR (365d) : {plan.compounded_arr_pct:,.2f}% ARR")
+            lines.append(f"  * Daily Run-Rate Profit : ${plan.daily_profit_usd:,.2f} / day")
+            lines.append(f"  * Monthly Run-Rate      : ${plan.monthly_profit_usd:,.2f} / month")
+            lines.append(f"  * Compounded ARR (365d) : {plan.compounded_arr_pct:,.2f}% ARR")
+            logger.info("\n".join(lines))
 

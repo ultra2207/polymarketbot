@@ -237,10 +237,10 @@ def main(argv: list[str] | None = None) -> int:
     args.out.write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
     logs = [m for m in markets if m["daily_pool"] > 0]
-    print(f"wrote {args.out}")
-    print(f"markets={len(markets)} dropped={dropped} with_rewards={len(logs)}")
+    log.info(f"wrote {args.out}")
+    log.info(f"markets={len(markets)} dropped={dropped} with_rewards={len(logs)}")
     for m in markets[:10]:
-        print(
+        log.info(
             f"  {m['condition_id'][:12]} events={m['book_events']:6d} "
             f"pool=${m['daily_pool']:.2f} min={m['min_size']:.0f} "
             f"{(m['question'] or '')[:60]}"

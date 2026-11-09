@@ -13,6 +13,8 @@ from __future__ import annotations
 import sys
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 BASE = (
     "https://huggingface.co/datasets/moose-code/polymarket-onchain-v1"
@@ -66,15 +68,15 @@ def main() -> None:
         "n", "min", "p10", "p25", "p50", "p75", "p90", "p99", "p999", "max", "mean",
     ]
 
-    print(f"\nfill size distribution - {year}-{month:02d}, first {limit:,} cash fills\n")
-    print(f"{'':6}{'USD':>14}")
+    log.info(f"\nfill size distribution - {year}-{month:02d}, first {limit:,} cash fills\n")
+    log.info(f"{'':6}{'USD':>14}")
     for name, value in zip(cols, stats):
         if name == "n":
-            print(f"{'n':6}{int(value):>14,}")
+            log.info(f"{'n':6}{int(value):>14,}")
         else:
-            print(f"{name:6}{value:>14,.2f}")
+            log.info(f"{name:6}{value:>14,.2f}")
 
-    print("\nshare of fills at or below:")
+    log.info("\nshare of fills at or below:")
     shares = con.sql(f"""
         WITH s AS ({sample})
         SELECT
@@ -88,7 +90,7 @@ def main() -> None:
     """).fetchall()[0]
 
     for threshold, pct in zip([10, 50, 100, 500, 1000, 5000], shares):
-        print(f"  ${threshold:>6,}  {pct:6.2f}%")
+        log.info(f"  ${threshold:>6,}  {pct:6.2f}%")
 
 
 if __name__ == "__main__":

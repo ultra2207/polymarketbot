@@ -536,13 +536,13 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
 
-    print(f"shared sealed hours: {len(shared)}  conditions: {summary['conditions']}  "
+    log.info(f"shared sealed hours: {len(shared)}  conditions: {summary['conditions']}  "
           f"Kalshi prints: {len(events)}  blocks: {len(blocks)}  size p50/p90: "
           f"{thresholds[0]:.0f}/{thresholds[1]:.0f}")
     header = f"{'tier':<18}" + "".join(
         f"{'H=' + str(int(h)) + 's':>10}" for h in HORIZONS
     )
-    print(header + "   (P(next PM print within H) / agreement)")
+    log.info(header + "   (P(next PM print within H) / agreement)")
     for tier, rows in (
         ("kalshi all", events),
         ("kalshi block", blocks),
@@ -562,21 +562,21 @@ def main(argv: list[str] | None = None) -> int:
                 cells.append(f"{p_within:.2f}/  - ")
             else:
                 cells.append(f"{p_within:.2f}/{agree:.2f}")
-        print(f"{tier:<18}" + "".join(f"{cell:>10}" for cell in cells))
-    print("\nper-condition (independent unit = condition; n >= 20 matched prints)")
+        log.info(f"{tier:<18}" + "".join(f"{cell:>10}" for cell in cells))
+    log.info("\nper-condition (independent unit = condition; n >= 20 matched prints)")
     for tier, rows in (("kalshi all", events), ("kalshi top decile", big), ("reverse: PM all", reverse)):
         table = per_condition_table(rows, horizon=5.0)
         usable = table[table["n"] >= 20].sort_values("n", ascending=False)
         if usable.empty:
-            print(f"{tier}: no condition reached 20 matched prints at H=5s")
+            log.info(f"{tier}: no condition reached 20 matched prints at H=5s")
             continue
         above = int((usable["agree"] > usable["chance"]).sum())
-        print(f"{tier}: {above}/{len(usable)} conditions above their own chance "
+        log.info(f"{tier}: {above}/{len(usable)} conditions above their own chance "
               f"(median agree {usable['agree'].median():.2f}, median n {usable['n'].median():.0f})")
         for row in usable.head(8).itertuples(index=False):
-            print(f"   {row.condition_id[:14]}  n={int(row.n):>4}  agree={row.agree:.2f}  chance={row.chance:.2f}")
+            log.info(f"   {row.condition_id[:14]}  n={int(row.n):>4}  agree={row.agree:.2f}  chance={row.chance:.2f}")
 
-    print("\nagreement vs chance (same marginals, independent draws)")
+    log.info("\nagreement vs chance (same marginals, independent draws)")
     for tier, rows in (("kalshi all", events), ("kalshi top decile", big), ("reverse: PM all", reverse)):
         for horizon in HORIZONS:
             stats = summarize(rows, horizon=horizon)
@@ -584,12 +584,12 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             chance = stats["agree_chance"]
             z = stats["z_vs_chance"]
-            print(
+            log.info(
                 f"{tier:<18}H={horizon:>3.0f}s  agree={stats['agree']:.3f}  chance={chance:.3f}"
                 f"  z={z:+.1f}  n={stats['n_agree']}"
             )
 
-    print("\nlatency of the first print after a Kalshi print (mean s, censored at "
+    log.info("\nlatency of the first print after a Kalshi print (mean s, censored at "
           f"{args.max_latency:.0f}s)")
     for tier, rows in (
         ("kalshi all", events),
@@ -599,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         ("null (reverse)", reverse_null),
     ):
         stats = summarize(rows, horizon=args.max_latency)
-        print(f"{tier:<18}{_fmt(stats['mean_latency_s'], 10)}  n={stats['n_within']}")
+        log.info(f"{tier:<18}{_fmt(stats['mean_latency_s'], 10)}  n={stats['n_within']}")
 
     frame = pd.DataFrame(events)
     frame["null"] = False

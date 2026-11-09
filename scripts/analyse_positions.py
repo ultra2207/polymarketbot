@@ -30,6 +30,7 @@ import argparse
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CACHE = "data/processed/wallet_token/*.parquet"
 LABELS = "data/processed/market_labels.parquet"
@@ -70,8 +71,8 @@ def main() -> None:
     """)
     logger.info(f"  ranked wallets: {con.sql('SELECT count(*) FROM rw').fetchall()[0][0]:,}")
 
-    print("\n=== share of traded shares by position type, per wallet-volume decile ===")
-    print("  dec   buy_only%   sell_only%   mixed%   mixed closed")
+    log.info("\n=== share of traded shares by position type, per wallet-volume decile ===")
+    log.info("  dec   buy_only%   sell_only%   mixed%   mixed closed")
     for r in con.sql("""
         SELECT rw.dec,
                100.0*sum(pr.bs) FILTER (WHERE pr.ss = 0) / sum(pr.bs + pr.ss),
@@ -82,15 +83,15 @@ def main() -> None:
         FROM pr JOIN rw ON rw.wallet = pr.wallet
         GROUP BY rw.dec ORDER BY rw.dec
     """).fetchall():
-        print(f"  {r[0]:>3}  {r[1]:>10.1f}  {r[2]:>11.1f}  {r[3]:>6.1f}   {r[4]:>6.3f}")
+        log.info(f"  {r[0]:>3}  {r[1]:>10.1f}  {r[2]:>11.1f}  {r[3]:>6.1f}   {r[4]:>6.3f}")
 
     logger.info("stage 3: top-decile positions only")
     con.execute("""
         CREATE OR REPLACE TEMP TABLE top_w AS
         SELECT wallet FROM rw WHERE dec = 1
     """)
-    print("\n=== top decile: closed fraction distribution (mixed positions) ===")
-    print("  closed      positions    shares m")
+    log.info("\n=== top decile: closed fraction distribution (mixed positions) ===")
+    log.info("  closed      positions    shares m")
     for r in con.sql("""
         SELECT b, count(*), sum(bs + ss)/1e6
         FROM (
@@ -100,7 +101,7 @@ def main() -> None:
             WHERE pr.bs > 0 AND pr.ss > 0
         ) GROUP BY b ORDER BY b
     """).fetchall():
-        print(f"  {r[0]*10:>3}-{r[0]*10+10:<3}%  {r[1]:>10,}  {r[2]:>10,.0f}")
+        log.info(f"  {r[0]*10:>3}-{r[0]*10+10:<3}%  {r[1]:>10,}  {r[2]:>10,.0f}")
 
     logger.info("stage 4: realised vs settled, with payout")
     con.execute(f"""
@@ -111,8 +112,8 @@ def main() -> None:
         SELECT token2, payout_1 FROM read_parquet('{LABELS}')
         WHERE resolved AND NOT coalesce(is_void,false) AND token2 IS NOT NULL
     """)
-    print("\n=== where the PnL comes from: round trip vs hold-to-resolution ===")
-    print("  dec   realised$m  settled$m  realised share")
+    log.info("\n=== where the PnL comes from: round trip vs hold-to-resolution ===")
+    log.info("  dec   realised$m  settled$m  realised share")
     for r in con.sql("""
         SELECT rw.dec,
                sum(least(bs, ss) * (CASE WHEN ss>0 THEN sc/ss ELSE 0 END
@@ -132,7 +133,7 @@ def main() -> None:
         JOIN rw ON rw.wallet = pr.wallet
         GROUP BY rw.dec ORDER BY rw.dec
     """).fetchall():
-        print(f"  {r[0]:>3}  {r[1]:>+9.2f}  {r[2]:>+9.2f}  {r[3]:>14.3f}")
+        log.info(f"  {r[0]:>3}  {r[1]:>+9.2f}  {r[2]:>+9.2f}  {r[3]:>14.3f}")
 
 
 if __name__ == "__main__":

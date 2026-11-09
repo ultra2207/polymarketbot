@@ -17,6 +17,8 @@ import time
 from typing import Dict, List
 
 import numpy as np
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 # 1. Measure L2 Auth HMAC
 def bench_l2_auth_hmac(iterations: int = 1000) -> Dict[str, float]:
@@ -182,19 +184,19 @@ def bench_json(iterations: int = 1000) -> Dict[str, float]:
     return res
 
 if __name__ == "__main__":
-    print("--- BENCHMARKING HOT EXECUTION PATHS IN PYTHON ---")
+    log.info("--- BENCHMARKING HOT EXECUTION PATHS IN PYTHON ---")
     t_start = time.time()
     
     hmac_res = bench_l2_auth_hmac()
-    print("1. L2 Auth HMAC-SHA256:", hmac_res)
+    log.info('{!s} {!s}', "1. L2 Auth HMAC-SHA256:", hmac_res)
     
     sniper_res = bench_latency_sniper()
-    print("2. LatencySniper Decision Path:", sniper_res)
+    log.info('{!s} {!s}', "2. LatencySniper Decision Path:", sniper_res)
     
     json_res = bench_json()
-    print("3. JSON Serialization/Parsing:", json_res)
+    log.info('{!s} {!s}', "3. JSON Serialization/Parsing:", json_res)
     
     eip712_res = bench_eip712_signing()
-    print("4. EIP-712 Order Hashing & ECDSA Signing:", eip712_res)
+    log.info('{!s} {!s}', "4. EIP-712 Order Hashing & ECDSA Signing:", eip712_res)
     
-    print(f"\nBenchmark completed in {time.time() - t_start:.2f}s")
+    log.info(f"\nBenchmark completed in {time.time() - t_start:.2f}s")

@@ -17,6 +17,7 @@ from __future__ import annotations
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CACHE = "data/processed/wallet_token/*.parquet"
 LABELS = "data/processed/market_labels.parquet"
@@ -77,9 +78,9 @@ def main() -> None:
     """)
 
     # ---------------------------------------------------------------- T1
-    print("\n=== T1  maker share of volume vs PnL ===")
-    print("  Does the money come from supplying liquidity or consuming it?")
-    print("\n  maker-share   wallets   volume $m   pnl $m     pnl/$    pos%    med_tokens")
+    log.info("\n=== T1  maker share of volume vs PnL ===")
+    log.info("  Does the money come from supplying liquidity or consuming it?")
+    log.info("\n  maker-share   wallets   volume $m   pnl $m     pnl/$    pos%    med_tokens")
     for r in con.sql("""
         SELECT maker_share_band, count(*), sum(volume)/1e6,
                sum(coalesce(realised,0)+coalesce(settled,0))/1e6,
@@ -93,11 +94,11 @@ def main() -> None:
         ) GROUP BY maker_share_band
         ORDER BY min(b)
     """).fetchall():
-        print(f"  {r[0]:>11}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  "
+        log.info(f"  {r[0]:>11}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  "
               f"{r[4]:>+8.5f}  {r[5]:>5.1f}  {r[6]:>10,.0f}")
 
-    print("\n  the same, only wallets in the top volume decile:")
-    print("\n  maker-share   wallets   volume $m   pnl $m     pnl/$    pos%")
+    log.info("\n  the same, only wallets in the top volume decile:")
+    log.info("\n  maker-share   wallets   volume $m   pnl $m     pnl/$    pos%")
     for r in con.sql("""
         SELECT maker_share_band, count(*), sum(volume)/1e6,
                sum(coalesce(realised,0)+coalesce(settled,0))/1e6,
@@ -110,12 +111,12 @@ def main() -> None:
             FROM wallet WHERE maker_cash+taker_cash >= 1000
         ) WHERE vdec = 1 GROUP BY maker_share_band ORDER BY min(b)
     """).fetchall():
-        print(f"  {r[0]:>11}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  {r[4]:>+8.5f}  {r[5]:>5.1f}")
+        log.info(f"  {r[0]:>11}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  {r[4]:>+8.5f}  {r[5]:>5.1f}")
 
     # ---------------------------------------------------------------- T3
-    print("\n=== T3  price band vs PnL ===")
-    print("  avg buy price of the wallet, bucketed; does the edge live in the tails?")
-    print("\n  price band   wallets   volume $m   pnl $m     pnl/$")
+    log.info("\n=== T3  price band vs PnL ===")
+    log.info("  avg buy price of the wallet, bucketed; does the edge live in the tails?")
+    log.info("\n  price band   wallets   volume $m   pnl $m     pnl/$")
     for r in con.sql("""
         SELECT band, count(*), sum(volume)/1e6,
                sum(coalesce(realised,0)+coalesce(settled,0))/1e6,
@@ -126,10 +127,10 @@ def main() -> None:
             FROM wallet WHERE maker_cash+taker_cash >= 10000
         ) GROUP BY band ORDER BY min(b)
     """).fetchall():
-        print(f"  {r[0]:>10}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  {r[4]:>+8.5f}")
+        log.info(f"  {r[0]:>10}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  {r[4]:>+8.5f}")
 
     # ---------------------------------------------------------------- T2
-    print("\n=== T2  coverage: tokens with volume but no top-decile maker ===")
+    log.info("\n=== T2  coverage: tokens with volume but no top-decile maker ===")
     con.execute("""
         CREATE OR REPLACE TEMP TABLE top_wallets AS
         SELECT wallet FROM (
@@ -158,19 +159,19 @@ def main() -> None:
                median(token_volume) med_token_vol
         FROM token_cov
     """).fetchall()[0]
-    print(f"  tokens traded: {r[0]:,}")
-    print(f"  with NO top-500 wallet present: {r[1]:,} ({r[2]:.1f} %)")
-    print(f"  volume in those tokens: ${r[3]:,.0f} m of ${r[4]:,.0f} m "
+    log.info(f"  tokens traded: {r[0]:,}")
+    log.info(f"  with NO top-500 wallet present: {r[1]:,} ({r[2]:.1f} %)")
+    log.info(f"  volume in those tokens: ${r[3]:,.0f} m of ${r[4]:,.0f} m "
           f"({100*r[3]/max(r[4],1e-9):.2f} %)")
-    print(f"  median token volume: ${r[5]:,.0f}")
+    log.info(f"  median token volume: ${r[5]:,.0f}")
 
-    print("\n  volume distribution of tokens by number of top-500 wallets present:")
-    print("\n  top-500 present   tokens     volume $m    median $")
+    log.info("\n  volume distribution of tokens by number of top-500 wallets present:")
+    log.info("\n  top-500 present   tokens     volume $m    median $")
     for r in con.sql("""
         SELECT least(top_wallets,5) tw, count(*), sum(token_volume)/1e6, median(token_volume)
         FROM token_cov GROUP BY 1 ORDER BY 1
     """).fetchall():
-        print(f"  {r[0]:>15}   {r[1]:>7,}   {r[2]:>9,.0f}   {r[3]:>9,.0f}")
+        log.info(f"  {r[0]:>15}   {r[1]:>7,}   {r[2]:>9,.0f}   {r[3]:>9,.0f}")
 
 
 if __name__ == "__main__":

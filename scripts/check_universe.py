@@ -28,6 +28,8 @@ import duckdb
 import requests
 
 from polymarketbot.universe.markets import universe_sql
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 PIT = OUT / "markets_pit.parquet"
@@ -48,8 +50,8 @@ def connect() -> duckdb.DuckDBPyConnection:
 
 
 def invariants(con: duckdb.DuckDBPyConnection) -> None:
-    print("invariants at 12 dates:")
-    print(f"  {'date':12} {'universe':>10} {'bad_created':>12} {'bad_fill':>10} {'expired':>9} {'zero_vol':>9}")
+    log.info("invariants at 12 dates:")
+    log.info(f"  {'date':12} {'universe':>10} {'bad_created':>12} {'bad_fill':>10} {'expired':>9} {'zero_vol':>9}")
     failures = 0
     for when in DATES:
         sql = universe_sql(when)
@@ -65,8 +67,8 @@ def invariants(con: duckdb.DuckDBPyConnection) -> None:
         """).fetchall()[0]
         bad = row[1] + row[2] + row[3] + row[4]
         failures += bad
-        print(f"  {when:12} {row[0]:>10,} {row[1]:>12,} {row[2]:>10,} {row[3]:>9,} {row[4]:>9,}")
-    print(f"\n  total violations: {failures}")
+        log.info(f"  {when:12} {row[0]:>10,} {row[1]:>12,} {row[2]:>10,} {row[3]:>9,} {row[4]:>9,}")
+    log.info(f"\n  total violations: {failures}")
     if failures:
         raise SystemExit("universe invariants failed")
 
@@ -126,7 +128,7 @@ def gamma_get(params: list[tuple], attempts: int = 6):
 
 def spot_check(con: duckdb.DuckDBPyConnection, n: int) -> dict:
     picks = pick_markets(con, n)
-    print(f"\nspot-checking {len(picks)} markets against Gamma ...")
+    log.info(f"\nspot-checking {len(picks)} markets against Gamma ...")
 
     ids = [p["condition_id"] for p in picks]
     # Gamma's keyset endpoint defaults to *open* markets only. Omitting this
@@ -135,7 +137,7 @@ def spot_check(con: duckdb.DuckDBPyConnection, n: int) -> dict:
               + [("closed", "true"), ("limit", str(len(ids)))])
     remote = gamma_get(params)
     if remote is None:
-        print("  ! Gamma unreachable; skipping live comparison")
+        log.info("  ! Gamma unreachable; skipping live comparison")
         return {"checked": 0, "error": "gamma unreachable"}
 
     by_condition = {m.get("conditionId"): m for m in remote}
@@ -173,7 +175,7 @@ def spot_check(con: duckdb.DuckDBPyConnection, n: int) -> dict:
 
     # `polymarket.com/market/<slug>` redirects to an event page; print the URL
     # that actually renders, otherwise the human check lands somewhere unhelpful.
-    print("  resolving public URLs ...")
+    log.info("  resolving public URLs ...")
     for r in rows:
         if not r.get("found"):
             continue
@@ -186,23 +188,23 @@ def spot_check(con: duckdb.DuckDBPyConnection, n: int) -> dict:
             r["http_status"] = None
             r["final_url"] = None
 
-    print(f"  {'condition':14} {'cat':10} {'found':5} {'slug':5} {'quest':5} {'closed':6} local_end -> remote_end")
+    log.info(f"  {'condition':14} {'cat':10} {'found':5} {'slug':5} {'quest':5} {'closed':6} local_end -> remote_end")
     for r in rows:
         if not r["found"]:
-            print(f"  {r['condition_id'][:12]:14} {r['category']:10} {'no':5}")
+            log.info(f"  {r['condition_id'][:12]:14} {r['category']:10} {'no':5}")
             continue
-        print(f"  {r['condition_id'][:12]:14} {r['category']:10} {'yes':5} "
+        log.info(f"  {r['condition_id'][:12]:14} {r['category']:10} {'yes':5} "
               f"{str(r['slug_match'])[0]:5} {str(r['question_match'])[0]:5} "
               f"{str(r['closed_match'])[0]:6} {str(r['local_end'])[:10]} -> {str(r['remote_end'])[:10]}")
 
-    print(f"\n  found {summary['found']}/{summary['picked']}, "
+    log.info(f"\n  found {summary['found']}/{summary['picked']}, "
           f"slug {summary['slug_match']}/{summary['found']}, "
           f"question {summary['question_match']}/{summary['found']}, "
           f"closed {summary['closed_match']}/{summary['found']}")
-    print("\n  open these to confirm by eye:")
+    log.info("\n  open these to confirm by eye:")
     for r in rows[:8]:
         if r.get("found"):
-            print(f"    [{r.get('http_status')}] {r.get('final_url') or r['url']}")
+            log.info(f"    [{r.get('http_status')}] {r.get('final_url') or r['url']}")
     return summary
 
 
@@ -217,7 +219,7 @@ def main() -> int:
 
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "universe_spotcheck.json").write_text(json.dumps(summary, indent=2, default=str))
-    print(f"\nwrote {OUT / 'universe_spotcheck.json'}")
+    log.info(f"\nwrote {OUT / 'universe_spotcheck.json'}")
 
     if summary.get("found") and summary["slug_match"] < summary["found"]:
         return 1

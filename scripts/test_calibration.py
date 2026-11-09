@@ -30,6 +30,7 @@ from pathlib import Path
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 TRADES = "data/raw/sii/trades.parquet"
 MARKETS = "data/processed/markets_pit.parquet"
@@ -112,8 +113,8 @@ def main() -> None:
         n = con.sql(f"SELECT count(*) FROM read_parquet('{dest}')").fetchall()[0][0]
         logger.info(f"{dest.name}: {n:,} tokens")
 
-    print("\n=== calibration: price in the 12-6h window vs realised outcome ===")
-    print("  price band   tokens      shares m    payout rate   priced   gap")
+    log.info("\n=== calibration: price in the 12-6h window vs realised outcome ===")
+    log.info("  price band   tokens      shares m    payout rate   priced   gap")
     for r in con.execute(f"""
         SELECT pbucket, count(*), sum(shares)/1e6,
                sum(payout*shares)/nullif(sum(shares),0),
@@ -122,7 +123,7 @@ def main() -> None:
     """).fetchall():
         if r[1] < 50:
             continue
-        print(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%  {r[1]:>7,}  {r[2]:>10,.0f}   "
+        log.info(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%  {r[1]:>7,}  {r[2]:>10,.0f}   "
               f"{r[3]:>11.3f}   {r[4]:>6.3f}  {r[3]-r[4]:>+6.3f}")
 
 

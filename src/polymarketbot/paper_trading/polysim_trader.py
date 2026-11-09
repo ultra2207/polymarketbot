@@ -423,27 +423,32 @@ class PolySimulatorTrader:
         # Calculate collateral held
         collateral_in_use = sum(q.size * q.price for q in self.active_quotes.values())
 
-        print("\n" + "=" * 88)
-        print(f" [POLYMARKET AUTONOMOUS TRADER] - {now_utc} | Mode: PolySimulator Cloud")
-        print("-" * 88)
-        print(f" Account Equity: ${bal.total_value:.2f} USD | Cash Balance: ${bal.balance:.2f} | Collateral In-Use: ${collateral_in_use:.2f}")
-        print(f" Unlocked Capital Cap: ${self.unlocked_capital_usd:.2f} | Active Sizing Q*: {self.quote_size:.0f} shares")
+        lines: list[str] = [
+            "=" * 88,
+            f" [POLYMARKET AUTONOMOUS TRADER] - {now_utc} | Mode: PolySimulator Cloud",
+            "-" * 88,
+            f" Account Equity: ${bal.total_value:.2f} USD | Cash Balance: ${bal.balance:.2f} | Collateral In-Use: ${collateral_in_use:.2f}",
+            f" Unlocked Capital Cap: ${self.unlocked_capital_usd:.2f} | Active Sizing Q*: {self.quote_size:.0f} shares",
+        ]
 
         if self.target_market:
             q_text = self.target_market.get("question", "")
             mid_str = f"${self.last_mid:.3f}" if self.last_mid else "N/A"
-            print(f"\n TARGET MARKET: '{q_text}'")
-            print(f" Midpoint: {mid_str} | YES Tick: {self.yes_tick} | NO Tick: {self.no_tick} | Reward Pool: ${self.daily_reward_pool:,.0f}/day")
+            lines.append("")
+            lines.append(f" TARGET MARKET: '{q_text}'")
+            lines.append(f" Midpoint: {mid_str} | YES Tick: {self.yes_tick} | NO Tick: {self.no_tick} | Reward Pool: ${self.daily_reward_pool:,.0f}/day")
 
-        print("\n ACTIVE RESTING QUOTES (PolySimulator Matching Engine):")
+        lines.append("")
+        lines.append(" ACTIVE RESTING QUOTES (PolySimulator Matching Engine):")
         if self.active_quotes:
             for q in self.active_quotes.values():
                 val = q.size * q.price
-                print(f"   • [ORDER #{q.order_id}] BUY {q.outcome:<3} : {q.size:.0f} shares @ ${q.price:.3f} (${val:.2f} collateral) [PENDING]")
+                lines.append(f"   • [ORDER #{q.order_id}] BUY {q.outcome:<3} : {q.size:.0f} shares @ ${q.price:.3f} (${val:.2f} collateral) [PENDING]")
         else:
-            print("   (Placing resting quotes...)")
+            lines.append("   (Placing resting quotes...)")
 
-        print("\n OPEN POSITIONS (Active Portfolio on polysimulator.com):")
+        lines.append("")
+        lines.append(" OPEN POSITIONS (Active Portfolio on polysimulator.com):")
         if positions:
             for p in positions:
                 qnt = float(p.get("quantity", 0))
@@ -451,36 +456,40 @@ class PolySimulatorTrader:
                 cur_p = float(p.get("current_price", 0))
                 unr = float(p.get("unrealized_pnl", 0))
                 m_q = p.get("market_question", "")[:35]
-                print(f"   • [{p.get('outcome')} on '{m_q}'] {qnt:.1f} shares @ avg ${avg_p:.3f} | Current: ${cur_p:.3f} | Unrealized PnL: ${unr:+.2f}")
+                lines.append(f"   • [{p.get('outcome')} on '{m_q}'] {qnt:.1f} shares @ avg ${avg_p:.3f} | Current: ${cur_p:.3f} | Unrealized PnL: ${unr:+.2f}")
         else:
-            print("   (0 token inventory held — quotes resting as maker liquidity)")
+            lines.append("   (0 token inventory held — quotes resting as maker liquidity)")
 
-        print("\n REWARDS ACCRUAL (Quadratic Scoring Engine in SQLite):")
+        lines.append("")
+        lines.append(" REWARDS ACCRUAL (Quadratic Scoring Engine in SQLite):")
         user_sc = compute_quadratic_score(self.max_spread_cents, self.spread_offset_cents, self.quote_size * 2)
         floor_label = f"CLEARED (${payout:.2f})" if floor_cleared else f"Accruing (${accrued:.3f}/$1.00)"
-        print(f"   • Quote Score S(v, s): {user_sc:.1f} pts | Daily Accrued: ${accrued:.3f} | $1.00 Floor: {floor_label} | Epochs: {total_epochs}/1440")
+        lines.append(f"   • Quote Score S(v, s): {user_sc:.1f} pts | Daily Accrued: ${accrued:.3f} | $1.00 Floor: {floor_label} | Epochs: {total_epochs}/1440")
 
         gov = getattr(self.client, "governor", None)
         if gov:
             st = gov.get_status()
-            print("\n RATE LIMIT & 100K MONTHLY BUDGET GOVERNOR:")
-            print(
+            lines.append("")
+            lines.append(" RATE LIMIT & 100K MONTHLY BUDGET GOVERNOR:")
+            lines.append(
                 f"   • Minute: {st.requests_last_minute}/40 RPM | "
                 f"Hour: {st.requests_last_hour}/138 RPH (Remaining: {st.hourly_budget_remaining}) | "
                 f"Day: {st.requests_today}/3,333 RPD"
             )
-            print(
+            lines.append(
                 f"   • Daily Orders Placed: {st.orders_placed_today}/90 | "
                 f"Order Placement Permitted: {'YES' if st.can_place_order else 'NO (Daily Cap)'}"
             )
 
         if fills:
-            print("\n " + "!" * 86)
+            lines.append("")
+            lines.append(" " + "!" * 86)
             for f in fills:
-                print(f" >>> [EXECUTION EVENT] {f}")
-            print(" " + "!" * 86)
+                lines.append(f" >>> [EXECUTION EVENT] {f}")
+            lines.append(" " + "!" * 86)
 
-        print("=" * 88)
+        lines.append("=" * 88)
+        log.info("\n".join(lines))
 
     def manage_positions(self) -> list[str]:
         """Autonomously manage open positions with CTF Merging and Tier 2 Active De-Skewing."""
@@ -727,7 +736,7 @@ class PolySimulatorTrader:
             while self._running:
                 now = time.time()
                 if duration_seconds and (now - start_time) >= duration_seconds:
-                    print(f"\n[INFO] Target duration of {duration_seconds}s reached. Exiting cleanly...")
+                    log.info(f"Target duration of {duration_seconds}s reached. Exiting cleanly...")
                     break
 
                 # 1. Sync orders to check fills
@@ -753,10 +762,10 @@ class PolySimulatorTrader:
                 time.sleep(self.poll_interval)
 
         except KeyboardInterrupt:
-            print("\n[INFO] Interrupted by user. Shutting down...")
+            log.info("Interrupted by user. Shutting down...")
         finally:
             self._running = False
             self.exit_session()
             final_bal = self.client.get_balance()
             cum_rewards = self.db.get_total_cumulative_rewards()
-            print(f"\n[SESSION COMPLETED] Final Balance: ${final_bal.balance:.2f} | Equity: ${final_bal.total_value:.2f} | Rewards: ${cum_rewards:.2f}\n")
+            log.info(f"[SESSION COMPLETED] Final Balance: ${final_bal.balance:.2f} | Equity: ${final_bal.total_value:.2f} | Rewards: ${cum_rewards:.2f}")

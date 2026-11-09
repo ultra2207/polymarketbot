@@ -44,7 +44,9 @@ from pathlib import Path
 
 sys.path.insert(0, "src")
 
-from polymarketbot.logs import IST
+from polymarketbot.logs import IST, get_logger
+
+log = get_logger(__name__)
 
 import duckdb
 from rich.console import Console
@@ -105,7 +107,7 @@ def main() -> int:
           AND token2 IS NOT NULL AND payout_1 IS NOT NULL
     """)
     n_tok = con.sql("SELECT count(*) FROM token_payout").fetchall()[0][0]
-    console.print(f"resolved tokens with a payout: {n_tok:,}")
+    log.info(f"resolved tokens with a payout: {n_tok:,}")
 
     con.execute("""
         CREATE OR REPLACE TEMP TABLE agg (wallet VARCHAR, fills BIGINT,
@@ -149,8 +151,7 @@ def main() -> int:
                 GROUP BY 1
             """)
             bar.update(task, advance=1)
-            console.print(f"  {label}: {con.sql('SELECT count(*) FROM agg').fetchall()[0][0]:,} wallets",
-                          highlight=False)
+            log.info(f"  {label}: {con.sql('SELECT count(*) FROM agg').fetchall()[0][0]:,} wallets")
 
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE w AS
@@ -172,34 +173,33 @@ def main() -> int:
     tot = con.sql("""
         SELECT count(*), sum(fills), sum(volume)/1e9, sum(edge_usd)/1e6 FROM w
     """).fetchall()[0]
-    console.print(f"\nmakers with >= {args.min_fills} priced fills: {tot[0]:,}")
-    console.print(f"fills: {tot[1]:,}   volume: ${tot[2]:.2f} B   terminal edge: ${tot[3]:,.0f} M")
+    log.info(f"\nmakers with >= {args.min_fills} priced fills: {tot[0]:,}")
+    log.info(f"fills: {tot[1]:,}   volume: ${tot[2]:.2f} B   terminal edge: ${tot[3]:,.0f} M")
 
     overall = con.sql("""
         SELECT sum(edge_usd) / nullif(sum(volume), 0) FROM w
     """).fetchall()[0][0]
-    console.print(f"edge per dollar of maker volume: {overall:+.5f} "
-                  f"({overall*100:+.3f} cents per $1)")
+    log.info(f"edge per dollar of maker volume: {overall:+.5f} "
+             f"({overall*100:+.3f} cents per $1)")
 
-    console.print("\nby volume decile (does size help or hurt?):")
-    console.print(f"  {'decile':8} {'makers':>7} {'volume $m':>10} {'edge $m':>9} "
-                  f"{'edge/$':>9} {'mean px':>8}")
+    log.info("\nby volume decile (does size help or hurt?):")
+    log.info(f"  {'decile':8} {'makers':>7} {'volume $m':>10} {'edge $m':>9} "
+             f"{'edge/$':>9} {'mean px':>8}")
     for d, nm, v, e, epd, mp in con.sql("""
         WITH r AS (SELECT *, ntile(10) OVER (ORDER BY volume DESC) AS dec FROM w)
         SELECT dec, count(*), sum(volume)/1e6, sum(edge_usd)/1e6,
                sum(edge_usd)/nullif(sum(volume),0), avg(mean_price)
         FROM r GROUP BY 1 ORDER BY 1
     """).fetchall():
-        console.print(f"  {d:<8} {nm:>7,} {v:>10,.0f} {e:>9,.1f} {epd:>+9.5f} {mp:>8.3f}",
-                      highlight=False)
+        log.info(f"  {d:<8} {nm:>7,} {v:>10,.0f} {e:>9,.1f} {epd:>+9.5f} {mp:>8.3f}")
 
     pos = con.sql("""
         SELECT count(*) FILTER (WHERE edge_usd > 0), count(*), 
                sum(volume) FILTER (WHERE edge_usd > 0)/1e9
         FROM w
     """).fetchall()[0]
-    console.print(f"\nmakers with positive terminal edge: {pos[0]:,} of {pos[1]:,} "
-                  f"({100*pos[0]/max(pos[1],1):.1f} %), carrying ${pos[2]:.2f} B of volume")
+    log.info(f"\nmakers with positive terminal edge: {pos[0]:,} of {pos[1]:,} "
+             f"({100*pos[0]/max(pos[1],1):.1f} %), carrying ${pos[2]:.2f} B of volume")
     return 0
 
 

@@ -39,6 +39,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 
@@ -68,9 +70,9 @@ def main() -> int:
     root = Path(args.book_dir)
     parts = sorted(root.rglob("books.parquet"))
     if not parts:
-        print(f"no reduced book under {root}")
+        log.info(f"no reduced book under {root}")
         return 1
-    print(f"book partitions: {len(parts):,}", flush=True)
+    log.info(f"book partitions: {len(parts):,}", )
 
     glob = (root / "**" / "books.parquet").as_posix()
     con = connect()
@@ -138,10 +140,10 @@ def main() -> int:
     """, [args.min_usd, args.min_usd])
 
     n = con.sql("SELECT count(*) FROM trades").fetchall()[0][0]
-    print(f"tokens quoted at both leads with >= ${args.min_usd:.0f} at the touch: {n:,}",
-          flush=True)
+    log.info(f"tokens quoted at both leads with >= ${args.min_usd:.0f} at the touch: {n:,}",
+          )
     if n == 0:
-        print("no overlap yet - the book window may not reach 168 h before any "
+        log.info("no overlap yet - the book window may not reach 168 h before any "
               "resolved end_date, which is expected until the block is longer")
         return 1
 
@@ -178,7 +180,7 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print(f"\n{'entry ask':12} {'markets':>8} {'entry':>7} {'exit':>7} "
+    log.info(f"\n{'entry ask':12} {'markets':>8} {'entry':>7} {'exit':>7} "
           f"{'gross':>8} {'fee':>7} {'net':>8} {'±se':>7} {'t':>6}")
     wins = 0
     rows = con.sql("""
@@ -193,14 +195,14 @@ def main() -> int:
         if abs(ne) > 2 * args.half_spread and abs(t) > 3:
             flag = "  <-- survives"
             wins += 1
-        print(f"{b:12} {nm:>8,} {ea:>7.3f} {xb:>7.3f} {gr:>+8.4f} {fe:>7.4f} "
+        log.info(f"{b:12} {nm:>8,} {ea:>7.3f} {xb:>7.3f} {gr:>+8.4f} {fe:>7.4f} "
               f"{ne:>+8.4f} {se:>7.4f} {t:>6.1f}{flag}")
 
-    print(f"\nbuckets whose net survives both crossings and |t| > 3: {wins}/{len(rows)}")
+    log.info(f"\nbuckets whose net survives both crossings and |t| > 3: {wins}/{len(rows)}")
     if wins:
-        print("=> A7 CONFIRMED on these buckets: the drift is larger than the spread.")
+        log.info("=> A7 CONFIRMED on these buckets: the drift is larger than the spread.")
     else:
-        print("=> A7 does not survive: buying the ask and selling the bid consumes the "
+        log.info("=> A7 does not survive: buying the ask and selling the bid consumes the "
               "drift. The earlier result measured the spread, not an edge.")
     return 0
 

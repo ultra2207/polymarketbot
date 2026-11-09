@@ -43,6 +43,8 @@ sys.path.insert(0, "src")
 from polymarketbot.logs import IST
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 TAPE = "data/raw/sii/trades.parquet"
@@ -90,7 +92,7 @@ def main() -> int:
     """)
     n_legs = con.sql("SELECT count(*) FROM legs").fetchall()[0][0]
     n_events = con.sql("SELECT count(DISTINCT event_id) FROM legs").fetchall()[0][0]
-    print(f"neg-risk legs: {n_legs:,} across {n_events:,} events", flush=True)
+    log.info(f"neg-risk legs: {n_legs:,} across {n_events:,} events", )
 
     # Last taker-BUY price per leg per minute, for both sides of each leg.
     con.execute(f"""
@@ -142,9 +144,9 @@ def main() -> int:
     """)
 
     n_sum = con.sql("SELECT count(*) FROM summ").fetchall()[0][0]
-    print(f"complete simultaneous snapshots: {n_sum:,}", flush=True)
+    log.info(f"complete simultaneous snapshots: {n_sum:,}", )
     if n_sum == 0:
-        print("no event had every leg quoted inside one minute")
+        log.info("no event had every leg quoted inside one minute")
         return 1
 
     # Fees: one taker fee per leg actually bought.
@@ -174,7 +176,7 @@ def main() -> int:
         (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print(f"\n{'side':5} {'snapshots':>10} {'gross>0':>9} {'net>min':>9} "
+    log.info(f"\n{'side':5} {'snapshots':>10} {'gross>0':>9} {'net>min':>9} "
           f"{'best gross':>11} {'median legs':>12}")
     for side, n, gpos, over, best, k in con.sql(f"""
         SELECT side, count(*),
@@ -183,7 +185,7 @@ def main() -> int:
                max(gross), median(k)
         FROM scored GROUP BY 1 ORDER BY 1
     """).fetchall():
-        print(f"{side:5} {n:>10,} {gpos:>9,} {over:>9,} {best:>11.4f} {k:>12,.0f}")
+        log.info(f"{side:5} {n:>10,} {gpos:>9,} {over:>9,} {best:>11.4f} {k:>12,.0f}")
 
     # Persistence, same discipline as E1: a blip is not an opportunity.
     con.execute(f"""
@@ -204,16 +206,16 @@ def main() -> int:
                max(minutes), median(minutes)
         FROM runs
     """).fetchall()[0]
-    print(f"\nruns lasting >= 2 minutes: {r[0]:,} "
+    log.info(f"\nruns lasting >= 2 minutes: {r[0]:,} "
           f"(longest {r[1] or 0} min, median {r[2] or 0:.0f})")
 
-    print("\ntop net violations:")
+    log.info("\ntop net violations:")
     for ev, side, m, net, k in con.sql(f"""
         SELECT event_id, side, m, net, k FROM scored
         WHERE net > {args.min_net} ORDER BY net DESC LIMIT 10
     """).fetchall():
         ts = datetime.fromtimestamp(m * args.bucket_seconds, tz=IST).strftime("%Y-%m-%d %H:%M")
-        print(f"  {ts} {side:3} net={net:+.4f} legs={k} {str(ev)[:20]}…")
+        log.info(f"  {ts} {side:3} net={net:+.4f} legs={k} {str(ev)[:20]}…")
     return 0
 
 

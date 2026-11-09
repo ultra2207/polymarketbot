@@ -42,6 +42,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 SNAPS = "data/raw/gamma/snapshot_*.parquet"
@@ -57,10 +59,10 @@ def main() -> int:
 
     files = sorted(Path("data/raw/gamma").glob("snapshot_*.parquet"))
     if not files:
-        print("no gamma snapshots - run scripts/snapshot_gamma.py first")
+        log.info("no gamma snapshots - run scripts/snapshot_gamma.py first")
         return 1
     use = ([f for f in files if args.date and args.date in f.name] or files)[-1]
-    print(f"snapshot: {use.name}", flush=True)
+    log.info(f"snapshot: {use.name}", )
 
     con = duckdb.connect()
     con.execute("SET threads = 8")
@@ -69,7 +71,7 @@ def main() -> int:
 
     cols = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM '{src}'").fetchall()}
     if "rewards_daily_rate" not in cols:
-        print(f"{use.name} predates the reward columns; only 2026-11-01 onwards can be used")
+        log.info(f"{use.name} predates the reward columns; only 2026-11-01 onwards can be used")
         return 1
 
     con.execute(f"""
@@ -86,21 +88,21 @@ def main() -> int:
     n_all = con.sql(f"SELECT count(*) FROM read_parquet('{src}')").fetchall()[0][0]
     n_pool = con.sql("SELECT count(*) FROM pools").fetchall()[0][0]
     total = con.sql("SELECT sum(daily_rate) FROM pools").fetchall()[0][0] or 0.0
-    print(f"markets snapshotted: {n_all:,}")
-    print(f"markets with a reward pool: {n_pool:,} ({100*n_pool/max(n_all,1):.1f} %)")
-    print(f"total paid out per day across pools: ${total:,.0f}")
+    log.info(f"markets snapshotted: {n_all:,}")
+    log.info(f"markets with a reward pool: {n_pool:,} ({100*n_pool/max(n_all,1):.1f} %)")
+    log.info(f"total paid out per day across pools: ${total:,.0f}")
 
     if n_pool == 0:
         return 0
 
-    print(f"\n{'category':16} {'pools':>6} {'$/day':>10} {'med rate':>9} "
+    log.info(f"\n{'category':16} {'pools':>6} {'$/day':>10} {'med rate':>9} "
           f"{'med minSize':>12} {'med maxSpread':>14}")
     for cat, n, s, med, ms, sp in con.sql("""
         SELECT coalesce(category,'?'), count(*), sum(daily_rate),
                median(daily_rate), median(min_size), median(max_spread)
         FROM pools GROUP BY 1 ORDER BY 2 DESC
     """).fetchall():
-        print(f"{str(cat)[:16]:16} {n:>6,} {s:>10,.0f} {med:>9,.1f} "
+        log.info(f"{str(cat)[:16]:16} {n:>6,} {s:>10,.0f} {med:>9,.1f} "
               f"{ms:>12,.0f} {sp:>14,.1f}")
 
     # The ceiling is degenerate and must not be read as a return.
@@ -128,10 +130,10 @@ def main() -> int:
                quantile_cont(daily_rate, 0.90), max(daily_rate)
         FROM ceiling WHERE min_size > 0
     """).fetchall()[0]
-    print(f"\npools with a size requirement: {r[0]:,}")
-    print(f"median minimum qualifying size: {r[1]:,.0f} shares")
-    print(f"median max spread:              {r[2]:,.1f} cents")
-    print(f"daily rate: median ${r[3]:,.1f}   p90 ${r[4]:,.1f}   max ${r[5]:,.1f}")
+    log.info(f"\npools with a size requirement: {r[0]:,}")
+    log.info(f"median minimum qualifying size: {r[1]:,.0f} shares")
+    log.info(f"median max spread:              {r[2]:,.1f} cents")
+    log.info(f"daily rate: median ${r[3]:,.1f}   p90 ${r[4]:,.1f}   max ${r[5]:,.1f}")
 
     dest = Path(args.dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -140,15 +142,15 @@ def main() -> int:
         TO '{(dest / 'reward_pools.parquet').as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
 
-    print("\nlargest pools by daily rate:")
-    print(f"  {'$/day':>8} {'minSize':>8} {'maxSpread':>10} {'competitive':>12}")
+    log.info("\nlargest pools by daily rate:")
+    log.info(f"  {'$/day':>8} {'minSize':>8} {'maxSpread':>10} {'competitive':>12}")
     for dr, ms, sp, cp in con.sql("""
         SELECT daily_rate, min_size, max_spread, competitive
         FROM ceiling ORDER BY daily_rate DESC LIMIT 12
     """).fetchall():
-        print(f"  {dr:>8,.1f} {ms:>8,.0f} {sp:>10,.1f} {cp:>12.2f}")
+        log.info(f"  {dr:>8,.1f} {ms:>8,.0f} {sp:>10,.1f} {cp:>12.2f}")
 
-    print("\nThe yield CANNOT be computed from this snapshot. Pro-rata payout means the "
+    log.info("\nThe yield CANNOT be computed from this snapshot. Pro-rata payout means the "
           "return is set by total qualifying size inside the reward band, which needs the "
           "order book. A minimum-size quote technically captures an entire pool, which is "
           "why no ceiling-based ranking is printed here - it would rank pools by size "

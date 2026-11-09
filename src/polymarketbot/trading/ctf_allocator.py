@@ -34,6 +34,8 @@ Markets unable to amortize their fixed batch gas friction are pruned from the ac
 from __future__ import annotations
 
 import math
+import threading
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
@@ -51,6 +53,28 @@ from polymarketbot.trading.ctf_split_arbitrage import (
 logger = get_logger("ctf_allocator")
 
 TYPICAL_MERGE_GAS_UNITS = 78_000
+
+# C12: malformed venue payloads are dropped, but the drop is surfaced at WARNING
+# at most once per minute per channel instead of silently disappearing.
+_WARN_INTERVAL_S = 60.0
+_warn_lock = threading.Lock()
+_last_warn_at: dict[str, float] = {}
+
+
+def _rate_limited_warning(channel: str, message: str) -> None:
+    now = time.time()
+    with _warn_lock:
+        if now - _last_warn_at.get(channel, -_WARN_INTERVAL_S) < _WARN_INTERVAL_S:
+            return
+        _last_warn_at[channel] = now
+    logger.warning(message)
+
+
+# C10: gas/POL defaults are the venue-oracle fallbacks (40 Gwei, $0.092/POL).
+# The live soak measures the oracles once per refresh and passes the measured
+# values into compute_sweep_curve, so the per-market hot path does no I/O.
+DEFAULT_GAS_PRICE_GWEI = 40.0
+DEFAULT_POL_USD_PRICE = 0.092
 
 
 class ArbitrageDirection(str, Enum):
@@ -94,6 +118,7 @@ class ParityLegDepth:
     fee_exponent: float = 1.0
     fee_schedule: Optional[FeeSchedule] = None
     is_maker: bool = False               # If True, incurs 0% taker fee
+    _sorted_cache: Optional[list[OrderBookLevel]] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_raw(
@@ -110,6 +135,7 @@ class ParityLegDepth:
     ) -> "ParityLegDepth":
         """Instantiate ParityLegDepth directly from raw CLOB dictionaries or tuples."""
         levels: list[OrderBookLevel] = []
+        dropped = 0
         for item in raw_levels:
             try:
                 if isinstance(item, (tuple, list)) and len(item) >= 2:
@@ -120,11 +146,20 @@ class ParityLegDepth:
                 elif isinstance(item, OrderBookLevel):
                     px, sz = item.price, item.size
                 else:
+                    dropped += 1
                     continue
-                if 0.0 <= px <= 1.0 and sz > 0.0:
-                    levels.append(OrderBookLevel(price=px, size=sz))
+                if not (0.0 <= px <= 1.0 and math.isfinite(sz) and sz > 0.0):
+                    dropped += 1
+                    continue
+                levels.append(OrderBookLevel(price=px, size=sz))
             except (ValueError, TypeError):
-                continue
+                dropped += 1
+        if dropped:
+            _rate_limited_warning(
+                "leg_parse",
+                f"CTF dropped {dropped} malformed L2 level(s) on token {token_id[:12]}... "
+                f"({len(levels)} usable)",
+            )
         return cls(
             token_id=token_id,
             condition_id=condition_id,
@@ -139,8 +174,11 @@ class ParityLegDepth:
 
     def sorted_levels(self) -> list[OrderBookLevel]:
         """Returns levels sorted best to worst: descending for bids, ascending for asks."""
+        if self._sorted_cache is not None:
+            return self._sorted_cache
         if not self.levels:
-            return []
+            self._sorted_cache = []
+            return self._sorted_cache
         # Consolidate identical price levels
         consolidated: dict[float, float] = {}
         for lvl in self.levels:
@@ -150,7 +188,10 @@ class ParityLegDepth:
 
         is_bid = (self.side.upper() == "BID")
         sorted_px = sorted(consolidated.keys(), reverse=is_bid)
-        return [OrderBookLevel(price=p, size=consolidated[p]) for p in sorted_px if consolidated[p] > 0]
+        self._sorted_cache = [
+            OrderBookLevel(price=p, size=consolidated[p]) for p in sorted_px if consolidated[p] > 0
+        ]
+        return self._sorted_cache
 
     def get_fee_schedule(self) -> FeeSchedule:
         if self.fee_schedule is not None:
@@ -303,11 +344,10 @@ class MarginalCtfAllocator:
         vip_tier: str = "bronze",
         hurdle_rate: float = 0.0,
         min_net_edge_usd: float = 0.0015,
-        default_gas_price_gwei: float = 40.0,
-        default_pol_usd_price: float = 0.40,
+        default_gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI,
+        default_pol_usd_price: float = DEFAULT_POL_USD_PRICE,
         gas_units_split: int = TYPICAL_SPLIT_GAS_UNITS,
         gas_units_merge: int = TYPICAL_MERGE_GAS_UNITS,
-        max_capital_per_market: Optional[float] = None,
     ) -> None:
         self.vip_tier = vip_tier.lower()
         if self.vip_tier not in VIP_TIER_REBATES:
@@ -318,7 +358,6 @@ class MarginalCtfAllocator:
         self.default_pol_usd_price = default_pol_usd_price
         self.gas_units_split = gas_units_split
         self.gas_units_merge = gas_units_merge
-        self.max_capital_per_market = max_capital_per_market
 
     @property
     def vip_rebate_rate(self) -> float:
@@ -608,7 +647,6 @@ class MarginalCtfAllocator:
         self,
         candidates: Sequence[SingleMarketSweepResult],
         total_budget: float,
-        max_capital_per_market: Optional[float] = None,
     ) -> PortfolioAllocationResult:
         """Equal-Marginal Water-Filling Capital Allocator across N dislocated markets.
 
@@ -617,8 +655,6 @@ class MarginalCtfAllocator:
         2. No market is allocated more than its optimal depth C* (preventing negative marginal return).
         3. Markets unable to amortize their fixed batch gas friction are pruned.
         """
-        market_cap_limit = max_capital_per_market or self.max_capital_per_market
-
         # Filter strictly viable candidates (optimal net profit >= min_net_edge_usd)
         viable_candidates = [
             c for c in candidates
@@ -657,7 +693,6 @@ class MarginalCtfAllocator:
             # Greedily water-fill budget B down the ordered tranches
             rem_budget = total_budget
             market_allocations_usd: dict[int, float] = {i: 0.0 for i in range(len(active_set))}
-            market_allocations_shs: dict[int, float] = {i: 0.0 for i in range(len(active_set))}
             shadow_lambda = 0.0
 
             for m_ret, m_idx, t in pool_tranches:
@@ -667,12 +702,9 @@ class MarginalCtfAllocator:
                 cand = active_set[m_idx]
                 curr_cap = market_allocations_usd[m_idx]
 
-                # Market cap headroom
-                max_cand_cap = cand.optimal_capital
-                if market_cap_limit is not None:
-                    max_cand_cap = min(max_cand_cap, market_cap_limit)
-
-                market_headroom = max(0.0, max_cand_cap - curr_cap)
+                # The optimizer's only per-market bound is the measured ladder depth
+                # (C*) and the remaining portfolio budget.
+                market_headroom = max(0.0, cand.optimal_capital - curr_cap)
                 if market_headroom <= 1e-4:
                     continue
 
@@ -680,9 +712,7 @@ class MarginalCtfAllocator:
                 alloc_usd = min(rem_budget, tranche_cap_avail, market_headroom)
 
                 if alloc_usd > 1e-4:
-                    shares_added = alloc_usd / t.capital_per_set
                     market_allocations_usd[m_idx] += alloc_usd
-                    market_allocations_shs[m_idx] += shares_added
                     rem_budget -= alloc_usd
                     shadow_lambda = m_ret
 

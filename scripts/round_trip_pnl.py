@@ -46,6 +46,7 @@ from pathlib import Path
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 TRADES = Path("data/raw/sii/trades.parquet")
 LABELS = Path("data/processed/market_labels.parquet")
@@ -209,8 +210,8 @@ def main() -> int:
     tot = con.sql("SELECT count(*), sum(volume) FROM accum").fetchall()[0]
     logger.info(f"total: {tot[0]:,} makers, ${tot[1]/1e9:.2f} B volume")
 
-    print("\nby volume decile (round-trip PnL, average cost):")
-    print("  decile    makers   volume $m    pnl $m     pnl/$   positive")
+    log.info("\nby volume decile (round-trip PnL, average cost):")
+    log.info("  decile    makers   volume $m    pnl $m     pnl/$   positive")
     for r in con.sql(f"""
         SELECT dec, count(*) makers, sum(volume)/1e6 vol_m,
                sum(coalesce(realised,0) + coalesce(settled,0))/1e6 pnl_m,
@@ -222,7 +223,7 @@ def main() -> int:
         )
         GROUP BY dec ORDER BY dec
     """).fetchall():
-        print(f"  {r[0]:>6}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  {r[4]:>+8.5f}  {r[5]:>7.1f}%")
+        log.info(f"  {r[0]:>6}  {r[1]:>8,}  {r[2]:>10,.0f}  {r[3]:>+9.2f}  {r[4]:>+8.5f}  {r[5]:>7.1f}%")
 
     allr = con.sql(f"""
         SELECT count(*), sum(volume), sum(coalesce(realised,0) + coalesce(settled,0)),
@@ -230,12 +231,12 @@ def main() -> int:
                100.0 * count(*) FILTER (WHERE coalesce(realised,0) + coalesce(settled,0) > 0) / count(*)
         FROM accum WHERE volume >= {args.min_volume}
     """).fetchall()[0]
-    print(f"\n  all      {allr[0]:>8,}  {allr[1]/1e6:>10,.0f}  {allr[2]/1e6:>+9.2f}  {allr[3]:>+8.5f}  {allr[4]:>7.1f}%")
+    log.info(f"\n  all      {allr[0]:>8,}  {allr[1]/1e6:>10,.0f}  {allr[2]/1e6:>+9.2f}  {allr[3]:>+8.5f}  {allr[4]:>7.1f}%")
 
-    print(f"\nmakers with >= ${args.min_volume:,.0f} maker volume: {allr[0]:,}")
-    print(f"round-trip pnl: ${allr[2]/1e6:+.2f} M on ${allr[1]/1e9:.2f} B "
+    log.info(f"\nmakers with >= ${args.min_volume:,.0f} maker volume: {allr[0]:,}")
+    log.info(f"round-trip pnl: ${allr[2]/1e6:+.2f} M on ${allr[1]/1e9:.2f} B "
           f"({allr[3]*100:+.4f} cents per $1)")
-    print(f"positive-PnL makers: {allr[4]:.1f} %")
+    log.info(f"positive-PnL makers: {allr[4]:.1f} %")
 
     top = con.sql(f"""
         SELECT maker, volume, coalesce(realised,0)+coalesce(settled,0) pnl,
@@ -243,10 +244,10 @@ def main() -> int:
         FROM accum WHERE volume >= {args.min_volume}
         ORDER BY volume DESC LIMIT 15
     """).fetchall()
-    print("\nthe 15 largest makers by volume:")
-    print("  pnl $m    volume $m    pnl/$      tokens  maker")
+    log.info("\nthe 15 largest makers by volume:")
+    log.info("  pnl $m    volume $m    pnl/$      tokens  maker")
     for m, vol, pnl, pd, tk in top:
-        print(f"  {pnl/1e6:>+7.2f}  {vol/1e6:>10,.1f}  {pd:>+8.5f}  {tk:>8,}  {m[:20]}")
+        log.info(f"  {pnl/1e6:>+7.2f}  {vol/1e6:>10,.1f}  {pd:>+8.5f}  {tk:>8,}  {m[:20]}")
     return 0
 
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CACHE = "data/processed/wallet_token/*.parquet"
 LABELS = "data/processed/market_labels.parquet"
@@ -95,16 +96,16 @@ def main() -> None:
         FROM pairp GROUP BY 1
     """)
 
-    print("\n=== identity check: entry + exit must equal profit exactly ===")
+    log.info("\n=== identity check: entry + exit must equal profit exactly ===")
     r = con.sql("""
         SELECT sum(entry_edge), sum(exit_edge), sum(profit),
                sum(entry_edge) + sum(exit_edge) - sum(profit)
         FROM wallet
     """).fetchall()[0]
-    print(f"  entry {r[0]:+,.0f}  exit {r[1]:+,.0f}  profit {r[2]:+,.0f}  residual {r[3]:+.6f}")
+    log.info(f"  entry {r[0]:+,.0f}  exit {r[1]:+,.0f}  profit {r[2]:+,.0f}  residual {r[3]:+.6f}")
 
-    print("\n=== by volume decile ===")
-    print("  dec  wallets   volume$m   entry/$   exit/$   entry share   carry   win%   pnl/token sd")
+    log.info("\n=== by volume decile ===")
+    log.info("  dec  wallets   volume$m   entry/$   exit/$   entry share   carry   win%   pnl/token sd")
     for r in con.sql("""
         SELECT dec, count(*), sum(volume)/1e6,
                sum(entry_edge)/nullif(sum(volume),0),
@@ -118,10 +119,10 @@ def main() -> None:
             FROM wallet WHERE volume >= 1000
         ) GROUP BY dec ORDER BY dec
     """).fetchall():
-        print(f"  {r[0]:>3}  {r[1]:>7,}  {r[2]:>9,.0f}  {r[3]:>+8.5f}  {r[4]:>+8.5f}  "
+        log.info(f"  {r[0]:>3}  {r[1]:>7,}  {r[2]:>9,.0f}  {r[3]:>+8.5f}  {r[4]:>+8.5f}  "
               f"{r[5]:>11.3f}  {r[6]:>6.3f}  {r[7]:>5.1f}  {r[8]:>+10.4f}")
 
-    print("\n=== dispersion: top decile vs the rest ===")
+    log.info("\n=== dispersion: top decile vs the rest ===")
     for label, where in (("top decile", "vdec = 1"), ("deciles 2-10", "vdec > 1")):
         r = con.sql(f"""
             SELECT count(*), sum(profit), sum(volume),
@@ -131,18 +132,18 @@ def main() -> None:
             FROM (SELECT *, ntile(10) OVER (ORDER BY volume DESC) AS vdec FROM wallet WHERE volume >= 1000)
             WHERE {where}
         """).fetchall()[0]
-        print(f"  {label:12} wallets {r[0]:>7,}  profit ${r[1]/1e6:>+8.2f} m  "
+        log.info(f"  {label:12} wallets {r[0]:>7,}  profit ${r[1]/1e6:>+8.2f} m  "
               f"win/loss {r[4]:>5.2f}  token win% {r[5]:>4.1f}")
 
-    print("\n=== the 12 largest wallets: entry vs exit ===")
-    print("  entry$m   exit$m   profit$m  entry share  carry   tokens")
+    log.info("\n=== the 12 largest wallets: entry vs exit ===")
+    log.info("  entry$m   exit$m   profit$m  entry share  carry   tokens")
     for r in con.sql("""
         SELECT entry_edge/1e6, exit_edge/1e6, profit/1e6,
                entry_edge/nullif(entry_edge+exit_edge,0),
                abs_net/nullif(shares,0), tokens
         FROM wallet WHERE volume >= 1000 ORDER BY volume DESC LIMIT 12
     """).fetchall():
-        print(f"  {r[0]:>+7.2f}  {r[1]:>+7.2f}  {r[2]:>+8.2f}  {r[3]:>11.3f}  {r[4]:>6.3f}  {r[5]:>7,}")
+        log.info(f"  {r[0]:>+7.2f}  {r[1]:>+7.2f}  {r[2]:>+8.2f}  {r[3]:>11.3f}  {r[4]:>6.3f}  {r[5]:>7,}")
 
 
 if __name__ == "__main__":

@@ -128,7 +128,8 @@ def maker_fee_rebate(
         shares: Number of filled shares.
         schedule: Market FeeSchedule.
         maker_rebate_share_pct: Override maker rebate share fraction. If 0.20 (the default)
-            and schedule.rebate_rate > 0, schedule.rebate_rate is preferred.
+            and schedule.rebate_rate > 0, schedule.rebate_rate is preferred. A
+            Gamma-sourced schedule with no rebateRate pays the maker nothing.
         rounding_dp: Rounding decimal places (defaults to config formula rounding_dp).
 
     Returns:
@@ -143,6 +144,11 @@ def maker_fee_rebate(
         gamma = float(maker_rebate_share_pct)
     elif schedule.rebate_rate > 0.0:
         gamma = float(schedule.rebate_rate)
+    elif schedule.source == "gamma":
+        # The venue's own feeSchedule is authoritative. If it reports no
+        # rebateRate, do not invent the 20% model default: doing so would
+        # fabricate maker edge on markets that pay none.
+        gamma = 0.0
     else:
         gamma = float(maker_rebate_share_pct if maker_rebate_share_pct is not None else 0.20)
 

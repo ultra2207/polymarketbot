@@ -37,6 +37,8 @@ sys.path.insert(0, "src")
 import duckdb
 import requests
 from tqdm import tqdm
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/raw/binance/klines")
 TMP = Path(".tmp/binance")
@@ -141,7 +143,7 @@ def main() -> int:
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     todo = months(args.start, end)
-    print(f"{len(symbols)} symbols x {len(todo)} months -> {OUT}", flush=True)
+    log.info(f"{len(symbols)} symbols x {len(todo)} months -> {OUT}", )
 
     counts = {"ok": 0, "skip": 0, "absent": 0, "error": 0}
     for symbol in symbols:
@@ -154,7 +156,7 @@ def main() -> int:
                 "absent" if status == "absent" else "error")
             counts[key] += 1
             bar.set_postfix_str(status)
-    print(f"\nfetched={counts['ok']} skipped={counts['skip']} "
+    log.info(f"\nfetched={counts['ok']} skipped={counts['skip']} "
           f"absent={counts['absent']} errors={counts['error']}")
 
     files = sorted(OUT.rglob("*.parquet"))
@@ -167,7 +169,7 @@ def main() -> int:
             FROM read_parquet('{(OUT / '**' / '*.parquet').as_posix()}',
                               hive_partitioning=true)
         """).fetchall()[0]
-        print(f"on disk: {r[0]:,} minutes across {r[1]} symbols, "
+        log.info(f"on disk: {r[0]:,} minutes across {r[1]} symbols, "
               f"{r[2]} -> {r[3]}")
     return 0 if counts["error"] == 0 else 1
 

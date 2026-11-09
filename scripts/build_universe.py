@@ -21,6 +21,8 @@ from pathlib import Path
 sys.path.insert(0, "src")
 
 from polymarketbot.db import connect
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 OUT = Path("data/processed")
 LABELS = OUT / "market_labels.parquet"
@@ -170,9 +172,9 @@ def main() -> int:
     """)
 
     n = con.sql(f"SELECT count(*) FROM read_parquet('{DEST.as_posix()}')").fetchall()[0][0]
-    print(f"wrote {DEST}  ({n:,} markets)\n")
+    log.info(f"wrote {DEST}  ({n:,} markets)\n")
 
-    print("composition:")
+    log.info("composition:")
     row = con.sql(f"""
         SELECT
             count(*) n,
@@ -183,41 +185,41 @@ def main() -> int:
             count(*) FILTER (WHERE label_source = 'missing') no_label
         FROM read_parquet('{DEST.as_posix()}')
     """).fetchall()[0]
-    print(f"  markets          {row[0]:>12,}")
-    print(f"  zero volume      {row[1]:>12,}  ({100*row[1]/row[0]:.1f}%)")
-    print(f"  void             {row[2]:>12,}  ({100*row[2]/row[0]:.1f}%)")
-    print(f"  resolved         {row[3]:>12,}")
-    print(f"  end<created      {row[4]:>12,}  ({100*row[4]/row[0]:.1f}%)")
-    print(f"  no label         {row[5]:>12,}")
+    log.info(f"  markets          {row[0]:>12,}")
+    log.info(f"  zero volume      {row[1]:>12,}  ({100*row[1]/row[0]:.1f}%)")
+    log.info(f"  void             {row[2]:>12,}  ({100*row[2]/row[0]:.1f}%)")
+    log.info(f"  resolved         {row[3]:>12,}")
+    log.info(f"  end<created      {row[4]:>12,}  ({100*row[4]/row[0]:.1f}%)")
+    log.info(f"  no label         {row[5]:>12,}")
     pre = con.sql(
         f"SELECT count(*) FROM read_parquet('{DEST.as_posix()}') WHERE traded_before_created"
     ).fetchall()[0][0]
-    print(f"  traded pre-create {pre:>11,}")
+    log.info(f"  traded pre-create {pre:>11,}")
 
-    print("\ntick size:")
+    log.info("\ntick size:")
     for r in con.sql(f"""
         SELECT tick_size_source, tick_size, count(*) n
         FROM read_parquet('{DEST.as_posix()}')
         GROUP BY 1,2 ORDER BY n DESC LIMIT 6
     """).fetchall():
-        print(f"  {r[0]:8} tick={r[1]:<6} {r[2]:>12,}")
+        log.info(f"  {r[0]:8} tick={r[1]:<6} {r[2]:>12,}")
 
-    print("\nexchange generation (which contract settled the fill):")
+    log.info("\nexchange generation (which contract settled the fill):")
     for r in con.sql(f"""
         SELECT exchange_generation, count(*) n, round(coalesce(sum(traded_usd), 0)/1e9, 2) usd_b
         FROM read_parquet('{DEST.as_posix()}') GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:8} {r[1]:>12,}  ${r[2]:>8.2f}B")
+        log.info(f"  {r[0]:8} {r[1]:>12,}  ${r[2]:>8.2f}B")
 
-    print("\nposition system (where balances live):")
+    log.info("\nposition system (where balances live):")
     for r in con.sql(f"""
         SELECT position_system, count(*) n,
                count(*) FILTER (WHERE position_version IS NOT NULL) verified
         FROM read_parquet('{DEST.as_posix()}') GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:16} {r[1]:>12,}  gamma-verified {r[2]:>10,}")
+        log.info(f"  {r[0]:16} {r[1]:>12,}  gamma-verified {r[2]:>10,}")
 
-    print("\nfee metadata coverage (Gamma):")
+    log.info("\nfee metadata coverage (Gamma):")
     fee = con.sql(f"""
         SELECT count(*) n,
                count(*) FILTER (WHERE fee_rate IS NOT NULL) with_rate,
@@ -225,20 +227,20 @@ def main() -> int:
                count(*) FILTER (WHERE fee_type IS NOT NULL) with_type
         FROM read_parquet('{DEST.as_posix()}') WHERE NOT is_zero_volume
     """).fetchall()[0]
-    print(f"  traded markets {fee[0]:>12,}  fee_schedule {fee[1]:>12,}  "
+    log.info(f"  traded markets {fee[0]:>12,}  fee_schedule {fee[1]:>12,}  "
           f"non-zero {fee[2]:>12,}  fee_type {fee[3]:>12,}")
-    print("\ncategory (tradable, non-void):")
+    log.info("\ncategory (tradable, non-void):")
     for r in con.sql(f"""
         SELECT category, count(*) n, round(coalesce(sum(traded_usd),0)/1e9,2) usd_b
         FROM read_parquet('{DEST.as_posix()}')
         WHERE NOT is_zero_volume AND NOT coalesce(is_void,false)
         GROUP BY 1 ORDER BY n DESC
     """).fetchall():
-        print(f"  {r[0]:12} {r[1]:>10,}  ${r[2]:>8.2f}B")
+        log.info(f"  {r[0]:12} {r[1]:>10,}  ${r[2]:>8.2f}B")
 
-    print("\nopen universe at 12 sample dates:")
-    print("  (volume shown is the market's *lifetime* total, for scale only —")
-    print("   it is NOT a point-in-time figure and must not be used as a feature)")
+    log.info("\nopen universe at 12 sample dates:")
+    log.info("  (volume shown is the market's *lifetime* total, for scale only —")
+    log.info("   it is NOT a point-in-time figure and must not be used as a feature)")
     con.execute(f"CREATE VIEW pit AS SELECT * FROM read_parquet('{DEST.as_posix()}')")
     dates = [
         "2024-01-01", "2024-04-01", "2024-07-01", "2024-10-01",
@@ -254,7 +256,7 @@ def main() -> int:
               AND to_timestamp(first_fill_ts) <= TIMESTAMPTZ '{d}'
               AND (end_date IS NULL OR end_date > TIMESTAMPTZ '{d}')
         """).fetchall()[0]
-        print(f"  {d}  {r[0]:>8,} markets   ${r[1]:>12,.1f}M lifetime")
+        log.info(f"  {d}  {r[0]:>8,} markets   ${r[1]:>12,.1f}M lifetime")
     return 0
 
 

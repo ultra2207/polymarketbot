@@ -146,3 +146,106 @@ executing, not after it times out.**
   3. All findings, detachments from reality, non-optimal code, and money left on the table are
      logged, reported, and remediated immediately.
 
+## Optimizer, not hand filters
+
+- **No hardcoded values, at all.** A value must be fetched dynamically from the venue/API,
+  measured from historical data, or derived from live observations. The only exceptions
+  are documented protocol constants (tick size, minimum order size, fee schedule, gas
+  units). Anything else — a cap, multiplier, threshold, hurdle, reserve, or fallback — is
+  a bug. Do not replace one guessed constant with another; fit it or measure it.
+- **Never shrink the tradable universe to make a scan faster.** Limiting the available
+  market space to improve universe-walk speed or latency is not acceptable: it can produce
+  a non-global-optimum allocation. Accept more API usage, parallelism, caching, indexing,
+  or a better algorithm instead. Every filter must be applied **inside the optimizer**,
+  with its economic reason and measured basis logged; never silently pre-filter candidates.
+- **If tractability needs a bound, make it a measured compute/time budget** with a logged
+  error bound; never silently truncate the candidate set to make the solver easy.
+- **The optimizer decides allocation, switching, slot count, and size.** Hand ranking
+  followed by a small subset is not an optimizer. If the solver cannot handle the full
+  set, iterate on the solver until it can; do not restore caps.
+
+## Continuous 30-minute paper-trader audit loop (latest operating instructions)
+
+This is the standing refinement loop for the three live paper strategies:
+**RewardHarvester**, **SettlementHarvester**, and **CtfMinter** (LatencySniper stays benched).
+
+### Logging contract (do not regress)
+
+- Every Python file that produces output calls
+  `from polymarketbot.logs import get_logger; log = get_logger(__name__)` and uses
+  `log.info` / `log.warning` / `log.error`; no bare `print()` in application or script code.
+- `polymarketbot.logs` writes every record to `data/logs/app.log` **and** to a
+  per-source-file log (for example `data/logs/polymarketbot.paper_trading.engine.log`,
+  `data/logs/scripts.run_live_paper_soak.log`). Timestamps are IST.
+- All file sinks rotate at `LOG_ROTATION` (default `10 MB`), retain
+  `LOG_RETENTION` rotations (default `3`), and compress rotated files. Do not add an
+  unrotated log file.
+- A long run must remain diagnosable from the logs alone: state, fills, allocations,
+  errors, and the periodic equity snapshot go through loguru, not stdout.
+
+### The loop
+
+1. **Soak.** Run the live paper trader for exactly 30 minutes:
+   `MALLOC_ARENA_MAX=2 uv run python scripts/run_live_paper_soak.py --capital 3000 --duration 1800 --interval 10`
+   Run this as a **normal foreground command** with a **2000-second timeout** — not as a
+   background job, not as a named service, and **not through a PTY**. Use plain
+   `uv run python ...`; the harness PTY path is buggy and has hung runs. The dashboard
+   streams to the terminal, so the
+   operator can check progress directly instead of asking the assistant. Wait for the
+   command to return; do not poll with repeated DB/log checks or short sleeps. The script's
+   own `--duration 1800` is the timer. This is the one explicitly authorised exception to
+   the 600-second invocation cap: it is a daemon with 10-second SQLite snapshots, per-file
+   logs, and graceful SIGINT/SIGTERM, so a kill still leaves inspectable progress. Never
+   launch it silently; the dashboard is logged every interval and
+   `data/paper_soak_telemetry.db` grows every interval.
+   - Inspect the live dashboard output directly while it runs. Do not wait 30 minutes to
+     discover it produced nothing.
+   - On completion, record the window (start/end UTC), starting/ending equity per pillar,
+     fills, and any errors from `data/logs/scripts.run_live_paper_soak.log`.
+
+2. **Audit + fix.** Dispatch **3 subagents in parallel**, one per strategy, each reading the
+   **last 30-minute run only** (the exact window from step 1) plus the code path that
+   produced it. Do not include older runs; they predate the current fixes and are not
+   evidence about the current code.
+   - **Reward Harvester Auditor** — liquidity reward allocations, queue priority/decay,
+     adverse-selection fills, marginal yield (KKT water-filling), maker rebate credit,
+     capital utilisation, banned/hardcoded caps.
+   - **Settlement Harvester Auditor** — active horizons, pending par redemptions, taker-fee
+     leakage, capital turnover velocity, resolution/hazard-rate logic, mark-to-par equity.
+   - **CTF Minter Auditor** — maker parity bundles (`Bid_A + Bid_B < 1.0` after fees/gas),
+     fill balance across legs, inventory skew, merge efficiency, sequential vs atomic legs.
+   Each auditor must report, with file:line evidence:
+   - bugs and unexpected behaviour,
+   - detachment from protocol reality (fees, ERC-1155 CTF, UMA resolution states),
+   - money left on the table,
+   - unoptimised code and unnecessary allocations on hot paths,
+   - hardcoded/non-dynamic parameters that should be solved or measured,
+   - haphazard design that a top HFT desk (Jump/Citadel) would reject.
+
+   **Auditors own their strategy's implementation.** They are not read-only and must not
+   dump findings on the orchestrator. Each auditor implements every fix it finds in its
+   own strategy files, runs the narrowest verifying test or bounded smoke, and reports the
+   diff plus evidence. There is no rush: the launch gate is Dec 1, and every found issue
+   is to be fixed, not deferred. The orchestrator only mediates shared-file/cross-strategy
+   conflicts, verifies the integrated result, and restarts the soak.
+
+3. **Integrate.** Orchestrator checks the three diffs for conflicts, compiles the tree,
+   runs a bounded smoke if the changes touch a shared path, records what changed, and
+   returns to step 1. Every audit cycle ends with the loop restarted; do not stop after
+   the report.
+
+### Operating constraints for the loop
+
+- **Host memory.** A `t3.micro` (930 MB) is **not sufficient** for the full-universe
+  3-pillar soak. Even with chunked book loading, spread trimming, compact reward rows and
+  allocator trimming, the soak peaks at 441–558 MB while the agent harness holds another
+  320–570 MB; a 30-minute run restarted the instance despite the memory guard. Use a
+  **>= 2 GB instance** (or the 16 GB local PC) and run the local-India assessment in
+  `docs/local-pc-india-analysis.md` before using a high-RTT host for live CTF.
+- Keep one compute process at a time; the soak is that process. Auditors read files and the
+  SQLite/log outputs, they do not launch duplicate soak runs.
+- Never kill the soak blind: check the per-file log and `paper_soak_telemetry.db` row growth
+  first. If it produced nothing after 300 seconds, stop and fix the code.
+- State the expected cost of the soak up front (3 engines, 3 radars, 6 threads, 10-second
+  snapshots, roughly 180 dashboard records and 180 snapshot rows per 30-minute run).
+

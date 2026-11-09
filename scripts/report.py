@@ -14,6 +14,8 @@ Sections
 from __future__ import annotations
 
 import duckdb
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 CUBE = "data/processed/cube.parquet"
 
@@ -23,8 +25,8 @@ def main() -> None:
     con.execute("SET threads=4")
     con.execute(f"CREATE OR REPLACE VIEW c AS SELECT * FROM read_parquet('{CUBE}')")
 
-    print("=== 1. selection: at the same price, does the top decile pick better outcomes? ===")
-    print("  bucket     top: payout  entry    edge  |  rest: payout  entry    edge  |    gap")
+    log.info("=== 1. selection: at the same price, does the top decile pick better outcomes? ===")
+    log.info("  bucket     top: payout  entry    edge  |  rest: payout  entry    edge  |    gap")
     for r in con.sql("""
         SELECT pbucket,
                sum(payout_bs) FILTER (WHERE dec = 1) / nullif(sum(bs) FILTER (WHERE dec = 1),0),
@@ -38,7 +40,7 @@ def main() -> None:
             continue
         te = r[1] - r[2]
         re = r[3] - r[4]
-        print(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%  {r[1]:>7.3f}  {r[2]:>6.3f}  {te:>+6.3f}  |"
+        log.info(f"  {r[0]*5:>3}-{r[0]*5+5:<3}%  {r[1]:>7.3f}  {r[2]:>6.3f}  {te:>+6.3f}  |"
               f" {r[3]:>7.3f}  {r[4]:>6.3f}  {re:>+6.3f}  | {te-re:>+6.3f}")
 
     r = con.sql("""
@@ -48,30 +50,30 @@ def main() -> None:
                  / nullif(sum(bs) FILTER (WHERE dec > 1),0)
         FROM c WHERE outcome >= 0
     """).fetchall()[0]
-    print(f"\n  total edge per share bought:  top {r[0]:+.4f}   rest {r[1]:+.4f}")
+    log.info(f"\n  total edge per share bought:  top {r[0]:+.4f}   rest {r[1]:+.4f}")
 
-    print("\n\n=== 2. closure: do winners get closed and losers held? (top decile) ===")
-    print("  outcome      positions     closed %")
+    log.info("\n\n=== 2. closure: do winners get closed and losers held? (top decile) ===")
+    log.info("  outcome      positions     closed %")
     for r in con.sql("""
         SELECT CASE outcome WHEN 1 THEN 'would win' WHEN 0 THEN 'would lose' ELSE 'unresolved' END o,
                sum(n), 100.0*sum(n_closed)/sum(n)
         FROM c WHERE dec = 1 GROUP BY outcome ORDER BY outcome DESC
     """).fetchall():
-        print(f"  {r[0]:<12} {r[1]:>12,}   {r[2]:>8.1f}")
+        log.info(f"  {r[0]:<12} {r[1]:>12,}   {r[2]:>8.1f}")
 
-    print("\n\n=== 3. lifecycle: round trip vs held, by wallet decile ===")
-    print("  dec   volume $m    closed $m    held $m    exit $m     net $m")
+    log.info("\n\n=== 3. lifecycle: round trip vs held, by wallet decile ===")
+    log.info("  dec   volume $m    closed $m    held $m    exit $m     net $m")
     for r in con.sql("""
         SELECT dec, (sum(bc) + sum(sc))/1e6,
                sum(closed_pnl)/1e6, sum(held_pnl)/1e6, sum(exit_pnl)/1e6,
                (sum(closed_pnl) + sum(held_pnl) + sum(exit_pnl))/1e6
         FROM c WHERE dec > 0 GROUP BY dec ORDER BY dec
     """).fetchall():
-        print(f"  {r[0]:>3}  {r[1]:>10,.0f}  {r[2]:>+11.2f}  {r[3]:>+9.2f}  "
+        log.info(f"  {r[0]:>3}  {r[1]:>10,.0f}  {r[2]:>+11.2f}  {r[3]:>+9.2f}  "
               f"{r[4]:>+9.2f}  {r[5]:>+9.2f}")
 
-    print("\n\n=== 4. top decile: never-closed positions by size ===")
-    print("  notional      never sold    held PnL $m    per held $")
+    log.info("\n\n=== 4. top decile: never-closed positions by size ===")
+    log.info("  notional      never sold    held PnL $m    per held $")
     labels = ["<$1", "$1-10", "$10-100", "$100-1k", "$1k-10k",
               "$10k-100k", "$100k-1M", "$1M-10M", "$10M+"]
     for r in con.sql("""
@@ -80,7 +82,7 @@ def main() -> None:
                sum(held_pnl)/nullif(sum(n_held),0)
         FROM c WHERE dec = 1 GROUP BY sbucket ORDER BY sbucket
     """).fetchall():
-        print(f"  {labels[r[0]]:<12} {r[1]:>12,}   {r[2]:>+9.2f}   {r[3]:>+14.2f}")
+        log.info(f"  {labels[r[0]]:<12} {r[1]:>12,}   {r[2]:>+9.2f}   {r[3]:>+14.2f}")
 
 
 if __name__ == "__main__":

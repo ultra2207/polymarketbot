@@ -24,6 +24,7 @@ import argparse
 import duckdb
 
 from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 POSITIONS = "data/processed/positions/*.parquet"
 MARKETS = "data/processed/markets_pit.parquet"
@@ -74,8 +75,8 @@ def main() -> None:
         GROUP BY 1, 2, 3
     """)
 
-    print("\n=== payout minus price, by category (volume-weighted over all buckets) ===")
-    print("  category            top pos   top edge | rest pos   rest edge |    gap")
+    log.info("\n=== payout minus price, by category (volume-weighted over all buckets) ===")
+    log.info("  category            top pos   top edge | rest pos   rest edge |    gap")
     for r in con.execute("""
         SELECT category,
                sum(n) FILTER (WHERE top = 1), 
@@ -91,10 +92,10 @@ def main() -> None:
     """, [args.min_positions]).fetchall():
         if r[2] is None or r[4] is None:
             continue
-        print(f"  {r[0]:<18} {r[1]:>9,}  {r[2]:>+8.4f} | {r[3]:>9,}  {r[4]:>+9.4f} | {r[2]-r[4]:>+8.4f}")
+        log.info(f"  {r[0]:<18} {r[1]:>9,}  {r[2]:>+8.4f} | {r[3]:>9,}  {r[4]:>+9.4f} | {r[2]-r[4]:>+8.4f}")
 
-    print("\n=== the same, for the 70-85 % price band only ===")
-    print("  category            top pos   top edge | rest pos   rest edge |    gap")
+    log.info("\n=== the same, for the 70-85 % price band only ===")
+    log.info("  category            top pos   top edge | rest pos   rest edge |    gap")
     for r in con.execute("""
         SELECT category,
                sum(n) FILTER (WHERE top = 1),
@@ -110,7 +111,7 @@ def main() -> None:
     """, [args.min_positions]).fetchall():
         if r[2] is None or r[4] is None:
             continue
-        print(f"  {r[0]:<18} {r[1]:>9,}  {r[2]:>+8.4f} | {r[3]:>9,}  {r[4]:>+9.4f} | {r[2]-r[4]:>+8.4f}")
+        log.info(f"  {r[0]:<18} {r[1]:>9,}  {r[2]:>+8.4f} | {r[3]:>9,}  {r[4]:>+9.4f} | {r[2]-r[4]:>+8.4f}")
 
 
 if __name__ == "__main__":

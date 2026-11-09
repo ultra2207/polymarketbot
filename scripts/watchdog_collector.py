@@ -37,6 +37,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from polymarketbot.logs import get_logger
+log = get_logger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT / "src") not in sys.path:
@@ -51,7 +53,7 @@ DEFAULT_MAX_AGE_S = 600.0
 
 def log(message: str) -> None:
     line = f"{datetime.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')} {message}"
-    print(line)
+    log.info(line)
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")

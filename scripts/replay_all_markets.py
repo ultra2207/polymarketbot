@@ -921,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
             "elapsed_s": float(frame["elapsed_s"].iloc[0]),
         }
     (tag_dir / "summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
-    print(json.dumps(summary, indent=1))
+    log.info(json.dumps(summary, indent=1))
     return 0
 
 
