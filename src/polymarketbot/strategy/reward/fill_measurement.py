@@ -9,6 +9,8 @@ cache, which lives here and nowhere else.
 
 from __future__ import annotations
 
+import threading
+
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -51,6 +53,15 @@ _QUOTE_FILL_HORIZON_TRIED = False
 _MAKER_MARKOUT: Any = None
 _MAKER_MARKOUT_TRIED = False
 
+# The loaders are called from the scanner's thread pool. Setting the tried flag
+# before the load returns meant a thread entering during the load window read
+# TRIED=True, skipped the load and got None - which the caller reads as
+# "fill side unmeasured" and prices with stay_fraction=1.0 (fill yield 0.0).
+# Measured consequence: 6 of the first 24 markets of a cold scan priced on a
+# missing measurement. The lock serialises the load and the flag flips only
+# after the table is assigned.
+_TABLE_LOCK = threading.Lock()
+
 
 def _fill_table() -> Any:
     """The measured horizon fill table, or ``None`` when it is unusable.
@@ -60,34 +71,40 @@ def _fill_table() -> Any:
     about how often a resting bid at the touch is filled.
     """
     global _QUOTE_FILL_HORIZON, _QUOTE_FILL_HORIZON_TRIED
-    if not _QUOTE_FILL_HORIZON_TRIED:
-        _QUOTE_FILL_HORIZON_TRIED = True
-        try:
-            from polymarketbot.strategy.reward.measurement import load_quote_fill_horizon
+    if _QUOTE_FILL_HORIZON_TRIED:
+        return _QUOTE_FILL_HORIZON
+    with _TABLE_LOCK:
+        if not _QUOTE_FILL_HORIZON_TRIED:
+            try:
+                from polymarketbot.strategy.reward.measurement import load_quote_fill_horizon
 
-            _QUOTE_FILL_HORIZON = load_quote_fill_horizon()
-        except Exception as exc:  # noqa: BLE001 - a missing measurement is data, not a crash
-            log.warning(
-                f"reward fill side unpriced: horizon fill measurement unavailable ({exc})"
-            )
-            _QUOTE_FILL_HORIZON = None
+                _QUOTE_FILL_HORIZON = load_quote_fill_horizon()
+            except Exception as exc:  # noqa: BLE001 - a missing measurement is data, not a crash
+                log.warning(
+                    f"reward fill side unpriced: horizon fill measurement unavailable ({exc})"
+                )
+                _QUOTE_FILL_HORIZON = None
+            _QUOTE_FILL_HORIZON_TRIED = True
     return _QUOTE_FILL_HORIZON
 
 
 def _markout_table() -> Any:
     """The measured single-leg markout, or ``None`` when it is unusable."""
     global _MAKER_MARKOUT, _MAKER_MARKOUT_TRIED
-    if not _MAKER_MARKOUT_TRIED:
-        _MAKER_MARKOUT_TRIED = True
-        try:
-            from polymarketbot.strategy.reward.measurement import load_maker_markout
+    if _MAKER_MARKOUT_TRIED:
+        return _MAKER_MARKOUT
+    with _TABLE_LOCK:
+        if not _MAKER_MARKOUT_TRIED:
+            try:
+                from polymarketbot.strategy.reward.measurement import load_maker_markout
 
-            _MAKER_MARKOUT = load_maker_markout()
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                f"reward fill side unpriced: single-leg markout unavailable ({exc})"
-            )
-            _MAKER_MARKOUT = None
+                _MAKER_MARKOUT = load_maker_markout()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    f"reward fill side unpriced: single-leg markout unavailable ({exc})"
+                )
+                _MAKER_MARKOUT = None
+            _MAKER_MARKOUT_TRIED = True
     return _MAKER_MARKOUT
 
 
