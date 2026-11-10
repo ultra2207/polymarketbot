@@ -43,6 +43,12 @@ runs have already wasted hours here.
 
 - **`scripts/` is for temporary, throwaway tooling only.** One-off probes, migration
   helpers, and experiments live there and are deleted when their question is answered.
+- **`tmp_python/` is for scratch Python too short-lived to earn a `scripts/` entry.**
+  Any throwaway probe longer than a few lines is written to a file there and run with
+  `uv run python tmp_python/<name>.py` — never pasted into the shell as a heredoc. The
+  reasons are practical: a multi-line heredoc mangles quoting and indentation, is
+  unreviewable after the fact, cannot be re-run or amended without rewriting it, and
+  buries the result in a wall of echoed source. `tmp_python/` is gitignored.
 - **Anything run repeatedly lives in `src/polymarketbot/` and is invoked with
   `python -m`.** The live paper soak is `polymarketbot.paper.main`, not a script:
   `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10`.

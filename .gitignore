@@ -62,3 +62,5 @@ logs/
 .vscode/
 *.sublime-project
 *.sublime-workspace
+# incidental python scratch scripts; see AGENTS.md "Where code lives"
+tmp_python/
