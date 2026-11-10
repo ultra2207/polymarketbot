@@ -845,7 +845,7 @@ def _ready_live_merge(engine, ctf, monkeypatch, route, meta):
     engine.shares_yes = engine.shares_no = 5.0
     engine._last_merge_ts = 0.0
     monkeypatch.setattr(
-        "polymarketbot.live.engine.verify_route",
+        "polymarketbot.live.engine.merge.verify_route",
         lambda *args, **kwargs: (True, "ok"),
     )
 

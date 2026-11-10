@@ -234,7 +234,7 @@ def test_dry_run_merge_and_redeem_unchanged(monkeypatch):
     monkeypatch.delenv("POLY_PRIVATE_KEY", raising=False)
     ctf = PolygonCtfClient(dry_run=True)
     monkeypatch.setattr(ctf, "get_dynamic_gas_price_gwei", lambda: 40.0)
-    monkeypatch.setattr("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", lambda: 0.092)
+    monkeypatch.setattr("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", lambda: 0.092)
     merge_res = ctf.merge_positions(CONDITION_ID, 20.0)
     redeem_res = ctf.redeem_positions(CONDITION_ID)
 
@@ -316,7 +316,7 @@ def test_live_merge_uses_supplied_token_ids_for_balance_check():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ctf, "get_dynamic_gas_price_gwei", lambda: 40.0)
-        mp.setattr("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", lambda: 0.1)
+        mp.setattr("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", lambda: 0.1)
         chain.get_transaction_count.return_value = 3
         chain.estimate_gas.return_value = 80_000
         chain.send_raw_transaction.side_effect = (
@@ -363,8 +363,8 @@ def test_live_merge_broadcasts_signed_tx_and_uses_receipt_gas():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ctf, "get_dynamic_gas_price_gwei", lambda: 40.0)
-        mp.setattr("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", lambda: 0.10)
-        mp.setattr("polymarketbot.strategy.onchain.ctf.sign_eip1559_transaction", spy_sign)
+        mp.setattr("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", lambda: 0.10)
+        mp.setattr("polymarketbot.strategy.onchain.ctf.rlp.sign_eip1559_transaction", spy_sign)
         res = ctf.merge_positions(CONDITION_ID, 25.0, pol_usd_price=0.10)
 
     assert res.success is True
@@ -401,7 +401,7 @@ def test_live_merge_revert_returns_failure_without_crediting_usdc():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ctf, "get_dynamic_gas_price_gwei", lambda: 40.0)
-        mp.setattr("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", lambda: 0.10)
+        mp.setattr("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", lambda: 0.10)
         res = ctf.merge_positions(CONDITION_ID, 25.0)
 
     assert res.success is False

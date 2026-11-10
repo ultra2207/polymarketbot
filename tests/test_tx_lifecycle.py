@@ -143,7 +143,7 @@ def _ctf(chain: FakeChain, store: PendingSettlementStore | None = None) -> Polyg
 @pytest.fixture(autouse=True)
 def _no_pol_price_network(monkeypatch):
     monkeypatch.setattr(
-        "polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", lambda: 0.1
+        "polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", lambda: 0.1
     )
 
 
