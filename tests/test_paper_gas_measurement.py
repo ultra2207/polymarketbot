@@ -1,87 +1,103 @@
-"""Gas cost for the paper soak is measured, and its absence is a refusal.
+"""Gas for the paper soak is measured from the shared path, or refused.
 
-The soak used to require an operator to pass ``--gas-usd``; without it CtfMinter
-and on-chain settlement were silently benched. The measurement must price from
-live inputs and return ``None`` (never ``0.0``) when an input is missing.
+The soak used to carry its own oracle lookup, which read ``fast.maxFee`` - a
+*certificate* of headroom, not the price - and fell back to
+``fast.maxPriorityFee``, which is the tip alone and drops the base fee entirely.
+Those two produced 381.34 Gwei and 25 Gwei respectively against a measured
+236.58 Gwei, so paper and live priced gas 1.6x apart (and up to 9x apart on the
+fallback). Both now read the one measurement.
+
+The contract these tests pin: the price is base + tip from the chain, an
+unmeasured input is ``None`` and never ``0.0``, and neither the cap nor the tip
+alone is ever substituted for the price.
 """
 
 from __future__ import annotations
 
-from polymarketbot.paper.main import (
-    GAS_ORACLE,
-    GAS_UNITS_PER_ONCHAIN_ACTION,
-    POL_PRICE_APIS,
-    measure_gas_usd,
-)
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from polymarketbot.paper.main import GAS_UNITS_PER_ONCHAIN_ACTION, measure_gas_usd
 
 
-class _Response:
-    def __init__(self, payload=None, error: Exception | None = None) -> None:
-        self._payload = payload
-        self._error = error
-
-    def raise_for_status(self) -> None:
-        if self._error is not None:
-            raise self._error
-
-    def json(self):
-        return self._payload
-
-
-class _Session:
-    """Routes by URL; a missing route behaves like a network failure."""
-
-    def __init__(self, routes: dict[str, _Response]) -> None:
-        self.routes = routes
-
-    def get(self, url: str, timeout: float | None = None) -> _Response:
-        return self.routes.get(url, _Response(error=RuntimeError(f"no route {url}")))
-
-
-def test_measured_cost_uses_gas_oracle_and_live_pol_price() -> None:
-    http = _Session(
-        {
-            GAS_ORACLE: _Response({"fast": {"maxFee": 30.0, "maxPriorityFee": 25.0}}),
-            POL_PRICE_APIS[0]: _Response({"price": "0.4"}),
-        }
+def _chain(base_gwei: float, tip_gwei: float) -> MagicMock:
+    chain = MagicMock()
+    chain._rpc.side_effect = lambda method, params: (
+        {"baseFeePerGas": hex(int(base_gwei * 1e9))}
+        if method == "eth_getBlockByNumber"
+        else hex(int(tip_gwei * 1e9))
+        if method == "eth_maxPriorityFeePerGas"
+        else None
     )
-    usd = measure_gas_usd(http)
-    expected = round(GAS_UNITS_PER_ONCHAIN_ACTION * 30.0 * 1e-9 * 0.4, 6)
-    assert usd == expected
+    return chain
 
 
-def test_priority_fee_is_used_when_max_fee_is_absent() -> None:
-    http = _Session(
-        {
-            GAS_ORACLE: _Response({"fast": {"maxPriorityFee": 25.0}}),
-            POL_PRICE_APIS[0]: _Response({"price": 1.0}),
-        }
+def test_price_is_base_plus_tip_not_the_oracle_cap(tmp_path, monkeypatch):
+    """The price is what the chain charges, not the oracle's fee cap."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas
+
+    monkeypatch.setattr(_gas, "GAS_STATE_PATH", tmp_path / "gas.json")
+    monkeypatch.setattr(_gas, "POL_STATE_PATH", tmp_path / "pol.json")
+    # The oracle publishes a 381 Gwei cap with headroom; it must not be used
+    # while an RPC measurement is available.
+    monkeypatch.setattr(
+        _gas, "_oracle_samples", lambda: {"oracle:fast.maxFee": 381.0, "oracle:fast.maxPriorityFee": 25.0}
     )
-    assert measure_gas_usd(http) == round(GAS_UNITS_PER_ONCHAIN_ACTION * 25.0 * 1e-9, 6)
+    monkeypatch.setattr(_gas, "get_dynamic_pol_usd_price", lambda **_: 0.09)
+
+    usd = measure_gas_usd(chain_client=_chain(base_gwei=200.0, tip_gwei=25.0))
+
+    assert usd == pytest.approx(round(GAS_UNITS_PER_ONCHAIN_ACTION * 225.0 * 1e-9 * 0.09, 6))
 
 
-def test_pol_price_falls_back_to_the_legacy_symbol() -> None:
-    http = _Session(
-        {
-            GAS_ORACLE: _Response({"fast": {"maxFee": 30.0}}),
-            POL_PRICE_APIS[1]: _Response({"price": "0.5"}),
-        }
+def test_tip_alone_is_never_used_as_the_price(tmp_path, monkeypatch):
+    """A missing base fee is not an invitation to price at the tip (25 Gwei)."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas
+
+    monkeypatch.setattr(_gas, "GAS_STATE_PATH", tmp_path / "gas.json")
+    monkeypatch.setattr(_gas, "POL_STATE_PATH", tmp_path / "pol.json")
+    monkeypatch.setattr(
+        _gas, "_oracle_samples", lambda: {"oracle:fast.maxPriorityFee": 25.0}
     )
-    assert measure_gas_usd(http) == round(GAS_UNITS_PER_ONCHAIN_ACTION * 30.0 * 1e-9 * 0.5, 6)
+    monkeypatch.setattr(_gas, "get_dynamic_pol_usd_price", lambda **_: 0.09)
+
+    chain = MagicMock()
+    chain._rpc.side_effect = RuntimeError("no base fee, no gas price")
+
+    assert measure_gas_usd(chain_client=chain) is None
 
 
-def test_missing_price_is_a_refusal_not_zero() -> None:
-    http = _Session({GAS_ORACLE: _Response({"fast": {"maxFee": 30.0}})})
-    assert measure_gas_usd(http) is None
+def test_unmeasured_pol_is_a_refusal_not_zero(tmp_path, monkeypatch):
+    """An unpriced action must not be treated as free."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas
+
+    monkeypatch.setattr(_gas, "GAS_STATE_PATH", tmp_path / "gas.json")
+    monkeypatch.setattr(_gas, "POL_STATE_PATH", tmp_path / "pol.json")
+    monkeypatch.setattr(_gas, "_oracle_samples", dict)
+    monkeypatch.setattr(_gas, "get_dynamic_pol_usd_price", lambda **_: None)
+
+    assert measure_gas_usd(chain_client=_chain(base_gwei=200.0, tip_gwei=25.0)) is None
 
 
-def test_missing_gas_price_is_a_refusal_not_zero(monkeypatch) -> None:
-    import polymarketbot.strategy.onchain.core as chain
+def test_live_and_paper_price_gas_identically(tmp_path, monkeypatch):
+    """The two entries read one measurement, so they cannot disagree."""
+    from polymarketbot.live.settlement import measure_gas_usd as live_gas
+    from polymarketbot.strategy.onchain.ctf import gas as _gas
 
-    class _NoRpc:
-        def __init__(self, *args, **kwargs) -> None:
-            raise RuntimeError("no RPC configured")
+    monkeypatch.setattr(_gas, "GAS_STATE_PATH", tmp_path / "gas.json")
+    monkeypatch.setattr(_gas, "POL_STATE_PATH", tmp_path / "pol.json")
+    monkeypatch.setattr(_gas, "_oracle_samples", dict)
+    monkeypatch.setattr(_gas, "get_dynamic_pol_usd_price", lambda **_: 0.0871)
 
-    monkeypatch.setattr(chain, "ChainClient", _NoRpc)
-    http = _Session({POL_PRICE_APIS[0]: _Response({"price": "0.4"})})
-    assert measure_gas_usd(http) is None
+    chain = _chain(base_gwei=211.5, tip_gwei=25.0)
+
+    units = 78_000
+    with patch("requests.get", side_effect=Exception("no network in this test")):
+        paper = measure_gas_usd(chain_client=chain)
+        live = live_gas(gas_units=units, chain_client=chain)
+
+    assert paper is not None and live is not None
+    # Same units, so any difference is a difference in the measured unit price.
+    assert paper == pytest.approx(live)
+    assert paper / units == pytest.approx(live / units)

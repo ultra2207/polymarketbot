@@ -13,8 +13,6 @@ import signal
 import sys
 from typing import Optional
 
-import requests
-
 from polymarketbot.gamma import GammaClient
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import BookFeed, PaperEngine, RttProbe, session
@@ -46,67 +44,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 # mergePositions/redeemPositions gas, a documented protocol constant (not a price).
 GAS_UNITS_PER_ONCHAIN_ACTION = 78_000
-GAS_ORACLE = "https://gasstation.polygon.technology/v2"
-POL_PRICE_APIS = (
-    "https://api.binance.com/api/v3/ticker/price?symbol=POLUSDT",
-    "https://api.binance.com/api/v3/ticker/price?symbol=MATICUSDT",
-)
 
 
-def _live_gas_price_gwei(http: requests.Session) -> Optional[float]:
-    """Polygon gas price in Gwei from a live oracle, else from a live RPC head."""
-    try:
-        resp = http.get(GAS_ORACLE, timeout=8.0)
-        resp.raise_for_status()
-        fast = resp.json()["fast"]
-        for key in ("maxFee", "maxPriorityFee"):
-            value = fast.get(key)
-            if value is not None and float(value) > 0.0:
-                return float(value)
-    except Exception as exc:  # noqa: BLE001 - the RPC fallback is next
-        log.debug(f"gas oracle unavailable ({exc}); falling back to RPC gas price")
-    try:
-        from polymarketbot.strategy.onchain.core import ChainClient
+def measure_gas_usd(chain_client=None) -> Optional[float]:
+    """Dollar cost of one on-chain action, from the shared measured path.
 
-        raw = ChainClient()._rpc("eth_gasPrice", [])
-        wei = int(raw, 16) if isinstance(raw, str) else int(raw)
-        if wei > 0:
-            return wei / 1e9
-    except Exception as exc:  # noqa: BLE001 - no measurement means no gas estimate
-        log.debug(f"RPC gas price unavailable ({exc})")
-    return None
-
-
-def _live_pol_usd(http: requests.Session) -> Optional[float]:
-    """POL/USD from a live ticker; a guessed price would silently price gas wrong."""
-    for url in POL_PRICE_APIS:
-        try:
-            resp = http.get(url, timeout=8.0)
-            resp.raise_for_status()
-            price = float(resp.json()["price"])
-            if price > 0.0:
-                return price
-        except Exception as exc:  # noqa: BLE001 - try the next symbol
-            log.debug(f"POL price unavailable at {url} ({exc})")
-    return None
-
-
-def measure_gas_usd(http: requests.Session) -> Optional[float]:
-    """Measure the dollar cost of one on-chain action, or return None.
+    This used to carry its own oracle lookup, which read ``fast.maxFee`` - a
+    cap recommendation with ~60 % headroom - and fell back to
+    ``fast.maxPriorityFee``, the *tip alone*. Both are wrong as a price: the
+    first overstated by 1.6x (381.34 Gwei against a measured 236.58 on
+    2026-11-10), the second would have dropped the base fee and understated by
+    ~9x. The paper entry and the live entry now read the same measurement.
 
     None is a refusal, never a zero: an unpriced action must not be treated as
-    free, and the pillars that need it stay off until both inputs are live.
+    free, and the pillars that need it stay off until it is measurable.
     """
-    gwei = _live_gas_price_gwei(http)
-    pol_usd = _live_pol_usd(http)
-    if gwei is None or pol_usd is None:
-        return None
-    usd = GAS_UNITS_PER_ONCHAIN_ACTION * gwei * 1e-9 * pol_usd
-    log.info(
-        f"Measured on-chain gas cost: {GAS_UNITS_PER_ONCHAIN_ACTION:,} units x "
-        f"{gwei:.2f} Gwei x ${pol_usd:.5f}/POL = ${usd:.5f}"
+    from polymarketbot.strategy.onchain.ctf.gas import estimate_merge_cost_usd
+
+    usd = estimate_merge_cost_usd(
+        gas_units=GAS_UNITS_PER_ONCHAIN_ACTION, chain_client=chain_client
     )
-    return round(usd, 6)
+    if usd is None:
+        log.warning(
+            "on-chain gas could not be measured; on-chain settlement stays disabled"
+        )
+        return None
+    log.info(
+        f"Measured on-chain gas cost: {GAS_UNITS_PER_ONCHAIN_ACTION:,} units -> ${usd:.6f}"
+    )
+    return usd
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
 
     gas_usd = args.gas_usd
     if gas_usd is None:
-        gas_usd = measure_gas_usd(http)
+        gas_usd = measure_gas_usd()
     if gas_usd is None:
         log.warning(
             "Gas cost unmeasured (live gas price and POL/USD both required): "
@@ -145,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
         interval=args.interval,
         duration=args.duration,
         gas_usd=gas_usd,
-        gas_probe=lambda: measure_gas_usd(http),
+        gas_probe=measure_gas_usd,
         resume=not args.fresh,
     )
 

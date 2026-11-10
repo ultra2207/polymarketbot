@@ -38,7 +38,6 @@ re-gated, in :meth:`LiveSettlementDesk.land_due`).
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
@@ -53,8 +52,6 @@ from polymarketbot.paper.settlement_risk import (
 from polymarketbot.strategy.latency import Action, ActionBook
 from polymarketbot.strategy.onchain.ctf.gas import (
     estimate_merge_cost_usd,
-    get_dynamic_gas_price_gwei,
-    get_dynamic_pol_usd_price,
 )
 from polymarketbot.strategy.settlement import decision as settlement
 from polymarketbot.strategy.settlement.allocator import (
@@ -105,39 +102,20 @@ def measure_gas_usd(
 ) -> Optional[float]:
     """One on-chain settlement action's cost in USD, or ``None`` when unmeasured.
 
-    The probes are :mod:`polymarketbot.strategy.onchain.ctf.gas`'s own, called
-    with ``nan`` as their documented fallback so "nothing resolved" is
-    *detectable* instead of being silently replaced by the module's invented
-    Gwei/POL baselines. ``None`` is a refusal: an unpriced exit is not free, and
-    the live trader must not size a position whose redemption cost it guessed.
+    Delegates to the single measured path in
+    :mod:`polymarketbot.strategy.onchain.ctf.gas`, which returns ``None`` rather
+    than substituting a baseline. ``None`` is a refusal: an unpriced exit is not
+    free, and the live trader must not size a position whose redemption cost it
+    guessed.
     """
-    gwei = get_dynamic_gas_price_gwei(
-        chain_client=chain_client, fallback_gwei=float("nan")
-    )
-    if not (math.isfinite(gwei) and gwei > 0.0):
-        log.warning(
-            "Settlement gas refused: no Polygon gas price could be measured "
-            "(RPC base fee, eth_gasPrice and the fast oracle all failed)"
-        )
-        return None
-    pol_usd = get_dynamic_pol_usd_price(fallback_price=float("nan"))
-    if not (math.isfinite(pol_usd) and pol_usd > 0.0):
-        log.warning(
-            "Settlement gas refused: no POL/USD ticker resolved, and a guessed "
-            "rate would price gas wrong"
-        )
-        return None
     usd = estimate_merge_cost_usd(
-        pol_usd_price=pol_usd,
-        gas_price_gwei=gwei,
-        gas_units=int(gas_units),
-        chain_client=chain_client,
+        gas_units=int(gas_units), chain_client=chain_client
     )
-    log.info(
-        f"Settlement gas measured: {int(gas_units):,} units x {gwei:.2f} Gwei x "
-        f"${pol_usd:.5f}/POL = ${usd:.5f}"
-    )
-    return float(usd)
+    if usd is None:
+        log.warning(
+            "Settlement gas refused: no measured Polygon gas price and POL/USD"
+        )
+    return usd
 
 
 def load_market(condition_id: str, *, gamma: Optional[GammaClient] = None) -> Optional[Market]:
