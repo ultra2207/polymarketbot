@@ -1274,6 +1274,180 @@ def cmd_bets(args) -> None:
     )
 
 
+def cmd_maker(args) -> None:
+    """Maker-side economics: rest a bid on the favourite and hold to expiry.
+
+    A taker pays the ask and needs the ask to be below the realised hit rate.
+    A maker instead *earns* the half-spread, but only takes a fill from a seller
+    who is dumping - and near expiry the seller dumping the favourite is, by
+    construction, someone who believes it is about to lose. So the maker's edge
+    is (half-spread + rebate) - (drop in realised hit rate among fills). This
+    measures both halves of that on the recorded book and print tape.
+
+    Fill models bracket the queue, because the tape records the price and size
+    of prints but not the resting depth behind the touch:
+      strict - filled only when a SELL print trades BELOW the bid, i.e. the
+               market traded through the level. No queue assumption at all.
+      touch  - filled when a SELL print trades AT the bid, i.e. we are assumed
+               to be ahead of whatever size was resting there.
+    The gap between the two is the queue risk, and nothing else.
+
+    The portfolio number is EV per market *quoted* (unfilled quotes score zero),
+    not EV per fill: you quote every market and get filled selectively.
+    """
+    import json as _json
+
+    con = duckdb.connect()
+    con.execute("set threads=4")
+    date_glob = f"date={args.date}" if args.date else "date=*"
+    books = (OUT / "books").as_posix()
+    min_bid = float(args.min_bid)
+    rebate = float(args.rebate_rate)
+
+    q = f"""
+    WITH m AS (
+        SELECT condition_id, window_end_ms, up_token, CAST(winner_up AS INTEGER) AS wup,
+               interval_minutes, fee_rate
+        FROM '{OUT.as_posix()}/markets.parquet'
+        WHERE winner_up IS NOT NULL
+    ),
+    b AS (
+        SELECT condition_id, side, offset_ms, best_bid
+        FROM read_parquet('{books}/{date_glob}/hour=*.parquet', union_by_name=true)
+    ),
+    p AS (
+        -- the books tape records the coin in `asset`, not the token id, so the
+        -- traded token is classified against the market's own up_token
+        SELECT t.condition_id, t.asset_id, t.price, t.size, t.venue_ts_ms,
+               CASE WHEN t.asset_id = m.up_token THEN 1 ELSE 0 END AS is_up
+        FROM '{(TAPE / "clob_trades").as_posix()}/{date_glob}/*/*.parquet' t
+        JOIN m ON m.condition_id = t.condition_id
+        WHERE t.side = 'SELL'
+    ),
+    q0 AS (
+        SELECT condition_id, offset_ms,
+               max(CASE WHEN side = 'up'   THEN best_bid END) AS up_bid,
+               max(CASE WHEN side = 'down' THEN best_bid END) AS down_bid
+        FROM b GROUP BY 1, 2
+    ),
+    q1 AS (
+        SELECT q0.*, m.window_end_ms, m.wup, m.interval_minutes, m.fee_rate,
+               CASE WHEN q0.up_bid >= q0.down_bid THEN 1 ELSE 0 END AS fav_up,
+               CASE WHEN q0.up_bid >= q0.down_bid THEN q0.up_bid ELSE q0.down_bid END AS bid_px
+        FROM q0 JOIN m USING (condition_id)
+        WHERE q0.up_bid IS NOT NULL AND q0.down_bid IS NOT NULL
+    )
+    SELECT q1.condition_id, q1.offset_ms, q1.interval_minutes, q1.bid_px, q1.fav_up, q1.wup,
+           count(p.price) AS n_prints,
+           min(p.price)  AS min_print,
+           sum(CASE WHEN p.price <= q1.bid_px THEN p.size ELSE 0 END) AS size_touch,
+           sum(CASE WHEN p.price <  q1.bid_px THEN p.size ELSE 0 END) AS size_strict,
+           cast(CASE WHEN q1.fav_up = 1 THEN q1.wup ELSE (CASE WHEN q1.wup = 0 THEN 1 ELSE 0 END) END AS INTEGER)
+               AS won
+    FROM q1
+    LEFT JOIN p
+      ON p.condition_id = q1.condition_id
+     AND p.is_up = q1.fav_up
+     AND p.venue_ts_ms BETWEEN q1.window_end_ms - q1.offset_ms AND q1.window_end_ms
+    WHERE q1.bid_px >= {min_bid}
+    GROUP BY 1, 2, 3, 4, 5, 6
+    """
+    df = con.execute(q).df()
+    if df.empty:
+        log.warning(f"maker: no two-sided quotes at bid >= {min_bid}")
+        return
+
+    df["won"] = df.won.astype(int)
+    df["touch"] = df.size_touch > 0
+    df["strict"] = df.size_strict > 0
+    # maker pays no fee and is credited the rebate on the taker fee it saves the venue
+    df["fav_px"] = [p if f else 1.0 - p for p, f in zip(df.bid_px, df.fav_up)]
+    df["rebate"] = [rebate * 0.07 * p * (1.0 - p) for p in df.fav_px]
+
+    def block(sub, model):
+        f = sub[sub[model]]
+        n_q = len(sub)
+        out = {"model": model, "quoted": n_q, "filled": int(len(f)),
+               "fill_rate": float(len(f) / n_q) if n_q else 0.0}
+        if f.empty:
+            return out
+        g = [(1.0 - p) + r if w else -p + r
+             for p, r, w in zip(f.bid_px, f.rebate, f.won)]
+        n = len(g)
+        ev = sum(g) / n
+        sd = (sum((x - ev) ** 2 for x in g) / (n - 1)) ** 0.5 if n > 1 else 0.0
+        se = sd / n ** 0.5 if n > 1 else 0.0
+        px = float(f.bid_px.mean())
+        loss = float(1 - f.won.mean())
+        b_odds = (1.0 - px) / px
+        ordered = sorted(g)
+        k = max(1, int(round(0.05 * n)))
+        out.update({
+            "mean_bid": px,
+            "hit_rate": float(f.won.mean()),
+            "edge_per_share": float(f.won.mean() - px),
+            "rebate_per_share": float(f.rebate.mean()),
+            "ev_per_fill": ev,
+            "ev_per_fill_se": se,
+            "ev_ci95": [ev - 1.96 * se, ev + 1.96 * se],
+            "ev_per_quote": ev * len(f) / n_q,
+            "loss_rate": loss,
+            # Kelly is not estimable on a sample with no observed losses: it
+            # reports 1.0 (all-in) off a single success and would be a lie.
+            "kelly": (None if loss == 0.0 else ((1 - loss) * b_odds - loss) / b_odds),
+            "cvar95": sum(ordered[:k]) / k,
+            "worst": ordered[0],
+            "mean_size_filled": float(f.size_touch.mean() if model == "touch" else f.size_strict.mean()),
+        })
+        return out
+
+    rows = []
+    for off, g in df.groupby("offset_ms"):
+        for model in ("strict", "touch"):
+            r = block(g, model)
+            r["offset_s"] = int(off) / 1000
+            rows.append(r)
+    for model in ("strict", "touch"):
+        r = block(df, model)
+        r["offset_s"] = -1.0
+        rows.append(r)
+
+    # The bid side is only present on some collected dates; report what was
+    # actually used rather than the glob, so "all dates" cannot imply coverage
+    # it does not have.
+    used_dates = sorted(con.execute(
+        f"select distinct cast(date as varchar) from read_parquet("
+        f"'{books}/{date_glob}/hour=*.parquet', union_by_name=true) "
+        f"where best_bid is not null").df().iloc[:, 0].tolist())
+    out = {
+        "min_bid": min_bid,
+        "date_glob": args.date or "all",
+        "dates_with_bid_data": used_dates,
+        "rebate_rate": rebate,
+        "unit": "one bet = (market, quote offset); unfilled quotes score zero",
+        "quotes": int(len(df)),
+        "markets": int(df.condition_id.nunique()),
+        "models": {m: [r for r in rows if r["model"] == m] for m in ("strict", "touch")},
+    }
+    (OUT / "maker.json").write_text(_json.dumps(out, indent=1, default=str))
+    log.info(f"maker: bid data present only on {used_dates} "
+             f"({out['quotes']} quotes over {out['markets']} markets)")
+    for r in rows:
+        tag = "ALL" if r["offset_s"] < 0 else f"T-{r['offset_s']:.1f}s"
+        if "ev_per_fill" not in r:
+            log.info(f"  {r['model']:>6} {tag:>7s}: quoted={r['quoted']} no fills")
+            continue
+        log.info(
+            f"  {r['model']:>6} {tag:>7s}: quoted={r['quoted']} filled={r['filled']} "
+            f"({r['fill_rate']:.1%}) bid={r['mean_bid']:.4f} hit={r['hit_rate']:.4f} "
+            f"edge={r['edge_per_share']:+.4f} ev/fill={r['ev_per_fill']:+.5f} "
+            f"ci=[{r['ev_ci95'][0]:+.5f},{r['ev_ci95'][1]:+.5f}] "
+            f"ev/quote={r['ev_per_quote']:+.5f} "
+            f"kelly={'n/a' if r['kelly'] is None else format(r['kelly'], '+.2f')} "
+            f"cvar95={r['cvar95']:+.3f}"
+        )
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1292,5 +1466,10 @@ if __name__ == "__main__":
     bt.add_argument("--threshold", type=float, default=0.99)
     bt.add_argument("--window-s", type=int, default=300)
     bt.set_defaults(fn=cmd_bets)
+    mk_ = sub.add_parser("maker")
+    mk_.add_argument("--min-bid", type=float, default=0.90)
+    mk_.add_argument("--rebate-rate", type=float, default=0.2)
+    mk_.add_argument("--date", default=None)
+    mk_.set_defaults(fn=cmd_maker)
     a = ap.parse_args()
     a.fn(a)
