@@ -4,19 +4,26 @@ Evidence date: 2026-11-10. Reachability was computed with an AST import BFS from
 the two real entry points, not from filenames. Line counts are **code lines**
 (non-blank, non-comment).
 
-## 0.0 Execution log (waves 1-5 landed, 2026-11-10)
+## 0.0 Execution log (waves 1-8 landed, 2026-11-10)
 
-| Metric | Before waves | After wave 6 | Change |
+| Metric | Before waves | Final (after wave 8) | Change |
 |---|---|---|---|
-| `src/` modules | 198 | **94** | −104 |
-| `src/` code lines | 70,592 | **36,086** | **−49 %** |
-| Files > 300 code lines | 77 | **38** | −39 |
+| `src/` modules | 198 | **170** | −28 |
+| `src/` code lines | 70,592 | **38,665** | **−45 %** |
+| Largest runtime module | 2,894 | **1,149** | −60 % |
+| Files > 300 code lines | 77 | **36** | −41 |
 | Reachable from neither entry | 98 modules / 32,124 lines | 7 modules / 2,456 lines | −92 % |
-| Test suite | 1,726 passed | **812 passed** | −914 (deleted subjects + 63 archived) |
-| Net working-tree change | — | **−61,580 lines** across 247 files | — |
+| Test suite | 1,726 passed | **830 passed** | see note |
+| Net working-tree change | — | **−51,970 lines** across 401 files | — |
 
-(Code lines = non-blank, non-comment, docstrings included, measured with the
-same counter before and after.)
+Module count falls less than line count because waves 6-7 deliberately split
+large modules into packages: the 2,894-line `trading/engine.py` alone became 16
+modules. The suite count drops because ~60 test files tested deleted or archived
+subjects (63 CTF tests moved to `archive/ctf/tests/` and still pass by explicit
+path); 14 new tests were added, all of them parity or regression tests.
+
+(Code lines = non-blank, non-comment, docstrings included, same counter before
+and after.)
 
 Landed:
 
@@ -46,8 +53,57 @@ pricing loads at runtime, and `tools/fill_calibration.py` produces
 `fill_model.json`, read by `rewards.queue_valuation`. Deleting either would have
 frozen live pricing with no regeneration path.
 
-**Wave 6 (in progress)** is the structural move to `live/` + `paper/` + shared
-`strategy/`, and **wave 7** is splitting the surviving large files.
+**Wave 8 (landed)** — the logical convergence, which is the part that matters
+after the folders are right. The live path now computes its decisions with the
+same `strategy/*` functions as the paper path:
+
+| Decision | Before | After |
+|---|---|---|
+| Reward score / share | inline copy in `live/yield_accounting.py`, `live/base.py` | `strategy/reward/scoring.py` |
+| Order spread for scoring | `abs(price-mid)*100` in `live/engine/quotes.py` | `scoring.order_spread_cents` |
+| Reservation-price variance | two duplicated blocks | `strategy/reward/deskew` |
+| Settlement sizing | **absent** — live never bought a resolved market | `strategy/settlement/allocator.optimize_tail_budget` |
+
+Three genuine divergences were found and reconciled to the paper semantics, not
+left as a second opinion: a sub-floor payout is now `0.0` (the $1/day minimum is
+a published venue term) instead of `$0.8163/day`; the yield no longer scores a
+configured offset that is not resting (that invented `$6.71/day` on a quote that
+scores `0`); and an unreadable book or denominator is a refusal, not a measured
+`0.0` that reads as "no competition".
+
+Live settlement refuses rather than guesses at five points — unmeasured gas or
+POL/USD, absent risk appetite, absent tail evidence, no proposal, non-positive
+edge — and lands one FOK whose worst case (`$523.8832`) stays under the grant
+(`$523.9067`) after a measured flight.
+
+Two parity test files pin all of this: `tests/test_decision_parity.py` (8 cases)
+and `tests/test_settlement_decision_parity.py` (6). Both were demonstrated
+failing with the old semantics restored, then reverted, so they genuinely
+discriminate.
+
+**Wave 7 (landed)** split every runtime module over 900 code lines at its named
+seams, preserving public import paths:
+
+| Original | Code lines | Result | Max file |
+|---|---|---|---|
+| `live/engine.py` | 2,894 | `live/engine/` — 16 modules | 264 |
+| `strategy/venue/clob.py` | 2,373 | `venue/clob/` — 14 modules | 277 |
+| `live/runner.py` | 1,976 | CLI / market / UI / loop | 1,149 |
+| `live/base.py` | 1,451 | economics / store / quoting / yield | 488 |
+| `strategy/onchain/ctf.py` | 1,472 | `onchain/ctf/` — 13 modules | 220 |
+| `strategy/venue/feed.py` | 974 | `venue/feed/` — 9 modules | 195 |
+| `strategy/reward/decision.py` | 1,095 | competition / candidates / accrual / fill / plan | 221 |
+| `strategy/reward/allocator.py` | 920 | marginal / milp / waterfill / candidates / reserve | 286 |
+| `strategy/settlement/fair_value.py` | 966 | verdict index / join / UMA tape / overlay | 251 |
+
+Byte-identity was proven against `HEAD`, not asserted: 180 calldata cases, 12
+signed-transaction grids, 150 water-fill candidate sets, 500 marginal-maths
+cases, 400 accruals, 400 fill audits, 200 verdict models, plus a seven-event
+websocket sequence.
+
+`live/runner.py` at 1,149 is the one honest exception: it is a single 920-line
+supervision function, and splitting it requires restructuring control flow, not
+moving code. It is flagged rather than cut.
 
 ## 0. Target architecture
 
