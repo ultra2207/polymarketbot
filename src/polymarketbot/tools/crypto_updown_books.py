@@ -43,7 +43,9 @@ import pandas as pd
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.feed import LivePolymarketFeed
 
-log = get_logger(__name__)
+# `-m` makes __name__ == "__main__", which would give every entry the same
+# unhelpful source name; name the source explicitly so it gets its own log.
+log = get_logger("crypto_updown_books")
 
 ROOT = Path(__file__).resolve().parents[3]
 OUT = ROOT / "data" / "derived" / "crypto_updown_study" / "books_live"
@@ -252,9 +254,75 @@ class BookBuffer:
         return len(rows)
 
 
+class TradeBuffer:
+    """Prints, without which no fill model is possible.
+
+    An L2 book cannot distinguish a cancelled level from a consumed one, so a
+    maker's fill is only observable from the trade tape. The repo's own
+    clob_trades collector stopped at 19:50 on 2026-11-10 and missed this whole
+    window, so the recorder keeps its own prints and the dataset is
+    self-contained.
+    """
+
+    def __init__(self, out: Path) -> None:
+        self.out = out
+        self.rows: deque = deque()
+        self.written = 0
+        self.meta: dict[str, dict[str, Any]] = {}
+
+    def set_markets(self, markets: list[dict[str, Any]]) -> None:
+        for m in markets:
+            for tok in m["tokens"]:
+                self.meta[tok] = {"condition_id": m["condition_id"], "slug": m["slug"],
+                                  "side": m["sides"].get(tok)}
+
+    def add(self, trade: Any) -> None:
+        info = self.meta.get(trade.asset_id)
+        if info is None:
+            return
+        self.rows.append((
+            time.time_ns(),
+            int(trade.timestamp * 1000) if trade.timestamp else None,
+            trade.asset_id,
+            info["condition_id"],
+            info["slug"],
+            info["side"],
+            float(trade.price),
+            float(trade.size),
+            str(trade.side).upper(),
+            trade.trade_id,
+            getattr(trade, "source", ""),
+        ))
+
+    def flush(self, now: float | None = None) -> int:
+        if not self.rows:
+            return 0
+        now = now or time.time()
+        dest = (self.out / f"date={datetime.fromtimestamp(now, UTC).strftime('%Y-%m-%d')}"
+                / f"hour={datetime.fromtimestamp(now, UTC).strftime('%H')}")
+        dest.mkdir(parents=True, exist_ok=True)
+        minute = datetime.fromtimestamp(now, UTC).strftime("%M")
+        rows = list(self.rows)
+        self.rows.clear()
+        df = pd.DataFrame(rows, columns=[
+            "recv_ns", "venue_ts_ms", "asset_id", "condition_id", "slug", "side",
+            "price", "size", "trade_side", "trade_id", "source",
+        ])
+        path = dest / f"minute={minute}.parquet"
+        if path.exists():
+            try:
+                df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
+            except Exception:
+                pass
+        df.to_parquet(path, index=False)
+        self.written += len(rows)
+        return len(rows)
+
+
 async def run(args: argparse.Namespace) -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     buf = BookBuffer(OUT)
+    tbuf = TradeBuffer(OUT.parent / "trades_live")
     disc = Discovery()
     feed = LivePolymarketFeed(fallback_poll_interval=args.poll_interval)
 
@@ -264,7 +332,11 @@ async def run(args: argparse.Namespace) -> int:
     def on_book(snap: Any) -> None:
         buf.add(snap, time.time_ns())
 
+    def on_trade(trade: Any) -> None:
+        tbuf.add(trade)
+
     feed.add_book_listener(on_book)
+    feed.add_trade_listener(on_trade)
 
     started = time.time()
     deadline = started + args.duration
@@ -276,6 +348,7 @@ async def run(args: argparse.Namespace) -> int:
             if now - state["last_discover"] >= args.rediscover:
                 markets = await asyncio.to_thread(disc.discover, now)
                 buf.set_markets(markets)
+                tbuf.set_markets(markets)
                 want = {t for m in markets for t in m["tokens"]}
                 expired = {t for t, meta in buf.meta.items()
                            if (meta["window_end_ms"] or 0) < (now - 120) * 1000}
@@ -292,9 +365,11 @@ async def run(args: argparse.Namespace) -> int:
 
             if now - state["last_flush"] >= args.flush:
                 n = await asyncio.to_thread(buf.flush)
+                nt = await asyncio.to_thread(tbuf.flush)
                 state["last_flush"] = now
-                if n:
-                    log.info(f"flush: {n} rows -> {buf.files} files, {buf.written} total")
+                if n or nt:
+                    log.info(f"flush: {n} book rows (total {buf.written}), "
+                             f"{nt} trades (total {tbuf.written})")
 
             if now - state["last_report"] >= 60:
                 state["last_report"] = now
@@ -305,7 +380,8 @@ async def run(args: argparse.Namespace) -> int:
             await asyncio.sleep(0.25)
 
     await asyncio.to_thread(buf.flush)
-    log.info(f"done: {buf.written} rows in {buf.files} files "
+    await asyncio.to_thread(tbuf.flush)
+    log.info(f"done: {buf.written} book rows, {tbuf.written} trades "
              f"after {time.time() - started:.0f}s")
     return 0
 
