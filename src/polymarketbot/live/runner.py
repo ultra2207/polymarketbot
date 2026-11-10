@@ -60,14 +60,7 @@ from polymarketbot.strategy.sizing import derive_quote_size, optimize_spread_off
 from polymarketbot.strategy.venue.clob import ClobAuthCredentials, LiveClobClient
 from polymarketbot.strategy.onchain.ctf import PolygonCtfClient
 from polymarketbot.live.engine import RealMoneyTradingEngine
-from polymarketbot.live.settlement import (
-    LiveSettlementDesk,
-    held_exposures,
-    load_market,
-)
-from polymarketbot.strategy.latency import ActionBook, RttProbe
 from polymarketbot.strategy.venue.feed import LivePolymarketFeed
-from polymarketbot.strategy.venue.reads import CLOB
 
 from polymarketbot.live.runner_cli import parse_args, require_live_confirmation
 from polymarketbot.live.runner_market import (
@@ -86,7 +79,6 @@ from polymarketbot.live.supervisor import sizing as _sizing
 from polymarketbot.live.supervisor import startup as _startup
 from polymarketbot.live.supervisor import switch as _switch
 from polymarketbot.live.supervisor.context import Deps, RunContext
-from polymarketbot.live.supervisor.desk import build_settlement_desk, settlement_tick
 from polymarketbot.live.supervisor.helpers import _close_engine_quietly, _thread_optional
 from polymarketbot.live.supervisor.lifecycle import REDEEM_RETRY_INTERVAL
 from polymarketbot.live.supervisor.loop import (
@@ -106,16 +98,13 @@ log = get_logger("real_money_trader")
 # import them from this module (and override the collaborators right here), so
 # the façade keeps exactly the surface the single-coroutine runner had.
 __all__ = [
-    "ActionBook",
     "BALANCE_SYNC_INTERVAL",
     "CANCEL_RETRY_ATTEMPTS",
     "CANCEL_RETRY_BACKOFF_SECONDS",
-    "CLOB",
     "ClobAuthCredentials",
     "EXIT_ORDERS_UNCONFIRMED",
     "LiveClobClient",
     "LivePolymarketFeed",
-    "LiveSettlementDesk",
     "LOOP_SLEEP_SECONDS",
     "MARKET_STATUS_INTERVAL",
     "MIN_APR_SAMPLES",
@@ -125,7 +114,6 @@ __all__ = [
     "PolygonCtfClient",
     "REDEEM_RETRY_INTERVAL",
     "RealMoneyTradingEngine",
-    "RttProbe",
     "SwitchDecision",
     "SwitchEvent",
     "_close_engine_quietly",
@@ -134,13 +122,10 @@ __all__ = [
     "_format_open_order_ids",
     "_settlement_available",
     "_thread_optional",
-    "build_settlement_desk",
     "build_switching_engine",
     "derive_quote_size",
     "find_optimal_lp_markets",
     "get_real_l2_score",
-    "held_exposures",
-    "load_market",
     "log",
     "main",
     "optimize_spread_offset",
@@ -150,7 +135,6 @@ __all__ = [
     "require_live_confirmation",
     "resolve_market_details",
     "run_live_runner_async",
-    "settlement_tick",
     "write_banner",
     "write_final_summary",
 ]

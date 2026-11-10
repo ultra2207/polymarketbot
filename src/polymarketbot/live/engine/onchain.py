@@ -251,7 +251,7 @@ class OnchainMixin:
         """Split collateral into YES+NO. Only simulated: no on-chain split exists here."""
         if not self.dry_run:
             message = (
-                "CTF split is not implemented for live settlement; refusing to mutate live "
+                "CTF split is not implemented for live trading; refusing to mutate live "
                 "inventory or cash"
             )
             logger.error(message)

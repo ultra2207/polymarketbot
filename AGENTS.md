@@ -147,20 +147,21 @@ executing, not after it times out.**
     Never record an unfinalized discounted win ($0.940$) as an equity drawdown simply because par redemption
     is waiting on oracle finalization.
   - **First-Principles Solvers:** Zero greedy heuristics or arbitrary caps. LP rewards must use KKT
-    water-filling convex optimization; CTF must use maker parity bundles; Settlement must use
-    hazard-rate / Bayesian survival horizon scans across the full active universe.
+    water-filling convex optimization over the full active universe.
 
 - **Production Soak & 30-Minute Continuous Audit Cycle:**
-  1. The live paper trader daemon runs continuously with all 3 pillars active.
-  2. Every 30 minutes, perform a rigorous system audit by dispatching **3 dedicated subagents**:
-     - **Subagent 1 (Reward Harvester Auditor):** Inspects liquidity reward allocations, queue
-       priority decay, adverse selection fills, and marginal yield optimization.
-     - **Subagent 2 (Settlement Harvester Auditor):** Audits active horizons, pending par redemptions,
-       taker fee leakage, and capital turnover velocity across the 10,000+ market radar.
-     - **Subagent 3 (CTF Minter Auditor):** Checks maker parity quoting spreads ($\text{Bid}_A + \text{Bid}_B < 1.0$),
-       fill balance across legs, inventory skew, and merge efficiency.
+  1. The live paper trader daemon runs continuously with the single live pillar (RewardHarvester).
+  2. Every 30 minutes, perform a rigorous system audit by dispatching **1 dedicated subagent**:
+     - **Reward Harvester Auditor:** Inspects liquidity reward allocations, queue
+       priority decay, adverse selection fills, marginal yield optimization (KKT
+       water-filling), maker rebate credit, capital utilisation, and inventory
+       merge/deskew efficiency.
   3. All findings, detachments from reality, non-optimal code, and money left on the table are
      logged, reported, and remediated immediately.
+  4. **Retired strategies do not get auditors.** SettlementHarvester and the crypto
+     up/down carry are archived (see `archive/README.md` and `docs/alpha-register.md`
+     #16–#19, #30, #31). Do not re-open them for lack of something else to audit:
+     their verdicts are recorded with the measured numbers that closed them.
 
 ## Optimizer, not hand filters
 
@@ -182,8 +183,11 @@ executing, not after it times out.**
 
 ## Continuous 30-minute paper-trader audit loop (latest operating instructions)
 
-This is the standing refinement loop for the three live paper strategies:
-**RewardHarvester**, **SettlementHarvester**, and **CtfMinter** (LatencySniper stays benched).
+This is the standing refinement loop for the single live paper strategy:
+**RewardHarvester**. SettlementHarvester, CtfMinter and LatencySniper are retired —
+archived code lives in `archive/`, and the measured verdicts in
+`docs/alpha-register.md` are the reason. Do not add a second strategy to this loop
+without a positive measured result in that register.
 
 ### Logging contract (do not regress)
 
@@ -241,38 +245,34 @@ round trip before it takes effect. This is not optional:
    launch it silently; the dashboard is logged every interval and
    `data/paper_soak_telemetry.db` grows every interval.
    - Gas is **measured at startup** from the live Polygon gas oracle (`fast.maxFee`) and
-     the live POL/USD ticker; both must resolve or CtfMinter and on-chain settlement refuse
-     to run. `--gas-usd` is an override, never a substitute for a measurement.
+     the live POL/USD ticker; both must resolve or the reward harvester's merge economics
+     refuse to price an inventory merge. `--gas-usd` is an override, never a substitute for
+     a measurement.
    - Inspect the live dashboard output directly while it runs. Do not wait 30 minutes to
      discover it produced nothing.
    - On completion, record the window (start/end UTC), starting/ending equity per pillar,
      fills, and any errors from `data/logs/polymarketbot.paper.main.log`.
 
-2. **Audit + fix.** Dispatch **3 subagents in parallel**, one per strategy, each reading the
+2. **Audit + fix.** Dispatch **1 subagent**, reading the
    **last 30-minute run only** (the exact window from step 1) plus the code path that
    produced it. Do not include older runs; they predate the current fixes and are not
    evidence about the current code.
    - **Reward Harvester Auditor** — liquidity reward allocations, queue priority/decay,
      adverse-selection fills, marginal yield (KKT water-filling), maker rebate credit,
      capital utilisation, banned/hardcoded caps.
-   - **Settlement Harvester Auditor** — active horizons, pending par redemptions, taker-fee
-     leakage, capital turnover velocity, resolution/hazard-rate logic, mark-to-par equity.
-   - **CTF Minter Auditor** — maker parity bundles (`Bid_A + Bid_B < 1.0` after fees/gas),
-     fill balance across legs, inventory skew, merge efficiency, sequential vs atomic legs.
    Each auditor must report, with file:line evidence:
    - bugs and unexpected behaviour,
-   - detachment from protocol reality (fees, ERC-1155 CTF, UMA resolution states),
+   - detachment from protocol reality (fees, ERC-1155 CTF, reward scoring),
    - money left on the table,
    - unoptimised code and unnecessary allocations on hot paths,
    - hardcoded/non-dynamic parameters that should be solved or measured,
    - haphazard design that a top HFT desk (Jump/Citadel) would reject.
 
-   **Auditors own their strategy's implementation.** They are not read-only and must not
-   dump findings on the orchestrator. Each auditor implements every fix it finds in its
-   own strategy files, runs the narrowest verifying test or bounded smoke, and reports the
-   diff plus evidence. There is no rush: the launch gate is Dec 1, and every found issue
-   is to be fixed, not deferred. The orchestrator only mediates shared-file/cross-strategy
-   conflicts, verifies the integrated result, and restarts the soak.
+   **The auditor owns the harvester's implementation.** It is not read-only and must not
+   dump findings on the orchestrator. It implements every fix it finds in the reward
+   strategy files, runs the narrowest verifying test or bounded smoke, and reports the
+   diff plus evidence. There is no rush: every found issue is to be fixed, not deferred.
+   The orchestrator verifies the integrated result and restarts the soak.
 
    **Hard 30-minute limit per auditor.** An auditor that has not returned a complete,
    compiling fix within 30 minutes is treated as irrecoverably stuck (observed: one
@@ -282,7 +282,7 @@ round trip before it takes effect. This is not optional:
    the loop. Do not wait for a stalled auditor and do not spawn a replacement for the
    same slice.
 
-3. **Integrate.** Orchestrator checks the three diffs for conflicts, compiles the tree,
+3. **Integrate.** Orchestrator checks the diff, compiles the tree,
    runs a bounded smoke if the changes touch a shared path, records what changed, and
    returns to step 1. Every audit cycle ends with the loop restarted; do not stop after
    the report.
@@ -290,11 +290,11 @@ round trip before it takes effect. This is not optional:
 ### Operating constraints for the loop
 
 - **Host memory.** A `t3.micro` (930 MB) is **not sufficient** for the full-universe
-  3-pillar soak. Even with chunked book loading, spread trimming, compact reward rows and
+  soak. Even with chunked book loading, spread trimming, compact reward rows and
   allocator trimming, the soak peaks at 441–558 MB while the agent harness holds another
   320–570 MB; a 30-minute run restarted the instance despite the memory guard. Use a
   **>= 2 GB instance** (or the 16 GB local PC) and run the local-India assessment in
-  `docs/local-pc-india-analysis.md` before using a high-RTT host for live CTF.
+  `docs/local-pc-india-analysis.md` before using a high-RTT host for live trading.
 - Keep one compute process at a time; the soak is that process. Auditors read files and the
   SQLite/log outputs, they do not launch duplicate soak runs.
 - Never kill the soak blind: check `data/logs/polymarketbot.paper.main.log` and the row

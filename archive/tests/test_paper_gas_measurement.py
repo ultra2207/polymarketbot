@@ -14,7 +14,7 @@ alone is ever substituted for the price.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -78,26 +78,3 @@ def test_unmeasured_pol_is_a_refusal_not_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(_gas, "get_dynamic_pol_usd_price", lambda **_: None)
 
     assert measure_gas_usd(chain_client=_chain(base_gwei=200.0, tip_gwei=25.0)) is None
-
-
-def test_live_and_paper_price_gas_identically(tmp_path, monkeypatch):
-    """The two entries read one measurement, so they cannot disagree."""
-    from polymarketbot.live.settlement import measure_gas_usd as live_gas
-    from polymarketbot.strategy.onchain.ctf import gas as _gas
-
-    monkeypatch.setattr(_gas, "GAS_STATE_PATH", tmp_path / "gas.json")
-    monkeypatch.setattr(_gas, "POL_STATE_PATH", tmp_path / "pol.json")
-    monkeypatch.setattr(_gas, "_oracle_samples", dict)
-    monkeypatch.setattr(_gas, "get_dynamic_pol_usd_price", lambda **_: 0.0871)
-
-    chain = _chain(base_gwei=211.5, tip_gwei=25.0)
-
-    units = 78_000
-    with patch("requests.get", side_effect=Exception("no network in this test")):
-        paper = measure_gas_usd(chain_client=chain)
-        live = live_gas(gas_units=units, chain_client=chain)
-
-    assert paper is not None and live is not None
-    # Same units, so any difference is a difference in the measured unit price.
-    assert paper == pytest.approx(live)
-    assert paper / units == pytest.approx(live / units)

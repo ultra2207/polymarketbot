@@ -49,11 +49,6 @@ def init_state(ctx: "RunContext") -> None:
     ctx.quotes_cancelled = False
     ctx.redeem_done = False
     ctx.redeem_skip_warned = False
-    # Settlement buys: built on the first halted tick (the paper pillar's gate
-    # and tail budget), never before the market stops accepting orders.
-    ctx.settlement_desk = None
-    ctx.settlement_desk_refused = False
-    ctx.settlement_note = ""
     ctx.awaiting_ws_ready = False
     ctx.running = True
     ctx.final_telemetry = None
@@ -135,7 +130,6 @@ async def run_loop(ctx: "RunContext") -> int:
 
             feed_stale = await feed.check_liveness(ctx, now)
             await feed.await_ws_ready(ctx)
-            await lifecycle.land_pending_settlement(ctx)
             await sync_orders(ctx, now)
             await sync_balances(ctx, now)
             await refresh_rewards(ctx, now)

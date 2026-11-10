@@ -1,9 +1,11 @@
 """End-to-end engine test with a fake venue: no network, real decision modules.
 
-Proves the two state transitions that matter: settlement buys against the
-landing book, and the ledger's equity reflects par value rather than the last
-trade price. The CTF parity transition moved with the archived strategy
-(``archive/ctf/tests/test_ctf_runner.py``).
+Proves the reward transitions that matter: a resting bid fills only from
+measured tape flow, the RTT probe follows its cadence, and an unmeasured book
+is flagged rather than priced. The CTF parity transition moved with the
+archived strategy (``archive/ctf/tests/test_ctf_runner.py``), and the
+settlement transition moved with the archived SettlementHarvester
+(``archive/tests/test_paper_pillars_settlement.py``).
 """
 
 from __future__ import annotations
@@ -100,55 +102,17 @@ def fake_venue(monkeypatch):
     return market, books
 
 
-def _engine(tmp_path, books, *, gas: float | None, rtt: float = 0.01):
+def _engine(tmp_path, books, *, rtt: float = 0.01):
     return engine_mod.PaperEngine(
-        {"RewardHarvester": 100.0, "SettlementHarvester": 100.0, "CtfMinter": 100.0},
+        {"RewardHarvester": 100.0},
         http=_Http(),
         gamma=_Gamma(),
         feed=_Feed(books),
         rtt=_Rtt(rtt),
         db_path=str(tmp_path / "engine.db"),
         interval=1.0,
-        gas_usd=gas,
         resume=False,
-        enable_uma_polling=False,
     )
-
-
-def test_settlement_buys_winner_at_landing_and_marks_par(tmp_path, fake_venue,
-                                                       monkeypatch):
-    _market, books = fake_venue
-    engine = _engine(tmp_path, books, gas=None)
-    engine.walker = _Walker([_market])
-    engine.settlement_model = type(
-        "Model", (), {
-            "refresh": lambda self, now=None: None,
-            "tape": type("Tape", (), {
-                "bind_condition_ids": lambda self, by_question: 0,
-                "live_verdict_condition_ids": lambda self, now=None: ["c1"],
-            })(),
-        }
-    )()
-    monkeypatch.setattr(
-        engine_mod.settlement, "verdict_for",
-        lambda model, m, now=None: __import__(
-            "polymarketbot.strategy.settlement.fair_value",
-            fromlist=["OracleVerdict"],
-        ).OracleVerdict(0, 1.0, "gamma_payout", time.time()),
-    )
-    engine._tick()
-    assert engine.ledger.cash("SettlementHarvester") == 100.0
-    time.sleep(0.02)
-    engine._land(books, [])
-    lots = engine.ledger.positions("SettlementHarvester")
-    assert len(lots) == 1
-    assert lots[0].token_id == "yes"
-    assert lots[0].shares == pytest.approx(100.0 / 0.90, rel=1e-6)
-    # Par value, not the 0.89 bid: buying at 0.90 converts $100 of cash into
-    # 111.11 shares worth $1.00 each at the oracle verdict.
-    equity = engine.ledger.equity()["SettlementHarvester"]
-    assert equity == pytest.approx(100.0 / 0.90, rel=1e-6)
-    engine.ledger.close()
 
 
 def test_reward_fill_uses_measured_tape_flow(tmp_path, monkeypatch):
@@ -158,7 +122,7 @@ def test_reward_fill_uses_measured_tape_flow(tmp_path, monkeypatch):
     books = {"y4": _book(0.47, 0.52), "n4": _book(0.47, 0.52)}
     monkeypatch.setattr(engine_mod.venue, "universe", lambda gamma, max_pages=30: [market])
     monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
-    engine = _engine(tmp_path, books, gas=None)
+    engine = _engine(tmp_path, books)
     engine.walker = _Walker([market])
     quote = engine_mod.Resting("RewardHarvester", "c4", "y4", 0.48, 100.0, 20.0, 0.0)
     engine.reward_quotes["y4"] = quote
@@ -203,16 +167,14 @@ def test_rtt_probe_is_refreshed_on_its_cadence_not_only_at_startup(
 
     probe = _CountingRtt()
     engine = engine_mod.PaperEngine(
-        {"RewardHarvester": 100.0, "SettlementHarvester": 100.0, "CtfMinter": 100.0},
+        {"RewardHarvester": 100.0},
         http=_Http(),
         gamma=_Gamma(),
         feed=_Feed(books),
         rtt=probe,
         db_path=str(tmp_path / "rtt.db"),
         interval=1.0,
-        gas_usd=None,
         resume=False,
-        enable_uma_polling=False,
         rtt_refresh_s=60.0,
     )
     engine.walker = _Walker([_market])
@@ -229,95 +191,11 @@ def test_rtt_probe_is_refreshed_on_its_cadence_not_only_at_startup(
     engine.ledger.close()
 
 
-def test_failed_gas_refresh_keeps_the_last_measured_cost(tmp_path, fake_venue, monkeypatch):
-    """A refresh that cannot be priced must not disable the pillars: the last
-    measured dollar cost stays in force, and it is never replaced by zero."""
-    _market, books = fake_venue
-    answers = [0.00032, None, 0.00040]
-
-    class _Rtt:
-        def measure(self):
-            return 0.01
-
-        def p50(self):
-            return 0.01
-
-    engine = engine_mod.PaperEngine(
-        {"RewardHarvester": 100.0, "SettlementHarvester": 100.0, "CtfMinter": 100.0},
-        http=_Http(),
-        gamma=_Gamma(),
-        feed=_Feed(books),
-        rtt=_Rtt(),
-        db_path=str(tmp_path / "gas.db"),
-        interval=1.0,
-        gas_usd=0.00030,
-        resume=False,
-        enable_uma_polling=False,
-        rtt_refresh_s=60.0,
-        gas_probe=lambda: answers.pop(0),
-    )
-    engine.walker = _Walker([_market])
-    monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
-
-    engine._refresh_venue_state()
-    assert engine.gas_usd == pytest.approx(0.00032)
-
-    engine._refresh_venue_state()  # probe returns None
-    assert engine.gas_usd == pytest.approx(0.00032)
-
-    engine._refresh_venue_state()  # probe recovers
-    assert engine.gas_usd == pytest.approx(0.00040)
-    engine.ledger.close()
-
-
-def test_block_interval_is_seconds_per_block_from_the_tape(tmp_path, fake_venue,
-                                                           monkeypatch):
-    """The poller's liveness maths divides by this constant, so it must be
-    seconds per block. Dividing blocks by elapsed measures blocks per second
-    and reported 0.79 s while the header tape measured 1.50 s."""
-    _market, books = fake_venue
-    engine = _engine(tmp_path, books, gas=None)
-
-    monkeypatch.setattr(
-        "polymarketbot.strategy.onchain.ctf.load_measured_block_interval_s",
-        lambda *a, **kw: 1.501,
-    )
-    poller = engine._make_uma_poller()
-    assert poller is not None
-    assert poller.block_interval_s == pytest.approx(1.501)
-
-    # Without a tape, two live heads over five seconds must give 5/4 = 1.25 s
-    # per block, not 4/5 = 0.8 blocks per second.
-    monkeypatch.setattr(
-        "polymarketbot.strategy.onchain.ctf.load_measured_block_interval_s",
-        lambda *a, **kw: None,
-    )
-    engine.interval = 10.0  # the live probe sleeps interval/2 = 5 s
-    heads = iter([1000, 1004])
-    clock = {"now": 0.0}
-
-    class _Chain:
-        def block_number(self):
-            return next(heads)
-
-    def _sleep(seconds):
-        clock["now"] += seconds
-
-    monkeypatch.setattr("polymarketbot.strategy.onchain.core.ChainClient", _Chain)
-    monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(engine_mod.time, "sleep", _sleep)
-
-    live = engine._make_uma_poller()
-    assert live is not None
-    assert live.block_interval_s == pytest.approx(1.25)
-    engine.ledger.close()
-
-
 def test_mark_stage_flags_a_vanished_book_once_then_clears(tmp_path):
     """No book: flag the lot, keep the last measurement, log one transition."""
     from loguru import logger
 
-    engine = _engine(tmp_path, {}, gas=None)
+    engine = _engine(tmp_path, {})
     assert engine.ledger.buy(
         "RewardHarvester", condition_id="c9", token_id="tok9",
         shares=100.0, price=0.40,

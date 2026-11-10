@@ -1,4 +1,4 @@
-"""Market status, redemption, and the halted-market settlement pass."""
+"""Market status and redemption."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.live.runner_market import MARKET_STATUS_INTERVAL, _coerce_float
-from polymarketbot.live.supervisor.desk import settlement_pass
 from polymarketbot.live.supervisor.helpers import _thread_optional
 
 if TYPE_CHECKING:  # the run record only appears in annotations
@@ -18,18 +17,8 @@ log = get_logger("real_money_trader")
 REDEEM_RETRY_INTERVAL = 60.0
 
 
-async def land_pending_settlement(ctx: "RunContext") -> None:
-    """Land whatever settlement buy has finished its measured flight."""
-    # -- Settlement buys: land whatever has finished its flight --------
-    if ctx.settlement_desk is not None and ctx.settlement_desk.pending():
-        try:
-            await asyncio.to_thread(ctx.settlement_desk.land_due)
-        except Exception as exc:
-            log.error(f"[SETTLEMENT] Landing failed; nothing was booked: {exc}")
-
-
 async def market_lifecycle(ctx: "RunContext", now: float) -> None:
-    """Halt on a dead market, redeem once it closes, then size the settlement buy."""
+    """Halt on a dead market, then redeem once it closes."""
     # -- Market lifecycle (every 60 s) ----------------------------------
     if now - ctx.last_market_check >= MARKET_STATUS_INTERVAL:
         ctx.last_market_check = now
@@ -112,4 +101,3 @@ async def market_lifecycle(ctx: "RunContext", now: float) -> None:
                                 f"{REDEEM_RETRY_INTERVAL:.0f}s): "
                                 f"{getattr(result, 'error', None) or 'unknown error'}."
                             )
-    await settlement_pass(ctx)

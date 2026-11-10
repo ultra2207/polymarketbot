@@ -1,11 +1,11 @@
-"""The paper engine: one clock, two decision loops, one ledger.
+"""The paper engine: one clock, one decision loop, one ledger.
 
 This module is the coordinator: it owns the tick order, the shared state and
-the accounting, and it delegates. The settlement radar (``paper.radar``), the
-landing of venue actions (``paper.actions``) and one runner per pillar
-(``paper.pillars.*_runner``) are free functions over this engine, reached
-through the one-line delegates at the bottom of the class, which keep every
-original bound-method name available on the instance.
+the accounting, and it delegates. The landing of venue actions
+(``paper.actions``) and the reward runner (``paper.pillars.reward_runner``) are
+free functions over this engine, reached through the one-line delegates at the
+bottom of the class, which keep every original bound-method name available on
+the instance.
 
 Cash and inventory move only through an ``ActionBook`` that charges the
 measured venue round trip, and taker actions re-price against the book that
@@ -16,26 +16,20 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import actions as venue_actions, radar
+from polymarketbot.paper import actions as venue_actions
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.paper.actions import Resting
 from polymarketbot.strategy.books import best_bid
 from polymarketbot.strategy.latency import ActionBook, RttProbe
 from polymarketbot.strategy.ledger import Ledger
-# ``settlement`` is re-exported: callers patch the shared module object
-# (``engine_mod.settlement.verdict_for``) and every runner must see the patch,
-# so all of them import the same module object.
-from polymarketbot.paper.pillars import reward_runner, settlement_runner, tail_budget  # noqa: F401
-import polymarketbot.strategy.settlement.decision as settlement
-from polymarketbot.strategy.settlement.allocator import MarginalSettlementAllocator
-from polymarketbot.strategy.settlement.fair_value import normalize_question
+from polymarketbot.paper.pillars import reward_runner
 
 log = get_logger(__name__)
 
-STRATEGIES = ("RewardHarvester", "SettlementHarvester")
+STRATEGIES = ("RewardHarvester",)
 
 
 class PaperEngine:
@@ -50,15 +44,11 @@ class PaperEngine:
         db_path: str,
         interval: float = 10.0,
         duration: Optional[float] = None,
-        gas_usd: Optional[float] = None,
         resume: bool = False,
-        enable_uma_polling: bool = True,
         rtt_refresh_s: float = 60.0,
-        gas_probe: Optional[Callable[[], Optional[float]]] = None,
     ) -> None:
         self.interval = max(1.0, float(interval))
         self.duration = duration
-        self.gas_usd = gas_usd
         self.http = http
         self.gamma = gamma
         self.feed = feed
@@ -70,49 +60,12 @@ class PaperEngine:
         # `rtt_refresh_s` costs 1 sample per 6 ticks at the 10 s interval,
         # about 1.9 % of a 570 ms-tick budget.
         self._rtt_refresh_s = max(1.0, float(rtt_refresh_s))
-        # Gas is venue state like the round trip: measured 42.70 Gwei at 05:14
-        # and 46.33 Gwei at 10:10, so one startup sample prices every on-chain
-        # leg for the whole run. A failed refresh keeps the last measured
-        # value - None here would disable the pillars and lose the sample.
-        self._gas_probe = gas_probe
         self.ledger = Ledger(capital, db_path, resume=resume)
         self.actions = ActionBook(self.rtt.p50)
         self.markets: list[venue.Market] = []
         self.by_condition: dict[str, venue.Market] = {}
-        self._token_index: dict[str, venue.Market] = {}
-        self._indexed_markets = -1
         self._stage_seconds: dict[str, list[float]] = {}
         self._stage_log_ts = 0.0
-        # Gamma rows fetched by condition id for verdict markets that the
-        # walker does not list. Kept so a refusal states whether Gamma has no
-        # such market or the market is closed - the difference between a
-        # coverage gap and protocol reality.
-        self._verdict_rows: dict[str, dict] = {}
-        # Every settlement-stage network call runs on the radar thread below,
-        # never inside the tick. Measured 2026-11-10 14:17 window:
-        # ``settlement=15.11s ... tick=18.76s`` and ``settlement=22.06s ...
-        # tick=13.56s`` inside a 5 s tick, settling to 0.31-0.67 s once the
-        # one-per-minute refresh had run. Three blocking calls shared that
-        # 60 s gate: the UMA ``eth_getLogs`` sweep, the Gamma row fetch for
-        # verdict conditions the walker does not list, and the Gamma row fetch
-        # for held conditions. Their latency is the venue's, so they cannot be
-        # made fast - only moved off the critical path, exactly as the RTT and
-        # gas probes were.
-        self._radar_markets: dict[str, venue.Market] = {}
-        self._radar_lock = threading.Lock()
-        self._radar_want: tuple[str, ...] = ()
-        self._radar_fetched: dict[str, float] = {}
-        self._radar_wake = threading.Event()
-        self._radar_cycles = 0
-        self._radar_cost = 0.0
-        #: The tail-budget settlement allocator.  It maximises expected profit
-        #: inside the loss the book may carry at the stated confidence, with the
-        #: tail probability *measured* from the proposal ledger.  All three
-        #: inputs (appetite, band, evidence) are required and are resolved here,
-        #: once, from one named place: a paper book that cannot state its
-        #: appetite does not spend.
-        self.settlement_allocator = MarginalSettlementAllocator("tail_budget")
-        self._tail_policy, self._tail_evidence = tail_budget.resolve_tail_inputs()
         self._last_tick_dt = 0.0
         self._reward_accrual_ts = time.time()
         self._reward_log_ts = 0.0
@@ -125,13 +78,9 @@ class PaperEngine:
         #: None until solved; the CTF gate refuses rather than assumes 0.
         self._shadow_yield: Optional[float] = None
         self.reward_quotes: dict[str, Resting] = {}
-        self.settlement_model = settlement.model()
-        self.poller = self._make_uma_poller() if enable_uma_polling else None
         self.walker = venue.UniverseWalker(gamma, pages_per_tick=20)
         self._universe_log_ts = 0.0
         self._book_cursor = 0
-        self._held_ts = 0.0
-        self._settlement_log_ts = 0.0
         self._stop = threading.Event()
         self._fills = {name: 0 for name in STRATEGIES}
 
@@ -153,12 +102,8 @@ class PaperEngine:
             target=self._probe_loop, name="venue-probes", daemon=True,
         )
         probe_thread.start()
-        radar_thread = threading.Thread(
-            target=self._settlement_radar_loop, name="settlement-radar", daemon=True,
-        )
-        radar_thread.start()
         log.info(
-            f"Paper engine start: capital={self.ledger.equity()} gas_usd={self.gas_usd} "
+            f"Paper engine start: capital={self.ledger.equity()} "
             f"interval={self.interval}s duration={self.duration} "
             f"rtt_refresh={self._rtt_refresh_s:.0f}s"
         )
@@ -177,7 +122,6 @@ class PaperEngine:
         self._stop.set()
         walker_thread.join(timeout=5.0)
         probe_thread.join(timeout=5.0)
-        radar_thread.join(timeout=5.0)
         self._snapshot()
         log.info(f"Paper engine stopped: equity={self.ledger.equity()}")
 
@@ -188,14 +132,6 @@ class PaperEngine:
         self.markets = self.walker.snapshot()
         complete = self.walker.complete
         self.by_condition = {m.condition_id: m for m in self.markets}
-        if len(self.markets) != self._indexed_markets:
-            self._token_index = {t: m for m in self.markets for t in m.token_ids}
-            self._indexed_markets = len(self.markets)
-            bound = self.settlement_model.tape.bind_condition_ids(
-                {normalize_question(m.question): m.condition_id for m in self.markets}
-            )
-            if bound:
-                log.info(f"verdict tape: bound {bound} proposal(s) to walked condition ids")
         if now - self._universe_log_ts >= 60.0:
             self._universe_log_ts = now
             log.info(f"universe: {len(self.markets)} known active markets "
@@ -205,24 +141,10 @@ class PaperEngine:
         tokens = [token for m in self.markets for token in m.token_ids]
         if tokens:
             size = min(len(tokens), 12000)
-            # A verdict market is the only place a live par edge exists, and it
-            # can sit anywhere in the rotation. Price it every tick, then spend
-            # the remaining budget on the round-robin slice.
-            priority: list[str] = []
-            for cid in self.settlement_model.tape.live_verdict_condition_ids(now):
-                market = self.by_condition.get(cid)
-                if market is not None:
-                    priority.extend(market.token_ids)
-            priority = list(dict.fromkeys(priority))
-            window = priority[:size]
-            need = size - len(window)
-            if need > 0:
-                rotated = tokens[self._book_cursor:self._book_cursor + need]
-                if len(rotated) < need:
-                    rotated += tokens[: need - len(rotated)]
-                seen = set(window)
-                window += [token for token in rotated if token not in seen]
-                self._book_cursor = (self._book_cursor + need) % len(tokens)
+            window = tokens[self._book_cursor:self._book_cursor + size]
+            if len(window) < size:
+                window += tokens[: size - len(window)]
+            self._book_cursor = (self._book_cursor + size) % len(tokens)
             self.feed.books(window)
         books = self.feed.snapshot()
         self._stage("books", tick_start0)
@@ -248,9 +170,6 @@ class PaperEngine:
         stage0 = time.monotonic()
         self._reward(books, prints)
         self._stage("reward", stage0)
-        stage0 = time.monotonic()
-        self._settlement(books)
-        self._stage("settlement", stage0)
         stage0 = time.monotonic()
         self._mark(books)
         self._stage("mark", stage0)
@@ -290,8 +209,8 @@ class PaperEngine:
     def _mark(self, books: dict[str, dict]) -> None:
         for strategy in STRATEGIES:
             for lot in self.ledger.positions(strategy):
-                # An oracle verdict is a protocol value, not a market guess: par
-                # already prices the lot and needs no book.
+                # A lot the journal prices at par needs no book: the stored
+                # value is the mark.
                 if lot.par_value is not None:
                     continue
                 bid = best_bid(books.get(lot.token_id) or {})
@@ -342,24 +261,9 @@ class PaperEngine:
     # -- delegates: the moved implementations, original names ------------
     def _refresh_venue_state(self) -> None: return venue_actions.refresh_venue_state(self)
     def _probe_loop(self) -> None: return venue_actions.probe_loop(self)
-    def _settlement_radar_loop(self) -> None: return radar.settlement_radar_loop(self)
-    def _fetch_verdict_rows(self, wanted, now) -> None: return radar.fetch_verdict_rows(self, wanted, now)
-    def _radar_snapshot(self): return radar.radar_snapshot(self)
-    def _market_refusal(self, condition_id, verdict_rows): return radar.market_refusal(condition_id, verdict_rows)
-    def _make_uma_poller(self) -> Any: return radar.make_uma_poller(self)
     def _land(self, books, prints) -> None: return venue_actions.land(self, books, prints)
-    def _land_settlement(self, strategy, payload, books) -> None:
-        return venue_actions.land_settlement(self, strategy, payload, books)
-    def _pending_for(self, condition_id) -> bool: return venue_actions.pending_for(self, condition_id)
     def _reward(self, books, prints) -> None: return reward_runner.run_reward(self, books, prints)
     def _apply_resting_fills(self, resting, strategy, books, prints, now) -> None:
         return reward_runner.apply_resting_fills(
             self, resting, strategy, books, prints, now
         )
-    def _settlement(self, books) -> None: return settlement_runner.run_settlement(self, books)
-    def _tail_budget(self, priced, books, verdict_rows, settle_sec, cash) -> dict[str, float]:
-        return tail_budget.tail_budget(
-            self, priced, books, verdict_rows, settle_sec, cash
-        )
-    def _reconcile_held(self, verdict_rows) -> None:
-        return settlement_runner.reconcile_held(self, verdict_rows)

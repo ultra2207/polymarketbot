@@ -88,9 +88,6 @@ class RunContext:
     quotes_cancelled: bool = False
     redeem_done: bool = False
     redeem_skip_warned: bool = False
-    settlement_desk: Any = None
-    settlement_desk_refused: bool = False
-    settlement_note: str = ""
     awaiting_ws_ready: bool = False
     running: bool = True
 
