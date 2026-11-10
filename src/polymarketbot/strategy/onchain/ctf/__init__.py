@@ -66,12 +66,15 @@ from .constants import (
     ZERO_BYTES32,
 )
 from .gas import (
-    _POL_PRICE_CACHE,
-    _POL_PRICE_LOCK,
     calculate_optimal_merge_threshold,
+    GasReading,
+    GasUnmeasured,
+    PolReading,
     estimate_merge_cost_usd,
     get_dynamic_gas_price_gwei,
     get_dynamic_pol_usd_price,
+    measure_gas,
+    measure_pol_usd,
 )
 from .measure import (
     DEFAULT_POLYGON_GAS_TAPE,
@@ -105,6 +108,11 @@ __all__ = [
     "PolygonCtfClient",
     "get_dynamic_pol_usd_price",
     "get_dynamic_gas_price_gwei",
+    "measure_gas",
+    "measure_pol_usd",
+    "GasReading",
+    "PolReading",
+    "GasUnmeasured",
     "estimate_merge_cost_usd",
     "calculate_optimal_merge_threshold",
 ]

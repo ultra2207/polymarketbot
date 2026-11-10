@@ -261,6 +261,26 @@ these by ~1.14: **\$0.0018** at the median.
 spent on all 248,319 merges in the tape is **≈ \$385**, against \$43.9 M of
 merged notional — **0.88 bps**.
 
+**Resolved (2026-11-10).** The constants this section indicted are gone, and the
+tape median above is confirmed by a live measurement. `gas.py` now measures and
+refuses; there is no default to fall through to.
+
+| Fabrication (before) | Measured now | Error that was live |
+|---|---:|---:|
+| EIP-1559 tip `30.0` Gwei | `maxPriorityFeePerGas` = **25.0** Gwei | +20 % |
+| all-in fallback `40.0` Gwei | **236.58** Gwei (median of 4 RPC samples, spread 0.28 %) | **−83 %** |
+| `POL/USD` `0.092` | **0.087172** (median of 4 venues, spread 0.138 %) | +5.8 % |
+| `PolygonPoSEnvironment(35, 45, 0.35)` | same measured values, no defaults | 0.35 was **4×** the real POL price |
+| `switching.py` `$0.015` merge gas | measured, or `+inf` (never switch on a guess) | 9.3× |
+
+The all-in fee at 236.58 Gwei is the number that matters, and at 78,000 gas it
+makes the merge cost **\$0.001609** against the \$0.000287 the old constants
+produced — the fabricated fee understated merge gas by **5.6×**, so the merge
+threshold sat 5.6× too low and sub-one-set merges that were gas-negative passed
+the hurdle. The oracle's `fast.maxFee` (323.09 Gwei) is a *cap recommendation*
+with 36 % headroom; it is deliberately not averaged into the price median, only
+used when no RPC answers and logged as a drift check.
+
 **Does the merge threshold move? Yes, by ~100×.**
 
 `calculate_optimal_merge_threshold` is `gas_cost / 0.0015` (a 15 bps friction

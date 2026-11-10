@@ -372,7 +372,8 @@ class DynamicSettlementDelayModel:
         base_queue_delay_hours: float = 0.05,  # 3 minutes baseline relayer batching
         dvm_vote_cycle_hours: float = DEFAULT_DVM_VOTE_DELAY_HOURS,
     ) -> None:
-        self.pos_env = pos_env or PolygonPoSEnvironment()
+        # No default fee market: refuse rather than invent a gas price.
+        self.pos_env = pos_env
         self.base_queue_delay_hours = base_queue_delay_hours
         self.dvm_vote_cycle_hours = dvm_vote_cycle_hours
 
@@ -382,13 +383,38 @@ class DynamicSettlementDelayModel:
         Formula:
             t_queue = t_base * (1 + max(0, (base_fee - 30) / 40)^2)
         """
-        fee = base_fee_gwei if base_fee_gwei is not None else self.pos_env.base_fee_gwei
+        from polymarketbot.strategy.onchain.ctf import gas as _gas
+
+        if base_fee_gwei is None:
+            if self.pos_env is not None:
+                base_fee_gwei = self.pos_env.base_fee_gwei
+            else:
+                base_fee_gwei = _gas.get_dynamic_gas_price_gwei()
+            if base_fee_gwei is None:
+                raise _gas.GasUnmeasured(
+                    "relayer queue delay needs a measured base fee; none available"
+                )
+        fee = base_fee_gwei
+        # 30/40 Gwei are the *shape* of the congestion response (the fee at
+        # which batching starts to slip, and the span over which the penalty
+        # quadruples). They are model parameters, not gas prices: the price
+        # itself is `fee`, which is measured. Flagged because a model that
+        # quotes a hardcoded fee scale is still a model with a hardcoded fee
+        # scale.
         congestion_ratio = max(0.0, (fee - 30.0) / 40.0)
         queue_hours = self.base_queue_delay_hours * (1.0 + (congestion_ratio ** 2))
         return float(min(6.0, queue_hours))
 
     def compute_redemption_gas_usd(self, gas_units: int = DEFAULT_CTF_REDEEM_GAS_UNITS) -> float:
-        """Compute exact Polygon PoS EIP-1559 gas fee for CTF.redeemPositions."""
+        """Exact Polygon PoS gas fee for CTF.redeemPositions, or raise.
+
+        Unmeasured gas is a refusal, never the empirical default this used to
+        substitute.
+        """
+        if self.pos_env is None:
+            # Resolve from measurement (raises when nothing can be measured)
+            # instead of falling back to the invented 35+45 Gwei / $0.35 env.
+            self.pos_env = PolygonPoSEnvironment.measured()
         return float(self.pos_env.gas_units_to_usd(gas_units))
 
     def calculate_turnover_delay(
@@ -427,11 +453,19 @@ def redemption_gas_usd(
     measurements fall back to ``PolygonPoSEnvironment``'s empirical defaults.
     No gas dollar constant is duplicated here.
     """
-    defaults = PolygonPoSEnvironment()
+    from polymarketbot.strategy.onchain.ctf import gas as _gas
+
+    if gas_price_gwei is None:
+        gas_price_gwei = _gas.get_dynamic_gas_price_gwei()
+    rate = pol_usd_price if pol_usd_price is not None else _gas.get_dynamic_pol_usd_price()
+    if gas_price_gwei is None or rate is None:
+        raise _gas.GasUnmeasured(
+            f"redeem gas unmeasured (gas_price_gwei={gas_price_gwei}, pol_usd={rate})"
+        )
     env = PolygonPoSEnvironment(
-        base_fee_gwei=float(gas_price_gwei) if gas_price_gwei is not None else defaults.base_fee_gwei,
-        priority_fee_gwei=0.0 if gas_price_gwei is not None else defaults.priority_fee_gwei,
-        pol_usd_rate=float(pol_usd_price) if pol_usd_price is not None else defaults.pol_usd_rate,
+        base_fee_gwei=float(gas_price_gwei),
+        priority_fee_gwei=0.0,
+        pol_usd_rate=float(rate),
     )
     return DynamicSettlementDelayModel(pos_env=env).compute_redemption_gas_usd(gas_units)
 

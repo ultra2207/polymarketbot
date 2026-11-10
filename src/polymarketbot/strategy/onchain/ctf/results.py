@@ -45,7 +45,9 @@ class SettlementOutcome:
 
     status: str
     tx_hash: str = ""
-    gas_fee_usd: float = 0.0
+    # None means the receipt was read but POL/USD was unmeasured: the gas
+    # cost is unknown, not zero.
+    gas_fee_usd: Optional[float] = 0.0
     gas_units_used: int = 0
     error: Optional[str] = None
 

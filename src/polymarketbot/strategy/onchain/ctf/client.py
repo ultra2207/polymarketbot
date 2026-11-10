@@ -80,7 +80,10 @@ class PolygonCtfClient(
                 self.signer_address = private_key_to_address(self._private_key_bytes)
 
         self.gas_profile = CTFGasProfile()
-        self.pos_env = PolygonPoSEnvironment()
+        # No fee-market environment is built here: it would carry invented
+        # defaults. Resolve one from measurement at the point of use with
+        # ``PolygonPoSEnvironment.measured(...)``.
+        self.pos_env: Optional[PolygonPoSEnvironment] = None
 
         # Every live settlement is written here before it is broadcast. The
         # engine replaces this with a store bound to the engine database so the

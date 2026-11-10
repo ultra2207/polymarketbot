@@ -142,8 +142,15 @@ class BaseMarketMakingEngine(StoreMixin, QuotingMixin, YieldMixin):
         if gas_fee_merge is not None:
             self.gas_fee_merge = float(gas_fee_merge)
         else:
-            from polymarketbot.strategy.onchain.ctf import estimate_merge_cost_usd
-            self.gas_fee_merge = float(estimate_merge_cost_usd())
+            from polymarketbot.strategy.onchain.ctf import GasUnmeasured, estimate_merge_cost_usd
+
+            measured_gas = estimate_merge_cost_usd()
+            if measured_gas is None:
+                raise GasUnmeasured(
+                    "on-chain merge gas is unmeasured; refusing to size quotes and "
+                    "reserves against a guessed fee"
+                )
+            self.gas_fee_merge = float(measured_gas)
 
         if auto_merge_threshold is not None:
             self.auto_merge_threshold = float(auto_merge_threshold)

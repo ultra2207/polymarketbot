@@ -81,6 +81,34 @@ and `tests/test_settlement_decision_parity.py` (6). Both were demonstrated
 failing with the old semantics restored, then reverted, so they genuinely
 discriminate.
 
+**Gas: the last fabrication, removed (2026-11-10).** Gas was still priced off
+invented constants in two separate models. Both are now measurement-or-refusal.
+
+| Where | Invented | Now |
+|---|---|---|
+| `gas.py` tip | `30.0` Gwei | `eth_maxPriorityFeePerGas`, `eth_feeHistory` p50, or `eth_gasPrice − baseFee` |
+| `gas.py` fallback | `40.0` Gwei | median of 4 RPC totals, then the recorded measurement with its age, then `None` |
+| `gas.py` POL | `0.092` (seeded) | median of binance/coinbase/okx/kraken = 0.087172 |
+| `gas.py` POL fallback | `MATICUSDT` | removed — MATIC and POL are different markets |
+| `queue.py` `PolygonPoSEnvironment` | `(35, 45, 0.35)` defaults | fields required; `measured()` or refuse |
+| `switching.py` | `$0.015` merge gas | measured, else `+inf` |
+| `paper/main.py` | already correct | unchanged |
+
+Measured at the time of writing: **236.58 Gwei** (4 RPC samples, 0.28 % spread)
+and **POL 0.087172** (4 venues, 0.138 % spread), giving a merge cost of
+**\$0.001609** — against **\$0.000287** from the old constants. The fabricated
+fee understated merge gas by **5.6×**, so the merge threshold was 5.6× too low.
+
+Three design points worth keeping:
+- the oracle's `fast.maxFee` is a **cap recommendation** with 36 % headroom, so
+  it is a drift check and a last resort, never averaged into the price median;
+  mixing it in produced a "median" of 208 Gwei from a genuine 40 and a genuine
+  377, which is worse than either;
+- a caller that supplies its own RPC gets **its own** measurement, never a cached
+  one from another transport;
+- a recorded measurement replayed with its age is still evidence; past the
+  staleness limit (300 s default, `POLYGON_GAS_MAX_STALE_S`) it is not.
+
 **Wave 7 (landed)** split every runtime module over 900 code lines at its named
 seams, preserving public import paths:
 

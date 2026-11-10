@@ -193,7 +193,15 @@ class RealMoneyTradingEngine(
 
         # Re-sync dynamic gas fee and merge threshold if not explicitly set
         if gas_fee_merge is None:
-            self.gas_fee_merge = self.ctf_client.estimate_merge_cost_usd()
+            measured_gas = self.ctf_client.estimate_merge_cost_usd()
+            if measured_gas is None:
+                from polymarketbot.strategy.onchain.ctf import GasUnmeasured
+
+                raise GasUnmeasured(
+                    "on-chain merge gas is unmeasured; refusing to construct the live "
+                    "engine on a guessed fee"
+                )
+            self.gas_fee_merge = float(measured_gas)
         if auto_merge_threshold is None:
             self.auto_merge_threshold = self.ctf_client.calculate_optimal_merge_threshold(
                 gas_cost_usd=self.gas_fee_merge

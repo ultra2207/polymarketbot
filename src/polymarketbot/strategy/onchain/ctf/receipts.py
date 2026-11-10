@@ -98,8 +98,16 @@ class CtfReceiptMixin:
             else _gas.get_dynamic_pol_usd_price()
         )
         # Gas is spent whether the call succeeded or reverted; report the receipt's
-        # actual cost either way so accounting never invents a number.
-        gas_fee_usd = round(gas_used * effective_price / 1e18 * pol_price, 6)
+        # actual cost either way so accounting never invents a number. Without a
+        # measured POL/USD the dollar figure is unknown: report None, not zero and
+        # not a price we made up.
+        if pol_price is None:
+            logger.error(
+                "receipt read but POL/USD is unmeasured; gas_fee_usd left unknown"
+            )
+            gas_fee_usd: Optional[float] = None
+        else:
+            gas_fee_usd = round(gas_used * effective_price / 1e18 * float(pol_price), 6)
 
         if status is None:
             self._resolve_settlement(tx_hash, SETTLEMENT_FAILED, receipt)

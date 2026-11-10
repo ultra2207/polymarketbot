@@ -281,75 +281,124 @@ def test_polygon_ctf_dry_run_merge():
         assert res.tx_hash.startswith("0xmock_tx_")
 
 
-def test_dynamic_gas_price_gwei_live_and_fallbacks():
-    """Verify dynamic gas pricing queries base fee + priority fee with fallback to oracle / 40 Gwei."""
-    # 1. EIP-1559 base fee (30 Gwei = 0x6fc23ac00) + priority fee (10 Gwei = 0x2540be400) -> 40.0 Gwei
+def test_dynamic_gas_price_gwei_live_and_fallbacks(tmp_path, monkeypatch):
+    """Gas is measured, replayed with an age, or refused. There is no default."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas_mod
+
+    # Keep the recorded-measurement file out of the real derived directory.
+    state = tmp_path / "onchain_gas.json"
+    monkeypatch.setattr(_gas_mod, "GAS_STATE_PATH", state)
+
+    # 1. EIP-1559 base fee (30 Gwei = 0x6fc23ac00) + priority fee (10 Gwei = 0x2540be400)
     mock_chain = MagicMock()
     mock_chain._rpc.side_effect = lambda method, params: (
         {"baseFeePerGas": "0x6fc23ac00"} if method == "eth_getBlockByNumber"
         else "0x2540be400" if method == "eth_maxPriorityFeePerGas"
         else None
     )
-    gas_gwei = get_dynamic_gas_price_gwei(chain_client=mock_chain)
+    with patch("requests.get", side_effect=Exception("no oracle in this case")):
+        gas_gwei = get_dynamic_gas_price_gwei(chain_client=mock_chain)
     assert gas_gwei == 40.0
 
-    # 2. Legacy eth_gasPrice fallback (45 Gwei = 0xa7a358200)
+    # 2. Legacy eth_gasPrice when the block has no EIP-1559 base fee (45 Gwei)
     mock_chain_legacy = MagicMock()
     mock_chain_legacy._rpc.side_effect = lambda method, params: (
         None if method == "eth_getBlockByNumber"
         else "0xa7a358200" if method == "eth_gasPrice"
         else None
     )
-    gas_legacy = get_dynamic_gas_price_gwei(chain_client=mock_chain_legacy)
+    with patch("requests.get", side_effect=Exception("no oracle in this case")):
+        gas_legacy = get_dynamic_gas_price_gwei(chain_client=mock_chain_legacy)
     assert gas_legacy == 45.0
 
-    # 3. Fast gas oracle fallback when RPC raises exception
+    # 3. No RPC at all: the oracle's cap recommendation is used, and labelled.
     mock_failing_chain = MagicMock()
     mock_failing_chain._rpc.side_effect = RuntimeError("RPC unreachable")
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
-    mock_resp.json.return_value = {"fast": {"maxFee": 52.4}}
+    mock_resp.json.return_value = {"fast": {"maxFee": 52.4, "maxPriorityFee": 25.0}}
 
     with patch("requests.get", return_value=mock_resp):
-        gas_oracle = get_dynamic_gas_price_gwei(chain_client=mock_failing_chain)
-        assert gas_oracle == 52.4
+        reading = _gas_mod.measure_gas(chain_client=mock_failing_chain)
+    assert reading is not None and reading.gwei == 52.4
+    assert reading.source == "oracle_cap_no_rpc"
 
-    # 4. Ultimate fallback to 40.0 Gwei when RPC and oracle fail
+    # 4. Nothing measurable: the measurement recorded in case 1-3 is replayed
+    #    WITH its age, because a recorded measurement is still evidence.
     with patch("requests.get", side_effect=Exception("Oracle down")):
-        gas_fallback = get_dynamic_gas_price_gwei(chain_client=mock_failing_chain)
-        assert gas_fallback == 40.0
+        replayed = _gas_mod.measure_gas(chain_client=mock_failing_chain)
+    assert replayed is not None and replayed.gwei == 52.4
+    assert replayed.is_stale and replayed.source.startswith("recorded(")
+
+    # 5. Nothing measurable and nothing recorded, or the record is too old:
+    #    refusal (None), never a constant. This is the case that used to return
+    #    an invented 40 Gwei.
+    state.unlink()
+    with patch("requests.get", side_effect=Exception("Oracle down")):
+        assert _gas_mod.measure_gas(chain_client=mock_failing_chain) is None
+
+    state.write_text(
+        '{"gwei": 40.0, "source": "test", "ts": 1.0}', encoding="utf-8"
+    )
+    with patch("requests.get", side_effect=Exception("Oracle down")):
+        assert (
+            _gas_mod.measure_gas(chain_client=mock_failing_chain, max_stale_seconds=1.0)
+            is None
+        )
 
 
-def test_dynamic_pol_usd_price_binance_rest_success():
-    """Verify get_dynamic_pol_usd_price queries Binance POLUSDT and caches result."""
-    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+def test_dynamic_pol_usd_price_medians_listed_venues(tmp_path, monkeypatch):
+    """POL/USD is the median across listed venues, and every venue is consulted."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas_mod
 
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"symbol": "POLUSDT", "price": "0.0954"}
+    monkeypatch.setattr(_gas_mod, "POL_STATE_PATH", tmp_path / "onchain_pol.json")
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = None
+        _gas_mod._POL_CACHE["ts"] = 0.0
 
-    with _POL_PRICE_LOCK:
-        _POL_PRICE_CACHE["price"] = 0.092
-        _POL_PRICE_CACHE["timestamp"] = 0.0
+    quoted = {
+        "binance": "0.09540000",
+        "coinbase": "0.095200",
+        "okx": "0.095600",
+        "kraken": "0.095300",
+    }
 
-    with patch("requests.get", return_value=mock_resp) as mock_get:
+    def mock_get(url, headers=None, timeout=None):
+        resp = MagicMock()
+        resp.status_code = 200
+        if "binance" in url:
+            resp.json.return_value = {"symbol": "POLUSDT", "price": quoted["binance"]}
+        elif "coinbase" in url:
+            resp.json.return_value = {"data": {"amount": quoted["coinbase"]}}
+        elif "okx" in url:
+            resp.json.return_value = {"code": "0", "data": [{"last": quoted["okx"]}]}
+        elif "kraken" in url:
+            resp.json.return_value = {"error": [], "result": {"POLUSD": {"c": [quoted["kraken"], "1"]}}}
+        else:
+            raise ValueError(f"Unexpected url {url}")
+        return resp
+
+    with patch("requests.get", side_effect=mock_get) as mock_get_all:
         px = get_dynamic_pol_usd_price(cache_ttl_seconds=300.0)
-        assert px == 0.0954
-        assert mock_get.call_count == 1
-        args, kwargs = mock_get.call_args
-        assert "POLUSDT" in args[0]
-        assert kwargs.get("timeout") == 3.0
-        assert kwargs.get("headers", {}).get("User-Agent") == "polymarketbot/1.0"
+
+    assert mock_get_all.call_count == 4
+    assert px == pytest.approx(0.09535)  # median of 0.0952, 0.0953, 0.0954, 0.0956
+    for call in mock_get_all.call_args_list:
+        assert call.kwargs.get("timeout") == 3.0
+        assert call.kwargs.get("headers", {}).get("User-Agent") == "polymarketbot/1.0"
 
 
 def test_dynamic_pol_usd_price_cache_ttl():
     """Verify cache hits within cache_ttl_seconds avoid outbound HTTP requests."""
-    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+    from polymarketbot.strategy.onchain.ctf import PolReading, gas as _gas_mod
 
-    with _POL_PRICE_LOCK:
-        _POL_PRICE_CACHE["price"] = 0.105
-        _POL_PRICE_CACHE["timestamp"] = time.time()
+    cached = PolReading(
+        usd=0.105, source="test", samples={}, spread_pct=0.0, measured_at=time.time()
+    )
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = cached
+        _gas_mod._POL_CACHE["ts"] = time.time()
 
     with patch("requests.get") as mock_get:
         px = get_dynamic_pol_usd_price(cache_ttl_seconds=300.0)
@@ -357,44 +406,77 @@ def test_dynamic_pol_usd_price_cache_ttl():
         assert mock_get.call_count == 0
 
 
-def test_dynamic_pol_usd_price_matic_fallback():
-    """Verify fallback to MATICUSDT when POLUSDT fails."""
-    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+def test_dynamic_pol_usd_price_ignores_matic(tmp_path, monkeypatch):
+    """MATICUSDT is a different market: it is never substituted for POL."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas_mod
 
-    with _POL_PRICE_LOCK:
-        _POL_PRICE_CACHE["price"] = 0.092
-        _POL_PRICE_CACHE["timestamp"] = 0.0
+    monkeypatch.setattr(_gas_mod, "POL_STATE_PATH", tmp_path / "onchain_pol.json")
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = None
+        _gas_mod._POL_CACHE["ts"] = 0.0
 
-    def mock_get_side_effect(url, headers=None, timeout=None):
-        if "POLUSDT" in url:
-            resp_fail = MagicMock()
-            resp_fail.status_code = 404
-            resp_fail.json.return_value = {"code": -1121, "msg": "Invalid symbol."}
-            return resp_fail
-        elif "MATICUSDT" in url:
-            resp_ok = MagicMock()
-            resp_ok.status_code = 200
-            resp_ok.json.return_value = {"symbol": "MATICUSDT", "price": "0.0915"}
-            return resp_ok
+    def mock_get(url, headers=None, timeout=None):
+        assert "MATIC" not in url, f"MATIC must not be consulted, got {url}"
+        if "binance" in url:
+            resp = MagicMock()
+            resp.status_code = 404
+            resp.json.return_value = {"code": -1121, "msg": "Invalid symbol."}
+            return resp
+        if "coinbase" in url:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"data": {"amount": "0.091500"}}
+            return resp
         raise ValueError(f"Unexpected url {url}")
 
-    with patch("requests.get", side_effect=mock_get_side_effect) as mock_get:
+    with patch("requests.get", side_effect=mock_get):
         px = get_dynamic_pol_usd_price(cache_ttl_seconds=300.0)
-        assert px == 0.0915
-        assert mock_get.call_count == 2
+    assert px == 0.0915
 
 
-def test_dynamic_pol_usd_price_all_fail_fallback():
-    """Verify fallback price is returned when all Binance queries fail."""
-    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+def test_dynamic_pol_usd_price_refuses_when_unmeasurable(tmp_path, monkeypatch):
+    """No venue answers and nothing recorded: None, never a guessed price."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas_mod
 
-    with _POL_PRICE_LOCK:
-        _POL_PRICE_CACHE["price"] = 0.092
-        _POL_PRICE_CACHE["timestamp"] = 0.0
+    monkeypatch.setattr(_gas_mod, "POL_STATE_PATH", tmp_path / "onchain_pol.json")
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = None
+        _gas_mod._POL_CACHE["ts"] = 0.0
 
-    with patch("requests.get", side_effect=ConnectionError("Binance unreachable")):
-        px = get_dynamic_pol_usd_price(fallback_price=0.088, cache_ttl_seconds=300.0)
-        assert px == 0.088
+    with patch("requests.get", side_effect=ConnectionError("every venue unreachable")):
+        assert get_dynamic_pol_usd_price(cache_ttl_seconds=300.0) is None
+
+
+def test_dynamic_pol_usd_price_replays_a_recorded_measurement(tmp_path, monkeypatch):
+    """A recorded measurement is replayed with its age, then refused past the limit."""
+    from polymarketbot.strategy.onchain.ctf import gas as _gas_mod
+
+    state = tmp_path / "onchain_pol.json"
+    monkeypatch.setattr(_gas_mod, "POL_STATE_PATH", state)
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"data": {"amount": "0.087100"}}
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = None
+        _gas_mod._POL_CACHE["ts"] = 0.0
+    with patch("requests.get", return_value=resp):
+        assert get_dynamic_pol_usd_price(cache_ttl_seconds=0.0) == 0.0871
+
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = None
+        _gas_mod._POL_CACHE["ts"] = 0.0
+    with patch("requests.get", side_effect=ConnectionError("venue down")):
+        replayed = _gas_mod.measure_pol_usd(cache_ttl_seconds=0.0)
+    assert replayed is not None and replayed.usd == 0.0871
+    assert replayed.is_stale and replayed.source.startswith("recorded(")
+
+    # Past the staleness limit the record stops being evidence.
+    with _gas_mod._POL_LOCK:
+        _gas_mod._POL_CACHE["reading"] = None
+        _gas_mod._POL_CACHE["ts"] = 0.0
+    with patch("requests.get", side_effect=ConnectionError("venue down")):
+        assert _gas_mod.measure_pol_usd(cache_ttl_seconds=0.0, max_stale_seconds=0.0) is None
 
 
 def test_estimate_merge_cost_usd_calculation():

@@ -87,8 +87,22 @@ class OnchainMixin:
         return {"checked": len(rows), "resolved": resolved, "pending": len(rows) - resolved}
 
     def update_dynamic_gas_and_threshold(self) -> Tuple[float, float]:
-        """Update dynamic gas fee and optimal merge threshold from live on-chain conditions."""
+        """Update dynamic gas fee and optimal merge threshold from live conditions.
+
+        An unmeasurable gas price does not move the threshold: the last measured
+        pair stays in force rather than being replaced by a guess.
+        """
         gas_cost = self.ctf_client.estimate_merge_cost_usd()
+        if gas_cost is None:
+            logger.warning(
+                "gas unmeasured this cycle; keeping the last measured merge gas "
+                f"${float(getattr(self, 'gas_fee_merge', 0.0)):.6f} and threshold "
+                f"{float(getattr(self, 'auto_merge_threshold', 0.0)):.2f}"
+            )
+            return (
+                float(getattr(self, "gas_fee_merge", 0.0)),
+                float(getattr(self, "auto_merge_threshold", 0.0)),
+            )
         threshold = self.ctf_client.calculate_optimal_merge_threshold(gas_cost_usd=gas_cost)
         self.gas_fee_merge = gas_cost
         self.auto_merge_threshold = threshold
@@ -146,13 +160,23 @@ class OnchainMixin:
                 if not outcome.apply:
                     return res
 
+                gas_usd = res.gas_fee_usd
+                if gas_usd is None:
+                    logger.error(
+                        "merge confirmed on chain but its gas cost is unmeasured "
+                        "(POL/USD unavailable); leaving it unapplied so the same "
+                        "transaction is replayed by hash instead of booking a "
+                        "guessed cash figure"
+                    )
+                    return res
+
                 sets_to_merge = preflight.sets_to_merge
                 now = preflight.now
                 self._last_merge_ts = now
                 self.shares_yes = max(0.0, self.shares_yes - sets_to_merge)
                 self.shares_no = max(0.0, self.shares_no - sets_to_merge)
-                self.cash += float(res.usdc_unlocked) - float(res.gas_fee_usd)
-                self.total_gas_fees += float(res.gas_fee_usd)
+                self.cash += float(res.usdc_unlocked) - float(gas_usd)
+                self.total_gas_fees += float(gas_usd)
                 self.total_merges += 1
                 self.merges_history.append(res)
 
@@ -180,8 +204,8 @@ class OnchainMixin:
                         self.condition_id,
                         sets_to_merge,
                         res.usdc_unlocked,
-                        res.gas_fee_usd,
-                        res.usdc_unlocked - res.gas_fee_usd,
+                        gas_usd,
+                        res.usdc_unlocked - gas_usd,
                         0.0,
                         self.cash,
                     ),
@@ -209,7 +233,7 @@ class OnchainMixin:
                             pathway="MERGE",
                             crossed_cents=0.0,
                             taker_fee_usd=0.0,
-                            gas_usd=float(res.gas_fee_usd or 0.0),
+                            gas_usd=float(gas_usd),
                             inventory_before=float(preflight.available_sets),
                             inventory_after=max(
                                 0.0, float(preflight.available_sets) - sets_to_merge

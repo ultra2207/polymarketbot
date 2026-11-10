@@ -167,20 +167,36 @@ class YieldMixin:
 
         y_a = daily_yield if daily_yield is not None else self.get_current_daily_yield()
 
-        decomp = self.migration_engine.compute_switching_cost(
-            q_a=net_q,
-            p_mid_a=mid_yes,
-            p_bid_a=b_yes,
-            p_ask_opp_a=a_no,
-            resting_bid_size=resting_bid_sz,
-            resting_ask_size=resting_ask_sz,
-            queue_ahead_bid=q_ahead_bid,
-            queue_ahead_ask=q_ahead_ask,
-            half_spread_cents_a=self.spread_offset_cents,
-            daily_yield_a=y_a,
-            has_matched_complete_sets=(pos.complete_sets > 0),
-            transit_latency_seconds=transit_latency_seconds,
-        )
+        try:
+            decomp = self.migration_engine.compute_switching_cost(
+                    q_a=net_q,
+                p_mid_a=mid_yes,
+                p_bid_a=b_yes,
+                p_ask_opp_a=a_no,
+                resting_bid_size=resting_bid_sz,
+                resting_ask_size=resting_ask_sz,
+                queue_ahead_bid=q_ahead_bid,
+                queue_ahead_ask=q_ahead_ask,
+                half_spread_cents_a=self.spread_offset_cents,
+                daily_yield_a=y_a,
+                has_matched_complete_sets=(pos.complete_sets > 0),
+                transit_latency_seconds=transit_latency_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - unmeasured gas is a refusal
+            # Fail closed, exactly as the no-book branch does: an unpriced merge
+            # makes the switching friction unknown, so report an infinite cost
+            # instead of substituting a gas number.
+            logger.warning(
+                f"Switching cost unknown for {self.condition_id}: {exc}"
+            )
+            decomp = SwitchingCostDecomposition(
+                queue_value_lost_usd=0.0,
+                liquidation_friction_usd=0.0,
+                gas_fees_usd=0.0,
+                opportunity_cost_downtime_usd=0.0,
+                total_switching_cost_usd=float("inf"),
+                liquidation_route=LiquidationRoute.ZERO_INVENTORY,
+            )
         self.latest_switching_cost = decomp
         return decomp
 

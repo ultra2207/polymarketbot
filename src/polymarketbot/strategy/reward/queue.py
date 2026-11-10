@@ -182,14 +182,52 @@ class CTFGasProfile:
     gas_split_cold: int = 114_000            # Zero-to-nonzero storage writes
     gas_split_proxy: int = 155_000           # Via proxy / multicall
 
+    gas_redeem_typical: int = 45_000         # redeemPositions, one outcome slot
+
 
 @dataclass(frozen=True)
 class PolygonPoSEnvironment:
-    """EIP-1559 Fee Market state on Polygon PoS."""
+    """EIP-1559 fee-market state on Polygon PoS, always measured.
 
-    base_fee_gwei: float = 35.0              # Empirical base fee (Gwei)
-    priority_fee_gwei: float = 45.0          # Validator tip floor (Gwei)
-    pol_usd_rate: float = 0.35               # POL / USD exchange rate
+    The fields have no defaults on purpose. This class previously shipped
+    ``base_fee_gwei=35.0``, ``priority_fee_gwei=45.0`` and ``pol_usd_rate=0.35``
+    and every caller that omitted them priced gas off those numbers. Measured
+    on 2026-11-09 the all-in price was 217.54 Gwei (not 80) and POL traded
+    0.08686 (not 0.35) - two wrong factors that multiplied into a third wrong
+    cost. Use :meth:`measured`, or pass values you measured yourself.
+    """
+
+    base_fee_gwei: float
+    priority_fee_gwei: float
+    pol_usd_rate: float
+
+    @classmethod
+    def measured(
+        cls,
+        chain_client: Any = None,
+        pol_usd_price: Optional[float] = None,
+        rpc_urls: Optional[tuple[str, ...]] = None,
+    ) -> "PolygonPoSEnvironment":
+        """Build from live gas and POL/USD measurements; raise when unmeasurable.
+
+        ``base_fee_gwei`` receives the *all-in* price with a zero tip, so a
+        caller that already measured the effective price does not charge the
+        tip twice.
+        """
+        from polymarketbot.strategy.onchain.ctf import gas as _gas
+
+        reading = _gas.measure_gas(chain_client=chain_client, rpc_urls=rpc_urls)
+        rate = pol_usd_price if pol_usd_price is not None else _gas.get_dynamic_pol_usd_price()
+        if reading is None or rate is None:
+            raise _gas.GasUnmeasured(
+                f"Polygon PoS fee market unmeasured (gwei={None if reading is None else reading.gwei}, "
+                f"pol_usd={rate}); refusing to build a priced environment"
+            )
+        return cls(
+            base_fee_gwei=float(reading.gwei),
+            priority_fee_gwei=0.0,
+            pol_usd_rate=float(rate),
+        )
 
     @property
     def total_gas_price_gwei(self) -> float:
@@ -503,7 +541,8 @@ class CapitalMigrationEngine:
         queue_model: Optional[QueuePriorityValuationModel] = None,
         safety_hurdle_pct: float = 0.0,
     ) -> None:
-        self.gas_env = gas_env or PolygonPoSEnvironment()
+        # No default environment: an unmeasured fee market must not be invented.
+        self.gas_env = gas_env
         self.ctf_profile = ctf_profile or CTFGasProfile()
         self.queue_model = queue_model or QueuePriorityValuationModel()
         self.safety_hurdle_pct = safety_hurdle_pct
@@ -580,8 +619,16 @@ class CapitalMigrationEngine:
         transit_latency_seconds: float = 4.5,
         taker_fee_rate: float = 0.0,
     ) -> SwitchingCostDecomposition:
-        """Compute the full economic switching friction: Cost_switch(A -> B)."""
-        merge_gas = self.gas_env.gas_units_to_usd(self.ctf_profile.gas_merge_direct_typical)
+        """Compute the full economic switching friction: Cost_switch(A -> B).
+
+        Raises :class:`GasUnmeasured` when no measured fee market is available:
+        an unpriced merge must not be treated as free.
+        """
+        env = self.gas_env
+        if env is None:
+            env = PolygonPoSEnvironment.measured()
+            self.gas_env = env
+        merge_gas = env.gas_units_to_usd(self.ctf_profile.gas_merge_direct_typical)
 
         # 1. Queue Priority Loss
         q_loss = self.compute_queue_loss(

@@ -127,11 +127,19 @@ def calculate_switching_cost(
     Switching Cost = Gas to unquote M_A (0.0 for off-chain EIP-712 cancel) + CTF merge gas + crossing spread friction to enter M_B.
     """
     if merge_gas_usd is None:
-        try:
-            from polymarketbot.strategy.onchain.ctf import estimate_merge_cost_usd
-            m_gas = float(estimate_merge_cost_usd())
-        except Exception:
-            m_gas = 0.015
+        from polymarketbot.strategy.onchain.ctf import estimate_merge_cost_usd
+
+        measured = estimate_merge_cost_usd()
+        if measured is None:
+            # An unpriced merge is not a cheap merge. Report an infinite
+            # switching cost so the candidate is never preferred, instead of
+            # substituting the $0.015 constant this used to bury here.
+            logger.warning(
+                "switching cost unknown: merge gas unmeasured; reporting +inf so no "
+                "migration is chosen on a guessed fee"
+            )
+            return float("inf")
+        m_gas = float(measured)
     else:
         m_gas = float(merge_gas_usd)
 
