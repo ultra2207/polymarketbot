@@ -1,0 +1,201 @@
+"""Focused tests for the rebuilt paper package.
+
+Accounting, latency and book math are pure and tested without a network.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from polymarketbot.paper.books import (
+    best_ask,
+    best_bid,
+    ladder,
+    mid,
+    qualifying_score,
+    shares_at,
+    walk_cost,
+)
+from polymarketbot.paper.latency import ActionBook
+from polymarketbot.paper.ledger import Ledger
+
+
+def _book(bids: list[tuple[float, float]], asks: list[tuple[float, float]]) -> dict:
+    return {
+        "bids": [{"price": str(price), "size": str(size)} for price, size in bids],
+        "asks": [{"price": str(price), "size": str(size)} for price, size in asks],
+    }
+
+
+# ---------------------------------------------------------------- ledger
+def test_buy_sell_and_cash_are_exact(tmp_path):
+    ledger = Ledger({"S": 100.0}, tmp_path / "l.db")
+    assert ledger.buy("S", condition_id="c", token_id="t", shares=10.0, price=0.40, fee=0.02)
+    assert ledger.cash("S") == pytest.approx(100.0 - 4.0 - 0.02)
+    pnl = ledger.sell("S", condition_id="c", token_id="t", shares=4.0, price=0.50, fee=0.01)
+    assert pnl == pytest.approx(4.0 * 0.50 - 0.01 - 4.0 * 0.40)
+    assert ledger.cash("S") == pytest.approx(100.0 - 4.02 + 1.99)
+    assert len(ledger.positions("S")) == 1
+    assert ledger.positions("S")[0].shares == pytest.approx(6.0)
+    ledger.close()
+
+
+def test_buy_is_refused_when_cash_does_not_cover_fee(tmp_path):
+    ledger = Ledger({"S": 5.0}, tmp_path / "l.db")
+    assert not ledger.buy("S", condition_id="c", token_id="t", shares=10.0, price=0.50,
+                          fee=0.01)
+    assert ledger.cash("S") == 5.0
+    ledger.close()
+
+
+def test_merge_burns_pairs_and_pays_par(tmp_path):
+    ledger = Ledger({"S": 10.0}, tmp_path / "l.db")
+    ledger.buy("S", condition_id="c", token_id="yes", shares=10.0, price=0.40)
+    ledger.buy("S", condition_id="c", token_id="no", shares=6.0, price=0.55)
+    before = ledger.cash("S")
+    pnl = ledger.merge("S", condition_id="c", token_id="yes", pair_shares=6.0, gas=0.0)
+    assert pnl == pytest.approx(6.0 * 1.0 - 6.0 * (0.40 + 0.55))
+    assert ledger.cash("S") == pytest.approx(before + 6.0)
+    assert {lot.token_id: lot.shares for lot in ledger.positions("S")} == {"yes": 4.0}
+    ledger.close()
+
+
+def test_equity_marks_unresolved_at_bid_and_resolved_at_par(tmp_path):
+    ledger = Ledger({"S": 100.0}, tmp_path / "l.db")
+    ledger.buy("S", condition_id="c", token_id="t", shares=10.0, price=0.50)
+    ledger.mark("t", 0.30)
+    assert ledger.equity()["S"] == pytest.approx(100.0 - 5.0 + 10.0 * 0.30)
+    ledger.set_par("c", "t")
+    assert ledger.equity()["S"] == pytest.approx(100.0 - 5.0 + 10.0)
+    ledger.close()
+
+
+def test_resume_restores_cash_and_lots(tmp_path):
+    path = tmp_path / "l.db"
+    ledger = Ledger({"S": 50.0}, path)
+    ledger.buy("S", condition_id="c", token_id="t", shares=8.0, price=0.50)
+    ledger.snapshot()
+    ledger.close()
+    resumed = Ledger({"S": 999.0}, path, resume=True)
+    assert resumed.cash("S") == pytest.approx(50.0 - 4.0)
+    assert resumed.positions("S")[0].shares == pytest.approx(8.0)
+    resumed.close()
+
+
+def test_missing_lot_sell_is_refused(tmp_path):
+    ledger = Ledger({"S": 10.0}, tmp_path / "l.db")
+    assert ledger.sell("S", condition_id="c", token_id="t", shares=1.0, price=0.5) == 0.0
+    assert ledger.cash("S") == 10.0
+    ledger.close()
+
+
+# ---------------------------------------------------------------- latency
+def test_action_lands_only_after_measured_rtt():
+    clock = [0.0]
+    actions = ActionBook(lambda: 0.25, clock=lambda: clock[0])
+    assert actions.submit("buy", "S", {"x": 1}) is not None
+    assert actions.due() == []
+    clock[0] = 0.24
+    assert actions.due() == []
+    clock[0] = 0.25
+    assert [a.kind for a in actions.due()] == ["buy"]
+
+
+def test_action_is_refused_without_measured_rtt():
+    actions = ActionBook(lambda: None)
+    assert actions.submit("buy", "S", {}) is None
+    assert actions.pending() == []
+
+
+def test_cancel_removes_pending_action():
+    actions = ActionBook(lambda: 10.0)
+    actions.submit("quote", "S", {"token_id": "a"})
+    actions.submit("quote", "S", {"token_id": "b"})
+    assert actions.cancel(lambda action: action.payload["token_id"] == "a") == 1
+    assert [action.payload["token_id"] for action in actions.pending()] == ["b"]
+
+
+# ---------------------------------------------------------------- books
+def test_best_mid_and_missing_side():
+    book = _book([(0.40, 10), (0.42, 5)], [(0.45, 3), (0.50, 9)])
+    assert best_bid(book) == 0.42
+    assert best_ask(book) == 0.45
+    assert mid(book) == pytest.approx(0.435)
+    assert mid({"bids": []}) is None
+    assert shares_at(book, bid=True, price=0.42) == 5
+
+
+def test_ladder_order_and_walk_cost():
+    book = _book([], [(0.50, 100), (0.45, 50)])
+    assert ladder(book, asks=True) == [(0.45, 50), (0.50, 100)]
+    cost, filled = walk_cost(ladder(book, asks=True), 75)
+    assert filled == 75
+    assert cost == pytest.approx(50 * 0.45 + 25 * 0.50)
+
+
+def test_qualifying_score_uses_quadratic_distance():
+    # 3.5c band, level 1.5c from mid: ((3.5-1.5)/3.5)^2 = 0.3265
+    book = _book([(0.485, 100)], [])
+    score = qualifying_score(book, max_spread_cents=3.5, mid_price=0.50)
+    assert score == pytest.approx(100 * ((3.5 - 1.5) / 3.5) ** 2)
+    # Outside the band contributes nothing.
+    far = _book([(0.40, 100)], [])
+    assert qualifying_score(far, max_spread_cents=3.5, mid_price=0.50) == 0.0
+
+
+class _StubRttSession:
+    """HTTP session whose /time answers instantly."""
+
+    status_code = 200
+
+    def get(self, url, timeout=None):
+        return self
+
+
+def test_rtt_probe_keeps_its_sample_out_of_the_latency_report(tmp_path):
+    """The CLOB p50 must not overwrite `local_latency.json`: the on-chain path
+    reads that report for the measured Polygon RPC round trip, and clobbering
+    it is why no measured RPC RTT ever existed."""
+    import json
+
+    from polymarketbot.paper.latency import RttProbe
+
+    report = tmp_path / "local_latency.json"
+    report.write_text(
+        json.dumps({"ts_utc": "2026-11-10T04:40:00Z",
+                    "endpoints": {"clob_time": {"ttfb_p50_ms": 250.0}}}),
+        encoding="utf-8",
+    )
+    stamp = report.stat().st_mtime_ns
+
+    probe = RttProbe(
+        "https://clob.example",
+        _StubRttSession(),
+        persisted=tmp_path / "clob_rtt.json",
+        legacy=report,
+    )
+    probe.measure()
+    probe.measure()
+
+    assert (tmp_path / "clob_rtt.json").exists()
+    assert report.stat().st_mtime_ns == stamp, "the latency report must not be rewritten"
+    assert json.loads(report.read_text(encoding="utf-8"))["endpoints"]["clob_time"][
+        "ttfb_p50_ms"
+    ] == 250.0
+
+
+def test_rtt_probe_seeds_from_a_legacy_sample_when_its_own_file_is_absent(tmp_path):
+    import json
+
+    from polymarketbot.paper.latency import RttProbe
+
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"p50_ms": 300.0}), encoding="utf-8")
+
+    probe = RttProbe(
+        "https://clob.example",
+        _StubRttSession(),
+        persisted=tmp_path / "absent.json",
+        legacy=legacy,
+    )
+    assert probe.p50() == pytest.approx(0.300)
