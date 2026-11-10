@@ -8,13 +8,14 @@ the live manifest, not the old snapshot.
 
 The Gamma ``/markets?condition_ids=`` endpoint accepts 100 ids per request and
 returns the event object plus ``feeType``/``feeSchedule``. For the 2,496-market
-universe that is 25 requests. This module fetches those rows, writes
+universe that is 25 requests. ``refresh()`` fetches those rows, writes
 ``data/derived/universe_metadata.parquet`` for the analysis scripts, and
 backfills the manifest so the risk code can group by ``event_id`` and net fees
-by ``fee_type``.
+by ``fee_type``. The live runner and session recorder read the parquet back
+through ``load_rows()``.
 
 Usage:
-    uv run python -m polymarketbot.data.refresh_universe_metadata
+    uv run python -c "from polymarketbot.data.universe_metadata import refresh; print(refresh())"
 """
 
 from __future__ import annotations

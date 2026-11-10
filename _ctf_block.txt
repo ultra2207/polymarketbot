@@ -1,0 +1,520 @@
+# ------------------------------------------------------------------ ctf
+def test_ctf_parity_funds_a_pair_below_par():
+    market = _market()
+    tranches = ctf.optimize_taker_parity(market, _book(0.39, 0.40), _book(0.54, 0.55),
+                                         cash_usd=100.0, gas_usd=0.0)
+    assert len(tranches) == 1
+    tranche = tranches[0]
+    assert tranche.shares == pytest.approx(100.0)  # ladder depth binds first
+    assert tranche.edge_usd == pytest.approx(tranche.shares * 0.05)
+
+
+def test_ctf_parity_refuses_a_pair_above_par():
+    market = _market()
+    assert ctf.optimize_taker_parity(market, _book(0.39, 0.60), _book(0.54, 0.55),
+                                     1000.0, 0.0) == []
+
+
+def test_ctf_parity_fee_can_erase_the_edge():
+    market = _market(fee_rate=0.2)
+    # Pair fee per share = 0.0975 > the 0.05 price edge.
+    assert ctf.optimize_taker_parity(market, _book(0.39, 0.40), _book(0.54, 0.55),
+                                     1000.0, 0.0) == []
+
+
+def _markout(*cells) -> "ctf.MakerMarkout":
+    """A measured-markout stub: ``(horizon_s, tick, usd_per_share, fills)``."""
+    return ctf.MakerMarkout(cells=tuple(cells))
+
+
+def _gate(*args, **kwargs):
+    """``optimize_maker_parity`` with the cost of capital stated explicitly.
+
+    The gate refuses when the opportunity cost is unmeasured, so every fixture
+    here declares its capital free (``min_daily_yield=0.0``) to isolate the
+    behaviour under test. The hurdle itself is covered by
+    ``test_ctf_maker_refuses_an_edge_below_the_shadow_yield``.
+    """
+    kwargs.setdefault("min_daily_yield", 0.0)
+    return ctf.optimize_maker_parity(*args, **kwargs)
+
+
+def test_ctf_maker_prices_the_pair_as_a_three_outcome_bet():
+    # A rebate-paying schedule and a zero-markout measurement keep this test
+    # about the EV arithmetic.  0.8 fee rate at a 25 % rebate share pays
+    # 0.25 * 0.8 * 0.25 = 0.05/share, which covers a naked leg whose cheapest
+    # exit is a hold to resolution at the measured zero drift.
+    market = _market(fee_rate=0.8, rebate_rate=0.25)
+    p = 0.5
+    quote = _gate(
+        market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+        requote_horizon_s=5.0, fill_probability=p,
+        markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+    )
+    assert quote is not None
+    assert quote.fill_prob_yes == pytest.approx(p)
+    assert quote.markout_usd == pytest.approx(0.0)
+    # The dump exit is one tick of slippage PLUS the taker fee paid to cross
+    # the spread.  Charging only the tick understated it by the whole fee.
+    dump_yes = market.tick + taker_fee(1, 0.39, market.fee_schedule)
+    assert quote.unwind_cost_yes == pytest.approx(dump_yes)
+    assert quote.unwind_cost_no == pytest.approx(
+        market.tick + taker_fee(1, 0.5, market.fee_schedule)
+    )
+    # Only the cheaper of (dump, hold-to-resolution) is incurred.
+    surplus = quote.rebate_yes - min(quote.unwind_cost_yes, quote.markout_usd)
+    surplus_no = quote.rebate_no - min(quote.unwind_cost_no, quote.markout_usd)
+    assert surplus > 0.0 and surplus_no > 0.0
+    assert quote.edge_usd == pytest.approx(
+        p * p * quote.edge_if_both_fill
+        + p * (1 - p) * surplus
+        + p * (1 - p) * surplus_no
+    )
+    # A pair above par is refused outright: nothing is left to lock.
+    assert _gate(
+        market, _book(0.39, 0.41), _book(0.60, 0.62), 100.0,
+        requote_horizon_s=5.0, fill_probability=p,
+        markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+    ) is None
+
+
+def test_ctf_maker_refuses_a_naked_leg_that_does_not_cover_its_measured_costs():
+    """The cheaper exit must still fit inside the rebate.
+
+    This is the 12:53 window's defect stated as a test.  There, the 0.25c rebate
+    beat the 0.1c one-tick *slippage* because the gate charged only slippage:
+    it omitted both the taker fee paid to dump the leg and the drift paid to
+    hold it.  Charging only the tick let 68-150 orders rest on 99.7 % of the
+    pillar's cash with none of them filling.  The gate must charge the cheaper
+    of the two real exits, and refuse while that exceeds the rebate.
+    """
+    market = _market(tick=0.001, fee_rate=0.04, rebate_rate=0.25)
+    # Live measured Politics schedule (rate 0.04, rebate 0.25) at a price near
+    # 0.5, which is where the 12:53 quotes sat: the rebate is 0.25c/share.
+    books = (_book(0.489, 0.492), _book(0.499, 0.502))
+    rebate = ctf.maker_fee_rebate(0.490, 1.0, market.fee_schedule)
+    assert rebate > market.tick  # the old gate accepted on this alone
+    # A drift a whole cent above the rebate: holding to resolution costs more
+    # than the rebate pays, and dumping costs more still.
+    refused = _gate(
+        market, *books, 100.0, requote_horizon_s=400.0, fill_probability=0.5,
+        markout_model=_markout((400.0, 0.001, 0.0100, 3975)),
+    )
+    assert refused is None
+    # The same quote clears when the drift is measured to be zero, so the
+    # refusal is the measured cost and not an unrelated floor.
+    accepted = _gate(
+        market, *books, 100.0, requote_horizon_s=400.0, fill_probability=0.5,
+        markout_model=_markout((400.0, 0.001, 0.0, 3975)),
+    )
+    assert accepted is not None and accepted.locked_spread > 0.0
+
+
+def test_ctf_maker_refuses_when_the_single_leg_markout_is_unmeasured(monkeypatch):
+    """No measured drift for this horizon means no quote, and it says so."""
+    warnings: list[str] = []
+    monkeypatch.setattr(ctf.markout, "logger", type("R", (), {
+        "warning": lambda _s, m: warnings.append(m),
+        "info": lambda _s, m: None,
+        "error": lambda _s, m: None,
+    })())
+    monkeypatch.setattr(ctf.markout, "_UNMEASURED_MARKOUT_LOGGED", set())
+    monkeypatch.setattr(ctf.parity, "_QUOTE_AUDIT", {
+        "logged_at": 0.0, "evaluated": 0, "accepted": 0, "refused": {},
+        "best_refusal": None,
+    })
+    market = _market(fee_rate=0.8, rebate_rate=0.25)
+    # The model covers 5 s only; a 400 s quote has no measured drift.
+    short = _markout((5.0, 0.01, 0.0, 1000))
+    assert _gate(
+        market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+        requote_horizon_s=400.0, fill_probability=0.5, markout_model=short,
+    ) is None
+    assert any("no single-leg markout is measured there" in message for message in warnings)
+    # An absent measurement is missing data, not a free exit.
+    monkeypatch.setattr(ctf.markout, "_default_maker_markout", lambda: None)
+    assert _gate(
+        market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+        requote_horizon_s=400.0, fill_probability=0.5,
+    ) is None
+    assert ctf.parity._QUOTE_AUDIT["refused"].get("markout_model_missing") == 1
+
+
+def test_ctf_maker_requires_a_measured_requote_horizon():
+    """There is no default quote lifetime: an assumed one prices a guess."""
+    market = _market(fee_rate=0.8, rebate_rate=0.25)
+    assert _gate(
+        market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+        fill_probability=0.5, markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+    ) is None
+
+
+def test_ctf_maker_refuses_an_unmeasured_horizon_probability():
+    """No measured cell for this horizon/tick/minimum order means no quote."""
+    market = _market(fee_rate=0.8, rebate_rate=0.25)
+    drift = _markout((5.0, 0.01, 0.0, 1000))
+    empty = ctf.QuoteFillHorizon(cells=())
+    assert _gate(market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+                                     requote_horizon_s=5.0, horizon_model=empty,
+                                     markout_model=drift) is None
+    # A measured cell for a harder fill size is a conservative lower bound, so
+    # it is used; a minimum order larger than every measured bucket is not.
+    coarse = ctf.QuoteFillHorizon(cells=((5.0, 0.01, 50.0, 0.3),))
+    priced = _gate(market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+                                       requote_horizon_s=5.0, horizon_model=coarse,
+                                       markout_model=drift)
+    assert priced is not None and priced.fill_prob_yes == pytest.approx(0.3)
+    big = _market(min_order=5_000.0, fee_rate=0.8, rebate_rate=0.25)
+    assert _gate(big, _book(0.39, 0.41), _book(0.50, 0.52), 10_000.0,
+                                     requote_horizon_s=5.0, horizon_model=coarse,
+                                     markout_model=drift) is None
+
+
+def test_ctf_maker_logs_the_six_ev_components_of_every_quote(monkeypatch):
+    """An accepted quote must be auditable from the log alone.
+
+    The 12:53 window rested 68-150 orders for 30 minutes with no line saying
+    what any of them was priced at, so "zero fills" could not be attributed.
+    """
+    lines: list[str] = []
+    monkeypatch.setattr(ctf.maker, "logger", type("R", (), {
+        "warning": lambda _s, m: None,
+        "info": lambda _s, m: lines.append(m),
+        "error": lambda _s, m: None,
+    })())
+    monkeypatch.setattr(ctf.parity, "_QUOTE_AUDIT", {
+        "logged_at": 0.0, "evaluated": 0, "accepted": 0, "refused": {},
+        "best_refusal": None,
+    })
+    monkeypatch.setattr(ctf.parity, "_ACCEPTED_QUOTES_LOGGED", set())
+    market = _market(fee_rate=0.8, rebate_rate=0.25)
+    quote = _gate(
+        market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+        requote_horizon_s=5.0, fill_probability=0.5,
+        markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+    )
+    assert quote is not None
+    joined = "\n".join(lines)
+    for component in ("p_yes=", "p_no=", "locked=", "rebate=", "unwind=",
+                      "markout=", "expected="):
+        assert component in joined
+    # The engine re-prices the same book every tick; the components are
+    # published once per distinct quote, and the summary still counts it.
+    lines.clear()
+    assert _gate(
+        market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+        requote_horizon_s=5.0, fill_probability=0.5,
+        markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+    ) is not None
+    assert not any("CTF maker quote" in line for line in lines)
+
+
+def test_ctf_maker_audit_states_the_best_refusal_when_nothing_quotes(monkeypatch):
+    """A window that quotes nothing must publish the nearest miss's components."""
+    lines: list[str] = []
+    monkeypatch.setattr(ctf.parity, "logger", type("R", (), {
+        "warning": lambda _s, m: None,
+        "info": lambda _s, m: lines.append(m),
+        "error": lambda _s, m: None,
+    })())
+    monkeypatch.setattr(ctf.parity, "_QUOTE_AUDIT", {
+        "logged_at": 0.0, "evaluated": 0, "accepted": 0, "refused": {},
+        "best_refusal": None,
+    })
+    market = _market(tick=0.001, fee_rate=0.04, rebate_rate=0.25)
+    assert _gate(
+        market, _book(0.489, 0.492), _book(0.499, 0.502), 100.0,
+        requote_horizon_s=400.0, fill_probability=0.5,
+        markout_model=_markout((400.0, 0.001, 0.0100, 3975)),
+    ) is None
+    summary = ctf.log_quote_audit(force=True)
+    if summary is None:
+        # The gate already drained and published on this evaluation (the first
+        # drain of a process always fires); take the line it wrote.
+        summary = lines[-1] if lines else None
+    assert summary is not None
+    assert "single_leg_below_measured_cost" in summary
+    for component in ("p_yes=", "p_no=", "locked=", "rebate=", "unwind=",
+                      "markout=", "surplus=", "expected="):
+        assert component in summary
+
+
+def test_ctf_maker_pins_a_scan_gap_wider_than_the_measured_horizon(monkeypatch):
+    """A 244-tick sweep gap (244 s) past a 225 s table is pinned, not dropped.
+
+    The engine derives the requote horizon from the scan cadence, so a tick that
+    overruns its interval silently widens every quote's life past the measured
+    support.  Refusing turned the pillar off (measured: 415-612 s gaps, 0 quotes
+    emitted); the policy is to price at the longest measured horizon, which is a
+    lower bound on the true probability, log the gap and the bound it costs, and
+    tell the caller which horizon it actually paid for.
+    """
+    warnings: list[str] = []
+
+    class Recorder:
+        def warning(self, message):
+            warnings.append(str(message))
+
+        def info(self, message):  # pragma: no cover - not exercised
+            pass
+
+        def error(self, message):  # pragma: no cover - not exercised
+            pass
+
+    monkeypatch.setattr(ctf.fill_model, "logger", Recorder())
+    monkeypatch.setattr(ctf.fill_model, "_UNMEASURED_HORIZON_LOGGED", set())
+    monkeypatch.setattr(ctf.fill_model, "_HORIZON_CLAMP_LOGGED", set())
+    model = ctf.QuoteFillHorizon(
+        cells=((5.0, 0.001, 5.0, 0.0002), (225.0, 0.001, 5.0, 0.0064))
+    )
+    # A 0.1-cent tick pair with the live measured Politics schedule
+    # (rate 0.04, rebate 0.25) and a measured-zero drift: the clamp's job is to
+    # price the horizon, so the branch economics are supplied as measurements.
+    market = _market(tick=0.001, fee_rate=0.04, rebate_rate=0.25)
+    drift = _markout((225.0, 0.001, 0.0, 3975))
+    held = _gate(market, _book(0.489, 0.492), _book(0.499, 0.502), 100.0,
+                                     requote_horizon_s=244.0, horizon_model=model,
+                                     markout_model=drift)
+    assert held is not None
+    assert held.fill_prob_yes == pytest.approx(0.0064)
+    assert held.priced_horizon_s == pytest.approx(225.0)
+    assert held.horizon_clamped_from_s == pytest.approx(244.0)
+    assert len(warnings) == 1
+    assert "measured maximum 225s horizon" in warnings[0]
+    assert "244s requote gap" in warnings[0]
+    assert "lower bound" in warnings[0]
+    # Second attempt at the same gap does not spam the log.
+    assert _gate(market, _book(0.489, 0.492), _book(0.499, 0.502), 100.0,
+                                     requote_horizon_s=244.0, horizon_model=model,
+                                     markout_model=drift) is not None
+    assert len(warnings) == 1
+
+
+def test_ctf_maker_still_refuses_a_horizon_below_the_measured_support(monkeypatch):
+    """Clamping is one-directional: a too-short life must not be priced up.
+
+    Pricing a 1 s quote with the 5 s cell would overstate its fill probability,
+    which is the direction that fabricates an edge.
+    """
+    warnings: list[str] = []
+    monkeypatch.setattr(ctf.fill_model, "logger", type("R", (), {"warning": lambda _s, m: warnings.append(m),
+                                                                 "info": lambda *_a: None,
+                                                                 "error": lambda *_a: None})())
+    monkeypatch.setattr(ctf.fill_model, "_UNMEASURED_HORIZON_LOGGED", set())
+    monkeypatch.setattr(ctf.fill_model, "_HORIZON_CLAMP_LOGGED", set())
+    model = ctf.QuoteFillHorizon(cells=((5.0, 0.01, 5.0, 0.0002), (225.0, 0.01, 5.0, 0.6)))
+    market = _market()
+    assert _gate(market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
+                                     requote_horizon_s=1.0, horizon_model=model) is None
+    assert any("1.0s requote horizon" in message for message in warnings)
+
+
+def test_shipped_horizon_table_prices_the_exact_price_event():
+    """The gate must price the event the paper execution model can realise.
+
+    ``load_quote_fill_horizon`` prices ``p_fill_exact``: a print that lands at the
+    quote's own price, which is what ``reward.measured_fill_shares`` books.  The
+    artifact also carries the at-or-below count as ``p_fill``.  Two things must
+    hold for the shipped table and this asserts both:
+
+    * the probability the model holds is the measured exact count, cell for cell
+      -- no scaling, no flattening of the horizon/tick dependence into a ratio;
+    * ``p_fill_exact <= p_fill`` everywhere, because a print at the quote is a
+      subset of a print at or below it.  An inversion means the two definitions
+      have been swapped again, which is the defect that let the gate price ~9
+      fills for every one the execution model could book.
+    """
+    payload = json.loads(ctf.DEFAULT_QUOTE_FILL_HORIZON_PATH.read_text(encoding="utf-8"))
+    rows = payload.get("cells") or []
+    assert rows
+    measured: dict[tuple[float, float, float], float] = {}
+    for row in rows:
+        key = (float(row["horizon_s"]), float(row["tick"]), float(row["min_flow_shares"]))
+        exact = row.get("p_fill_exact")
+        # A table measured before the exact cells existed is not a usable
+        # measurement: the loader must refuse it rather than silently price the
+        # at-or-below count, so its absence here is a defect too.
+        assert exact is not None, f"cell {key} has no measured exact-price count"
+        assert float(exact) <= float(row["p_fill"]) + 1e-12, f"cell {key} inverted"
+        measured[key] = float(exact)
+
+    model = ctf.load_quote_fill_horizon()
+    loaded = {(cell[0], cell[1], cell[2]): cell[3] for cell in model.cells}
+    assert loaded == measured
+
+    # The one cell both definitions were measured on must differ: the exact
+    # event is strictly rarer than the at-or-below event wherever prints sweep
+    # past the quote.
+    at_quote = next(
+        row for row in rows
+        if (row["horizon_s"], row["tick"], row["min_flow_shares"]) == (225.0, 0.01, 5.0)
+    )
+    assert float(at_quote["p_fill_exact"]) < float(at_quote["p_fill"])
+
+
+def test_ctf_maker_markout_brackets_an_unmeasured_horizon_with_the_worse_neighbour():
+    """A gap between cells is charged a measured neighbour, never a line.
+
+    The drift is not monotone in the measured table, so interpolating it would
+    invent values; charging the larger bracketing cell can only overstate the
+    cost the quote must clear.
+    """
+    model = ctf.MakerMarkout(cells=((5.0, 0.001, 0.0008, 76), (30.0, 0.001, 0.0025, 401)))
+    assert model.markout(5.0, 0.001) == pytest.approx(0.0008)
+    assert model.markout(11.0, 0.001) == pytest.approx(0.0025)
+    assert model.markout(4.9, 0.001) is None      # below support: missing data
+    assert model.markout(400.0, 0.001) is None    # above support: out of contract
+    assert model.markout(11.0, 0.01) is None      # tick not measured
+
+
+def test_shipped_markout_covers_every_horizon_the_fill_table_prices():
+    """The two artifacts must sit on one grid, or the gate refuses on a mismatch.
+
+    The gate looks the markout up at the horizon the fill table priced.  A
+    markout cell missing there is missing data, so the pillar would go dark for
+    a reason that is an artifact mismatch rather than an economic verdict.
+    """
+    fill_payload = json.loads(
+        ctf.DEFAULT_QUOTE_FILL_HORIZON_PATH.read_text(encoding="utf-8")
+    )
+    fill_cells = {
+        (float(row["horizon_s"]), float(row["tick"]))
+        for row in fill_payload.get("cells") or []
+    }
+    markout = ctf.load_maker_markout()
+    measured = {(cell[0], cell[1]) for cell in markout.cells}
+    missing = sorted(fill_cells - measured)
+    assert not missing, f"markout table has no cell for {missing}"
+    # Every shipped markout cell carries a real sample and a signed estimate.
+    for cell in markout.cells:
+        assert cell[3] > 0
+    # The measurement must cover the life the 12:53 engine actually rested
+    # quotes for (the 428-459 s sweep gaps were clamped to the 400 s cell).
+    assert markout.markout(400.0, 0.01) is not None
+    assert markout.markout(400.0, 0.001) is not None
+
+
+def test_horizon_table_without_the_exact_count_refuses(tmp_path):
+    """A pre-exact table is missing data: refuse, never revert to crossing.
+
+    Pricing the at-or-below count is a 9-13x overstatement of the fill
+    probability the paper model can produce, so a cell without an exact count is
+    dropped and a table with no exact cells raises.
+    """
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"cells": [
+        {"horizon_s": 5.0, "tick": 0.01, "min_flow_shares": 5.0, "p_fill": 0.5},
+    ]}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        ctf.load_quote_fill_horizon(legacy)
+
+    # A mixed table keeps only the cells that carry the exact count.
+    mixed = tmp_path / "mixed.json"
+    mixed.write_text(json.dumps({"cells": [
+        {"horizon_s": 5.0, "tick": 0.01, "min_flow_shares": 5.0, "p_fill": 0.5},
+        {"horizon_s": 5.0, "tick": 0.01, "min_flow_shares": 20.0,
+         "p_fill": 0.4, "p_fill_exact": 0.0002},
+    ]}), encoding="utf-8")
+    model = ctf.load_quote_fill_horizon(mixed)
+    assert [cell[2] for cell in model.cells] == [20.0]
+    assert model.cells[0][3] == pytest.approx(0.0002)
+
+
+
+def test_ctf_merge_pairs_is_the_complete_set_count():
+    class Lot:
+        def __init__(self, token, shares):
+            self.condition_id = "c1"
+            self.token_id = token
+            self.shares = shares
+
+    lots = [Lot("yes", 10.0), Lot("yes", 5.0), Lot("no", 12.0), Lot("other", 99.0)]
+    assert ctf.merge_pairs(lots, "c1") == pytest.approx(12.0)
+
+
+def test_ctf_onchain_leg_pays_rpc_rtt_plus_block_interval():
+    """An admitted merge flies for the measured RPC round trip plus one block."""
+    timing = ctf.require_on_chain_timing(0.42, 2.0, action="merge")
+    assert timing.flight_s == pytest.approx(2.42)
+
+
+@pytest.mark.parametrize(
+    "rpc_rtt_s, block_interval_s, head_error, missing",
+    [
+        # eth_blockNumber rate limited: cooldown 921 s, head unreadable.
+        (0.42, 2.0, "eth_blockNumber rate limited, cooldown 921s", "live Polygon head"),
+        # The latency probe never recorded a polygon_rpc endpoint, because the
+        # paper engine's RttProbe overwrote data/derived/local_latency.json.
+        (None, 2.0, None, "measured Polygon RPC round trip"),
+        # No consecutive-head sequence exists to measure the block interval.
+        (0.42, None, None, "measured Polygon block interval"),
+        (0.42, 0.0, None, "measured Polygon block interval"),
+        (0.0, 2.0, None, "measured Polygon RPC round trip"),
+    ],
+)
+def test_ctf_onchain_leg_is_refused_when_its_clock_is_unmeasured(
+    rpc_rtt_s, block_interval_s, head_error, missing
+):
+    """No fallback interval: a leg with an unmeasured clock refuses and says why."""
+    with pytest.raises(ctf.OnChainRefused) as excinfo:
+        ctf.require_on_chain_timing(
+            rpc_rtt_s, block_interval_s, action="merge", head_unavailable_reason=head_error
+        )
+    assert missing in str(excinfo.value)
+
+
+def test_ctf_onchain_leg_refuses_during_an_rpc_outage_without_touching_the_tape():
+    """A starved RPC refuses the merge even when historical measurements exist.
+
+    The block interval measured from the header tape is a fact about Polygon,
+    not about this transaction: with the head unreadable the transaction cannot
+    be broadcast, so the merge must not be scheduled against a stale clock.
+    """
+    calls = {"rpc": 0, "block": 0}
+
+    def rpc_rtt():
+        calls["rpc"] += 1
+        return 0.42
+
+    def block_interval():
+        calls["block"] += 1
+        return 2.0
+
+    with pytest.raises(ctf.OnChainRefused):
+        ctf.resolve_on_chain_timing(
+            "merge",
+            head_error="eth_blockNumber rate limited, cooldown 921s",
+            rpc_rtt_loader=rpc_rtt,
+            block_interval_loader=block_interval,
+        )
+    assert "cooldown 921s" in str(
+        ctf.OnChainRefused("eth_blockNumber rate limited, cooldown 921s")
+    )
+    assert calls == {"rpc": 1, "block": 1}  # loaders are cheap reads, not the blocker
+
+    admitted = ctf.resolve_on_chain_timing(
+        "merge",
+        probe_head=False,
+        rpc_rtt_loader=rpc_rtt,
+        block_interval_loader=block_interval,
+    )
+    assert admitted.flight_s == pytest.approx(2.42)
+
+
+def test_ctf_onchain_leg_never_probes_the_head_when_a_reason_is_supplied(monkeypatch):
+    """A caller that already saw the outage failure does not pay a second probe."""
+    probed = {"n": 0}
+
+    def boom():
+        probed["n"] += 1
+        return "should not be called"
+
+    monkeypatch.setattr(ctf.onchain, "_live_head_error", boom)
+    with pytest.raises(ctf.OnChainRefused):
+        ctf.resolve_on_chain_timing(
+            "redeem",
+            head_error="eth_blockNumber unavailable",
+            rpc_rtt_loader=lambda: 0.42,
+            block_interval_loader=lambda: 2.0,
+        )
+    assert probed["n"] == 0

@@ -1,8 +1,9 @@
 """End-to-end engine test with a fake venue: no network, real decision modules.
 
-Proves the three state transitions that matter: settlement buys against the
-landing book, CTF parity buys both legs and merges them into cash, and the
-ledger's equity reflects par value rather than the last trade price.
+Proves the two state transitions that matter: settlement buys against the
+landing book, and the ledger's equity reflects par value rather than the last
+trade price. The CTF parity transition moved with the archived strategy
+(``archive/ctf/tests/test_ctf_runner.py``).
 """
 
 from __future__ import annotations
@@ -147,73 +148,6 @@ def test_settlement_buys_winner_at_landing_and_marks_par(tmp_path, fake_venue,
     # 111.11 shares worth $1.00 each at the oracle verdict.
     equity = engine.ledger.equity()["SettlementHarvester"]
     assert equity == pytest.approx(100.0 / 0.90, rel=1e-6)
-    engine.ledger.close()
-
-
-def test_ctf_parity_buys_both_legs_and_merges_to_cash(tmp_path, monkeypatch):
-    market = _market("c2", "y2", "n2", min_order=5.0)
-    books = {"y2": _book(0.39, 0.40), "n2": _book(0.54, 0.55)}
-    monkeypatch.setattr(engine_mod.venue, "universe", lambda gamma, max_pages=30: [market])
-    monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
-    engine = _engine(tmp_path, books, gas=0.0)
-    engine.walker = _Walker([market])
-    # A merge lands after the Polygon round trip plus one block, not after the
-    # CLOB round trip; the test supplies that measured flight explicitly.
-    monkeypatch.setattr(
-        engine_mod.ctf, "resolve_on_chain_timing",
-        lambda action, **kw: engine_mod.ctf.OnChainTiming(0.004, 0.002),
-    )
-    engine._tick()
-    assert engine.actions.pending(), "parity edge must queue a taker action"
-    time.sleep(0.02)
-    engine._land(books, [])
-    time.sleep(0.02)
-    engine._land(books, [])
-    lots = engine.ledger.positions("CtfMinter")
-    assert lots == []
-    # Cash-bounded size = 100 / (0.40 + 0.55) shares, merged at $1: +$0.05/share.
-    shares = 100.0 / 0.95
-    assert engine.ledger.cash("CtfMinter") == pytest.approx(100.0 + shares * 0.05, rel=1e-6)
-    engine.ledger.close()
-
-
-def test_ctf_merge_is_refused_when_its_flight_is_unmeasured(tmp_path, monkeypatch):
-    """Filled parity legs stay as inventory rather than being merged on the
-    CLOB round trip: a merge priced with an unmeasured RPC clock would credit
-    par for a transaction that was never broadcast."""
-    market = _market("c5", "y5", "n5", min_order=5.0)
-    books = {"y5": _book(0.39, 0.40), "n5": _book(0.54, 0.55)}
-    monkeypatch.setattr(engine_mod.venue, "universe", lambda gamma, max_pages=30: [market])
-    monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
-
-    def _refuse(action, **kwargs):
-        raise engine_mod.ctf.OnChainRefused("on-chain merge refused: no measured RPC round trip")
-
-    monkeypatch.setattr(engine_mod.ctf, "resolve_on_chain_timing", _refuse)
-    engine = _engine(tmp_path, books, gas=0.0)
-    engine.walker = _Walker([market])
-    engine._tick()
-    time.sleep(0.02)
-    engine._land(books, [])
-    time.sleep(0.02)
-    engine._land(books, [])
-    lots = engine.ledger.positions("CtfMinter")
-    assert lots, "both parity legs remain as inventory"
-    assert {lot.tag for lot in lots} == {"ctf_leg"}
-    assert not [q for q in engine.actions.pending() if q.kind == "ctf_merge"]
-    engine.ledger.close()
-
-
-def test_ctf_is_refused_when_gas_is_unmeasured(tmp_path, monkeypatch):
-    market = _market("c3", "y3", "n3")
-    books = {"y3": _book(0.39, 0.40), "n3": _book(0.54, 0.55)}
-    monkeypatch.setattr(engine_mod.venue, "universe", lambda gamma, max_pages=30: [market])
-    monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
-    engine = _engine(tmp_path, books, gas=None)
-    engine.walker = _Walker([market])
-    engine._tick()
-    assert engine.actions.pending() == []
-    assert engine.ledger.cash("CtfMinter") == 100.0
     engine.ledger.close()
 
 

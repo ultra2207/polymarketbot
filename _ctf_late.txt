@@ -1,0 +1,63 @@
+def test_horizon_fill_probability_interpolates_only_between_measured_cells() -> None:
+    """A gap that falls between measured horizons must be priced, not refused:
+    the operating scan gap (sweep ticks x tick) is rarely a measured value.
+    Interpolation is linear in time and validated on the exact-price series at a
+    25.71 % worst held-out error (the looser at-or-below series measured 5.31 %),
+    so the midpoint of two cells is their mean, and anything outside the
+    measured support still refuses rather than extrapolating."""
+    model = ctf.QuoteFillHorizon(cells=(
+        (10.0, 0.01, 5.0, 0.001),
+        (30.0, 0.01, 5.0, 0.003),
+        (60.0, 0.01, 5.0, 0.006),
+        (10.0, 0.01, 100.0, 0.0005),
+        (30.0, 0.01, 100.0, 0.002),
+    ), placements=1_000)
+
+    assert model.p_fill(10.0, 0.01, 5.0) == pytest.approx(0.001)  # exact cell wins
+    assert model.p_fill(20.0, 0.01, 5.0) == pytest.approx(0.002)  # midpoint
+    assert model.p_fill(30.0, 0.01, 5.0) == pytest.approx(0.003)
+    assert model.p_fill(15.0, 0.01, 5.0) == pytest.approx(0.0015)
+    assert model.p_fill(45.0, 0.01, 5.0) == pytest.approx(0.0045)
+
+    # Outside the measured support: no extrapolation, no invented probability.
+    assert model.p_fill(5.0, 0.01, 5.0) is None
+    assert model.p_fill(61.0, 0.01, 5.0) is None
+    # The 100-share bucket stops at 30 s, so a 45 s quote for 100 shares is
+    # outside its support even though the 5-share bucket covers it.
+    assert model.p_fill(45.0, 0.01, 100.0) is None
+    # An unmeasured tick is not interpolated across.
+    assert model.p_fill(20.0, 0.001, 5.0) is None
+
+
+def test_ctf_maker_refuses_an_edge_below_the_shadow_yield():
+    """A positive expected value is not a reason to lock capital.
+
+    The 14:06 window accepted two quotes at ``expected=$6.629e-09/set`` with
+    ``p_fill=6.163e-06``: the lock carries weight ``p^2`` and a naked leg only
+    ``p``, so at that probability the rebate surplus collapses to a rounding
+    error while ~$0.82 of capital per set rests for the horizon. Annualised
+    over the 9 s horizon that is 7.7e-05 /USD/day, three orders of magnitude
+    below what the same dollar earns on the reward book.
+    """
+    market = _market(fee_rate=0.8, rebate_rate=0.25)
+    books = (_book(0.39, 0.41), _book(0.50, 0.52))
+    dust = 6.163e-06
+
+    # Positive EV, uneconomic yield: refused on the measured hurdle.
+    assert _gate(market, *books, 100.0, requote_horizon_s=5.0,
+                 fill_probability=dust,
+                 markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+                 min_daily_yield=0.03) is None
+
+    # The identical quote clears when capital is genuinely free, so the refusal
+    # is the hurdle and not an unrelated floor.
+    assert _gate(market, *books, 100.0, requote_horizon_s=5.0,
+                 fill_probability=dust,
+                 markout_model=_markout((5.0, 0.01, 0.0, 1000))) is not None
+
+    # An unmeasured opportunity cost is missing data, never a zero hurdle: the
+    # gate must refuse without the argument at all.
+    assert ctf.optimize_maker_parity(
+        market, *books, 100.0, requote_horizon_s=5.0, fill_probability=0.5,
+        markout_model=_markout((5.0, 0.01, 0.0, 1000)),
+    ) is None

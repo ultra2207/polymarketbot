@@ -22,14 +22,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from polymarketbot.risk.models import CircuitBreakerReason
-from polymarketbot.simulator.feed import OrderBookLevel
+from polymarketbot.trading.feed import OrderBookLevel
 from polymarketbot.trading.client import (
     ClobAPIError,
     ClobAuthCredentials,
     LiveClobClient,
     build_clob_hmac_signature,
 )
-from polymarketbot.simulator.portfolio import SimulatedPortfolio
 from polymarketbot.trading.ctf import (
     DEFAULT_COLLATERAL_USDC,
     MERGE_POSITIONS_SELECTOR,
@@ -439,32 +438,6 @@ def test_calculate_optimal_merge_threshold():
     with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0):
         ctf_thresh = ctf.calculate_optimal_merge_threshold(pol_usd_price=0.45)
         assert ctf_thresh >= 1.0
-
-
-def test_simulated_portfolio_dynamic_gas_and_threshold_integration():
-    """Verify SimulatedPortfolio integrates dynamic gas pricing and optimal merge threshold."""
-    ctf = PolygonCtfClient(dry_run=True)
-    with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-         patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
-        portfolio = SimulatedPortfolio(initial_cash=100.0, ctf_client=ctf)
-
-        # Dynamic gas fee should be set from ctf_client (78,000 * 40 Gwei * 1e-9 * 0.092 = 0.000287)
-        assert portfolio.gas_fee_merge == 0.000287
-
-        # Optimal threshold from portfolio helper (0.000287 / 0.0015 = 0.191 -> floored at 1.0)
-        threshold = portfolio.get_optimal_merge_threshold()
-        assert threshold == 1.0
-
-        # Test merge execution deducts dynamic gas fee
-        portfolio.process_fill("DEFAULT", "BUY", "YES", 0.45, 10.0)
-        portfolio.process_fill("DEFAULT", "BUY", "NO", 0.50, 10.0)
-        assert portfolio.get_position("DEFAULT").complete_sets == 10.0
-
-        res = portfolio.merge("DEFAULT", amount_sets=5.0)
-        assert res is not None
-        assert res.complete_sets_merged == 5.0
-        assert res.gas_fee_deducted == portfolio.gas_fee_merge
-        assert portfolio.total_gas_fees == portfolio.gas_fee_merge
 
 
 def test_real_money_engine_dynamic_merge_threshold_initialization():

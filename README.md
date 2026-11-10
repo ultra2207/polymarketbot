@@ -60,14 +60,12 @@ Everything else is derived and reproducible from these four files.
 ## Quick start
 
 ```bash
-uv run python -m polymarketbot.tools.verify_core           # if data exists, re-verify integrity
 uv run python -m polymarketbot.data.builders.build_labels         # authoritative payout labels
 uv run python -m polymarketbot.data.builders.build_categories     # slug rules + Gamma tag overrides
 uv run python -m polymarketbot.data.builders.build_market_stats   # per-market activity from the tape
 uv run python -m polymarketbot.data.builders.build_tick_sizes     # tick sizes from Dome
 uv run python -m polymarketbot.data.builders.build_universe       # point-in-time market table
 uv run pytest -q                                                  # universe invariants
-uv run python -m polymarketbot.tools.check_universe --n 24        # invariants + live spot-check
 uv run python -m polymarketbot.data.builders.fetch_wallet_cohort  # ranked wallets + PnL decomposition
 ```
 

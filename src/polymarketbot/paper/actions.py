@@ -18,7 +18,7 @@ from typing import Optional
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import venue
 from polymarketbot.paper.books import ladder
-from polymarketbot.paper.pillars import ctf, settlement
+from polymarketbot.paper.pillars import settlement
 
 log = get_logger(__name__)
 
@@ -92,26 +92,11 @@ def land(engine, books: dict[str, dict], prints: list[venue.Print]) -> None:
             engine.reward_quotes.pop(payload["token_id"], None)
         elif action.kind == "reward_quote":
             engine.reward_quotes[payload["token_id"]] = payload["resting"]
-        elif action.kind == "ctf_cancel":
-            engine.maker_quotes.pop(payload["token_id"], None)
-        elif action.kind == "ctf_quote":
-            engine.maker_quotes[payload["token_id"]] = payload["resting"]
-        elif action.kind in ("settle_buy", "ctf_taker"):
+        elif action.kind == "settle_buy":
             market = engine.by_condition.get(payload["condition_id"])
             fresh = (engine.feed.books(market.token_ids, force=True)
                      if market is not None else books)
-            if action.kind == "settle_buy":
-                land_settlement(engine, action.strategy, payload, fresh)
-            else:
-                land_ctf_taker(engine, action.strategy, payload, fresh)
-        elif action.kind == "ctf_merge":
-            engine.ledger.merge(
-                action.strategy,
-                condition_id=payload["condition_id"],
-                token_id=payload["token_id"],
-                pair_shares=payload["pair_shares"],
-                gas=payload["gas"],
-            )
+            land_settlement(engine, action.strategy, payload, fresh)
 
 
 def land_settlement(engine, strategy: str, payload: dict, books: dict[str, dict]) -> None:
@@ -149,40 +134,6 @@ def land_settlement(engine, strategy: str, payload: dict, books: dict[str, dict]
             engine._fills[strategy] += 1
             log.info(f"settled buy {leg.shares:.1f} @ {leg.price:.4f} "
                      f"p_win={leg.p_win:.3f} edge=${leg.edge_usd:.4f}")
-
-
-def land_ctf_taker(engine, strategy: str, payload: dict, books: dict[str, dict]) -> None:
-    market = engine.by_condition.get(payload["condition_id"])
-    if market is None or not market.binary:
-        return
-    yes, no = market.token_ids
-    tranches = ctf.optimize_taker_parity(
-        market, books.get(yes) or {}, books.get(no) or {},
-        engine.ledger.cash(strategy), engine.gas_usd or 0.0,
-    )
-    for tranche in tranches:
-        if engine.ledger.buy(strategy, condition_id=market.condition_id, token_id=yes,
-                             shares=tranche.shares, price=tranche.price_yes,
-                             fee=tranche.fee_yes, tag="ctf_leg"):
-            if engine.ledger.buy(strategy, condition_id=market.condition_id, token_id=no,
-                                 shares=tranche.shares, price=tranche.price_no,
-                                 fee=tranche.fee_no, tag="ctf_leg"):
-                engine._fills[strategy] += 1
-                log.info(f"ctf parity {tranche.shares:.1f} sh "
-                         f"@{tranche.price_yes:.4f}+{tranche.price_no:.4f} "
-                         f"edge=${tranche.edge_usd:.4f}")
-                if engine.gas_usd is not None:
-                    try:
-                        onchain = ctf.resolve_on_chain_timing("merge")
-                    except ctf.OnChainRefused as exc:
-                        log.warning(f"{exc}; parity legs stay as inventory")
-                        continue
-                    engine.actions.submit("ctf_merge", strategy, {
-                        "condition_id": market.condition_id,
-                        "token_id": yes,
-                        "pair_shares": tranche.shares,
-                        "gas": tranche.gas,
-                    }, rtt=onchain.flight_s)
 
 
 def pending_for(engine, condition_id: str) -> bool:

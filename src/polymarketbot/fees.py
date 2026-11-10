@@ -310,7 +310,7 @@ def _as_utc(when: datetime | str) -> datetime:
 
 
 def schedule_at(row: dict, when: datetime | str) -> FeeSchedule:
-    """The schedule for a fill at `when` — the function a simulator should call.
+    """The schedule for a fill at `when` — the function a fill model should call.
 
     `schedule_from_market` answers "what does this market charge *now*"; this
     answers "what did it charge *then*". Gamma publishes only the current

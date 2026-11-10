@@ -1,23 +1,16 @@
 """UMA/adapter log decoding: ABI topics, payloads, and the address mismatch.
 
 The event signatures are asserted against the topic0 values observed on
-Polygon mainnet (see the live probe in docs/data-collection.md), so a typo in
-the ABI table fails a test instead of silently decoding nothing.
+Polygon mainnet (see ``CHAIN_TOPIC0`` below), so a typo in the ABI table fails
+a test instead of silently decoding nothing.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any, Sequence
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
-from polymarketbot.data.config import load_config
-from polymarketbot.data.schema import POLYGON_LOGS
-from polymarketbot.data.streams.polygon import PolygonSettings
 from polymarketbot.data.uma import (
     CONTRACT_ADAPTER_V1,
     CONTRACT_ADAPTER_V2,
@@ -26,22 +19,12 @@ from polymarketbot.data.uma import (
     UMA_ADAPTER_V1,
     UMA_ADAPTER_V2,
     UMA_OO_V2,
+    ancillary_title,
     decode_log,
     event_topic0,
+    hex_int,
+    parse_log,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from polymarketbot.data.uma_replay import (  # noqa: E402
-    configured_addresses,
-    main as replay_main,
-    run_probe,
-)
-
-CONFIG = REPO_ROOT / "configs" / "data_collection.yaml"
-CTF = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
 
 
 # --------------------------------------------------------------------------- #
@@ -457,192 +440,6 @@ def test_truncated_payload_returns_none_not_partial_row() -> None:
     assert decode_log(row) is None
 
 
-# --------------------------------------------------------------------------- #
-# Replay script
-# --------------------------------------------------------------------------- #
-def _polygon_row(log: dict[str, Any]) -> dict[str, Any]:
-    row = {name: None for name in POLYGON_LOGS.names}
-    row.update(log)
-    row.setdefault("recv_mono_ns", 1)
-    return row
-
-
-def test_replay_writes_uma_rows_and_skips_scanned_parts(tmp_path: Path) -> None:
-    tape_root = tmp_path / "tape"
-    part = tape_root / "polygon_logs" / "date=2026-11-04" / "hour=00" / "part-1.parquet"
-    part.parent.mkdir(parents=True)
-    uma_log = build_log(
-        UMA_OO_V2,
-        "ProposePrice(address,address,bytes32,uint256,bytes,int256,uint256,address)",
-        indexed=[("requester", ADAPTER), ("proposer", PROPOSER)],
-        data=[
-            ("identifier", IDENTIFIER),
-            ("timestamp", 1_765_910_303),
-            ("ancillaryData", ANCILLARY),
-            ("proposedPrice", 10**18),
-            ("expirationTimestamp", 1_793_778_520),
-            ("currency", CURRENCY),
-        ],
-    )
-    ctf_log = {
-        "address": "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
-        "topic0": "0x" + "11" * 32,
-        "data": "0x",
-        "block_number": 1,
-        "tx_index": 0,
-        "log_index": 0,
-        "removed": False,
-        "recv_ts_ns": 1,
-    }
-    pq.write_table(
-        pa.Table.from_pylist([_polygon_row(ctf_log), _polygon_row(uma_log)], schema=POLYGON_LOGS),
-        part,
-    )
-
-    output = tmp_path / "uma_events.parquet"
-    journal = tmp_path / "uma_events.parts.json"
-    argv = ["--tape-root", str(tape_root), "--output", str(output), "--journal", str(journal)]
-    assert replay_main(argv) == 0
-
-    table = pq.read_table(output)
-    assert table.num_rows == 1
-    row = table.to_pylist()[0]
-    assert row["event"] == "ProposePrice"
-    assert row["proposer"] == PROPOSER
-    assert row["source_part"].endswith("part-1.parquet")
-
-    # Second run: the part is in the journal, so nothing is decoded or appended.
-    assert replay_main(argv) == 0
-    assert pq.read_table(output).num_rows == 1
-
-
-def test_replay_decodes_v1_adapter_log_from_tape(tmp_path: Path) -> None:
-    """The v1 adapter is a separate config key, so it must survive the filter."""
-    tape_root = tmp_path / "tape"
-    part = tape_root / "polygon_logs" / "date=2026-11-04" / "hour=01" / "part-1.parquet"
-    part.parent.mkdir(parents=True)
-    v1_log = build_log(
-        UMA_ADAPTER_V1,
-        "QuestionInitialized(bytes32,bytes,uint256,address,uint256,uint256,bool)",
-        indexed=[("questionID", QUESTION_ID)],
-        data=[
-            ("ancillaryData", ANCILLARY),
-            ("resolutionTime", 1_793_778_520),
-            ("rewardToken", CURRENCY),
-            ("reward", 10 * 10**6),
-            ("proposalBond", 5 * 10**18),
-            ("earlyResolutionEnabled", False),
-        ],
-    )
-    pq.write_table(pa.Table.from_pylist([_polygon_row(v1_log)], schema=POLYGON_LOGS), part)
-
-    output = tmp_path / "uma_events.parquet"
-    journal = tmp_path / "uma_events.parts.json"
-    argv = [
-        "--tape-root",
-        str(tape_root),
-        "--output",
-        str(output),
-        "--journal",
-        str(journal),
-        "--config",
-        str(CONFIG),
-    ]
-    assert replay_main(argv) == 0
-
-    row = pq.read_table(output).to_pylist()[0]
-    assert row["event"] == "QuestionInitialized"
-    assert row["contract"] == "uma_ctf_adapter_v1"
-    assert row["question_id"] == QUESTION_ID
-    assert row["early_resolution"] is False
-
-
-# --------------------------------------------------------------------------- #
-# Config-driven address filter and the read-only probe
-# --------------------------------------------------------------------------- #
-def test_config_declares_the_four_subscribed_addresses() -> None:
-    section = load_config(CONFIG)["streams"]["polygon"]
-    settings = PolygonSettings.from_section(section, fallbacks=[])
-    assert len(settings.addresses) == 4
-    lowered = [address.lower() for address in settings.addresses]
-    assert len(set(lowered)) == 4
-    assert set(lowered) == {CTF, UMA_OO_V2, UMA_ADAPTER_V1, UMA_ADAPTER_V2}
-    # The replay filters on exactly the same set the stream subscribes to.
-    assert {address.lower() for address in configured_addresses(CONFIG)} == set(lowered)
-
-
-class _Recorder:
-    """Minimal loguru stand-in: the probe only needs info/error/warning."""
-
-    def __init__(self) -> None:
-        self.lines: list[tuple[str, str]] = []
-
-    def info(self, message: str, *args: Any) -> None:
-        self.lines.append(("info", message.format(*args)))
-
-    def warning(self, message: str, *args: Any) -> None:
-        self.lines.append(("warning", message.format(*args)))
-
-    def error(self, message: str, *args: Any) -> None:
-        self.lines.append(("error", message.format(*args)))
-
-
-class _StubRpc:
-    def __init__(self, head: int, *, fail: Sequence[str] = ()) -> None:
-        self.head = head
-        self.fail = set(fail)
-        self.calls: list[tuple[str, int, int]] = []
-        self.closed = False
-
-    def block_number(self) -> int:
-        return self.head
-
-    def get_logs(self, addresses: Sequence[str], low: int, high: int) -> list[dict[str, Any]]:
-        (address,) = addresses
-        self.calls.append((address, low, high))
-        if address.lower() in self.fail:
-            raise RuntimeError(f"{address}: HTTP 429 rate limited")
-        if address.lower() != UMA_OO_V2:
-            return []
-        return [
-            {
-                "address": address,
-                "blockNumber": hex(high),
-                "topics": ["0x" + "ab" * 32],
-                "data": "0x",
-            }
-        ]
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def test_probe_reports_every_address_and_continues_after_a_failure() -> None:
-    rpc = _StubRpc(1_000, fail=[UMA_ADAPTER_V1])
-    log = _Recorder()
-    addresses = configured_addresses(CONFIG)
-
-    assert run_probe(addresses, 200, log=log, client=rpc) == 1
-
-    # One call per address over the same window, not one combined call.
-    assert [call[0] for call in rpc.calls] == list(addresses)
-    assert all(call[1:] == (801, 1_000) for call in rpc.calls)
-    assert rpc.closed
-
-    messages = [line for _kind, line in log.lines]
-    for address in addresses:
-        assert any(address in line and line.startswith("probe ") for line in messages)
-    assert any("0x" + "ab" * 32 in line for line in messages)
-    assert any("HTTP 429" in line for _kind, line in log.lines if _kind == "error")
-
-
-def test_probe_exits_clean_when_every_address_answers() -> None:
-    rpc = _StubRpc(500)
-    log = _Recorder()
-    assert run_probe([CTF, UMA_OO_V2], 10, log=log, client=rpc) == 0
-    assert [call[1:] for call in rpc.calls] == [(491, 500), (491, 500)]
-
-
 # Topic0s observed on chain for UMA OptimisticOracleV2 (0xee3afe..7c24) in
 # ``data/tape/polygon_logs`` over the whole taped window (2026-11-10):
 # 0x6e51dd00.. -> 283 ProposePrice, 0xf1679315.. -> 38 RequestPrice,
@@ -675,3 +472,96 @@ def test_dispute_price_decodes_all_three_indexed_parties() -> None:
     """``disputer`` is topic 3, not topic 2: a shifted read names the proposer."""
     spec = SPEC_BY_CONTRACT_TOPIC[(CONTRACT_OO_V2, CHAIN_TOPIC0["DisputePrice"])]
     assert [name for name, _type in spec.indexed] == ["requester", "proposer", "disputer"]
+
+
+# --------------------------------------------------------------------------- #
+# Raw log parsing: the poller feeds node JSON straight in
+# --------------------------------------------------------------------------- #
+def _log_object() -> dict:
+    return {
+        "address": "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+        "topics": [
+            "0x63bf4d16b2a61e2b1d4b0c8d1e4c5e0a0b8b3c6f2ad2e1e3f7d1c0b9a8e7d6c5",
+            "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "0x0000000000000000000000000000000000000000000000000000000000000002",
+        ],
+        "data": "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000",
+        "blockNumber": "0x5c378e5",
+        "transactionHash": "0x" + "ab" * 32,
+        "transactionIndex": "0x2",
+        "blockHash": "0x" + "cd" * 32,
+        "logIndex": "0x7",
+        "removed": False,
+    }
+
+
+def test_hex_int_parses_rpc_quantities() -> None:
+    assert hex_int("0x5c378e5") == 96_696_549
+    assert hex_int("0x0") == 0
+    assert hex_int("42") == 42
+    assert hex_int(12) == 12
+    assert hex_int(None) is None
+    assert hex_int("0x") is None
+    assert hex_int("not hex") is None
+    assert hex_int(True) is None
+    assert hex_int("", default=-1) == -1
+
+
+def test_parse_log_maps_every_field() -> None:
+    row = parse_log(_log_object(), recv_ts_ns=1_700_000_000_000_000_000, recv_mono_ns=99)
+    assert row is not None
+    assert row["recv_ts_ns"] == 1_700_000_000_000_000_000
+    assert row["recv_mono_ns"] == 99
+    assert row["block_number"] == 96_696_549
+    assert row["tx_index"] == 2
+    assert row["log_index"] == 7
+    assert row["address"] == "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+    assert row["topic0"].startswith("0x63bf4d16")
+    assert row["topic1"].endswith("01") and row["topic2"].endswith("02")
+    assert row["topic3"] is None
+    assert row["data"].startswith("0x0000000000000000")
+    assert row["block_hash"] == "0x" + "cd" * 32
+    assert row["tx_hash"] == "0x" + "ab" * 32
+    assert row["removed"] is False
+
+
+def test_parse_log_keeps_removed_flag() -> None:
+    raw = _log_object()
+    raw["removed"] = True
+    row = parse_log(raw)
+    assert row is not None
+    assert row["removed"] is True
+
+
+def test_parse_log_rejects_unplaceable_log() -> None:
+    raw = _log_object()
+    raw.pop("blockNumber")
+    assert parse_log(raw) is None
+    assert parse_log("not an object") is None
+
+
+def test_parse_log_tolerates_missing_topics_and_indices() -> None:
+    row = parse_log({"blockNumber": "0x10"})
+    assert row is not None
+    assert row["block_number"] == 16
+    assert row["topic0"] is None and row["topic3"] is None
+    assert row["tx_index"] is None and row["log_index"] is None
+    assert row["address"] is None
+    assert row["removed"] is False
+
+
+def test_parse_log_feeds_decode_log() -> None:
+    """The poller's path: node JSON -> row -> decoded UMA event."""
+    row = parse_log(_log_object())
+    assert row is not None
+    # CTF address with an unknown topic is not a UMA event, but the row parses.
+    assert decode_log(row) is None
+
+
+def test_ancillary_title_extracts_the_question() -> None:
+    text = "q: title: Will BTC close above 100k on Friday, Dec 5?, description: resolves per Coinbase"
+    assert ancillary_title(text) == "Will BTC close above 100k on Friday, Dec 5?"
+    assert ancillary_title("q: title: , description: empty") is None
+    assert ancillary_title("resolution rules without a title") is None
+    assert ancillary_title(None) is None
+

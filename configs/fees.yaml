@@ -125,7 +125,8 @@ category_map:
 #
 # Measured 2026-11-01 across 1,937,137 markets: these 16 types cover the entire
 # scheduled universe, and each type has exactly one (rate, exponent, rebate)
-# triple. Reproduce with `uv run python -m polymarketbot.tools.validate_fee_model`.
+# triple. The measurement script (`polymarketbot.tools.validate_fee_model`)
+# has been retired; the measured table is the contract below.
 #
 # `rate` is the type's *current* value. Gamma reports only the present
 # schedule, so a market created in 2025-06 carries today's rate — that is why

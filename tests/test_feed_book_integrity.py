@@ -13,7 +13,7 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
-from polymarketbot.simulator.feed import (
+from polymarketbot.trading.feed import (
     EVENT_QUEUE_MAXSIZE,
     LivePolymarketFeed,
     MarketTrade,

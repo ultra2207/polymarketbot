@@ -1,4 +1,4 @@
-"""The paper engine: one clock, three decision loops, one ledger.
+"""The paper engine: one clock, two decision loops, one ledger.
 
 This module is the coordinator: it owns the tick order, the shared state and
 the accounting, and it delegates. The settlement radar (``paper.radar``), the
@@ -24,16 +24,16 @@ from polymarketbot.paper.actions import Resting
 from polymarketbot.paper.books import best_bid
 from polymarketbot.paper.latency import ActionBook, RttProbe
 from polymarketbot.paper.ledger import Ledger
-# ``ctf`` and ``settlement`` are re-exported: callers patch the shared module
-# objects (``engine_mod.ctf.resolve_on_chain_timing``) and every runner must
-# see the patch, so all of them import the same module object.
-from polymarketbot.paper.pillars import ctf, ctf_runner, reward_runner, settlement, settlement_runner, tail_budget  # noqa: F401
-from polymarketbot.trading.domain2 import settlement_allocator
+# ``settlement`` is re-exported: callers patch the shared module object
+# (``engine_mod.settlement.verdict_for``) and every runner must see the patch,
+# so all of them import the same module object.
+from polymarketbot.paper.pillars import reward_runner, settlement, settlement_runner, tail_budget  # noqa: F401
+from polymarketbot.trading.domain2.settlement_allocator import MarginalSettlementAllocator
 from polymarketbot.trading.domain2.settlement_fair_value import normalize_question
 
 log = get_logger(__name__)
 
-STRATEGIES = ("RewardHarvester", "SettlementHarvester", "CtfMinter")
+STRATEGIES = ("RewardHarvester", "SettlementHarvester")
 
 
 class PaperEngine:
@@ -109,11 +109,8 @@ class PaperEngine:
         #: inputs (appetite, band, evidence) are required and are resolved here,
         #: once, from one named place: a paper book that cannot state its
         #: appetite does not spend.
-        self.settlement_allocator = settlement_allocator.MarginalSettlementAllocator("tail_budget")
+        self.settlement_allocator = MarginalSettlementAllocator("tail_budget")
         self._tail_policy, self._tail_evidence = tail_budget.resolve_tail_inputs()
-        self._ctf_budget = 1500
-        self._ctf_cursor = 0
-        self._ctf_coverage_ts = 0.0
         self._last_tick_dt = 0.0
         self._reward_accrual_ts = time.time()
         self._reward_log_ts = 0.0
@@ -126,7 +123,6 @@ class PaperEngine:
         #: None until solved; the CTF gate refuses rather than assumes 0.
         self._shadow_yield: Optional[float] = None
         self.reward_quotes: dict[str, Resting] = {}
-        self.maker_quotes: dict[str, Resting] = {}
         self.settlement_model = settlement.model()
         self.poller = self._make_uma_poller() if enable_uma_polling else None
         self.walker = venue.UniverseWalker(gamma, pages_per_tick=20)
@@ -231,7 +227,7 @@ class PaperEngine:
         stage0 = time.monotonic()
         prints = venue.tape(self.http, window_s=max(120.0, 4 * self.interval))
         notional: dict[str, float] = {}
-        for quote in list(self.reward_quotes.values()) + list(self.maker_quotes.values()):
+        for quote in list(self.reward_quotes.values()):
             if quote.cancel_at is None:
                 notional[quote.condition_id] = notional.get(quote.condition_id, 0.0) + (
                     quote.shares * quote.price
@@ -253,9 +249,6 @@ class PaperEngine:
         stage0 = time.monotonic()
         self._settlement(books)
         self._stage("settlement", stage0)
-        stage0 = time.monotonic()
-        self._ctf(books, prints)
-        self._stage("ctf", stage0)
         stage0 = time.monotonic()
         self._mark(books)
         self._stage("mark", stage0)
@@ -316,15 +309,11 @@ class PaperEngine:
             )
         log.info(" | ".join(parts) +
                  f" | rtt={f'{rtt*1000:.0f}ms' if rtt else 'unmeasured'} "
-                 f"resting={len(self.reward_quotes) + len(self.maker_quotes)}"
-                 f" (reward={len(self.reward_quotes)} ctf={len(self.maker_quotes)}"
-                 # Each pillar owns its own cash, so a summed reserve reads as a
-                 # breach when both are individually inside their balance. Show
-                 # the pair against the balance each is actually drawn on.
+                 f"resting={len(self.reward_quotes)}"
+                 # The pillar owns its own cash, so the reserve is shown against
+                 # the balance it is actually drawn on.
                  f" reserved=reward {self._reserved(self.reward_quotes):.2f}"
-                 f"/{self.ledger.cash('RewardHarvester'):.2f}"
-                 f" ctf {self._reserved(self.maker_quotes):.2f}"
-                 f"/{self.ledger.cash('CtfMinter'):.2f})")
+                 f"/{self.ledger.cash('RewardHarvester'):.2f})")
 
     # -- delegates: the moved implementations, original names ------------
     def _refresh_venue_state(self) -> None: return venue_actions.refresh_venue_state(self)
@@ -334,12 +323,9 @@ class PaperEngine:
     def _radar_snapshot(self): return radar.radar_snapshot(self)
     def _market_refusal(self, condition_id, verdict_rows): return radar.market_refusal(condition_id, verdict_rows)
     def _make_uma_poller(self) -> Any: return radar.make_uma_poller(self)
-    def _markets_with_books(self, books) -> list[venue.Market]: return ctf_runner.markets_with_books(self, books)
     def _land(self, books, prints) -> None: return venue_actions.land(self, books, prints)
     def _land_settlement(self, strategy, payload, books) -> None:
         return venue_actions.land_settlement(self, strategy, payload, books)
-    def _land_ctf_taker(self, strategy, payload, books) -> None:
-        return venue_actions.land_ctf_taker(self, strategy, payload, books)
     def _pending_for(self, condition_id) -> bool: return venue_actions.pending_for(self, condition_id)
     def _reward(self, books, prints) -> None: return reward_runner.run_reward(self, books, prints)
     def _apply_resting_fills(self, resting, strategy, books, prints, now) -> None:
@@ -353,4 +339,3 @@ class PaperEngine:
         )
     def _reconcile_held(self, verdict_rows) -> None:
         return settlement_runner.reconcile_held(self, verdict_rows)
-    def _ctf(self, books, prints) -> None: return ctf_runner.run_ctf(self, books, prints)

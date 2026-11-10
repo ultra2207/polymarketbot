@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.rewards.merger import (
-    CompleteSetPosition,
-    build_ctf_merge_transaction,
-)
 from polymarketbot.rewards.scoring import (
     OrderQuote,
     calculate_epoch_payout,
@@ -46,17 +42,9 @@ def test_quadratic_order_score_basic() -> None:
         == 0.0
     )
 
-    # Disqualification when duration < 3.5 seconds
-    assert (
-        quadratic_order_score(
-            max_spread_cents=3.0,
-            spread_cents=1.0,
-            size=100.0,
-            duration_seconds=2.0,
-            min_duration_seconds=3.5,
-        )
-        == 0.0
-    )
+    # No resting-time gate: the published rule scores whatever rests at the
+    # sample instant (docs, equation 6), so there is no minimum order age and
+    # no `duration_seconds` argument to zero a quote with.
 
 
 def test_official_worked_example_from_docs() -> None:
@@ -137,83 +125,6 @@ def test_epoch_payout_and_floor() -> None:
     assert share == pytest.approx(0.005)
     assert gross == pytest.approx(0.50)
     assert net == 0.0
-
-
-def test_complete_set_merge_logic() -> None:
-    pos = CompleteSetPosition(auto_merge_threshold=10.0)
-    assert CompleteSetPosition().auto_merge_threshold == 100.0
-
-    # Buy 500 YES shares @ $0.40
-    pos.record_fill(outcome="YES", side="BUY", price=0.40, size=500.0)
-    assert pos.shares_yes == 500.0
-    assert pos.shares_no == 0.0
-    assert pos.usdc_cash == pytest.approx(-200.0)
-    assert pos.net_inventory == 500.0
-    assert pos.total_merged_shares == 0.0
-
-    # Buy 300 NO shares @ $0.58
-    # Holding 500 YES and 300 NO -> 300 complete sets can merge into $300 USDC!
-    # Deducts one merge gas fee, measured at $0.0016 (78k gas at 216 gwei)
-    pos.record_fill(outcome="NO", side="BUY", price=0.58, size=300.0)
-
-    # Auto-merge should have executed
-    assert pos.total_merged_shares == 300.0
-    assert pos.total_unlocked_usd == 300.0
-    assert pos.shares_yes == 200.0
-    assert pos.shares_no == 0.0
-    # Net inventory before was 500 - 300 = 200; after merge it is still 200 - 0 = 200!
-    assert pos.net_inventory == 200.0
-    gas = pos.gas_fee_per_merge
-    assert pos.usdc_cash == pytest.approx(-200.0 - 174.0 + 300.0 - gas)
-    assert pos.total_gas_fees == pytest.approx(gas)
-
-    # Test CTF transaction builder
-    tx = build_ctf_merge_transaction(condition_id="0xabc123", amount_shares=100.0)
-    assert tx["method"] == "mergePositions"
-    assert tx["params"]["conditionId"] == "0xabc123"
-    assert tx["params"]["amount"] == 100_000_000  # 6 decimals
-
-
-def test_short_sale_split_and_merge() -> None:
-    pos = CompleteSetPosition(auto_merge_threshold=10.0)
-    # Sell 100 YES without holding any: splits $100 USDC -> holds 100 NO and receives $51
-    pos.record_fill(outcome="YES", side="SELL", price=0.51, size=100.0)
-    assert pos.shares_yes == 0.0
-    assert pos.shares_no == 100.0
-    assert pos.usdc_cash == pytest.approx(-49.0)
-    assert pos.net_inventory == -100.0
-
-    # Buy 100 YES @ 0.49: now holds 100 YES and 100 NO -> auto-merges into $100 USDC (-gas fee)!
-    pos.record_fill(outcome="YES", side="BUY", price=0.49, size=100.0)
-    assert pos.shares_yes == 0.0
-    assert pos.shares_no == 0.0
-    assert pos.net_inventory == 0.0
-    assert pos.total_merged_shares == 100.0
-    assert pos.total_unlocked_usd == 100.0
-    assert pos.usdc_cash == pytest.approx(2.0 - pos.gas_fee_per_merge)  # spread less gas
-
-
-def test_batch_merge_threshold_and_gas_fee() -> None:
-    # Default threshold is 100.0 shares
-    pos = CompleteSetPosition()
-    assert pos.auto_merge_threshold == 100.0
-    assert pos.gas_fee_per_merge == pytest.approx(0.0016)
-
-    # Buy 90 YES and 90 NO: threshold 100 not met -> no merge executed
-    pos.record_fill(outcome="YES", side="BUY", price=0.50, size=90.0)
-    pos.record_fill(outcome="NO", side="BUY", price=0.50, size=90.0)
-    assert pos.total_merged_shares == 0.0
-    assert pos.total_gas_fees == 0.0
-    assert pos.shares_yes == 90.0
-    assert pos.shares_no == 90.0
-
-    # Buy another 15 YES and 15 NO: total 105 >= 100 -> batch merge triggers!
-    pos.record_fill(outcome="YES", side="BUY", price=0.50, size=15.0)
-    pos.record_fill(outcome="NO", side="BUY", price=0.50, size=15.0)
-    assert pos.total_merged_shares == 105.0
-    assert pos.total_gas_fees == pytest.approx(pos.gas_fee_per_merge)
-    assert pos.shares_yes == 0.0
-    assert pos.shares_no == 0.0
 
 
 def test_competitor_depth_ladder_and_jensens_inequality() -> None:

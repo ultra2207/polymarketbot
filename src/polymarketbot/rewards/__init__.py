@@ -1,10 +1,5 @@
 """Polymarket Liquidity Rewards bot and backtesting package."""
 
-from polymarketbot.rewards.merger import (
-    CompleteSetPosition,
-    MergeEvent,
-    build_ctf_merge_transaction,
-)
 from polymarketbot.rewards.microstructure import (
     MicrostructureEngine,
     MicrostructureState,
@@ -43,9 +38,6 @@ from polymarketbot.rewards.deskew import (
 )
 
 __all__ = [
-    "CompleteSetPosition",
-    "MergeEvent",
-    "build_ctf_merge_transaction",
     "DEFAULT_COMPETITOR_LADDER",
     "OrderQuote",
     "calculate_epoch_payout",

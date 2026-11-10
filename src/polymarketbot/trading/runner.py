@@ -63,11 +63,11 @@ from polymarketbot.rewards.switching import (
     SwitchEvent,
     SwitchingConfig,
 )
-from polymarketbot.simulator.feed import LivePolymarketFeed
-from polymarketbot.simulator.optimizer import derive_quote_size, optimize_spread_offset
+from polymarketbot.strategy.sizing import derive_quote_size, optimize_spread_offset
 from polymarketbot.trading.client import ClobAuthCredentials, LiveClobClient
 from polymarketbot.trading.ctf import PolygonCtfClient
 from polymarketbot.trading.engine import MarkoutTracker, RealMoneyTradingEngine
+from polymarketbot.trading.feed import LivePolymarketFeed
 
 log = get_logger("real_money_trader")
 

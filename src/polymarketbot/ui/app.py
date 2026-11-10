@@ -206,7 +206,7 @@ def main() -> None:
     with col_title:
         st.title("⚡ Live Paper Trading Telemetry")
         st.caption(
-            "RewardHarvester · SettlementHarvester · CtfMinter — journal-backed, "
+            "RewardHarvester · SettlementHarvester — journal-backed, "
             "no simulated prices in this view."
         )
     with col_status:

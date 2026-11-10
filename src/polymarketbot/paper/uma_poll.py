@@ -434,8 +434,7 @@ class UmaProposalPoller:
         ``ProposePrice`` has no condition id; the tape indexes it by question
         and the radar binds the exact id from its scanned universe later.
         """
-        from polymarketbot.data.streams.polygon import parse_log
-        from polymarketbot.data.streams.uma import ancillary_title
+        from polymarketbot.data.uma import ancillary_title, parse_log
 
         events: Dict[str, Tuple[str, Optional[TapeProposal]]] = {}
         for raw in logs:

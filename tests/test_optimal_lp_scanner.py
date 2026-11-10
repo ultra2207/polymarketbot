@@ -209,36 +209,6 @@ def test_get_real_l2_score_caching_and_429():
     assert "HTTP 429" in telemetry.last_error_message
 
 
-def test_instant_cooldown_scanner_trigger_and_throttling():
-    """Verify instant scan trigger trips on volatility breaker and logging is throttled."""
-    import time
-    from polymarketbot.simulator.engine import NativePaperTradingEngine
-
-    engine = NativePaperTradingEngine(
-        condition_id="0x_test_cooldown",
-        initial_cash=100.0,
-        quote_size=20.0,
-    )
-
-    # Initial state
-    assert engine.pop_instant_scan_trigger() is False
-
-    # Simulate price jump from 0.50 to 0.53 (> 2.0c jump in 60s)
-    now = time.time()
-    engine._check_volatility_breaker(0.50, ts=now)
-    breaker_tripped = engine._check_volatility_breaker(0.53, ts=now + 5.0)
-
-    assert breaker_tripped is True
-    # Verify instant scan trigger was set
-    assert engine.pop_instant_scan_trigger() is True
-    # Verify popping it resets the flag
-    assert engine.pop_instant_scan_trigger() is False
-
-    # Subsequent tick within cooldown still returns True
-    cooldown_active = engine._check_volatility_breaker(0.52, ts=now + 6.0)
-    assert cooldown_active is True
-
-
 
 # ---------------------------------------------------------------------------
 # Measured microstructure: one test per removed invention.
@@ -322,7 +292,7 @@ def test_missing_tape_regime_refuses_the_market():
 
 def test_fill_probability_is_the_measured_horizon_cell_not_a_fill_share():
     """P(fill) comes from the measured (tick, flow, horizon) cell, uncapped."""
-    from polymarketbot.paper.pillars.ctf import load_quote_fill_horizon
+    from polymarketbot.rewards.fill_measurement import load_quote_fill_horizon
     from polymarketbot.rewards.scanner import calculate_expected_yield
 
     table = load_quote_fill_horizon()

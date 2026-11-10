@@ -555,9 +555,12 @@ class CapitalMigrationEngine:
         """Forgone yield over the measured unquoted interval.
 
         ``latency_seconds`` is the whole interval the market is unquoted, so a
-        cancel-then-place move must pass both measured flights plus the venue's
-        3.5 s qualification timer. The default is a placeholder; measured callers
-        always supply the round trip they actually observe.
+        cancel-then-place move passes both measured flights and nothing else:
+        the published scoring rule has **no minimum rest time** (the venue
+        samples the book once per minute and scores what rests at that instant,
+        ``docs.polymarket.com/programs/liquidity-rewards``), so an order begins
+        accruing as soon as it lands. The default is a placeholder; measured
+        callers always supply the round trip they actually observe.
         """
         return daily_yield_a * (max(0.0, latency_seconds) / 86_400.0)
 
@@ -610,13 +613,14 @@ class CapitalMigrationEngine:
             gas_fees = 0.0
 
         # 4. Downtime Opportunity Cost
-        # A migration is sequential: the old quote must pay its cancel flight,
-        # the new quote pays its placement flight, and only then does the venue
-        # 3.5 s qualification timer start. One transit latency cannot cover the
-        # unquoted interval of a cancel-then-place move.
+        # A migration is sequential: the old quote must pay its cancel flight
+        # and the new quote pays its placement flight, and the quote accrues
+        # from the moment it lands - the published rule has no minimum rest
+        # time. One transit latency cannot cover the unquoted interval of a
+        # cancel-then-place move.
         opp_cost = self.compute_downtime_cost(
             daily_yield_a=daily_yield_a,
-            latency_seconds=2.0 * max(0.0, transit_latency_seconds) + 3.5,
+            latency_seconds=2.0 * max(0.0, transit_latency_seconds),
         )
 
         # Baseline switching friction (network transit, order cancel/replacement latency)

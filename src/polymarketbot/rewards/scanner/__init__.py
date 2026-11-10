@@ -12,7 +12,7 @@ Every microstructure term in (2) is measured:
 
 * P(fill) comes from ``data/derived/ctf_quote_fill_horizon.json`` (8,773,815 tape
   placements, cells keyed by quote lifetime, tick and required flow) through
-  ``polymarketbot.paper.pillars.ctf.load_quote_fill_horizon`` - the same table
+  ``polymarketbot.rewards.fill_measurement.load_quote_fill_horizon`` - the same table
   the CTF maker gate prices with.
 * Per-share adverse drift comes from ``data/derived/ctf_maker_markout.json``
   (44,068 measured fills) through ``load_maker_markout``.

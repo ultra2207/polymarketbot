@@ -43,6 +43,7 @@ log joins to the adapter log without an off-chain lookup.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -57,13 +58,14 @@ from Crypto.Hash import keccak
 # and PolygonScan verified source: UmaCtfAdapter uses IOptimisticOracleV2.
 UMA_OO_V2 = "0xee3afe347d5c74317041e2618c49534daf887c24"
 
-# configs/data_collection.yaml key `uma_v1_adapter`. PolygonScan calls this
-# contract `UmaConditionalTokensBinaryAdapter` (name tag "UMA CTF Adapter Old").
+# Polymarket's old binary adapter (retired collector config key
+# `uma_v1_adapter`). PolygonScan calls this contract
+# `UmaConditionalTokensBinaryAdapter` (name tag "UMA CTF Adapter Old").
 # It is an adapter, not the oracle; markets opened before the v2 cutover settle
 # through it, so both adapters must be decoded.
 UMA_ADAPTER_V1 = "0xcb1822859cef82cd2eb4e6276c7916e692995130"
 
-# configs/data_collection.yaml key `uma_adapter`.
+# `UmaCtfAdapter` v2.0.0 (retired collector config key `uma_adapter`).
 UMA_ADAPTER_V2 = "0x6a9d222616c90fca5754cd1333cfd9b7fb6a4f74"
 
 CONTRACT_OO_V2 = "optimistic_oracle_v2"
@@ -539,6 +541,102 @@ def _payouts(value: Any) -> str | None:
     if value is None:
         return None
     return "[" + ", ".join(str(int(item)) for item in value) + "]"
+
+
+# --------------------------------------------------------------------------- #
+# Raw logs
+# --------------------------------------------------------------------------- #
+# Polymarket's UMA ancillary data starts ``q: title: <question>, description:``.
+# The title itself may contain commas, so the terminator is the literal
+# ``description:`` key, not the first comma.
+_TITLE_RE = re.compile(r"^\s*q:\s*title:\s*(.*?),\s*description:", re.S)
+
+
+def hex_int(value: Any, default: int | None = None) -> int | None:
+    """Parse a JSON-RPC quantity such as ``"0x1a"`` into an int.
+
+    Nodes normally return hex strings, but web3-style clients and some proxies
+    return ints. Anything unusable yields ``default`` instead of raising: one
+    malformed log must not kill the poll.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            if text[:2].lower() == "0x":
+                return int(text[2:], 16) if len(text) > 2 else default
+            return int(text, 10)
+        except ValueError:
+            return default
+    return default
+
+
+def _topic(topics: Sequence[Any], index: int) -> str | None:
+    if index < len(topics):
+        value = topics[index]
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def parse_log(
+    raw: Any,
+    *,
+    recv_ts_ns: int | None = None,
+    recv_mono_ns: int | None = None,
+) -> dict[str, Any] | None:
+    """One `eth_getLogs` / `logs` subscription object -> a `polygon_logs` row.
+
+    Returns None when the object carries no block number, because a log that
+    cannot be placed on the chain cannot be reasoned about.
+    """
+    if not isinstance(raw, dict):
+        return None
+    block_number = hex_int(raw.get("blockNumber"))
+    if block_number is None:
+        return None
+    topics = raw.get("topics")
+    if not isinstance(topics, list):
+        topics = []
+    data = raw.get("data")
+    return {
+        "recv_ts_ns": recv_ts_ns,
+        "recv_mono_ns": recv_mono_ns,
+        "block_number": block_number,
+        "block_hash": raw.get("blockHash") if isinstance(raw.get("blockHash"), str) else None,
+        "tx_hash": (
+            raw.get("transactionHash")
+            if isinstance(raw.get("transactionHash"), str)
+            else None
+        ),
+        "tx_index": hex_int(raw.get("transactionIndex")),
+        "log_index": hex_int(raw.get("logIndex")),
+        "address": raw.get("address") if isinstance(raw.get("address"), str) else None,
+        "topic0": _topic(topics, 0),
+        "topic1": _topic(topics, 1),
+        "topic2": _topic(topics, 2),
+        "topic3": _topic(topics, 3),
+        "data": data if isinstance(data, str) else None,
+        "removed": bool(raw.get("removed", False)),
+    }
+
+
+def ancillary_title(text: Any) -> str | None:
+    """The market question from Polymarket's UMA ancillary text, if present."""
+    if not isinstance(text, str):
+        return None
+    match = _TITLE_RE.match(text)
+    if not match:
+        return None
+    title = match.group(1).strip()
+    return title or None
 
 
 def decode_log(

@@ -126,9 +126,27 @@ under-stating fees inflates every measured edge, so over-stating is the safe err
 - **Per-league overrides exist.** `sports_fees_nfl_cfb_oct26` charges 0.03 while the sports
   category is 0.05. The category table cannot express this; the per-market `feeSchedule`
   can.
-- **Rebates are aggregate maker-side flow**, not a per-wallet entitlement. The rebate table
-  tells you how much of collected taker fees returns to makers in total; it does not tell you
-  whether *your* resting order qualifies.
+- **Rebates are a per-wallet entitlement, not aggregate maker-side flow.** The
+  `rebateRate` on a market's `feeSchedule` is the share of that market's taker
+  fees paid out to makers; the venue then splits that pool by
+  `rebate = (your_fee_equivalent / total_fee_equivalent) * rebate_pool`, computed
+  **per market**, paid daily in pUSD to the maker address, with a **$1 minimum**
+  accrual before any payout
+  (`docs.polymarket.com/programs/maker-rebates`). So the table tells you both the
+  pool size *and* — once you know your share of filled maker flow in that market
+  — your own entitlement. `fees.maker_fee_rebate` prices one fill from the
+  published share, which is exact only when the maker is the sole filler; the
+  authoritative number is the wallet's own
+  `GET /rebates/current?date=&maker_address=`, which returns
+  `rebated_fees_usdc` per `condition_id` (an array, or `null` when there are no
+  rows). `LiveClobClient.get_current_rebates` reads it and the paper ledger
+  credits that number when it is available, falling back to the model only when
+  the endpoint is unreachable.
+- **Rebates are funded by taker fees, so a 0 %-fee market pays no rebate** for as
+  long as the fee is zero (including fee holidays), even though the maker's
+  resting order may still earn liquidity-reward points. The two programs are
+  separate: rewards come from the market's reward pool, rebates from its taker
+  fees.
 - The **realised `taker_fee` check against `orderfilled.parquet`** (127 GB) is no longer the
   primary validation route: 100 % of the 2024+ traded universe now has an observed per-market
   schedule from Gamma, which is the same source the exchange quotes from. The 127 GB file

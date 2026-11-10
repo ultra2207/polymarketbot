@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live paper soak entry point: RewardHarvester, SettlementHarvester, CtfMinter.
+"""Live paper soak entry point: RewardHarvester, SettlementHarvester.
 
 The engine charges the measured venue round trip for every state change, writes
 every trade to ``data/paper_engine.db``, and logs a dashboard line per interval.
@@ -27,9 +27,9 @@ CLOB = "https://clob.polymarket.com"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Three-pillar live paper soak")
+    parser = argparse.ArgumentParser(description="Two-pillar live paper soak (reward + settlement)")
     parser.add_argument("--capital", type=float, default=3000.0,
-                        help="Total virtual bankroll split evenly across the three pillars")
+                        help="Total virtual bankroll split evenly across the two pillars")
     parser.add_argument("--duration", type=float, default=None,
                         help="Stop after N seconds (default: run until interrupted)")
     parser.add_argument("--interval", type=float, default=10.0,
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gas-usd", type=float, default=None,
                         help="Override the measured on-chain cost per merge/redeem in USD. "
                              "Unset means measure it live; if the live measurement fails, "
-                             "CtfMinter and on-chain settlement stay disabled.")
+                             "on-chain settlement stays disabled.")
     return parser
 
 
@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     if gas_usd is None:
         log.warning(
             "Gas cost unmeasured (live gas price and POL/USD both required): "
-            "CtfMinter and on-chain settlement are disabled rather than priced "
+            "on-chain settlement is disabled rather than priced "
             "with an invented zero."
         )
 

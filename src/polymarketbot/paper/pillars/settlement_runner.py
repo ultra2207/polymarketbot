@@ -80,33 +80,67 @@ def run_settlement(engine, books: dict[str, dict]) -> None:
         1.0, float(getattr(engine.settlement_model.tape, "measured_liveness_sec", 0.0) or 1.0)
     )
     priced: list[tuple[float, venue.Market, float, object]] = []
-    for cid in wanted:
+
+    def price_one(cid: str, *, tally: bool) -> bool:
+        """Append one candidate if it has a verdict, an ask and a positive edge.
+
+        ``tally`` decides whether a refusal enters the once-a-minute tally: a
+        verdict id is a market the pillar meant to fund, while a staged
+        near-close id is one it is merely positioned for, and thousands of
+        expected "no verdict yet" lines would bury the refusals that matter.
+        """
         market = engine.by_condition.get(cid)
         if market is None or not market.binary:
             reason = engine._market_refusal(cid, verdict_rows)
-            refused[reason] = refused.get(reason, 0) + 1
-            continue
+            if tally:
+                refused[reason] = refused.get(reason, 0) + 1
+            return False
         verdict = settlement.verdict_for(engine.settlement_model, market)
         if verdict is None:
-            refused[NO_VERDICT] = refused.get(NO_VERDICT, 0) + 1
-            continue
+            if tally:
+                refused[NO_VERDICT] = refused.get(NO_VERDICT, 0) + 1
+            return False
         token_id = market.token_ids[verdict.winning_index]
         ask = best_ask(books.get(token_id) or {})
         if ask is None or ask <= 0.0:
             # A market with no ask cannot be bought at any price: that is a
             # different fact from a market whose edge is negative, and the
             # difference is the whole question a zero-fill window asks.
-            refused[NO_ASK] = refused.get(NO_ASK, 0) + 1
-            continue
+            if tally:
+                refused[NO_ASK] = refused.get(NO_ASK, 0) + 1
+            return False
         edge = settlement.marginal_edge(market, verdict, ask)
         if edge is None:
-            refused[NO_EDGE] = refused.get(NO_EDGE, 0) + 1
-            continue
+            if tally:
+                refused[NO_EDGE] = refused.get(NO_EDGE, 0) + 1
+            return False
         if edge <= 0.0:
-            refused[NEGATIVE_EDGE] = refused.get(NEGATIVE_EDGE, 0) + 1
-            refused_ask.append(ask)
-            continue
+            if tally:
+                refused[NEGATIVE_EDGE] = refused.get(NEGATIVE_EDGE, 0) + 1
+                refused_ask.append(ask)
+            return False
         priced.append((edge / ask, market, ask, verdict))
+        return True
+
+    for cid in wanted:
+        price_one(cid, tally=True)
+    # The staged cohort: markets whose ``endDate`` is near, bound and rowed by
+    # the radar before any proposal exists. They are priced here every tick so
+    # the first tick after the oracle speaks is already positioned, but a market
+    # without a proposal has no verdict and therefore no candidate - staging
+    # prepares and budgets, it never invents a price.
+    # Imported here, not at module scope: ``paper.radar`` imports this module
+    # for its refusal names, and a top-level import would close the cycle.
+    from polymarketbot.paper import radar
+
+    staged_rows, staged_ids = radar.near_close_snapshot(engine)
+    seen = set(wanted)
+    staged_priced = 0
+    for cid in staged_ids:
+        if cid in seen:
+            continue
+        if price_one(cid, tally=False):
+            staged_priced += 1
     budget = tail_budget(engine, priced, books, verdict_rows, settle_sec, remaining)
     for _edge, market, ask, _verdict in sorted(priced, key=lambda item: -item[0]):
         if pending_for(engine, market.condition_id):
@@ -133,6 +167,9 @@ def run_settlement(engine, books: dict[str, dict]) -> None:
         line = (
             f"settlement candidates: {len(wanted)} verdict cid(s), "
             f"{len(priced)} +EV, cash ${remaining:.2f}"
+            + (f" | near-close staged: {len(staged_rows)} rows, "
+               f"{len(staged_ids)} accepting orders, {staged_priced} priced"
+               if staged_rows or staged_ids else "")
             + (f" | refused: {tally}" if tally else "")
             + best
         )
@@ -141,7 +178,8 @@ def run_settlement(engine, books: dict[str, dict]) -> None:
         # 2026-11-10 12:53-13:23: 30 identical lines, not one of them a
         # finding. Log on change, and reprint once past the heartbeat so a
         # silent radar is still visible as alive.
-        signature = (len(wanted), len(priced), tuple(sorted(refused.items())))
+        signature = (len(wanted), len(priced), tuple(sorted(refused.items())),
+                     staged_priced)
         last = getattr(engine, "_settlement_signature", None)
         quiet = now - getattr(engine, "_settlement_log_beat", 0.0)
         if signature != last or quiet >= _SETTLEMENT_HEARTBEAT_SEC:

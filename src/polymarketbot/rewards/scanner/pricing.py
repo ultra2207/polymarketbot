@@ -57,7 +57,7 @@ _SECONDS_PER_DAY = 86_400.0
 def _fill_horizon_table() -> Optional[Any]:
     """The measured horizon fill table, or ``None`` when it cannot be loaded.
 
-    Same artifact and same loader the CTF maker gate prices with
+    Same artifact and same loader the paper reward gate prices with
     (``data/derived/ctf_quote_fill_horizon.json``, 8,773,815 tape placements),
     so the scanner and the harvester cannot disagree about how often a resting
     quote is filled.
@@ -66,7 +66,7 @@ def _fill_horizon_table() -> Optional[Any]:
     if not _FILL_HORIZON_TRIED:
         _FILL_HORIZON_TRIED = True
         try:
-            from polymarketbot.paper.pillars.ctf import load_quote_fill_horizon
+            from polymarketbot.rewards.fill_measurement import load_quote_fill_horizon
 
             _FILL_HORIZON = load_quote_fill_horizon()
         except Exception as exc:  # noqa: BLE001 - a missing measurement is data
@@ -83,7 +83,7 @@ def _maker_markout_table() -> Optional[Any]:
     if not _MAKER_MARKOUT_TRIED:
         _MAKER_MARKOUT_TRIED = True
         try:
-            from polymarketbot.paper.pillars.ctf import load_maker_markout
+            from polymarketbot.rewards.fill_measurement import load_maker_markout
 
             _MAKER_MARKOUT = load_maker_markout()
         except Exception as exc:  # noqa: BLE001 - a missing measurement is data

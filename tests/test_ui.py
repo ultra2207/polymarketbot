@@ -7,17 +7,14 @@ import sqlite3
 from pathlib import Path
 
 APP = Path("src/polymarketbot/ui/app.py")
-ORCHESTRATOR = Path("src/polymarketbot/strategy/orchestrator.py")
 
 
 def test_ui_files_exist():
     assert APP.exists()
-    assert ORCHESTRATOR.exists()
 
 
 def test_ui_syntax():
     py_compile.compile(str(APP), doraise=True)
-    py_compile.compile(str(ORCHESTRATOR), doraise=True)
 
 
 def test_ui_imports_without_streamlit_runtime():

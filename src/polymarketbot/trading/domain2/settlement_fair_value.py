@@ -50,7 +50,7 @@ from polymarketbot.trading.domain2.robust_hazard import BayesianDisputeTracker
 
 log = get_logger("domain2_settlement_fair_value")
 
-# The UMA event tape written by ``data.streams.uma`` (see its column set).
+# The UMA event tape written by ``data.uma`` (see its column set).
 UMA_TAPE_GLOB: str = "data/tape/uma_events/**/*.parquet"
 # A proposal is only relevant while its liveness window and the on-chain legs can
 # still be pending; a bound on how far back the tape is read keeps the refresh

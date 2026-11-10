@@ -7,6 +7,14 @@ Implements the official quadratic scoring function and epoch aggregation:
 4. Sample score normalization across market makers
 5. 1,440-minute daily epoch accumulation
 6. Reward payout calculation with $1.00 minimum daily floor per market
+
+There is **no minimum rest time** in the published rules. The venue samples the
+book once per minute at a random offset and scores whatever rests at that
+instant (``docs.polymarket.com/programs/liquidity-rewards``, equation 6); an
+order that is on the book when the sample lands counts, and one that is not
+does not. An earlier revision of this module gated scoring on a 3.5 s
+"qualification timer" that appears nowhere in the documentation; it was
+removed on 2026-11-10 because it silently zeroed orders that the venue pays.
 """
 
 from __future__ import annotations
@@ -23,7 +31,6 @@ class OrderQuote:
     outcome: str  # "YES" or "NO"
     price: float  # order price in (0, 1)
     size: float  # quantity in shares
-    duration_seconds: float = 60.0  # seconds resting on book (must be >= 3.5s)
 
 
 def order_spread_cents(order_price: float, mid_price: float, side: str) -> float:
@@ -31,6 +38,15 @@ def order_spread_cents(order_price: float, mid_price: float, side: str) -> float
 
     For a bid (BUY), order sits below mid: spread = (mid - price) * 100.
     For an ask (SELL), order sits above mid: spread = (price - mid) * 100.
+
+    ``mid_price`` is the **raw** L2 mid ``(best_bid + best_ask) / 2``. The
+    published rule measures ``s`` from the *size-cutoff-adjusted* midpoint
+    (``docs.polymarket.com/programs/liquidity-rewards``, variable table), but
+    the adjustment is never defined - no published formula maps the minimum
+    size or the book to an adjusted mid. This module therefore measures from
+    the raw mid and the reward pillar's accrual log states the resulting known
+    bias every window; inventing an adjustment would be a guess dressed as a
+    measurement.
     """
     s = side.upper() if not (side == "BUY" or side == "SELL") else side
     if s == "BUY":
@@ -47,8 +63,6 @@ def quadratic_order_score(
     size: float,
     multiplier: float = 1.0,
     min_size: float = 0.0,
-    duration_seconds: float = 60.0,
-    min_duration_seconds: float = 3.5,
 ) -> float:
     """Calculate quadratic reward score for a single order: S(v, s).
 
@@ -60,17 +74,16 @@ def quadratic_order_score(
         size: Share quantity of the order.
         multiplier: Optional in-game or promotional multiplier (b).
         min_size: Minimum qualifying size for the market.
-        duration_seconds: Duration the order has rested on the book.
-        min_duration_seconds: Polymarket rule requiring resting >= 3.5s.
 
     Returns:
         Quadratic score for the order, or 0.0 if not qualifying.
+
+    There is no resting-time input: the published rule scores whatever is on
+    the book at the sample instant, so an order has no minimum age to clear.
     """
     if max_spread_cents <= 0 or size <= 0:
         return 0.0
     if size < min_size:
-        return 0.0
-    if duration_seconds < min_duration_seconds:
         return 0.0
     if spread_cents > max_spread_cents or spread_cents < 0.0:
         return 0.0
@@ -102,7 +115,7 @@ def compute_book_side_scores(
     q_two = 0.0
 
     for q in quotes:
-        if q.size < min_size or q.duration_seconds < 3.5:
+        if q.size < min_size:
             continue
 
         outcome = q.outcome.upper() if not (q.outcome == "YES" or q.outcome == "NO") else q.outcome
@@ -116,7 +129,6 @@ def compute_book_side_scores(
                 size=q.size,
                 multiplier=multiplier,
                 min_size=min_size,
-                duration_seconds=q.duration_seconds,
             )
             if side == "BUY":
                 q_one += score
@@ -130,7 +142,6 @@ def compute_book_side_scores(
                 size=q.size,
                 multiplier=multiplier,
                 min_size=min_size,
-                duration_seconds=q.duration_seconds,
             )
             # NO ask complements YES bid -> contributes to Q_one
             if side == "SELL":
@@ -140,6 +151,11 @@ def compute_book_side_scores(
                 q_two += score
 
     return q_one, q_two
+
+
+# Documented epoch structure (equation 6): the order book is sampled once per
+# minute at a random offset, so one UTC day holds up to 1,440 samples.
+PROTOCOL_EPOCH_SAMPLES = 1_440
 
 
 # Documented protocol constants of the two-sided rule below: inside the

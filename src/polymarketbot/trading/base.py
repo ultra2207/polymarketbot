@@ -961,7 +961,6 @@ class BaseMarketMakingEngine:
                 outcome=str(q.get("token_side", "YES")).upper(),
                 price=price,
                 size=size,
-                duration_seconds=60.0,
             )
             if quote.outcome == "NO":
                 no_quotes.append(quote)

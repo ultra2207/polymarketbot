@@ -7,16 +7,11 @@ Tests:
 1. Calculation of maker rebate for standard, sports, and crypto markets.
 2. Net maker edge improvement: buying at $0.980 with 0% maker fee + 0.08c maker rebate
    improves effective cost to $0.9792!
-3. Domain 2 Settlement Maker Pricing Engine accounts for rebates and effective prices.
-4. Domain 2 Harvester Engine accurately books net cost basis and settlement P&L.
-5. Domain 2 OR-Tools Allocator boosts net edge and ARR from maker rebates.
-6. Domain 1 RealMoneyTradingEngine credits maker rebates, logs to SQLite fills, and tracks cash.
-7. Simulator Portfolio reflects net basis and maker rebates.
+3. Domain 1 RealMoneyTradingEngine credits maker rebates, logs to SQLite fills, and tracks cash.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
 import sqlite3
 import pytest
 
@@ -27,24 +22,7 @@ from polymarketbot.fees import (
     maker_rebate,
     taker_fee,
 )
-from polymarketbot.trading.domain2.maker_pricing_engine import (
-    MakerEngineConfig,
-    SettlementMakerPricingEngine,
-)
-from polymarketbot.trading.domain2.types import (
-    DiscountOpportunity,
-    Domain2Position,
-    MakerExecutionRegime,
-)
-from polymarketbot.trading.domain2.harvester_engine import (
-    Domain2SettlementHarvester,
-)
-from polymarketbot.trading.domain2.ortools_allocator import (
-    Domain2Candidate,
-    Domain2OrtoolsAllocator,
-)
 from polymarketbot.trading.engine import RealMoneyTradingEngine
-from polymarketbot.simulator.portfolio import SimulatedPortfolio
 
 
 # ---------------------------------------------------------------------------
@@ -144,135 +122,7 @@ def test_net_maker_edge_improvement_98_cents():
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Domain 2 Settlement Maker Pricing Engine Integration
-# ---------------------------------------------------------------------------
-
-def test_domain2_pricing_engine_accounts_for_rebates():
-    """Verify SettlementMakerPricingEngine incorporates maker rebates into expected ARR."""
-    schedule = FeeSchedule(rate=0.2040816, exponent=1.0, rebate_rate=0.20)
-    config = MakerEngineConfig(default_tick_size=0.001)
-
-    engine_with_fee = SettlementMakerPricingEngine(config=config)
-    engine_fee_free = SettlementMakerPricingEngine(config=config)
-
-    # Evaluate decision with schedule vs fee-free
-    dec_with_rebate = engine_with_fee.evaluate_decision(
-        best_bid=0.980,
-        best_ask=0.985,
-        allocated_capital_usdc=98.0,
-        hours_to_expiry=5.0,
-        schedule=schedule,
-    )
-
-    dec_fee_free = engine_fee_free.evaluate_decision(
-        best_bid=0.980,
-        best_ask=0.985,
-        allocated_capital_usdc=98.0,
-        hours_to_expiry=5.0,
-        schedule=FeeSchedule.zero(),
-    )
-
-    assert dec_with_rebate.maker_rebate_usd > 0.0
-    assert dec_fee_free.maker_rebate_usd == 0.0
-
-    # Effective price must be lower than quote price for maker bids
-    assert dec_with_rebate.effective_price < dec_with_rebate.quote_price
-    assert dec_fee_free.effective_price == dec_fee_free.quote_price
-
-    # ARR with rebate must be higher than without rebate
-    assert dec_with_rebate.expected_arr > dec_fee_free.expected_arr
-
-
-# ---------------------------------------------------------------------------
-# Test 4: Domain 2 Harvester Engine Fill & Settlement Accounting
-# ---------------------------------------------------------------------------
-
-def test_domain2_harvester_net_cost_basis():
-    """Verify Domain2SettlementHarvester records net cost basis reducing cash outflow."""
-    clob_mock = MagicMock()
-    ctf_mock = MagicMock()
-    engine = Domain2SettlementHarvester(
-        clob_client=clob_mock,
-        ctf_client=ctf_mock,
-        initial_capital_usdc=1000.0,
-        dry_run=True,
-    )
-
-    # Buy 100 shares at $0.980 with $0.08 maker rebate
-    pos = engine.record_fill(
-        condition_id="0x" + "a" * 64,
-        asset_id="0x" + "1" * 64,
-        shares=100.0,
-        price=0.980,
-        liveness_expiry_ts=1700000000,
-        is_maker=True,
-        maker_rebate_usd=0.08,
-    )
-
-    # Net cost should be 100 * 0.980 - 0.08 = 97.92 USDC
-    assert pos.cost_basis_usdc == pytest.approx(97.92, abs=1e-5)
-    assert pos.entry_price == pytest.approx(0.9792, abs=1e-5)
-    assert pos.maker_rebate_usd == pytest.approx(0.08, abs=1e-5)
-
-    # Available cash deducted net amount: 1000 - 97.92 = 902.08
-    assert engine.available_cash == pytest.approx(902.08, abs=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Test 5: Domain 2 OR-Tools Allocator Edge Boost from Maker Rebates
-# ---------------------------------------------------------------------------
-
-def test_domain2_ortools_allocator_rebate_boost():
-    """Verify OR-Tools Allocator credits maker rebate reducing effective price and boosting edge."""
-    schedule = FeeSchedule(rate=0.2040816, exponent=1.0, rebate_rate=0.20)
-    allocator = Domain2OrtoolsAllocator(min_order_usd=20.0)
-
-    # Candidate with fee schedule (maker order)
-    cand_rebate = Domain2Candidate(
-        condition_id="0x" + "b" * 64,
-        token_id="0x" + "2" * 64,
-        question="Will X occur?",
-        category="crypto",
-        price=0.980,
-        hours_to_resolution=2.0,
-        depth_usd=5000.0,
-        fee_schedule=schedule,
-        is_taker=False,
-        is_uma_proposed=True,
-    )
-
-    # Candidate without fee schedule (0% fee, 0 rebate)
-    cand_zero = Domain2Candidate(
-        condition_id="0x" + "c" * 64,
-        token_id="0x" + "3" * 64,
-        question="Will Y occur?",
-        category="geopolitics",
-        price=0.980,
-        hours_to_resolution=2.0,
-        depth_usd=5000.0,
-        fee_schedule=FeeSchedule.zero(),
-        is_taker=False,
-        is_uma_proposed=True,
-    )
-
-    res_rebate = allocator.optimize_allocation(candidates=[cand_rebate], bankroll_usd=1000.0)
-    res_zero = allocator.optimize_allocation(candidates=[cand_zero], bankroll_usd=1000.0)
-
-    assert len(res_rebate.allocations) == 1
-    assert len(res_zero.allocations) == 1
-
-    alloc_reb = res_rebate.allocations[0]
-    alloc_zero = res_zero.allocations[0]
-
-    assert alloc_reb.maker_rebate_usd > 0.0
-    assert alloc_zero.maker_rebate_usd == 0.0
-
-    # Net edge of candidate with rebate must be strictly greater than candidate without rebate
-    assert alloc_reb.net_edge_pct > alloc_zero.net_edge_pct
-
-
-# ---------------------------------------------------------------------------
-# Test 6: Domain 1 RealMoneyTradingEngine Maker Rebate Execution & SQLite
+# Test 3: Domain 1 RealMoneyTradingEngine Maker Rebate Execution & SQLite
 # ---------------------------------------------------------------------------
 
 def test_domain1_real_money_trading_engine_maker_rebates(tmp_path):
@@ -327,32 +177,3 @@ def test_domain1_real_money_trading_engine_maker_rebates(tmp_path):
     assert row[3] == pytest.approx(0.35, abs=1e-4)  # realized_pnl delta
     conn.close()
 
-
-# ---------------------------------------------------------------------------
-# Test 7: Simulator Portfolio Net Basis and Rebates
-# ---------------------------------------------------------------------------
-
-def test_simulator_portfolio_maker_rebate():
-    """Verify SimulatedPortfolio handles maker rebates on BUY and SELL fills."""
-    portfolio = SimulatedPortfolio(initial_cash=1000.0)
-
-    # Process maker BUY fill of 100 YES @ $0.980 with $0.08 maker rebate
-    tx = portfolio.process_fill(
-        condition_id="cond_1",
-        side="BUY",
-        outcome="YES",
-        price=0.980,
-        size=100.0,
-        is_maker=True,
-        maker_rebate_usd=0.08,
-    )
-
-    assert tx.maker_rebate == pytest.approx(0.08, abs=1e-4)
-    # Net cash paid: 98.00 - 0.08 = 97.92
-    assert tx.net_cash_delta == pytest.approx(-97.92, abs=1e-4)
-    assert portfolio.cash == pytest.approx(902.08, abs=1e-4)
-
-    # Average cost basis should be 97.92 / 100 = 0.9792
-    pos = portfolio.get_position("cond_1")
-    assert pos.avg_cost_yes == pytest.approx(0.9792, abs=1e-5)
-    assert getattr(portfolio, "total_rebates_usd", 0.0) == pytest.approx(0.08, abs=1e-4)

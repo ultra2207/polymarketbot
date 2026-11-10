@@ -3,6 +3,7 @@
 import pytest
 from polymarketbot.trading.domain2.robust_hazard import (
     calculate_cycle_velocity,
+    calculate_physical_cycle_time,
     BayesianCategoryState,
     BayesianDisputeTracker,
     RobustHazardModel,
@@ -137,3 +138,44 @@ def test_minimax_worst_case_evaluation():
     assert h_robust >= 0.040
     assert p_win == 1.0 - h_robust
     assert hourly_vel > 0.0
+
+
+def test_physical_capital_cycle_time_regimes():
+    """Verify physical cycle time T_cycle under on-chain pipeline physics across all regimes."""
+    # 1. Regime A: Already UMA-proposed, 0.3h of liveness remaining
+    t_regime_a_acute = calculate_physical_cycle_time(
+        hours_to_resolution=0.3,
+        is_uma_proposed=True,
+    )
+    # Expected: 0.0 (event) + 0.0 (prop) + 0.3 (liveness) + 0.05 (redeem) + 0.15 (reinvest) = 0.50h
+    assert pytest.approx(t_regime_a_acute, abs=1e-3) == 0.50
+
+    # Regime A: Just proposed, full 2.0h liveness remaining
+    t_regime_a_fresh = calculate_physical_cycle_time(
+        hours_to_resolution=2.0,
+        is_uma_proposed=True,
+    )
+    # Expected: 0.0 + 0.0 + 2.0 + 0.05 + 0.15 = 2.20h
+    assert pytest.approx(t_regime_a_fresh, abs=1e-3) == 2.20
+    assert 0.5 <= t_regime_a_acute <= 2.2
+    assert 0.5 <= t_regime_a_fresh <= 2.2
+
+    # 2. Regime B: Event concluded in real world (Track 6), not yet proposed
+    t_regime_b = calculate_physical_cycle_time(
+        hours_to_resolution=10.0,  # nominal market expiry
+        is_uma_proposed=False,
+        is_deterministic_conclusion=True,
+    )
+    # Expected: 0.0 (event concluded!) + 0.25 (prop lag) + 2.0 (liveness) + 0.05 (redeem) + 0.15 (reinvest) = 2.45h
+    assert pytest.approx(t_regime_b, abs=1e-3) == 2.45
+    assert 2.0 <= t_regime_b <= 2.5
+
+    # 3. In-Play Unconcluded Market: 48h to event resolution
+    t_inplay = calculate_physical_cycle_time(
+        hours_to_resolution=48.0,
+        is_uma_proposed=False,
+        is_deterministic_conclusion=False,
+    )
+    # Expected: 48.0 (event) + 0.25 (prop) + 2.0 (liveness) + 0.05 (redeem) + 0.15 (reinvest) = 50.45h
+    assert pytest.approx(t_inplay, abs=1e-3) == 50.45
+

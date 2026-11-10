@@ -217,11 +217,11 @@ By default (leading to December 1st live launch), `polymarketbot.service` execut
 ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 ```
 
-### Preflight Health Audit (Run before or after starting daemon):
-```bash
-cd /opt/polymarketbot
-uv run python -m polymarketbot.tools.preflight
-```
+### Preflight Health Audit
+
+The standalone `polymarketbot.tools.preflight` CLI was removed with the dead
+tooling; the engine's built-in `preflight_check()` runs inside `paper.main` and
+the live runner before they trade.
 
 To switch to a different operational mode, run:
 ```bash
@@ -235,10 +235,7 @@ ExecStart=
 # --- Option 1: 3-Strategy Live Paper Soak Daemon ($3,000 virtual capital) ---
 ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 
-# --- Option 2: Preflight Verification Health Audit ---
-# ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.tools.preflight
-
-# --- Option 3: Live Real Money Quoter (BLOCKED until Dec 1st - requires real capital) ---
+# --- Option 2: Live Real Money Quoter (BLOCKED until Dec 1st - requires real capital) ---
 # ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.trading.runner --live --yes --budget-pct 0.20
 ```
 

@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS lots (
     last_mark REAL NOT NULL DEFAULT 0,
     tag TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS reward_accrual (
+    ts REAL NOT NULL,
+    day TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    accrued_usd REAL NOT NULL,
+    priced_markets INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reward_accrual_day ON reward_accrual (day, condition_id);
 """
 
 
@@ -276,6 +284,62 @@ class Ledger:
             self._row(strategy, "write_off", condition_id, token_id, shares, 0.0,
                       0.0, -cost, detail)
             return -cost
+
+    def record_reward_accrual(
+        self,
+        *,
+        day: str,
+        condition_id: str,
+        accrued_usd: float,
+        priced_markets: int,
+        ts: Optional[float] = None,
+    ) -> None:
+        """Journal one tick's per-market reward accrual.
+
+        ``day`` is the UTC epoch day (``YYYY-MM-DD``), the period the venue pays
+        on, and ``priced_markets`` is how many markets were priced in that tick
+        (repeated on every row of the tick) so a reader can tell a measured zero
+        from a market that was never priced. The row exists so the modelled
+        accrual can be joined, per condition and per day, against the venue's
+        own ``GET /rewards/user`` report: ``reward_accrual`` is the ledger side
+        of that reconciliation, and ``trades`` only carries the aggregate
+        credit.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO reward_accrual"
+                " (ts, day, condition_id, accrued_usd, priced_markets)"
+                " VALUES (?,?,?,?,?)",
+                (
+                    time.time() if ts is None else float(ts),
+                    str(day),
+                    str(condition_id),
+                    float(accrued_usd),
+                    int(priced_markets),
+                ),
+            )
+            self._conn.commit()
+
+    def reward_accrual_by_condition(self, day: str) -> dict[str, float]:
+        """Per-condition accrual summed over ``day`` (UTC epoch day)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT condition_id, SUM(accrued_usd) FROM reward_accrual"
+                " WHERE day = ? GROUP BY condition_id",
+                (str(day),),
+            ).fetchall()
+        return {str(condition_id): float(total or 0.0) for condition_id, total in rows}
+
+    def rebates_by_condition(self, day: str) -> dict[str, float]:
+        """Maker rebates credited on ``day``, per condition, from the journal."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT condition_id, SUM(cash_delta) FROM trades"
+                " WHERE kind = 'credit' AND detail LIKE 'maker_rebate%'"
+                " AND date(ts, 'unixepoch') = ? GROUP BY condition_id",
+                (str(day),),
+            ).fetchall()
+        return {str(condition_id): float(total or 0.0) for condition_id, total in rows}
 
     # -- marks -----------------------------------------------------------
     def credit(

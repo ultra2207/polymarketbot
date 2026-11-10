@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-from polymarketbot.data.universe import Market
 from polymarketbot.data.universe_metadata import apply_to_manifest, load_rows, to_row, write_rows
 
 
@@ -93,25 +92,3 @@ def test_metadata_parquet_round_trip(tmp_path) -> None:
     assert loaded["0xaaa"]["tags"] == ["Politics"]
 
 
-def test_market_round_trips_event_and_fee_fields() -> None:
-    market = Market(
-        condition_id="0xaaa",
-        question="q",
-        slug="s",
-        daily_pool=10.0,
-        min_size=5.0,
-        max_spread=4.0,
-        volume=1.0,
-        liquidity=2.0,
-        neg_risk=True,
-        tokens=("1", "2"),
-        event_id="30829",
-        event_title="Democratic Presidential Nominee 2028",
-        fee_type="politics_fees",
-        fee_rate=0.04,
-        tags=("Politics",),
-    )
-    item = market.to_dict()
-    assert item["event_id"] == "30829"
-    assert item["fee_type"] == "politics_fees"
-    assert item["tags"] == ["Politics"]

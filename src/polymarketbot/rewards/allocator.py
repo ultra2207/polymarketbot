@@ -65,6 +65,13 @@ class MarketAllocation:
     """Measured per-horizon fill probability behind the fill term; ``None``
     when the candidate's fill side was not priced."""
 
+    competing_samples: int = 0
+    """Venue-cadence readings behind ``competing_depth``. The venue divides by
+    the mean of up to 1,440 samples per epoch, so a ranking built on one
+    snapshot is labelled rather than presented as the epoch rate."""
+    competing_low_confidence: bool = False
+    """True when ``competing_depth`` came from a single snapshot."""
+
     @property
     def token_yes(self) -> str:
         if self.yes_token:
@@ -445,6 +452,20 @@ class LiquidityRewardsAllocator:
                 "measured fill side; accrual-only objective (measured share, unpriced fills)"
             )
 
+        thin = [
+            m for m in parsed_candidates
+            if bool(m["cand"].get("competing_low_confidence"))
+        ]
+        if thin:
+            # The venue divides by the epoch average of up to 1,440 samples; a
+            # ranking built on one snapshot is a point estimate and is labelled
+            # as such rather than reported as the epoch rate.
+            log.info(
+                f"allocator: {len(thin)}/{len(parsed_candidates)} candidate(s) rank on a "
+                "LOW-CONFIDENCE competing score (one snapshot, not an epoch average); "
+                "the estimate firms up as the venue-cadence window fills"
+            )
+
         if unmeasured:
             log.info(
                 f"allocator: refused {unmeasured}/{len(candidates)} candidates whose "
@@ -621,6 +642,10 @@ class LiquidityRewardsAllocator:
                         expected_fill_yield_usd_per_day=round(fill_usd, 4),
                         expected_total_yield_usd_per_day=round(payout * stay + fill_usd, 4),
                         p_fill=cand_dict.get("p_fill"),
+                        competing_samples=int(cand_dict.get("competing_samples") or 0),
+                        competing_low_confidence=bool(
+                            cand_dict.get("competing_low_confidence")
+                        ),
                     )
                 )
                 total_allocated += cap
@@ -780,6 +805,10 @@ class LiquidityRewardsAllocator:
                     expected_fill_yield_usd_per_day=round(fill_usd, 4),
                     expected_total_yield_usd_per_day=round(payout * stay + fill_usd, 4),
                     p_fill=cand_dict.get("p_fill"),
+                    competing_samples=int(cand_dict.get("competing_samples") or 0),
+                    competing_low_confidence=bool(
+                        cand_dict.get("competing_low_confidence")
+                    ),
                 )
             )
             total_allocated += cap

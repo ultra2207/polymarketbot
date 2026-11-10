@@ -1,12 +1,5 @@
-"""Institutional data collection package.
+"""Market data: UMA log decoding and Gamma universe metadata.
 
-Streams live in ``polymarketbot.data.streams`` and are discovered at runtime.
-Each stream module exposes ``NAME`` and ``async def run(ctx)``.
+The live collection platform (streams, builders, collectors) is retired; what
+remains is the decoding and metadata that the paper and live trading paths read.
 """
-
-from polymarketbot.data.config import load_config
-from polymarketbot.data.context import CollectorContext, HealthRegistry
-from polymarketbot.data.schema import SCHEMAS
-from polymarketbot.data.writer import WriterHub
-
-__all__ = ["CollectorContext", "HealthRegistry", "SCHEMAS", "WriterHub", "load_config"]

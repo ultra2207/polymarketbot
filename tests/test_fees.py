@@ -222,7 +222,8 @@ def test_unknown_fee_type_falls_back_to_era():
 def test_observed_fee_types_match_era_end_state():
     """Contract: the era table's final rates must equal what Gamma reports.
 
-    `fee_types` is measured from 1,937,137 markets (python -m polymarketbot.tools.validate_fee_model).
+    `fee_types` is measured from 1,937,137 markets (the measurement script has
+    been retired; the table is the recorded contract).
     If an era edit and the observed schedules disagree, every PnL number is
     wrong in one of the two eras, so fail loudly here.
     """

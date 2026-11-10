@@ -9,7 +9,10 @@ quote is one venue tick inside the touch, capped at the highest price that
 still rests below the ask, and a market whose quote falls outside the band is
 not a candidate.
 
-Every function is a pure function of its arguments; the caller owns all I/O.
+Every pricing function is a pure function of its arguments; the caller owns all
+I/O. The one piece of state is :class:`CompetingScoreWindow`, which the caller
+creates and feeds explicitly (it is the epoch-average estimator, and it is
+passed in, never global).
 
 Units: prices, mids and ticks are fractions of 1.00 USDC per share; spreads
 are cents; sizes are shares; ``daily_pool`` and capital are USDC per day and
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import statistics
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
@@ -32,11 +36,26 @@ from polymarketbot.rewards.allocator import (
     LiquidityRewardsAllocator,
     PortfolioAllocationResult,
 )
-from polymarketbot.rewards.scoring import single_sided_score_fraction
+from polymarketbot.rewards.scoring import (
+    PROTOCOL_EPOCH_SAMPLES,
+    SINGLE_SIDED_PENALTY,
+    single_sided_score_fraction,
+)
 
 log = get_logger(__name__)
 
 _SECONDS_PER_DAY = 86_400.0
+
+# The sampling cadence implied by the documented epoch, in seconds (60 s). The
+# competitor window below samples at this cadence rather than at the engine's
+# tick rate, so the estimate does not depend on whatever interval the engine
+# happens to run at.
+PROTOCOL_SAMPLE_INTERVAL_S = _SECONDS_PER_DAY / float(PROTOCOL_EPOCH_SAMPLES)
+# A window of one reading cannot state a variance and is not an average: the
+# venue's denominator is the mean over the epoch. Below two samples the
+# estimate is labelled low-confidence instead of being reported as the epoch
+# rate.
+MIN_CONFIDENT_SAMPLES = 2
 
 
 def _as_float(value: Any, missing: float) -> float:
@@ -117,14 +136,14 @@ def _fill_table() -> Any:
     """The measured horizon fill table, or ``None`` when it is unusable.
 
     Loaded from the same artifacts the CTF maker gate prices against
-    (``polymarketbot.paper.pillars.ctf``), so the two pillars cannot disagree
+    (``polymarketbot.rewards.fill_measurement``), so the two pillars cannot disagree
     about how often a resting bid at the touch is filled.
     """
     global _QUOTE_FILL_HORIZON, _QUOTE_FILL_HORIZON_TRIED
     if not _QUOTE_FILL_HORIZON_TRIED:
         _QUOTE_FILL_HORIZON_TRIED = True
         try:
-            from polymarketbot.paper.pillars.ctf import load_quote_fill_horizon
+            from polymarketbot.rewards.fill_measurement import load_quote_fill_horizon
 
             _QUOTE_FILL_HORIZON = load_quote_fill_horizon()
         except Exception as exc:  # noqa: BLE001 - a missing measurement is data, not a crash
@@ -141,7 +160,7 @@ def _markout_table() -> Any:
     if not _MAKER_MARKOUT_TRIED:
         _MAKER_MARKOUT_TRIED = True
         try:
-            from polymarketbot.paper.pillars.ctf import load_maker_markout
+            from polymarketbot.rewards.fill_measurement import load_maker_markout
 
             _MAKER_MARKOUT = load_maker_markout()
         except Exception as exc:  # noqa: BLE001
@@ -228,6 +247,206 @@ def _cheaper_leg(
     return best
 
 
+@dataclass(frozen=True)
+class CompetingEstimate:
+    """Epoch-average competing score estimated from measured samples.
+
+    ``mean`` is the arithmetic mean of the window's readings and is the
+    denominator used for ranking and accrual; ``samples`` states how many
+    venue-cadence snapshots it came from; ``variance`` is the unbiased sample
+    variance of the window (``None`` below two samples, where it is undefined);
+    ``snapshot`` is the latest raw reading. ``low_confidence`` is True below
+    :data:`MIN_CONFIDENT_SAMPLES`: one snapshot is a point observation of a
+    quantity that moves, not the epoch average the venue divides by, and
+    :attr:`label` says so.
+    """
+
+    mean: float
+    samples: int
+    variance: Optional[float]
+    snapshot: float
+
+    @property
+    def low_confidence(self) -> bool:
+        return self.samples < MIN_CONFIDENT_SAMPLES
+
+    @property
+    def label(self) -> str:
+        """Short provenance string for logs: sample count and confidence."""
+        if self.samples <= 0:
+            return "unmeasured"
+        if self.low_confidence:
+            return (
+                f"LOW-CONFIDENCE n={self.samples} "
+                f"(one snapshot, not an epoch average)"
+            )
+        spread = f", sd={math.sqrt(self.variance):,.1f}" if self.variance else ""
+        return f"n={self.samples}{spread}"
+
+
+class CompetingScoreWindow:
+    """Rolling window of measured competing scores, one reading per venue interval.
+
+    The venue divides a maker's score by the epoch average of the competing
+    book, over up to 1,440 samples. A single L2 snapshot is not that average:
+    measured on the paper engine it moved the implied reward rate 4.5x between
+    ticks ($104 -> $472.91/day, 49.37 %/day, window 9 of 2026-11-10) while the
+    time-averaged equity delta over the same 30 minutes was $286/day. This
+    window keeps at most one reading per :data:`PROTOCOL_SAMPLE_INTERVAL_S`
+    over one epoch and reports the mean, the count and the variance, so every
+    denominator can state how much evidence stands behind it.
+
+    A reading is only taken when the cadence has elapsed; the window itself is
+    pure state, the caller supplies ``now``.
+    """
+
+    def __init__(self, horizon_s: float = _SECONDS_PER_DAY) -> None:
+        self._horizon_s = float(horizon_s)
+        self._readings: dict[str, list[tuple[float, float]]] = {}
+
+    def _prune(self, condition_id: str, now: float) -> list[tuple[float, float]]:
+        cutoff = now - self._horizon_s
+        series = self._readings.get(condition_id)
+        if not series:
+            return []
+        while series and series[0][0] < cutoff:
+            series.pop(0)
+        return series
+
+    def observe(self, condition_id: str, snapshot: float, now: float) -> CompetingEstimate:
+        """Record one measured reading, at most once per venue sample interval.
+
+        ``snapshot`` must be a measured positive score; a zero or non-finite
+        reading is not a measurement of competition and raises rather than
+        entering the window as a zero denominator.
+        """
+        if not math.isfinite(snapshot) or snapshot <= 0.0:
+            raise ValueError(
+                f"competing score must be a measured positive value, got {snapshot!r}"
+            )
+        series = self._readings.setdefault(condition_id, [])
+        self._prune(condition_id, now)
+        if not series or now - series[-1][0] >= PROTOCOL_SAMPLE_INTERVAL_S:
+            series.append((float(now), float(snapshot)))
+        return self.estimate(condition_id, now, snapshot=snapshot)
+
+    def estimate(
+        self,
+        condition_id: str,
+        now: float,
+        snapshot: Optional[float] = None,
+    ) -> Optional[CompetingEstimate]:
+        """Window mean and its provenance; ``None`` when nothing was measured."""
+        series = self._prune(condition_id, now)
+        if not series:
+            return None
+        values = [value for _ts, value in series]
+        mean = sum(values) / len(values)
+        variance = statistics.variance(values) if len(values) >= MIN_CONFIDENT_SAMPLES else None
+        latest = float(snapshot) if snapshot is not None else values[-1]
+        return CompetingEstimate(
+            mean=mean, samples=len(values), variance=variance, snapshot=latest
+        )
+
+    def forget(self, condition_id: str) -> None:
+        """Drop a market's window (the market left the reward universe)."""
+        self._readings.pop(condition_id, None)
+
+    def clear(self) -> None:
+        self._readings.clear()
+
+
+@dataclass(frozen=True)
+class CompetingDetail:
+    """Measured in-band score of one market's pair, and what it can claim.
+
+    ``q_one_side`` is every bid on YES plus every ask on NO (the quantity that
+    sums to the venue's ``Q_one`` across makers), ``q_two_side`` its
+    complement, and ``total`` their sum - the denominator this pillar uses.
+    The venue's actual denominator is ``sum_makers Q_min``, and per maker
+    ``Q_min`` lies between ``(Q_one + Q_two) / (c + 1)`` and
+    ``Q_one + Q_two`` (the low end is a maker quoting one side at ``1/c`` of
+    the other, the high end a perfectly two-sided maker). Summing over makers,
+    the venue's denominator therefore lies in ``[total / (c + 1), total]``:
+    ``total`` is an upper bound, so the share this pillar claims is
+    *understated* - conservative, never an overclaim - by at most
+    :attr:`bias_factor_high`. The bracket cannot be tightened from the books
+    because per-maker pairing is not published.
+    """
+
+    total: float
+    q_one_side: float
+    q_two_side: float
+
+    @property
+    def venue_denominator_low(self) -> float:
+        return self.total / (1.0 + SINGLE_SIDED_PENALTY)
+
+    @property
+    def bias_factor_high(self) -> float:
+        return 1.0 + SINGLE_SIDED_PENALTY
+
+    @property
+    def direction(self) -> str:
+        return "overstates denominator -> understates our share (conservative)"
+
+
+def market_competing_detail(
+    market: Market, books: dict[str, dict[str, Any]]
+) -> Optional[CompetingDetail]:
+    """Side-resolved measured competing score of a binary market's pair.
+
+    Returns ``None`` under the same conditions as
+    :func:`market_competing_score`: a non-binary market, no published band, a
+    missing book or mid, or a measured total of zero (an unmeasured or empty
+    book, which cannot be told apart from a stale snapshot).
+    """
+    if not market.binary or market.reward_max_spread_cents <= 0.0:
+        return None
+    # Q_one is bids on YES plus asks on NO; Q_two the complement. Gamma lists
+    # outcomes as (Yes, No); when the label is missing the two sides cannot be
+    # attributed, but their sum (the denominator) is still measured.
+    yes_first = bool(market.outcomes) and str(market.outcomes[0]).upper() in ("YES", "Y")
+    q_one = 0.0
+    q_two = 0.0
+    for index, token_id in enumerate(market.token_ids):
+        book = books.get(token_id)
+        if not isinstance(book, dict):
+            return None
+        token_mid = mid(book)
+        if token_mid is None:
+            return None
+        band = float(market.reward_max_spread_cents)
+        is_yes = (index == 0) == yes_first
+        for side in ("bids", "asks"):
+            levels = book.get(side)
+            if not isinstance(levels, (list, tuple)):
+                continue
+            score = 0.0
+            for level in levels:
+                try:
+                    price = float(level["price"])
+                    size = float(level["size"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (0.0 < price < 1.0) or size <= 0.0:
+                    continue
+                distance = abs(price - token_mid) * 100.0
+                if distance > band:
+                    continue
+                score += size * ((band - distance) / band) ** 2
+            # A YES bid and a NO ask are the same book side of the pair; so are
+            # a YES ask and a NO bid. This mirrors Q_one/Q_two in the docs.
+            if (side == "bids") == is_yes:
+                q_one += score
+            else:
+                q_two += score
+    total = q_one + q_two
+    if total <= 0.0:
+        return None
+    return CompetingDetail(total=total, q_one_side=q_one, q_two_side=q_two)
+
+
 def market_competing_score(
     market: Market, books: dict[str, dict[str, Any]]
 ) -> Optional[float]:
@@ -253,23 +472,17 @@ def market_competing_score(
     indistinguishable from a stale snapshot, so the caller must refuse the
     market instead of pricing it. A market that is not binary has no pair to
     measure and is likewise refused.
+
+    This sum is ``Q_one + Q_two`` over every resting order, while the venue's
+    denominator is ``sum_makers Q_min``. It is therefore an **upper bound**
+    (see :class:`CompetingDetail`): our share is understated by a factor
+    between ``1`` and ``1 + c``, which is the conservative direction and is
+    stated in the accrual log. It is also a *snapshot*; the venue averages
+    1,440 of them per epoch, so callers that price a rate must feed
+    :class:`CompetingScoreWindow` rather than use this reading directly.
     """
-    if not market.binary or market.reward_max_spread_cents <= 0.0:
-        return None
-    total = 0.0
-    for token_id in market.token_ids:
-        book = books.get(token_id)
-        if not isinstance(book, dict):
-            return None
-        token_mid = mid(book)
-        if token_mid is None:
-            return None
-        total += qualifying_score(
-            book,
-            max_spread_cents=market.reward_max_spread_cents,
-            mid_price=token_mid,
-        )
-    return total if total > 0.0 else None
+    detail = market_competing_detail(market, books)
+    return None if detail is None else detail.total
 
 
 def reward_candidates(
@@ -277,6 +490,8 @@ def reward_candidates(
     books: dict[str, dict[str, Any]],
     tape_prints: list[Print],
     fill_horizon_s: Optional[float] = None,
+    competitor: Optional[CompetingScoreWindow] = None,
+    now: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Allocator candidate dicts for every market quoting inside the band.
 
@@ -303,10 +518,20 @@ def reward_candidates(
     summed over both outcome-token books (see :func:`market_competing_score`) -
     an upper bound on the competitors' ``Q_min``, because every competitor's own
     two-sided penalty can only shrink it (``sum Q_min <= sum raw``). Using the
-    upper bound understates our share, which is the safe direction. A market
-    whose books or mids are missing, or whose measured total is zero, is refused
-    here rather than priced at a floor: the denominator is the claim's only
-    evidence.
+    upper bound understates our share, which is the safe direction; the
+    candidate carries ``venue_denominator_low`` and ``denominator_bias_high``
+    so a caller can state the bracket instead of hiding it. A market whose
+    books or mids are missing, or whose measured total is zero, is refused here
+    rather than priced at a floor: the denominator is the claim's only evidence.
+
+    ``competitor`` (with the sample clock ``now``) turns that single snapshot
+    into the venue's epoch-average estimate: every candidate is observed into
+    the rolling window, and ``competing_score`` is the window **mean**, with
+    ``competing_samples``, ``competing_variance`` and
+    ``competing_low_confidence`` stating how much evidence stands behind it. A
+    one-sample window is reported as low-confidence, never as the epoch rate.
+    Without a window the candidate carries one snapshot and is likewise marked
+    low-confidence.
 
     ``lot_price`` is the price our own order rests at, so the optimizer funds
     the venue's minimum *share* lot at the quote rather than at the mid.
@@ -363,9 +588,21 @@ def reward_candidates(
         score_fraction = single_sided_score_fraction(leg_mid)
         if score_fraction <= 0.0:
             continue
-        score = market_competing_score(market, books)
-        if score is None:
+        detail = market_competing_detail(market, books)
+        if detail is None:
             continue
+        estimate: Optional[CompetingEstimate] = None
+        if competitor is not None:
+            if now is None:
+                raise ValueError(
+                    "reward_candidates needs the sample clock `now` when a "
+                    "competitor window is supplied: a timestamp invented here "
+                    "would place the reading in the wrong epoch"
+                )
+            estimate = competitor.observe(market.condition_id, detail.total, float(now))
+        score = detail.total if estimate is None else estimate.mean
+        samples = 1 if estimate is None else estimate.samples
+        low_confidence = True if estimate is None else estimate.low_confidence
         min_size = max(market.reward_min_size, market.min_order)
         fill_yield: Optional[MarketFillYield] = None
         if fill_horizon_s is not None:
@@ -389,6 +626,17 @@ def reward_candidates(
                 "question": market.question,
                 "daily_pool": market.daily_reward,
                 "competing_score": score,
+                # Provenance of the denominator: how many venue-cadence
+                # readings the mean came from, their variance, and whether a
+                # single snapshot is all the evidence there is.
+                "competing_snapshot": detail.total,
+                "competing_samples": samples,
+                "competing_variance": None if estimate is None else estimate.variance,
+                "competing_low_confidence": low_confidence,
+                # Q_one+Q_two is an upper bound on the venue's sum Q_min:
+                # ours overstates by at most `denominator_bias_high`x.
+                "venue_denominator_low": detail.venue_denominator_low,
+                "denominator_bias_high": detail.bias_factor_high,
                 "max_spread": market.reward_max_spread_cents,
                 "min_size": min_size,
                 "real_mid": leg_mid,
@@ -453,11 +701,18 @@ class AccrualShare:
     ``pool * our_score / (measured_competing_score + our_score)``, with
     ``our_score = alpha(shares, |price - leg_mid|) * shares * 1/c`` (``c`` = the
     venue's one-sided penalty) and ``competing_score`` the pair-wide in-band
-    score from :func:`market_competing_score`. ``qualifies`` is False when the
-    quote earns the venue nothing at all (size below the market's reward
-    minimum, price outside the band, or a leg mid outside the two-sided band);
-    the payout is then a measured zero rather than an omission. Units: USD/day,
-    shares, score units, USD/day.
+    score, as the epoch-average estimate from
+    :class:`CompetingScoreWindow` when the caller supplies one (otherwise a
+    single snapshot). ``qualifies`` is False when the quote earns the venue
+    nothing at all (size below the market's reward minimum, price outside the
+    band, or a leg mid outside the two-sided band); the payout is then a
+    measured zero rather than an omission.
+
+    ``competing_samples``, ``competing_variance`` and ``low_confidence`` are the
+    provenance of the denominator: a single-sample estimate is flagged rather
+    than presented as the epoch rate, and ``competing_snapshot`` keeps the raw
+    latest reading so the averaging is auditable. Units: USD/day, shares, score
+    units, USD/day.
     """
 
     usd_per_day: float
@@ -466,6 +721,17 @@ class AccrualShare:
     competing_score: float
     pool_usd_per_day: float
     qualifies: bool
+    competing_samples: int = 1
+    competing_variance: Optional[float] = None
+    low_confidence: bool = True
+    competing_snapshot: Optional[float] = None
+
+    @property
+    def provenance(self) -> str:
+        if self.low_confidence:
+            return f"LOW-CONFIDENCE n={self.competing_samples} (snapshot, not an epoch average)"
+        spread = f", sd={math.sqrt(self.competing_variance):,.1f}" if self.competing_variance else ""
+        return f"n={self.competing_samples}{spread}"
 
 
 def measured_accrual(
@@ -477,6 +743,7 @@ def measured_accrual(
     max_spread_cents: Optional[float],
     leg_book: Optional[dict[str, Any]],
     other_book: Optional[dict[str, Any]],
+    competing: Optional[CompetingEstimate] = None,
 ) -> Optional[AccrualShare]:
     """The payout a resting bid earns per day, from its own measured books.
 
@@ -484,11 +751,18 @@ def measured_accrual(
     measurement and nothing has a fallback: the pool is the venue's published
     daily rate for the market, the band and the minimum size are the venue's
     published campaign parameters, ``price``/``shares`` are what is actually
-    resting, and the mid and competing score come from the current L2 snapshot
-    of *both* outcome-token books. Returns ``None`` - and the caller must then
-    credit nothing - when any of those is missing or when the measured
-    competing score is zero (a singular denominator), because a payout without
-    a measured denominator is a guess.
+    resting, and the mid comes from the current L2 snapshot of *both*
+    outcome-token books. Returns ``None`` - and the caller must then credit
+    nothing - when any of those is missing or when the measured competing score
+    is zero (a singular denominator), because a payout without a measured
+    denominator is a guess.
+
+    ``competing`` is the epoch-average estimate for this market's pair. The
+    venue divides by the average of up to 1,440 samples, so pricing an epoch
+    rate from one snapshot is the estimator error this parameter removes: when
+    it is supplied the mean is used and the sample count travels with the
+    result; when it is absent the single measured snapshot is used and the
+    result is marked low-confidence.
 
     Deliberately different from :func:`quotes_from_allocation`: that one prices
     a *plan* from the optimizer, whose payout was computed once for the planned
@@ -507,40 +781,60 @@ def measured_accrual(
     other_mid = mid(other_book)
     if leg_mid is None or other_mid is None:
         return None
-    competing = qualifying_score(
+    snapshot = qualifying_score(
         leg_book, max_spread_cents=max_spread_cents, mid_price=leg_mid
     ) + qualifying_score(
         other_book, max_spread_cents=max_spread_cents, mid_price=other_mid
     )
-    if competing <= 0.0:
+    if competing is not None:
+        denominator = float(competing.mean)
+        samples = competing.samples
+        variance = competing.variance
+        low = competing.low_confidence
+        latest = competing.snapshot
+    else:
+        denominator = snapshot
+        samples = 1
+        variance = None
+        low = True
+        latest = snapshot
+    if denominator <= 0.0:
         return None
+
+    def _share(usd: float, share: float, our: float, qualifies: bool) -> AccrualShare:
+        return AccrualShare(
+            usd_per_day=usd,
+            share=share,
+            our_score=our,
+            competing_score=denominator,
+            pool_usd_per_day=pool_usd_per_day,
+            qualifies=qualifies,
+            competing_samples=samples,
+            competing_variance=variance,
+            low_confidence=low,
+            competing_snapshot=latest,
+        )
+
     if shares <= 0.0 or shares < min_size or not 0.0 < price < 1.0:
-        return AccrualShare(0.0, 0.0, 0.0, competing, pool_usd_per_day, False)
+        return _share(0.0, 0.0, 0.0, False)
     band = float(max_spread_cents)
     distance = abs(price - leg_mid) * 100.0
     if distance >= band:
         # Outside the band the venue scores nothing: a measured zero payout.
-        return AccrualShare(0.0, 0.0, 0.0, competing, pool_usd_per_day, False)
+        return _share(0.0, 0.0, 0.0, False)
     fraction = single_sided_score_fraction(leg_mid)
     if fraction <= 0.0:
-        return AccrualShare(0.0, 0.0, 0.0, competing, pool_usd_per_day, False)
+        return _share(0.0, 0.0, 0.0, False)
     our_score = ((band - distance) / band) ** 2 * float(shares) * fraction
-    denom = competing + our_score
+    denom = denominator + our_score
     share = our_score / denom if denom > 0.0 else 0.0
     usd_per_day = pool_usd_per_day * share
     # Documented venue floor: a market whose daily payout is below $1.00 pays
     # nothing, so the quote's share of it is a measured zero, not a small cash
     # amount the engine would otherwise bank.
     if usd_per_day < PROTOCOL_MIN_DAILY_PAYOUT_USD:
-        return AccrualShare(0.0, share, our_score, competing, pool_usd_per_day, False)
-    return AccrualShare(
-        usd_per_day=usd_per_day,
-        share=share,
-        our_score=our_score,
-        competing_score=competing,
-        pool_usd_per_day=pool_usd_per_day,
-        qualifies=True,
-    )
+        return _share(0.0, share, our_score, False)
+    return _share(usd_per_day, share, our_score, True)
 
 
 @dataclass(frozen=True)

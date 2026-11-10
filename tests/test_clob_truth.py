@@ -367,6 +367,17 @@ def test_daily_rewards_paginates_and_converts_asset_rates():
                 },
             ],
         }),
+        # Maker rebates are a separate per-wallet program; the day's rebated
+        # fees are read from /rebates/current.
+        FakeResponse([
+            {
+                "date": "2026-01-02",
+                "condition_id": "0xcond1",
+                "asset_address": USDC_ADDRESS,
+                "maker_address": PROXY_ADDRESS,
+                "rebated_fees_usdc": "0.750000",
+            },
+        ]),
     )
     client = make_client(fake)
     daily = client.get_daily_rewards("2026-01-02")
@@ -375,7 +386,11 @@ def test_daily_rewards_paginates_and_converts_asset_rates():
     assert daily["source"] == "clob_api"
     assert daily["date"] == "2026-01-02"
     assert daily["daily_rewards_usd"] == pytest.approx(0.237519 + expected_cond2)
-    assert daily["daily_combined_usd"] == pytest.approx(daily["daily_rewards_usd"])
+    assert daily["daily_rebates_usd"] == pytest.approx(0.75)
+    assert daily["rebate_source"] == "clob_api"
+    assert daily["daily_combined_usd"] == pytest.approx(
+        daily["daily_rewards_usd"] + 0.75
+    )
     assert daily["unknown_earnings"] == []
     assert daily["row_count"] == 3
 
@@ -386,12 +401,58 @@ def test_daily_rewards_paginates_and_converts_asset_rates():
     assert [c["url"] for c in fake.calls] == [
         "https://clob.polymarket.com/rewards/user",
         "https://clob.polymarket.com/rewards/user",
+        "https://clob.polymarket.com/rebates/current",
     ]
     assert params_of(fake.calls[0])["date"] == "2026-01-02"
     assert params_of(fake.calls[0])["signature_type"] == 1
     assert params_of(fake.calls[0])["maker_address"] == PROXY_ADDRESS
     assert params_of(fake.calls[0])["next_cursor"] == "MA=="
     assert params_of(fake.calls[1])["next_cursor"] == "MTAw"
+
+
+def test_current_rebates_reads_the_venue_number_and_null_as_zero():
+    fake = FakeSession(FakeResponse([
+        {
+            "date": "2026-10-06",
+            "condition_id": "0xcond1",
+            "asset_address": USDC_ADDRESS,
+            "maker_address": PROXY_ADDRESS,
+            "rebated_fees_usdc": "1.599840",
+        },
+        {
+            "date": "2026-10-06",
+            "condition_id": "0xcond1",
+            "asset_address": USDC_ADDRESS,
+            "maker_address": PROXY_ADDRESS,
+            "rebated_fees_usdc": "0.400160",
+        },
+    ]))
+    client = make_client(fake)
+    rebates = client.get_current_rebates("2026-10-06")
+
+    assert rebates["source"] == "clob_api"
+    assert rebates["total_usd"] == pytest.approx(2.0)
+    assert rebates["by_condition"] == {"0xcond1": pytest.approx(2.0)}
+    assert rebates["row_count"] == 2
+    assert fake.calls[0]["url"].endswith("/rebates/current")
+    params = params_of(fake.calls[0])
+    assert params["date"] == "2026-10-06"
+    assert params["maker_address"] == PROXY_ADDRESS
+
+    # Documented "no rows" answer: the venue was asked and has nothing to
+    # report, which is a measured zero rather than an unreadable endpoint.
+    empty = make_client(FakeSession(FakeResponse(None)))
+    none = empty.get_current_rebates("2026-10-06")
+    assert none["source"] == "clob_api"
+    assert none["total_usd"] == 0.0
+    assert none["by_condition"] == {}
+
+    # An unreachable endpoint must not be reported as a zero payout.
+    down = make_client(FakeSession(FakeResponse({"error": "boom"}, status_code=503)))
+    failed = down.get_current_rebates("2026-10-06")
+    assert failed["source"] == "unavailable"
+    assert failed["error"]
+    assert failed["by_condition"] == {}
 
 
 def test_daily_rewards_missing_rate_only_defaults_for_usdc():

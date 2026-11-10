@@ -1,124 +1,14 @@
-"""Domain 2: UMA Settlement Basis & Resolution Discount Harvester.
+"""Domain 2: UMA settlement basis and resolution-risk models.
 
 Provides:
-- Event Listener for UMA Optimistic Oracle and Polygon CTF resolution logs.
-- Emergency Circuit Breakers triggered by UMA DisputePrice events.
-- Passive CLOB Order Placer targeting 50-250 bps settlement discounts.
-- Smart Settlement Worker executing on-chain `CTF.redeemPositions()`.
-- Production Harvester Engine orchestrating the entire lifecycle.
+- ``types``: shared data structures for proposals, disputes and resolutions.
+- ``robust_hazard``: dispute hazard, liveness and gas-delay modelling.
+- ``settlement_fair_value``: oracle-verdict fair value and decay.
+- ``tail_evidence``: measured tail-risk evidence loading.
+- ``settlement_allocator``: marginal settlement allocation.
+
+This package deliberately re-exports nothing.  Import each symbol from the
+module that defines it (``polymarketbot.trading.domain2.types``,
+``polymarketbot.trading.domain2.settlement_allocator``, ...) so that a consumer
+of a single submodule executes only that submodule.
 """
-
-from __future__ import annotations
-
-from polymarketbot.trading.domain2.types import (
-    Domain2MarketState,
-    UmaProposalEvent,
-    UmaDisputeEvent,
-    ConditionResolutionEvent,
-    DiscountOpportunity,
-    Domain2Position,
-    MakerExecutionRegime,
-    MakerPricingDecision,
-    LiveBookMetrics,
-)
-from polymarketbot.trading.domain2.maker_pricing_engine import (
-    SettlementMakerPricingEngine,
-    MakerEngineConfig,
-    RollingTradeBuffer,
-    parse_l2_book,
-    calculate_upward_drift_rate,
-)
-from polymarketbot.trading.domain2.event_listener import (
-    Domain2EventListener,
-    UMA_OO_V2,
-    CTF_CONTRACT,
-    TOPIC_PROPOSE_PRICE,
-    TOPIC_DISPUTE_PRICE,
-    TOPIC_CONDITION_RESOLUTION,
-)
-from polymarketbot.trading.domain2.circuit_breaker import Domain2CircuitBreaker
-from polymarketbot.trading.domain2.clob_order_placer import Domain2ClobOrderPlacer
-from polymarketbot.trading.domain2.settlement_worker import Domain2SettlementWorker
-from polymarketbot.trading.domain2.harvester_engine import Domain2SettlementHarvester
-from polymarketbot.trading.domain2.ortools_allocator import (
-    Domain2OrtoolsAllocator,
-    Domain2Candidate,
-    Domain2Allocation,
-    Domain2OptimizationResult,
-)
-from polymarketbot.trading.domain2.dynamic_sizer import (
-    DynamicPositionSizer,
-    DynamicSizerConfig,
-    StrikeDistanceMetrics,
-)
-from polymarketbot.trading.domain2.settlement_allocator import (
-    HeldExposure,
-    MarginalSettlementAllocator,
-    ResolutionClusterBook,
-    SettlementCandidate,
-    SettlementAllocation,
-    SettlementOptimizationResult,
-    TailBudgetReport,
-)
-from polymarketbot.trading.domain2.tail_evidence import (
-    TailEvidence,
-    UnmeasuredTail,
-    load_tail_evidence,
-)
-from polymarketbot.trading.domain2.gamma_universe import StratumSweep, sweep_stratum
-from polymarketbot.trading.domain2.robust_hazard import (
-    BayesianDisputeTracker,
-    MeasuredDisputeCounts,
-    measured_dispute_counts,
-    redemption_gas_usd,
-)
-
-__all__ = [
-    "Domain2MarketState",
-    "UmaProposalEvent",
-    "UmaDisputeEvent",
-    "ConditionResolutionEvent",
-    "DiscountOpportunity",
-    "Domain2Position",
-    "MakerExecutionRegime",
-    "MakerPricingDecision",
-    "LiveBookMetrics",
-    "SettlementMakerPricingEngine",
-    "MakerEngineConfig",
-    "RollingTradeBuffer",
-    "parse_l2_book",
-    "calculate_upward_drift_rate",
-    "Domain2EventListener",
-    "Domain2CircuitBreaker",
-    "Domain2ClobOrderPlacer",
-    "Domain2SettlementWorker",
-    "Domain2SettlementHarvester",
-    "Domain2OrtoolsAllocator",
-    "Domain2Candidate",
-    "Domain2Allocation",
-    "Domain2OptimizationResult",
-    "DynamicPositionSizer",
-    "DynamicSizerConfig",
-    "StrikeDistanceMetrics",
-    "MarginalSettlementAllocator",
-    "SettlementCandidate",
-    "SettlementAllocation",
-    "SettlementOptimizationResult",
-    "HeldExposure",
-    "ResolutionClusterBook",
-    "TailBudgetReport",
-    "TailEvidence",
-    "UnmeasuredTail",
-    "load_tail_evidence",
-    "StratumSweep",
-    "sweep_stratum",
-    "BayesianDisputeTracker",
-    "MeasuredDisputeCounts",
-    "measured_dispute_counts",
-    "redemption_gas_usd",
-    "UMA_OO_V2",
-    "CTF_CONTRACT",
-    "TOPIC_PROPOSE_PRICE",
-    "TOPIC_DISPUTE_PRICE",
-    "TOPIC_CONDITION_RESOLUTION",
-]
