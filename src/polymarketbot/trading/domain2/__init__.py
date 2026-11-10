@@ -52,10 +52,25 @@ from polymarketbot.trading.domain2.dynamic_sizer import (
     StrikeDistanceMetrics,
 )
 from polymarketbot.trading.domain2.settlement_allocator import (
+    HeldExposure,
     MarginalSettlementAllocator,
+    ResolutionClusterBook,
     SettlementCandidate,
     SettlementAllocation,
     SettlementOptimizationResult,
+    TailBudgetReport,
+)
+from polymarketbot.trading.domain2.tail_evidence import (
+    TailEvidence,
+    UnmeasuredTail,
+    load_tail_evidence,
+)
+from polymarketbot.trading.domain2.gamma_universe import StratumSweep, sweep_stratum
+from polymarketbot.trading.domain2.robust_hazard import (
+    BayesianDisputeTracker,
+    MeasuredDisputeCounts,
+    measured_dispute_counts,
+    redemption_gas_usd,
 )
 
 __all__ = [
@@ -89,6 +104,18 @@ __all__ = [
     "SettlementCandidate",
     "SettlementAllocation",
     "SettlementOptimizationResult",
+    "HeldExposure",
+    "ResolutionClusterBook",
+    "TailBudgetReport",
+    "TailEvidence",
+    "UnmeasuredTail",
+    "load_tail_evidence",
+    "StratumSweep",
+    "sweep_stratum",
+    "BayesianDisputeTracker",
+    "MeasuredDisputeCounts",
+    "measured_dispute_counts",
+    "redemption_gas_usd",
     "UMA_OO_V2",
     "CTF_CONTRACT",
     "TOPIC_PROPOSE_PRICE",

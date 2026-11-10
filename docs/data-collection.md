@@ -128,7 +128,7 @@ Two corrections to the master plan are baked into this implementation:
 The collector polls Kalshi by ticker, so it needs a list of Kalshi tickers that
 mean the same thing as a Polymarket condition. There is no shared id; the map is
 derived deterministically from structure and tokens (no model calls) by
-`scripts/build_kalshi_mapping.py` → `data/derived/kalshi_mapping.parquet`:
+`polymarketbot.data.kalshi_mapping` → `data/derived/kalshi_mapping.parquet`:
 
 1. read `data/tape/manifest_current.json` (the live universe; 3,255 markets
    at 2026-11-04T10:10Z);
@@ -367,7 +367,7 @@ or a manual anchor reset. A corrupt state file is logged and starts cold.
 
 ```bash
 # smoke run against the live RPC; separate tape root
-.venv/Scripts/python.exe scripts/run_data_collector.py \
+.venv/Scripts/python.exe -m polymarketbot.data.collector \
   --streams uma --duration 60 --root data/tape_smoke_uma
 ```
 
@@ -412,20 +412,20 @@ data/tape/
 Preflight (first run is capped at 300 s):
 
 ```bash
-.venv/Scripts/python.exe scripts/run_data_collector.py --duration 300
+.venv/Scripts/python.exe -m polymarketbot.data.collector --duration 300
 ```
 
 One stream only:
 
 ```bash
-.venv/Scripts/python.exe scripts/run_data_collector.py --streams clob --duration 60
+.venv/Scripts/python.exe -m polymarketbot.data.collector --streams clob --duration 60
 ```
 
 14-day run (run it in a persistent terminal; the supervisor restarts a crashed
 stream with backoff, and the WAL recovers on restart):
 
 ```bash
-.venv/Scripts/python.exe scripts/run_data_collector.py --allow-long --duration 0
+.venv/Scripts/python.exe -m polymarketbot.data.collector --allow-long --duration 0
 ```
 
 Stop with Ctrl-C. The collector cancels streams, flushes and compacts the
@@ -436,13 +436,13 @@ touch the production tape.
 
 ### Long-running supervision
 
-`scripts/watchdog_collector.py` is the missing restart supervisor. It looks for
+`polymarketbot.ops.watchdog` is the missing restart supervisor. It looks for
 a live `run_data_collector.py` (it handles the uv venv trampoline, which makes
 the process appear twice), starts one detached when none exists, and never kills
 a slow but live process. Install it for the current user, no admin needed:
 
 ```bash
-schtasks /create /tn PolymarketCollector /tr "\"C:\Users\Sivasai\Documents\GitHub\polymarketbot\.venv\Scripts\python.exe\" \"C:\Users\Sivasai\Documents\GitHub\polymarketbot\scripts\watchdog_collector.py\" --once" /sc minute /mo 120 /f
+schtasks /create /tn PolymarketCollector /tr "\"C:\Users\Sivasai\Documents\GitHub\polymarketbot\.venv\Scripts\python.exe\" -m polymarketbot.ops.watchdog --once" /sc minute /mo 120 /f
 ```
 
 The registered task repeats every 2 hours (the collector itself runs detached,
@@ -460,7 +460,7 @@ the 2026-11-01 Gamma snapshot predates most of the current universe. Refresh
 the fields keyed by the live manifest:
 
 ```bash
-.venv/Scripts/python.exe scripts/refresh_universe_metadata.py
+.venv/Scripts/python.exe -m polymarketbot.data.refresh_universe_metadata
 ```
 
 That is 25 Gamma requests (~8 s for 2,496 markets). It writes
@@ -476,7 +476,7 @@ and backtest scripts prefer the live table over the snapshot; as of
 ## UMA resolution events (derived)
 
 `data/derived/uma_events.parquet` is rebuilt from `polygon_logs` by
-`scripts/replay_uma.py`. It answers the questions Gamma cannot: when a price was
+`polymarketbot.data.uma_replay`. It answers the questions Gamma cannot: when a price was
 requested, who proposed it, at what price, whether it was disputed, when the
 proposal expires, and when it settled.
 
@@ -512,8 +512,8 @@ versions emit `QuestionReset(bytes32)`, `QuestionPaused(bytes32)` and
 |---|---|---|
 | Optimistic Oracle V2 | `RequestPrice(address,bytes32,uint256,bytes,address,uint256,uint256)` | `0xf1679315ff325c257a944e0ca1bfe7b26616039e9511f9610d4ba3eca851027b` |
 | Optimistic Oracle V2 | `ProposePrice(address,address,bytes32,uint256,bytes,int256,uint256,address)` | `0x6e51dd00371aabffa82cd401592f76ed51e98a9ea4b58751c70463a2c78b5ca1` |
-| Optimistic Oracle V2 | `DisputePrice(address,address,bytes32,uint256,bytes,int256)` | `0xdb5d525cf38fcf3b5f15304610b0482cea1a86f2c3aac48adf04617cf8a84490` |
-| Optimistic Oracle V2 | `Settle(address,address,address,bytes32,uint256,bytes,int256,int256)` | `0x44b71f4dd337078450f2f5aa7bf770c1b0005de6ccd88581311987934eaa5711` |
+| Optimistic Oracle V2 | `DisputePrice(address,address,address,bytes32,uint256,bytes,int256)` | `0x5165909c3d1c01c5d1e121ac6f6d01dda1ba24bc9e1f975b5a375339c15be7f3` |
+| Optimistic Oracle V2 | `Settle(address,address,address,bytes32,uint256,bytes,int256,uint256)` | `0x3f384afb4bd9f0aef0298c80399950011420eb33b0e1a750b20966270247b9a0` |
 | Adapter v1 | `QuestionInitialized(bytes32,bytes,uint256,address,uint256,uint256,bool)` | `0x53af6c2e40505bb55a47d917203a12c8f063b6c505c11094d98ac8f772e8a031` |
 | Adapter v1 | `ResolutionDataRequested(address,uint256,bytes32,bytes32,bytes,address,uint256,uint256,bool)` | `0x6010c5373137e7c7c584b6bf87be56bf4a685890351251ac0a8d74e599455929` |
 | Adapter v2 | `QuestionInitialized(bytes32,uint256,address,bytes,address,uint256,uint256)` | `0xeee0897acd6893adcaf2ba5158191b3601098ab6bece35c5d57874340b64c5b7` |
@@ -557,9 +557,9 @@ is worse than a parse at the query site.
 ### Running the replay
 
 ```bash
-.venv/Scripts/python.exe scripts/replay_uma.py
+.venv/Scripts/python.exe -m polymarketbot.data.uma_replay
 # decode everything again, replacing the output
-.venv/Scripts/python.exe scripts/replay_uma.py --reset
+.venv/Scripts/python.exe -m polymarketbot.data.uma_replay --reset
 ```
 
 The script scans `data/tape/polygon_logs/**/*.parquet` oldest first, filters on
@@ -598,10 +598,10 @@ Assumptions and limits:
 
 ```bash
 # per-table row counts, time range, gaps
-.venv/Scripts/python.exe scripts/validate_tape.py --summary --root data/tape
+.venv/Scripts/python.exe -m polymarketbot.data.tape_validation --summary --root data/tape
 
 # replay one asset/hour and optionally compare to the live REST book
-.venv/Scripts/python.exe scripts/validate_tape.py \
+.venv/Scripts/python.exe -m polymarketbot.data.tape_validation \
   --root data/tape --table clob_events --asset <token_id> --hour 20261104T12 \
   --rest-check
 ```
@@ -612,15 +612,15 @@ resync anchor. A gap is recorded, never silently filled.
 
 ## Cost stack: spread, markout, fees, gas
 
-`scripts/report_tape_costs.py` answers the Gate 1 question from the raw tape,
+`polymarketbot.reports.tape_costs` answers the Gate 1 question from the raw tape,
 not from the paper engine:
 
 ```bash
 # default: the last two UTC hours in the tape
-.venv/Scripts/python.exe scripts/report_tape_costs.py --top 20
+.venv/Scripts/python.exe -m polymarketbot.reports.tape_costs --top 20
 
 # a named window and a stated POL price for gas in USD
-.venv/Scripts/python.exe scripts/report_tape_costs.py \
+.venv/Scripts/python.exe -m polymarketbot.reports.tape_costs \
   --date 2026-11-04 --hour-from 13 --hour-to 14 --pol-usd 0.40
 ```
 
@@ -655,14 +655,14 @@ replays that into per-level queue telemetry for a hypothetical maker order.
 
 ```bash
 # first run: the hour's most-traded asset, prints counts
-.venv/Scripts/python.exe scripts/build_l3_queue.py --date 2026-11-04 --hour 01
+.venv/Scripts/python.exe -m polymarketbot.data.l3_queue --date 2026-11-04 --hour 01
 
 # one named asset-hour
-.venv/Scripts/python.exe scripts/build_l3_queue.py --date 2026-11-04 --hour 01 \
+.venv/Scripts/python.exe -m polymarketbot.data.l3_queue --date 2026-11-04 --hour 01 \
   --asset 107118433685650702332040991454078902188473746599223732907923581436160160612542
 
 # expand: every asset with a book in the hour, in batches
-.venv/Scripts/python.exe scripts/build_l3_queue.py --date 2026-11-04 --hour 01 \
+.venv/Scripts/python.exe -m polymarketbot.data.l3_queue --date 2026-11-04 --hour 01 \
   --all-assets --assets-per-batch 25
 ```
 
@@ -938,7 +938,7 @@ compacted, so no rows were lost.
   `data.news.log`, `data.kalshi.log`, …)
 * metadata `data/tape/runs/20261104T010043.json`
 * stop: `taskkill /PID 30336` (or `Stop-Process -Id 30336`)
-* monitor: `python scripts/validate_tape.py --summary --root data/tape`
+* monitor: `python -m polymarketbot.data.tape_validation --summary --root data/tape`
 
 CLOB shards now connect 2 s apart. Eight simultaneous handshakes after a
 restart were reset by Polymarket's connection rate limit; a 120 s staggered
@@ -1053,8 +1053,9 @@ sample size, and n/a rules. They read the tape; none sits in the collector path.
 
 | Script | Answers | Main caveat it prints |
 |---|---|---|
-| `scripts/score_markets.py` | Per-condition spread, markout(300 s), fee/share, `edge = half_spread − markout − fee`, Gate 1, reward/capital | fee coverage: 832/834 traded conditions (2026-11-05 window) via `universe_metadata`; the 2026-11-01 snapshot alone covers 138/647; passes with n<30 are marked, not measurements |
-| `scripts/calibrate_fill_model.py` | P(fill) by pre-event queue ratio × size, isotonic + logistic | `queue_ratio=1` is a separate regime (0/3,376 fills); strict-penetration sensitivity printed |
+| `polymarketbot.tools.market_scorecard` | Per-condition spread, markout(300 s), fee/share, `edge = half_spread − markout − fee`, Gate 1, reward/capital | fee coverage: 832/834 traded conditions (2026-11-05 window) via `universe_metadata`; the 2026-11-01 snapshot alone covers 138/647; passes with n<30 are marked, not measurements |
+| `polymarketbot.tools.fill_calibration` | P(fill) by pre-event queue ratio × size, isotonic + logistic | `queue_ratio=1` is a separate regime (0/3,376 fills); strict-penetration sensitivity printed |
+| `polymarketbot.tools.ctf_quote_fill_horizon` | Horizon-matched P(fill) for a buy at `best_bid + tick`, per requote lifetime / tick / minimum order | print-conditional, not joint: `fill_model.json` has no arrival rate and overstates a one-tick quote ~2,000×; the sample is 3 of 72 recorded tape hours (hour=10 of 2026-11-04/05/06), 8.77M placements |
 | `scripts/scan_toxicity.py` | Signed markout(30 s/5 m), trade imbalance, OFI per condition × 5 min | OFI flags a no-trade bucket; wide matched quotes dropped |
 | `scripts/backtest_quotes.py` | Quote episodes on one L3 asset-hour: observed fill rate, spread capture, markout, gas | shadow-order fill count is an optimistic upper bound; one asset-hour is not a strategy result |
 | `scripts/report_kalshi_basis.py` | Polymarket vs Kalshi mid basis, spreads, lead-lag | only 76 mapped pairs are quoted on both sides; the panel needs ≥30 pairs |

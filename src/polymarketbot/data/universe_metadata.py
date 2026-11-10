@@ -14,7 +14,7 @@ backfills the manifest so the risk code can group by ``event_id`` and net fees
 by ``fee_type``.
 
 Usage:
-    .venv/Scripts/python.exe scripts/refresh_universe_metadata.py
+    uv run python -m polymarketbot.data.refresh_universe_metadata
 """
 
 from __future__ import annotations

@@ -1,507 +1,355 @@
-"""Executive Telemetry & Analytics Terminal for Autonomous Liquidity Rewards Harvester.
+"""Executive telemetry for the live paper soak.
 
-Viewer & Analytics Dashboard for the fully autonomous market maker:
-- The bot autonomously scans the market universe, ranks net yields, and selects markets.
-- The bot autonomously sizes quote shares (Q*) and decides single vs multi-market allocation.
-- The ONLY user-configurable parameter is `unlocked_capital_usd` ($100 default).
-- Displays real-time executive analytics: rewards progress toward $1.00 floor, live book depth,
-  bot's active quotes, algorithmic decision reasoning, and performance graphs.
+Run with ``streamlit run src/polymarketbot/ui/app.py``. Every panel reads the
+SQLite journal written by ``python -m polymarketbot.paper.main``
+(``data/paper_engine.db``: ``trades``, ``snapshots``, ``lots``). The dashboard
+never imports the trading engine and never starts or stops it: the soak is its
+own process, so the UI is read-only by construction.
+
+The UI is imported in tests without a Streamlit runtime; ``streamlit`` and
+``pandas`` are imported inside :func:`main`, so a plain ``import
+polymarketbot.ui.app`` stays cheap and side-effect free.
 """
 
 from __future__ import annotations
 
-import time
+import os
+import sqlite3
 from datetime import datetime
-import pandas as pd
-import streamlit as st
+from pathlib import Path
+from typing import Any
 
 from polymarketbot.logs import IST
-from polymarketbot.paper_trading.autonomous_daemon import AutonomousHarvesterDaemon
-from polymarketbot.paper_trading.polysim_client import PolySimulatorClient
-from polymarketbot.paper_trading.polysim_db import PolySimDatabase
-from polymarketbot.paper_trading.rewards import (
-    compute_competing_depth_score,
-    compute_quadratic_score,
+
+DB_PATH = Path(os.environ.get("POLYMARKETBOT_PAPER_DB", "data/paper_engine.db"))
+
+SNAPSHOT_COLUMNS = ("ts", "strategy", "cash", "positions_value", "equity")
+TRADE_COLUMNS = (
+    "ts",
+    "strategy",
+    "kind",
+    "condition_id",
+    "token_id",
+    "shares",
+    "price",
+    "fee",
+    "cash_delta",
+    "detail",
+)
+LOT_COLUMNS = (
+    "strategy",
+    "condition_id",
+    "token_id",
+    "shares",
+    "cost_usd",
+    "par_value",
+    "last_mark",
+    "tag",
 )
 
 
-# -----------------------------------------------------------------------------
-# Streamlit App Configuration
-# -----------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Autonomous Rewards Harvester Terminal",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown(
-    """
-    <style>
-    .terminal-card {
-        background-color: #1a1e29;
-        border: 1px solid #282f3f;
-        border-radius: 8px;
-        padding: 16px;
-        margin-bottom: 12px;
-    }
-    .metric-header {
-        color: #8b949e;
-        font-size: 12px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-    }
-    .metric-number {
-        color: #f0f6fc;
-        font-size: 26px;
-        font-weight: 700;
-        margin-top: 4px;
-    }
-    .status-running {
-        background-color: rgba(35, 134, 54, 0.2);
-        color: #3fb950;
-        border: 1px solid #238636;
-        padding: 4px 10px;
-        border-radius: 20px;
-        font-weight: 600;
-        font-size: 13px;
-        display: inline-block;
-    }
-    .status-paused {
-        background-color: rgba(218, 54, 51, 0.2);
-        color: #f85149;
-        border: 1px solid #da3633;
-        padding: 4px 10px;
-        border-radius: 20px;
-        font-weight: 600;
-        font-size: 13px;
-        display: inline-block;
-    }
-    .decision-box {
-        background-color: #131722;
-        border-left: 4px solid #58a6ff;
-        padding: 12px 16px;
-        border-radius: 0 8px 8px 0;
-        margin: 10px 0;
-        font-family: monospace;
-        font-size: 13px;
-        color: #e6edf3;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-@st.cache_resource
-def get_client() -> PolySimulatorClient:
-    return PolySimulatorClient()
-
-
-@st.cache_resource
-def get_db() -> PolySimDatabase:
-    return PolySimDatabase()
-
-
-client = get_client()
-db = get_db()
-
-
-@st.cache_data(ttl=6)
-def fetch_balance(_c):
-    try:
-        return _c.get_balance()
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=6)
-def fetch_open_orders(_c):
-    try:
-        return _c.get_open_orders()
-    except Exception:
+def read_table(db_path: Path | str, table: str, columns: tuple[str, ...],
+               order_by: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+    """Read one journal table, returning ``[]`` when the soak has not run yet."""
+    path = Path(db_path)
+    if not path.exists() or path.stat().st_size == 0:
         return []
-
-
-@st.cache_data(ttl=6)
-def fetch_positions(_c):
+    query = f"SELECT {', '.join(columns)} FROM {table}"
+    if order_by:
+        query += f" ORDER BY {order_by}"
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
     try:
-        return _c.get_positions(status="open")
-    except Exception:
+        conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
         return []
-
-
-@st.cache_data(ttl=6)
-def fetch_book(_c, token_id: str):
     try:
-        return _c.get_book(token_id, depth=12)
-    except Exception:
-        return {}
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(query)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
 
 
-# -----------------------------------------------------------------------------
-# Sidebar: The Single User Parameter & Engine Controls
-# -----------------------------------------------------------------------------
-st.sidebar.title("⚡ Autonomous Harvester")
-
-if not client.api_key:
-    st.sidebar.error("⚠️ POLYSIMULATOR_API_KEY is not configured in .env!")
-    st.stop()
+def read_snapshots(db_path: Path | str = DB_PATH) -> list[dict[str, Any]]:
+    return read_table(db_path, "snapshots", SNAPSHOT_COLUMNS, order_by="ts")
 
 
-st.sidebar.markdown(
-    """
-    **Autonomous Operation:**  
-    The bot on its own scans candidate markets, evaluates net marginal yields, sizes quote shares ($Q^*$),
-    and executes complementary binary quotes (`BUY YES` + `BUY NO`).
-    """
-)
-st.sidebar.markdown("---")
+def read_trades(db_path: Path | str = DB_PATH, limit: int = 500) -> list[dict[str, Any]]:
+    return read_table(db_path, "trades", TRADE_COLUMNS, order_by="ts DESC", limit=limit)
 
-# The ONLY user parameter: Unlocked Capital Fraction
-st.sidebar.subheader("💰 Capital Allocation")
-unlocked_capital = st.sidebar.slider(
-    "Unlocked Trading Capital ($)",
-    min_value=25.0,
-    max_value=500.0,
-    value=100.0,
-    step=25.0,
-    help="Fraction of your account balance unlocked for the bot. We set this to $100 to simulate real-money deployment.",
-)
 
-# Get or initialize the Autonomous Daemon
-daemon = AutonomousHarvesterDaemon.get_instance(unlocked_capital_usd=unlocked_capital)
-daemon.update_capital(unlocked_capital)
+def read_lots(db_path: Path | str = DB_PATH) -> list[dict[str, Any]]:
+    return read_table(db_path, "lots", LOT_COLUMNS, order_by="strategy, condition_id")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎮 Engine Lifecycle")
 
-col_btn1, col_btn2 = st.sidebar.columns(2)
-if not daemon.is_running():
-    if col_btn1.button("▶️ Start Engine", type="primary", use_container_width=True):
-        daemon.start()
-        st.sidebar.success("Engine started!")
-        time.sleep(1)
-        st.rerun()
-else:
-    if col_btn1.button("⏸️ Pause Engine", use_container_width=True):
-        daemon.stop()
-        st.sidebar.warning("Engine paused.")
-        time.sleep(1)
-        st.rerun()
+def _first_and_last(snapshots: list[dict[str, Any]]) -> tuple[dict[str, dict], dict[str, dict]]:
+    first: dict[str, dict[str, Any]] = {}
+    last: dict[str, dict[str, Any]] = {}
+    for row in snapshots:
+        strategy = row["strategy"]
+        if strategy not in first:
+            first[strategy] = row
+        last[strategy] = row
+    return first, last
 
-if col_btn2.button("🛑 Kill-Switch", use_container_width=True):
-    daemon.stop()
-    client.cancel_all()
-    for o in db.get_live_orders():
-        db.update_order_status(o["order_id"], "cancelled")
-    st.sidebar.error("Emergency kill-switch executed.")
-    time.sleep(1)
-    st.rerun()
 
-# Auto-refresh
-st.sidebar.markdown("---")
-auto_refresh = st.sidebar.checkbox("Auto-refresh Telemetry", value=True)
-refresh_interval = st.sidebar.slider("Refresh Cadence (s)", min_value=2, max_value=20, value=4)
+def summarise(snapshots: list[dict[str, Any]], trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate the journal into the headline numbers the panels show."""
+    first, last = _first_and_last(snapshots)
+    strategies = sorted(last)
+    total_equity = sum(float(last[name]["equity"]) for name in strategies)
+    initial_equity = sum(float(first[name]["equity"]) for name in strategies)
+    cash = sum(float(last[name]["cash"]) for name in strategies)
+    positions_value = sum(float(last[name]["positions_value"]) for name in strategies)
+    rows = []
+    for name in strategies:
+        trades_for = [t for t in trades if t["strategy"] == name]
+        rows.append({
+            "Strategy": name,
+            "Equity": float(last[name]["equity"]),
+            "Cash": float(last[name]["cash"]),
+            "Positions": float(last[name]["positions_value"]),
+            "PnL": float(last[name]["equity"]) - float(first[name]["equity"]),
+            "Trades": len(trades_for),
+            "Fees": sum(float(t["fee"]) for t in trades_for),
+            "Last snapshot": last[name]["ts"],
+        })
+    return {
+        "strategies": strategies,
+        "total_equity": total_equity,
+        "initial_equity": initial_equity,
+        "pnl": total_equity - initial_equity,
+        "cash": cash,
+        "positions_value": positions_value,
+        "trade_count": len(trades),
+        "fees": sum(float(t["fee"]) for t in trades),
+        "last_snapshot": max((float(last[name]["ts"]) for name in strategies), default=None),
+        "rows": rows,
+    }
 
-# -----------------------------------------------------------------------------
-# Main Header: Executive Status & Telemetry
-# -----------------------------------------------------------------------------
-is_active = daemon.is_running()
 
-col_title, col_status = st.columns([4, 1])
-with col_title:
-    st.title("⚡ Autonomous Liquidity Rewards Terminal")
-    st.caption("Real-Time Telemetry & Performance Analytics for Cloud Paper Trading on PolySimulator")
+def lot_value(lot: dict[str, Any]) -> float:
+    """Value one lot the way the ledger does: par when known, else the mark."""
+    shares = float(lot["shares"])
+    if lot["par_value"] is not None:
+        return shares * float(lot["par_value"])
+    return shares * float(lot["last_mark"])
 
-with col_status:
-    if is_active:
-        st.markdown('<div class="status-running">● AUTONOMOUS BOT ACTIVE</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="status-paused">■ ENGINE PAUSED</div>', unsafe_allow_html=True)
 
-bal = fetch_balance(client)
+def format_ts(ts: float | None) -> str:
+    if ts is None:
+        return "never"
+    return datetime.fromtimestamp(float(ts), tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
-# Top Metrics Row
 
-m1, m2, m3, m4, m5 = st.columns(5)
-with m1:
-    st.metric("Total Equity", f"${bal.total_value:.2f}" if bal else "$100.00")
-with m2:
-    st.metric("Unlocked Capital Cap", f"${unlocked_capital:.2f}", help="Total capital cap allocated to the autonomous bot")
-with m3:
-    active_mkt_title = daemon.current_market.get("question", "Scanning...") if daemon.current_market else "Scanning Universe..."
-    st.metric("Autonomous Market", active_mkt_title[:24] + "..." if len(active_mkt_title) > 24 else active_mkt_title)
-with m4:
-    st.metric("Quote Size (Q*)", f"{daemon.current_quote_size:.0f} shares", help="Autonomously sized by the capital optimizer")
-with m5:
-    cum_rewards = db.get_total_cumulative_rewards()
-    st.metric("Accumulated Rewards", f"${cum_rewards:.2f}", delta="Cleared $1 Floor" if cum_rewards >= 1.0 else "Accruing")
+def main() -> None:
+    import time
 
-st.markdown("---")
+    import pandas as pd
+    import streamlit as st
 
-# -----------------------------------------------------------------------------
-# Main Tabs: 1. Autonomous Brain | 2. Live Microstructure | 3. Rewards Analytics | 4. Universe Leaderboard
-# -----------------------------------------------------------------------------
-tab_brain, tab_book, tab_analytics, tab_leaderboard, tab_audit = st.tabs([
-    "🧠 Autonomous Decision Reasoner",
-    "📊 Live Book & Active Quotes",
-    "📈 Rewards & Performance Analytics",
-    "🏆 Opportunity Universe Leaderboard",
-    "📑 Audit Log & Positions",
-])
+    db_path = Path(os.environ.get("POLYMARKETBOT_PAPER_DB", str(DB_PATH)))
 
-# =============================================================================
-# TAB 1: Autonomous Decision Reasoner (The "Brain" Panel)
-# =============================================================================
-with tab_brain:
-    st.subheader("🧠 Algorithmic Decision & Optimization Rationale")
+    st.set_page_config(
+        page_title="Paper Soak Telemetry",
+        page_icon="⚡",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     st.markdown(
         """
-        The bot makes all capital allocation, sizing, and market selection decisions mathematically.
-        Below is the transparent reasoning output generated by the optimizer.
-        """
+        <style>
+        .status-running {
+            background-color: rgba(35, 134, 54, 0.2);
+            color: #3fb950;
+            border: 1px solid #238636;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 13px;
+            display: inline-block;
+        }
+        .status-paused {
+            background-color: rgba(218, 54, 51, 0.2);
+            color: #f85149;
+            border: 1px solid #da3633;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 13px;
+            display: inline-block;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    latest_decision = db.get_latest_decision()
-    if latest_decision:
-        dec_time = datetime.fromtimestamp(latest_decision["timestamp"], tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
-        st.markdown(
-            f"""
-            <div class="decision-box">
-                <b>[TIMESTAMP: {dec_time}] {latest_decision['decision_type']}</b><br/>
-                <b>Target:</b> {latest_decision['market_question']}<br/>
-                <b>Allocated Quoting Capital:</b> ${latest_decision['allocated_capital']:.2f} | <b>Quote Size Q*:</b> {latest_decision['quote_size']:.0f} shares<br/>
-                <b>Estimated Net Yield:</b> +${latest_decision['net_yield_est']:.2f}/day<br/><br/>
-                <b>Optimizer Rationale:</b><br/>
-                {latest_decision['rationale']}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.info("The autonomous bot is initializing its first scan. Rationale will appear immediately.")
-
-    st.markdown("#### Recent Decision History")
-    recent_decisions = db.get_recent_decisions(limit=8)
-    if recent_decisions:
-        df_dec = pd.DataFrame(recent_decisions)
-        df_dec["timestamp"] = pd.to_datetime(df_dec["timestamp"], unit="s")
-        st.dataframe(
-            df_dec[["timestamp", "decision_type", "market_question", "allocated_capital", "quote_size", "net_yield_est", "rationale"]],
-            hide_index=True,
-            use_container_width=True,
-        )
-
-# =============================================================================
-# TAB 2: Live Book & Active Quotes
-# =============================================================================
-with tab_book:
-    st.subheader("📊 Live Order Book & Active Resting Quotes")
-
-    if daemon.current_market and daemon.current_yes_token:
-        st.markdown(f"**Target Market:** `{daemon.current_market.get('question')}`")
-        st.caption(f"Condition: `{daemon.current_market.get('condition_id')}` | YES Token: `{daemon.current_yes_token[:20]}...`")
-
-        col_depth, col_my_quotes = st.columns([3, 2])
-
-        with col_depth:
-            st.markdown("#### Live PolySimulator L2 Order Book")
-            try:
-                book = fetch_book(client, daemon.current_yes_token)
-                raw_bids = book.get("bids", [])
-                raw_asks = book.get("asks", [])
-
-                fmt_bids = [
-                    {"Side": "BID", "Price": f"${float(b['price']):.3f}", "Size": f"{float(b['size']):.1f}", "Value": f"${float(b['price'])*float(b['size']):.2f}"}
-                    for b in reversed(raw_bids)
-                ]
-                fmt_asks = [
-                    {"Side": "ASK", "Price": f"${float(a['price']):.3f}", "Size": f"{float(a['size']):.1f}", "Value": f"${float(a['price'])*float(a['size']):.2f}"}
-                    for a in reversed(raw_asks)
-                ]
-
-                cb, ca = st.columns(2)
-                with cb:
-                    st.markdown("**Bids (YES)**")
-                    if fmt_bids:
-                        st.dataframe(pd.DataFrame(fmt_bids), hide_index=True, use_container_width=True)
-                with ca:
-                    st.markdown("**Asks (YES)**")
-                    if fmt_asks:
-                        st.dataframe(pd.DataFrame(fmt_asks), hide_index=True, use_container_width=True)
-            except Exception as e:
-                st.error(f"Error fetching order book: {e}")
-
-        with col_my_quotes:
-            st.markdown("#### Bot's Resting Maker Quotes on PolySimulator")
-            try:
-                open_orders = fetch_open_orders(client)
-                if open_orders:
-                    view_orders = []
-                    for o in open_orders:
-                        view_orders.append({
-                            "Order ID": str(o.get("order_id") or o.get("id")),
-                            "Outcome": o.get("outcome", ""),
-                            "Side": o.get("side", ""),
-                            "Price": f"${float(o.get('limit_price') or o.get('price') or 0):.3f}",
-                            "Size": f"{float(o.get('quantity') or o.get('size') or 0):.0f}",
-                            "Status": o.get("status", "PENDING"),
-                        })
-                    st.dataframe(pd.DataFrame(view_orders), hide_index=True, use_container_width=True)
-                else:
-                    st.info("No active resting quotes currently. Bot will place them during quoting loop.")
-            except Exception as e:
-                st.error(f"Error reading open orders: {e}")
-
-
-            # Collateral & Capital Utilization Gauge
-            quoting_capital = daemon.current_quote_size * (daemon.current_mid or 0.50) * 2
-            free_cash = max(0.0, unlocked_capital - quoting_capital)
-            st.markdown("#### Capital Utilization ($100 Cap)")
-            st.progress(min(1.0, quoting_capital / unlocked_capital))
-            st.write(f"**Quoting Collateral Held:** `${quoting_capital:.2f}` | **Liquid Reserve Buffer:** `${free_cash:.2f}`")
-    else:
-        st.info("Engine is currently evaluating universe. Book and active quotes will display momentarily.")
-
-# =============================================================================
-# TAB 3: Rewards & Performance Analytics
-# =============================================================================
-with tab_analytics:
-    st.subheader("📈 Liquidity Rewards & Quantitative Analytics")
-
-    daily_summary = db.get_daily_summary()
-    accrued_today = daily_summary.get("accumulated_reward_usd", 0.0) if daily_summary else 0.0
-    payout_today = daily_summary.get("payout_usd", 0.0) if daily_summary else 0.0
-    cleared = bool(daily_summary.get("cleared_floor", 0)) if daily_summary else False
-    epochs_sampled = daily_summary.get("total_epochs", 0) if daily_summary else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Accrued Rewards Today", f"${accrued_today:.4f}")
-    with c2:
-        st.metric("Daily Payout ($1.00 Floor)", f"${payout_today:.2f}", delta="Floor Cleared!" if cleared else "Floor Pending")
-    with c3:
-        st.metric("Daily Sampling Epochs", f"{epochs_sampled} / 1,440")
-    with c4:
-        user_sc = compute_quadratic_score(daemon.max_spread_cents, daemon.spread_offset_cents, daemon.current_quote_size * 2)
-        st.metric("Quote Quadratic Score", f"{user_sc:.1f} pts")
-
-    # Milestone Progress Bar
-    floor_pct = min(1.0, accrued_today / 1.0)
-    st.write(f"**Daily Floor Clearance Progress:** `${accrued_today:.3f}` / `$1.000` ({floor_pct*100:.1f}%)")
-    st.progress(floor_pct)
-
-    # Historical Graphs from SQLite
-    with db._get_connection() as conn:
-        df_epochs = pd.read_sql_query(
-            "SELECT timestamp, epoch_reward_usd, user_score, competing_score FROM reward_epochs ORDER BY timestamp DESC LIMIT 120",
-            conn,
-        )
-
-    if not df_epochs.empty:
-        df_epochs["time"] = pd.to_datetime(df_epochs["timestamp"], unit="s")
-        df_epochs["cum_rewards"] = df_epochs["epoch_reward_usd"][::-1].cumsum()[::-1]
-
-        g1, g2 = st.columns(2)
-        with g1:
-            st.markdown("#### Cumulative Accrued Rewards ($)")
-            st.line_chart(df_epochs.set_index("time")[["cum_rewards"]], height=260)
-        with g2:
-            st.markdown("#### User Score vs Competing Market Maker Depth")
-            st.line_chart(df_epochs.set_index("time")[["user_score", "competing_score"]], height=260)
-    else:
-        st.info("Rewards epoch data is accumulating. Charts update every 60 seconds.")
-
-# =============================================================================
-# TAB 4: Opportunity Universe Leaderboard
-# =============================================================================
-with tab_leaderboard:
-    st.subheader("🏆 Dynamic Market Opportunity Leaderboard")
-    st.markdown(
-        """
-        The bot scans Polymarket and PolySimulator head pools, scoring each market by **Net Marginal Yield per Dollar**
-        after taking into account quadratic reward shares, spread capture, category adverse selection, and gas fees.
-        """
+    st.sidebar.title("⚡ Paper Soak")
+    st.sidebar.caption(f"Journal: `{db_path}`")
+    st.sidebar.markdown(
+        "Read-only telemetry. Start the soak in its own terminal:\n\n"
+        "`python -m polymarketbot.paper.main`"
     )
-    try:
-        raw_mkts = client.get_markets(limit=20, hot_only=True)
-        if not raw_mkts:
-            raw_mkts = client.get_markets(limit=20)
+    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
+    refresh_interval = st.sidebar.slider("Refresh cadence (s)", 2, 20, 5)
+    if st.sidebar.button("🔄 Refresh now", use_container_width=True):
+        st.rerun()
 
-        leaderboard_data = []
-        for m in raw_mkts:
-            if m.get("closed") or len(m.get("clob_token_ids", [])) < 2:
-                continue
-            pool = float(m.get("reward_pool", 2000.0))
-            tok = m["clob_token_ids"][0]
-            mid = client.get_midpoint(tok) or 0.50
-            # Sizing based on unlocked capital
-            q = min(100.0, max(50.0, unlocked_capital * 0.75))
-            u_score = compute_quadratic_score(3.0, 0.75, q * 2)
-            c_score = 15000.0  # approximate baseline
-            est_payout = (u_score / (u_score + c_score)) * pool
-            net_yield_dollar = est_payout / max(1.0, unlocked_capital * 0.75)
+    snapshots = read_snapshots(db_path)
+    trades = read_trades(db_path)
+    lots = read_lots(db_path)
+    state = summarise(snapshots, trades)
 
-            is_chosen = bool(daemon.current_market and daemon.current_market.get("condition_id") == m.get("condition_id"))
-            leaderboard_data.append({
-                "Status": "⭐ CURRENT" if is_chosen else "Candidate",
-                "Market Question": m.get("question", "")[:45] + "...",
-                "Daily Pool ($)": f"${pool:,.0f}",
-                "Mid Price": f"${mid:.3f}",
-                "Sized Q*": f"{q:.0f}",
-                "Est. Daily Reward": f"${est_payout:.2f}",
-                "Net Yield / $": f"${net_yield_dollar:.4f}",
-                "Floor >= $1": "✅" if est_payout >= 1.0 else "❌",
-            })
+    col_title, col_status = st.columns([4, 1])
+    with col_title:
+        st.title("⚡ Live Paper Trading Telemetry")
+        st.caption(
+            "RewardHarvester · SettlementHarvester · CtfMinter — journal-backed, "
+            "no simulated prices in this view."
+        )
+    with col_status:
+        if state["last_snapshot"] is None:
+            st.markdown('<div class="status-paused">■ NO SNAPSHOTS</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="status-running">● JOURNAL LIVE</div>', unsafe_allow_html=True)
+            st.caption(f"Last snapshot {format_ts(state['last_snapshot'])}")
 
-        if leaderboard_data:
-            st.dataframe(pd.DataFrame(leaderboard_data), hide_index=True, use_container_width=True)
-    except Exception as e:
-        st.error(f"Error generating leaderboard: {e}")
+    if not snapshots and not trades:
+        st.info(
+            "The journal is empty. Run `python -m polymarketbot.paper.main` (add `--fresh` "
+            "to ignore the last durable snapshot) and this page will fill in."
+        )
+        st.stop()
 
-# =============================================================================
-# TAB 5: Audit Log & Positions
-# =============================================================================
-with tab_audit:
-    st.subheader("📑 Execution Audit Log & Positions")
-
-    st.info(
-
-        "💡 **Resting Orders vs. Token Positions:**\n\n"
-        "- **Resting Maker Orders (Active Liquidity):** Our bot places limit orders on the book. As long as they rest without filling, you earn **Quadratic Liquidity Rewards** every minute with zero directional inventory risk.\n"
-        "- **Open Positions:** A position is ONLY created when an external taker trades against your resting quotes and executes a fill.\n"
-        "- **Website Dashboard Wallet:** On `polysimulator.com`, ensure you switch your wallet selector from 'MAIN' to **'API Sandbox'** to view your bot's resting orders and balance."
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Equity", f"${state['total_equity']:.2f}")
+    m2.metric(
+        "Cumulative PnL",
+        f"${state['pnl']:+.2f}",
+        delta=f"{state['pnl'] / state['initial_equity'] * 100.0:+.2f} %"
+        if state["initial_equity"] else None,
     )
+    m3.metric("Cash", f"${state['cash']:.2f}")
+    m4.metric("Positions Value", f"${state['positions_value']:.2f}")
+    m5.metric("Trades", f"{state['trade_count']}", help=f"Fees paid: ${state['fees']:.2f}")
 
-    col_p, col_o = st.columns(2)
-    with col_p:
-        st.markdown("#### Open Token Positions (PolySimulator)")
-        try:
-            pos = fetch_positions(client)
-            if pos:
-                st.dataframe(pd.DataFrame(pos), hide_index=True, use_container_width=True)
-            else:
-                st.info("No token positions held yet (orders are resting as maker liquidity).")
-        except Exception as e:
-            st.error(f"Error reading positions: {e}")
+    st.markdown("---")
+    tab_perf, tab_positions, tab_trades, tab_strategies = st.tabs([
+        "📈 Performance",
+        "📦 Positions & Lots",
+        "📑 Trade Journal",
+        "🧩 Strategies",
+    ])
 
+    with tab_perf:
+        st.subheader("Equity and Cash Over Time")
+        if snapshots:
+            frame = pd.DataFrame(snapshots)
+            frame["time"] = pd.to_datetime(frame["ts"], unit="s")
+            equity = frame.pivot_table(
+                index="time", columns="strategy", values="equity", aggfunc="last"
+            ).sort_index().ffill()
+            equity["total"] = equity.sum(axis=1)
+            st.markdown("#### Equity per strategy")
+            st.line_chart(equity, height=320)
+            cash = frame.pivot_table(
+                index="time", columns="strategy", values="cash", aggfunc="last"
+            ).sort_index().ffill()
+            st.markdown("#### Cash per strategy")
+            st.line_chart(cash, height=260)
+        else:
+            st.info("No snapshots recorded yet.")
 
-    with col_o:
-        st.markdown("#### Recent Database Orders")
-        with db._get_connection() as conn:
-            df_ord = pd.read_sql_query(
-                "SELECT order_id, outcome, side, price, size, status, placed_at FROM orders ORDER BY placed_at DESC LIMIT 30",
-                conn,
+    with tab_positions:
+        st.subheader("Open Lots")
+        if lots:
+            frame = pd.DataFrame(lots)
+            frame["value"] = [lot_value(lot) for lot in lots]
+            frame["cost_usd"] = frame["cost_usd"].astype(float)
+            frame["unrealised"] = frame["value"] - frame["cost_usd"]
+            st.dataframe(
+                frame[[
+                    "strategy", "condition_id", "token_id", "shares", "cost_usd",
+                    "par_value", "last_mark", "value", "unrealised", "tag",
+                ]].rename(columns={
+                    "strategy": "Strategy",
+                    "condition_id": "Condition",
+                    "token_id": "Token",
+                    "shares": "Shares",
+                    "cost_usd": "Cost",
+                    "par_value": "Par",
+                    "last_mark": "Mark",
+                    "value": "Value",
+                    "unrealised": "Unrealised",
+                    "tag": "Tag",
+                }),
+                hide_index=True,
+                use_container_width=True,
             )
-        if not df_ord.empty:
-            df_ord["placed_at"] = pd.to_datetime(df_ord["placed_at"], unit="s")
-            st.dataframe(df_ord, hide_index=True, use_container_width=True)
+            st.caption(f"Total lot value: ${sum(lot_value(lot) for lot in lots):.2f}")
+        else:
+            st.info("No inventory held: every quote is resting or has been settled.")
 
-# -----------------------------------------------------------------------------
-# Auto-refresh Loop
-# -----------------------------------------------------------------------------
-if auto_refresh:
-    time.sleep(refresh_interval)
-    st.rerun()
+    with tab_trades:
+        st.subheader("Journal")
+        if trades:
+            strategies = sorted({t["strategy"] for t in trades})
+            kinds = sorted({t["kind"] for t in trades})
+            picked_strategies = st.multiselect("Strategy", strategies, default=strategies)
+            picked_kinds = st.multiselect("Kind", kinds, default=kinds)
+            shown = [
+                t for t in trades
+                if t["strategy"] in picked_strategies and t["kind"] in picked_kinds
+            ]
+            frame = pd.DataFrame(shown)
+            if not frame.empty:
+                frame["time"] = pd.to_datetime(frame["ts"], unit="s")
+                st.dataframe(
+                    frame[[
+                        "time", "strategy", "kind", "condition_id", "token_id",
+                        "shares", "price", "fee", "cash_delta", "detail",
+                    ]].rename(columns={
+                        "time": "Time",
+                        "strategy": "Strategy",
+                        "kind": "Kind",
+                        "condition_id": "Condition",
+                        "token_id": "Token",
+                        "shares": "Shares",
+                        "price": "Price",
+                        "fee": "Fee",
+                        "cash_delta": "Cash Δ",
+                        "detail": "Detail",
+                    }),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.info("No trades match the selected filters.")
+        else:
+            st.info("No trades recorded yet.")
+
+    with tab_strategies:
+        st.subheader("Per-Strategy Accounting")
+        if state["rows"]:
+            table = pd.DataFrame(state["rows"])
+            table["Last snapshot"] = [format_ts(row["Last snapshot"]) for row in state["rows"]]
+            st.dataframe(table, hide_index=True, use_container_width=True)
+        else:
+            st.info("No strategies have written a snapshot yet.")
+        if trades:
+            st.markdown("#### Trades by kind")
+            frame = pd.DataFrame(trades)
+            counts = frame.pivot_table(
+                index="strategy", columns="kind", values="ts", aggfunc="count", fill_value=0
+            )
+            st.dataframe(counts, use_container_width=True)
+
+    if auto_refresh:
+        time.sleep(refresh_interval)
+        st.rerun()
+
+
+if __name__ == "__main__":
+    main()

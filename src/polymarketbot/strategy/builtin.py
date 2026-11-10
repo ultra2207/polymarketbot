@@ -8,7 +8,7 @@ Reproducing both on the same slice is the harness's own acceptance test.
 
 from __future__ import annotations
 
-from polymarketbot.paper_trading.orchestrator import (
+from polymarketbot.strategy.orchestrator import (
     OrchestratorConfig,
     QueueSnapshot,
     QuoteOrchestrator,

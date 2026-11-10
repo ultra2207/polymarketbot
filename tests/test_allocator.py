@@ -6,7 +6,7 @@ from polymarketbot.rewards.allocator import LiquidityRewardsAllocator, MarketAll
 
 @pytest.fixture
 def allocator():
-    return LiquidityRewardsAllocator(reserve_pct=0.25, default_spread_offset_cents=1.50)
+    return LiquidityRewardsAllocator(reserve_pct=0.25)
 
 
 @pytest.fixture
@@ -20,6 +20,7 @@ def sample_candidates():
             "max_spread": 4.5,
             "min_size": 20.0,
             "real_mid": 0.435,
+            "spread_offset_cents": 1.5,
         },
         {
             "condition_id": "0x_gemini_carbon",
@@ -29,6 +30,7 @@ def sample_candidates():
             "max_spread": 4.5,
             "min_size": 20.0,
             "real_mid": 0.745,
+            "spread_offset_cents": 1.5,
         },
         {
             "condition_id": "0x_iran_diplomacy",
@@ -38,6 +40,7 @@ def sample_candidates():
             "max_spread": 4.5,
             "min_size": 20.0,
             "real_mid": 0.445,
+            "spread_offset_cents": 1.5,
         },
         {
             "condition_id": "0x_ca_wealth_tax",
@@ -47,6 +50,7 @@ def sample_candidates():
             "max_spread": 3.0,
             "min_size": 50.0,
             "real_mid": 0.235,
+            "spread_offset_cents": 1.5,
         },
     ]
 

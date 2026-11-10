@@ -1,7 +1,8 @@
 """Gate 2 invariants for the point-in-time universe.
 
 These are the cheap, non-negotiable checks. They are not a substitute for the
-20 market spot-check against polymarket.com (scripts/check_universe.py), but
+20 market spot-check against polymarket.com
+(python -m polymarketbot.tools.check_universe), but
 they catch the failure mode that actually matters: lookahead.
 """
 

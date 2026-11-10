@@ -9,22 +9,16 @@ against a temp SQLite database.
 from __future__ import annotations
 
 import re
-import sys
-from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
+from polymarketbot.reports.market_yield import build_report
 from polymarketbot.rewards.deskew import (
     DeSkewDecision,
     DeSkewPathway,
     DynamicDeSkewOptimizer,
 )
 from polymarketbot.simulator.engine import NativePaperTradingEngine
-from scripts.report_market_yield import build_report
 
 CONDITION_ID = "0xREBALANCE_LEDGER_TEST"
 TS = 1_767_312_000.0  # 2026-01-02T00:00:00Z

@@ -125,7 +125,7 @@ category_map:
 #
 # Measured 2026-11-01 across 1,937,137 markets: these 16 types cover the entire
 # scheduled universe, and each type has exactly one (rate, exponent, rebate)
-# triple. Reproduce with `uv run scripts/validate_fee_model.py`.
+# triple. Reproduce with `uv run python -m polymarketbot.tools.validate_fee_model`.
 #
 # `rate` is the type's *current* value. Gamma reports only the present
 # schedule, so a market created in 2025-06 carries today's rate — that is why
@@ -150,3 +150,80 @@ fee_types:
   economics_fees:             {rate: 0.05,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
   mentions_fees:              {rate: 0.04,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
   general_fees:               {rate: 0.05,   exponent: 1.0, rebate: 0.25,  effective_from: 2026-03-30}
+
+# ---------------------------------------------------------------------------
+# Venue schedules. There are two live schedules and they are NOT the same:
+#
+#   global (clob.polymarket.com)  per-category feeRate, no volume tiers.
+#                                 docs.polymarket.com/trading/fees, read 2026-11-10.
+#   us     (polymarket.us)        one coefficient Theta per account tier, set daily
+#                                 from trailing 30 *completed* ET days excluding
+#                                 today. docs.polymarket.us/fees, read 2026-11-10.
+#
+# The bot trades the global CLOB, so `global` is the default and the `eras`
+# table above is its history. The US ladder is data, not a constant, because a
+# tier-1 account pays Theta 0.095 and a tier-4 account 0.0695 - a 36.7 % swing
+# in fee on the same trade. Applying the global rate on a US venue would
+# under-charge by that amount, so `fees.us_taker_coefficient` refuses to price
+# a tier when the trailing volume is unknown rather than assuming one.
+venues:
+  global:
+    formula: "C * rate * (p * (1 - p)) ^ exponent"
+    rounding:
+      dp: 5
+      mode: half_up
+    effective_from: 2026-07-10
+    # Taker Rebate Program (live 2026-05-28, docs.polymarket.com/programs/
+    # taker-rebates). A rebate reduces the *effective* taker cost, so leaving it
+    # at zero overstates cost - the safe direction, but it must not be silent.
+    #
+    #   wV = trade_size_usd * (1 - entry_price) * category_weight * bonuses
+    #
+    # Tier is set by 30-day wV and updates daily at midnight UTC; rebates are
+    # paid daily in pUSD with a $1 minimum. Tier 0 is 0 %, and 30-day wV below
+    # $2,000 is tier 0 - the current state of this bot, which is why the model
+    # books no rebate. `fees.taker_rebate_rate` refuses an unmeasured wV rather
+    # than defaulting to the 0 % tier.
+    taker_rebates:
+      weighted_volume_weights:
+        sports: 1.0
+        politics: 1.3
+        finance: 1.3
+        mentions: 1.3
+        tech: 1.3
+        economics: 1.7
+        culture: 1.7
+        weather: 1.7
+        other: 1.7
+        crypto: 2.3
+        geopolitics: 0.0
+        combos: 1.7
+      tiers:
+        - {name: tier_0, min_30d_weighted_volume: 0.0, rebate: 0.00}
+        - {name: bronze, min_30d_weighted_volume: 2000.0, rebate: 0.03}
+        - {name: silver, min_30d_weighted_volume: 20000.0, rebate: 0.08}
+        - {name: gold, min_30d_weighted_volume: 200000.0, rebate: 0.18}
+        - {name: platinum, min_30d_weighted_volume: 1000000.0, rebate: 0.32}
+        - {name: diamond, min_30d_weighted_volume: 4000000.0, rebate: 0.44}
+        - {name: obsidian, min_30d_weighted_volume: 10000000.0, rebate: 0.50}
+  us:
+    formula: "theta * C * p * (1 - p)"
+    effective_from: 2026-11-06T13:00:00-05:00
+    rounding:
+      dp: 2
+      mode: half_even
+    taker_tiers:
+      # min trailing 30-day taker volume, in USD, to qualify for the tier.
+      - {name: tier_1, min_30d_taker_volume_usd: 0.0, theta: 0.095}
+      - {name: tier_2, min_30d_taker_volume_usd: 10000.0, theta: 0.085}
+      - {name: tier_3, min_30d_taker_volume_usd: 50000.0, theta: 0.075}
+      - {name: tier_4, min_30d_taker_volume_usd: 250000.0, theta: 0.0695}
+    new_account_window:
+      days_1_7_theta: 0.0695
+      days_8_30_volume_acceleration: 30 / 7
+    combo:
+      # Fee = C * p * [theta * (1 - p) + fixed * (1 - p)^4]
+      formula: "C * p * (theta * (1 - p) + fixed_power4 * (1 - p) ** 4)"
+      fixed_power4_before: 0.085
+      fixed_power4_after: 0.06
+      change_effective_from: 2026-11-11T13:00:00-05:00

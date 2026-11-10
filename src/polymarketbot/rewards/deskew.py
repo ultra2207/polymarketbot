@@ -342,7 +342,22 @@ class DynamicDeSkewOptimizer:
         """Evaluate inventory and return the optimal cost-minimizing de-skewing trajectory."""
         net_q = shares_yes - shares_no  # q > 0: Long YES; q < 0: Long NO
         abs_q = abs(net_q)
-        mid_yes = (best_bid_yes + best_ask_yes) / 2.0 if (best_bid_yes and best_ask_yes) else 0.50
+        if not (best_bid_yes and best_ask_yes and best_bid_no and best_ask_no):
+            # A missing side means the market cannot be priced; hold rather than
+            # invent a 0.50 mid and de-skew against a fabricated spread.
+            return DeSkewDecision(
+                pathway=DeSkewPathway.HOLD_STABLE,
+                urgency_level="LOW",
+                target_token="NONE",
+                action_side="SELL",
+                order_type="LIMIT_MAKER",
+                target_price=0.0,
+                target_size=0.0,
+                expected_cost_bps=0.0,
+                synthetic_savings_cents=0.0,
+                reason="no two-sided quote; de-skew refused",
+            )
+        mid_yes = (best_bid_yes + best_ask_yes) / 2.0
         spread_yes_cents = max(0.1, (best_ask_yes - best_bid_yes) * 100.0)
 
         # Dynamic parameter resolution

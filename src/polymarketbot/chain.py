@@ -252,11 +252,19 @@ def mask_url(url: str) -> str:
 # --------------------------------------------------------------------------- #
 # Provider registry, cooldown and retry jitter
 # --------------------------------------------------------------------------- #
-# A 429 is a statement about the *provider*, not about the request: the same
+# A 429 is a statement about the *credential*, not about the request: the same
 # call usually succeeds immediately somewhere else. Rotating on a 429 and
 # resting the provider is therefore the only retry that helps; retrying the
 # same URL (what this client did until 2026-11-04) is what kept that incident
 # alive for four hours.
+#
+# Hosted nodes throttle the key, not the hostname: one Alchemy key serves both
+# `eth-mainnet.g.alchemy.com/v2/<key>` and `polygon-mainnet.g.alchemy.com/v2/<key>`.
+# Resting only the URL that answered rotates to its sibling on the same
+# throttled key, which re-earns the 429 and climbs a second, independent
+# backoff ladder. Measured 2026-11-10 in one 30-minute soak: cooldown
+# 56 s -> 142 s -> 921 s on a single configured key. Cooldown is therefore
+# applied to every endpoint sharing a credential.
 MIN_COOLDOWN_S = 60.0
 MAX_COOLDOWN_S = 900.0
 RETRY_BASE_S = 0.5
@@ -299,6 +307,25 @@ def provider_name(url: str) -> str:
         return "quicknode"
     cleaned = re.sub(r"[^a-z0-9]+", "_", host).strip("_")
     return cleaned or "unknown"
+
+
+def rate_limit_key(url: str) -> str:
+    """Identity whose quota a 429 on ``url`` actually exhausted.
+
+    Hosted nodes throttle the credential: one Alchemy key serves every chain's
+    endpoint, so `eth-mainnet.../v2/<key>` and `polygon-mainnet.../v2/<key>`
+    share one bucket and must share one cooldown. Public providers throttle
+    per host, so their identity is the provider name alone.
+    """
+    host = urlsplit(url or "").netloc.lower()
+    name = provider_name(url)
+    if "alchemy.com" in host or "infura.io" in host:
+        parts = [p for p in (urlsplit(url or "").path or "").split("/") if p]
+        credential = parts[-1] if parts else ""
+        return f"{name}:{credential}" if credential else name
+    if "quiknode.pro" in host or "quicknode" in host:
+        return f"{name}:{host.split('.')[0]}"
+    return name
 
 
 def websocket_url(url: str) -> str:
@@ -460,9 +487,18 @@ class ProviderPool:
             return
         health.calls += 1
         health.ok += 1
+        health.last_kind = None
+        # A success proves the credential is not throttled, so the ladder its
+        # siblings inherited from the same 429 no longer applies. Their
+        # remaining cooldown is left to expire so the pool does not thrash.
+        key = rate_limit_key(health.url)
+        for member in self._providers.values():
+            if member is health:
+                continue
+            if rate_limit_key(member.url) == key:
+                member.streak = 0
         health.streak = 0
         health.cooldown_until = 0.0
-        health.last_kind = None
 
     def mark_error(self, url: str, kind: str = UNKNOWN) -> None:
         """A failure that is not a rate limit: failover, but no cooldown."""
@@ -474,21 +510,31 @@ class ProviderPool:
         health.last_kind = kind
 
     def mark_rate_limited(self, url: str) -> float:
-        """Put a provider to rest after a 429; returns the cooldown in seconds."""
+        """Rest the whole credential behind ``url`` after a 429.
+
+        Every endpoint sharing that credential is cooled together and shares
+        the backoff ladder, because the quota is the credential's. Returns the
+        remaining cooldown for the URL that was called.
+        """
         health = self.get(url)
         if health is None:
             return 0.0
         health.calls += 1
         health.errors += 1
         health.rate_limits += 1
-        health.streak += 1
         health.last_kind = RATE_LIMIT
+        key = rate_limit_key(health.url)
+        group = [h for h in self._providers.values() if rate_limit_key(h.url) == key] or [health]
+        streak = max(h.streak for h in group) + 1
         ceiling = min(
             self.cooldown_max_s,
-            self.cooldown_base_s * (2 ** max(0, health.streak - 1)),
+            self.cooldown_base_s * (2 ** max(0, streak - 1)),
         )
         delay = ceiling * (0.75 + 0.5 * max(0.0, min(1.0, float(self._rng()))))
-        health.cooldown_until = max(health.cooldown_until, self._clock() + delay)
+        until = self._clock() + delay
+        for member in group:
+            member.streak = streak
+            member.cooldown_until = max(member.cooldown_until, until)
         return self.cooldown_remaining(url)
 
     def metrics(self, now: float | None = None) -> dict[str, float]:

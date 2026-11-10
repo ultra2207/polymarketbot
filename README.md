@@ -60,15 +60,15 @@ Everything else is derived and reproducible from these four files.
 ## Quick start
 
 ```bash
-uv run scripts/verify_core.py              # if data exists, re-verify integrity
-uv run scripts/build_labels.py             # authoritative payout labels
-uv run scripts/build_categories.py         # slug rules + Gamma tag overrides
-uv run scripts/build_market_stats.py       # per-market activity from the tape
-uv run scripts/build_tick_sizes.py         # tick sizes from Dome
-uv run scripts/build_universe.py           # point-in-time market table
-uv run pytest -q                           # universe invariants
-uv run scripts/check_universe.py --n 24    # invariants + live spot-check
-uv run scripts/fetch_wallet_cohort.py      # ranked wallets + PnL decomposition
+uv run python -m polymarketbot.tools.verify_core           # if data exists, re-verify integrity
+uv run python -m polymarketbot.data.builders.build_labels         # authoritative payout labels
+uv run python -m polymarketbot.data.builders.build_categories     # slug rules + Gamma tag overrides
+uv run python -m polymarketbot.data.builders.build_market_stats   # per-market activity from the tape
+uv run python -m polymarketbot.data.builders.build_tick_sizes     # tick sizes from Dome
+uv run python -m polymarketbot.data.builders.build_universe       # point-in-time market table
+uv run pytest -q                                                  # universe invariants
+uv run python -m polymarketbot.tools.check_universe --n 24        # invariants + live spot-check
+uv run python -m polymarketbot.data.builders.fetch_wallet_cohort  # ranked wallets + PnL decomposition
 ```
 
 ## Things this dataset will teach you the hard way
@@ -86,7 +86,7 @@ uv run scripts/fetch_wallet_cohort.py      # ranked wallets + PnL decomposition
 
 ## Conventions
 
-- Python 3.14, managed with `uv`. Run everything as `uv run <script>.py`.
+- Python 3.14, managed with `uv`. Run everything as `uv run python -m polymarketbot.<module>`.
 - DuckDB for all local analytics; Parquet everywhere; ZSTD compression.
 - `data/raw` is immutable and gitignored. `data/processed` is derived and rebuildable.
 - Every gate is re-runnable and leaves an artefact in `data/processed/`.

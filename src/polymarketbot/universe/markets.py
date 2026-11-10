@@ -82,7 +82,7 @@ def settle(con: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyRelation:
     """Resolution labels in payout form, with voids marked.
 
     `payout_0` is the per-share payout of `token1`, proven to be on-chain
-    outcome slot 0 (see scripts/build_labels.py). A void pays 0.5 per share for
+    outcome slot 0 (see polymarketbot.data.builders.build_labels). A void pays 0.5 per share for
     a standard binary market; it is neither a win nor a loss.
     """
     return con.sql(f"""

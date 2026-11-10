@@ -22,6 +22,7 @@ from polymarketbot.data.uma import (
     CONTRACT_ADAPTER_V1,
     CONTRACT_ADAPTER_V2,
     CONTRACT_OO_V2,
+    SPEC_BY_CONTRACT_TOPIC,
     UMA_ADAPTER_V1,
     UMA_ADAPTER_V2,
     UMA_OO_V2,
@@ -33,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.replay_uma import (  # noqa: E402
+from polymarketbot.data.uma_replay import (  # noqa: E402
     configured_addresses,
     main as replay_main,
     run_probe,
@@ -161,12 +162,12 @@ ANCILLARY = b"q: title: Will the Democratic Party win the WI-01 House seat?"
             "0x6e51dd00371aabffa82cd401592f76ed51e98a9ea4b58751c70463a2c78b5ca1",
         ),
         (
-            "DisputePrice(address,address,bytes32,uint256,bytes,int256)",
-            "0xdb5d525cf38fcf3b5f15304610b0482cea1a86f2c3aac48adf04617cf8a84490",
+            "DisputePrice(address,address,address,bytes32,uint256,bytes,int256)",
+            "0x5165909c3d1c01c5d1e121ac6f6d01dda1ba24bc9e1f975b5a375339c15be7f3",
         ),
         (
-            "Settle(address,address,address,bytes32,uint256,bytes,int256,int256)",
-            "0x44b71f4dd337078450f2f5aa7bf770c1b0005de6ccd88581311987934eaa5711",
+            "Settle(address,address,address,bytes32,uint256,bytes,int256,uint256)",
+            "0x3f384afb4bd9f0aef0298c80399950011420eb33b0e1a750b20966270247b9a0",
         ),
         # Adapter v1 (0xCB18..., PolygonScan: UmaConditionalTokensBinaryAdapter).
         (
@@ -274,8 +275,8 @@ def test_dispute_price_sets_disputed() -> None:
     disputer = "0x00000000000000000000000000000000000000aa"
     row = build_log(
         UMA_OO_V2,
-        "DisputePrice(address,address,bytes32,uint256,bytes,int256)",
-        indexed=[("requester", ADAPTER), ("disputer", disputer)],
+        "DisputePrice(address,address,address,bytes32,uint256,bytes,int256)",
+        indexed=[("requester", ADAPTER), ("proposer", PROPOSER), ("disputer", disputer)],
         data=[
             ("identifier", IDENTIFIER),
             ("timestamp", 1),
@@ -294,14 +295,14 @@ def test_settle_disputed_flag_follows_disputer() -> None:
     def settle(disputer: str) -> dict[str, Any] | None:
         row = build_log(
             UMA_OO_V2,
-            "Settle(address,address,address,bytes32,uint256,bytes,int256,int256)",
+            "Settle(address,address,address,bytes32,uint256,bytes,int256,uint256)",
             indexed=[("requester", ADAPTER), ("proposer", PROPOSER), ("disputer", disputer)],
             data=[
                 ("identifier", IDENTIFIER),
                 ("timestamp", 1),
                 ("ancillaryData", ANCILLARY),
                 ("proposedPrice", 10**18),
-                ("settlementPrice", 0),
+                ("expirationTime", 0),
             ],
         )
         return decode_log(row)
@@ -310,7 +311,7 @@ def test_settle_disputed_flag_follows_disputer() -> None:
     disputed = settle("0x00000000000000000000000000000000000000aa")
     assert undisputed is not None and disputed is not None
     assert undisputed["disputed"] is False
-    assert undisputed["settlement_price"] == "0"
+    assert undisputed["expiry"] == 0
     assert disputed["disputed"] is True
 
 
@@ -640,3 +641,37 @@ def test_probe_exits_clean_when_every_address_answers() -> None:
     log = _Recorder()
     assert run_probe([CTF, UMA_OO_V2], 10, log=log, client=rpc) == 0
     assert [call[1:] for call in rpc.calls] == [(491, 500), (491, 500)]
+
+
+# Topic0s observed on chain for UMA OptimisticOracleV2 (0xee3afe..7c24) in
+# ``data/tape/polygon_logs`` over the whole taped window (2026-11-10):
+# 0x6e51dd00.. -> 283 ProposePrice, 0xf1679315.. -> 38 RequestPrice,
+# 0x3f384afb.. -> 272 Settle.  The dispute topic below occurs zero times, which
+# is why the 2026-11-10 window's dispute posterior is unexercised rather than
+# zero: no dispute was emitted for this population in 34 h.
+CHAIN_TOPIC0 = {
+    "ProposePrice": "0x6e51dd00371aabffa82cd401592f76ed51e98a9ea4b58751c70463a2c78b5ca1",
+    "RequestPrice": "0xf1679315ff325c257a944e0ca1bfe7b26616039e9511f9610d4ba3eca851027b",
+    "Settle": "0x3f384afb4bd9f0aef0298c80399950011420eb33b0e1a750b20966270247b9a0",
+    "DisputePrice": "0x5165909c3d1c01c5d1e121ac6f6d01dda1ba24bc9e1f975b5a375339c15be7f3",
+}
+
+
+@pytest.mark.parametrize(("event", "topic0"), sorted(CHAIN_TOPIC0.items()))
+def test_the_collector_looks_up_the_topic0s_the_chain_emits(event: str, topic0: str) -> None:
+    """A spec whose signature drifted from the ABI is a silent hole.
+
+    ``DisputePrice`` used to hash ``0xdb5d525c..`` (two indexed addresses) and
+    ``Settle`` ``0x44b71f4d..`` (``settlementPrice`` instead of
+    ``expirationTime``): neither topic occurs on chain, so every dispute and all
+    272 settlements in the taped window were dropped as "not a UMA event".
+    """
+    spec = SPEC_BY_CONTRACT_TOPIC.get((CONTRACT_OO_V2, topic0))
+    assert spec is not None, f"{event} {topic0} is not decodable"
+    assert spec.name == event
+
+
+def test_dispute_price_decodes_all_three_indexed_parties() -> None:
+    """``disputer`` is topic 3, not topic 2: a shifted read names the proposer."""
+    spec = SPEC_BY_CONTRACT_TOPIC[(CONTRACT_OO_V2, CHAIN_TOPIC0["DisputePrice"])]
+    assert [name for name, _type in spec.indexed] == ["requester", "proposer", "disputer"]

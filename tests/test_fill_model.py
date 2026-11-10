@@ -1,22 +1,21 @@
-"""Pure-function tests for scripts/calibrate_fill_model.py.
+"""Pure-function tests for polymarketbot.tools.fill_calibration.
 
 The calibration must not be able to point the wrong way: if more queue ahead
-made a fill *more* likely, the model would be nonsense and the script has to
-say so. These tests feed the module synthetic rows with a known monotone
-relation and check the pre-state reconstruction, the bucket probabilities, the
-isotonic fit and the logistic sign. No tape, no network, no L3 scan: the module
-is loaded from the script path and only its pure helpers are called.
+made a fill *more* likely, the model would be nonsense and the module has to
+say so. These tests feed it synthetic rows with a known monotone relation and
+check the pre-state reconstruction, the bucket probabilities, the isotonic fit
+and the logistic sign. No tape, no network, no L3 scan: only the module's pure
+helpers are called.
 """
 
 from __future__ import annotations
-
-import importlib.util
-from pathlib import Path
 
 import duckdb
 import numpy as np
 import pyarrow as pa
 import pytest
+
+import polymarketbot.tools.fill_calibration as fill_calibration
 
 NS = 1_000_000_000
 RATIOS = (0.0, 0.1, 0.25, 0.4, 0.6, 0.8, 0.95, 1.0)
@@ -24,12 +23,7 @@ RATIOS = (0.0, 0.1, 0.25, 0.4, 0.6, 0.8, 0.95, 1.0)
 
 @pytest.fixture(scope="module")
 def fill_model():
-    path = Path(__file__).resolve().parent.parent / "scripts" / "calibrate_fill_model.py"
-    spec = importlib.util.spec_from_file_location("calibrate_fill_model_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return fill_calibration
 
 
 # ------------------------------------------------------------------ fixtures

@@ -18,14 +18,11 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper_trading.models import MarketConfig
+from polymarketbot.market import MarketConfig
 from polymarketbot.rewards.scanner import MarketOpportunity, OpportunityScanner
-
-if TYPE_CHECKING:
-    from polymarketbot.paper_trading.engine import PaperTradingEngine
 
 logger = get_logger("market_switching")
 
@@ -79,6 +76,43 @@ class SwitchEvent:
             "hurdle_threshold": round(self.hurdle_threshold, 2),
             "reason": self.reason,
             "unlocked_cash_usd": round(self.unlocked_cash_usd, 2),
+        }
+
+
+@dataclass
+class SwitchDecision:
+    """Outcome of one re-scan: hold the active market or migrate to a candidate."""
+
+    timestamp: float
+    from_condition_id: Optional[str]
+    from_question: str
+    to_condition_id: Optional[str]
+    to_question: str
+    y_net_from: float
+    y_net_to: float
+    expected_gain_per_day: float
+    switching_cost_usd: float
+    amortized_cost_per_day: float
+    hurdle_threshold: float
+    should_switch: bool
+    reason: str
+    candidate: Optional[MarketOpportunity] = field(default=None, repr=False, compare=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timestamp": self.timestamp,
+            "from_condition_id": self.from_condition_id,
+            "from_question": self.from_question,
+            "to_condition_id": self.to_condition_id,
+            "to_question": self.to_question,
+            "y_net_from": round(self.y_net_from, 2),
+            "y_net_to": round(self.y_net_to, 2),
+            "expected_gain_per_day": round(self.expected_gain_per_day, 2),
+            "switching_cost_usd": round(self.switching_cost_usd, 4),
+            "amortized_cost_per_day": round(self.amortized_cost_per_day, 4),
+            "hurdle_threshold": round(self.hurdle_threshold, 2),
+            "should_switch": self.should_switch,
+            "reason": self.reason,
         }
 
 
@@ -158,16 +192,38 @@ class OpportunisticSwitchingEngine:
         self,
         scanner: OpportunityScanner,
         config: Optional[SwitchingConfig] = None,
-        bankroll_usd: float = 300.0,
-        concentration_pct: float = 0.75,
+        *,
+        bankroll_usd: float,
+        concentration_pct: float,
     ) -> None:
+        """Wire the engine to a scanner and the caller's own capital split.
+
+        ``bankroll_usd`` and ``concentration_pct`` are the caller's numbers and
+        have no defaults: the engine reports yield on the capital the caller is
+        prepared to deploy in one market, and an engine that invented a $300
+        bankroll at 75 % concentration was reporting 75 % of a bankroll nobody
+        had chosen. The scanner is told the resulting dollar amount, so the
+        concentration decision is made once, here, instead of inside a scanner
+        default.
+        """
+        if bankroll_usd is None or float(bankroll_usd) <= 0.0:
+            raise ValueError(
+                f"bankroll_usd must be > 0, got {bankroll_usd!r}: capital "
+                "allocation has no default"
+            )
+        if concentration_pct is None or not 0.0 < float(concentration_pct) <= 1.0:
+            raise ValueError(
+                f"concentration_pct must be in (0, 1], got {concentration_pct!r}"
+            )
         self.scanner = scanner
         self.config = config or SwitchingConfig()
-        self.bankroll_usd = bankroll_usd
-        self.concentration_pct = concentration_pct
+        self.bankroll_usd = float(bankroll_usd)
+        self.concentration_pct = float(concentration_pct)
+        self.allocated_capital_usd = self.bankroll_usd * self.concentration_pct
         self.state = SwitchEngineState.IDLE
         self.active_opportunity: Optional[MarketOpportunity] = None
         self.last_scan_time: float = 0.0
+        self.last_decision: Optional[SwitchDecision] = None
         self.history: list[SwitchEvent] = []
 
     def set_active_market(self, opp: MarketOpportunity) -> None:
@@ -176,50 +232,182 @@ class OpportunisticSwitchingEngine:
         self.state = SwitchEngineState.QUOTING
         logger.info(f"Active market set: '{opp.question[:40]}' (yield: ${opp.net_expected_yield:.2f}/d)")
 
+    def refresh_active_market(self, opp: MarketOpportunity) -> None:
+        """Update the active market's measured metrics without re-announcing it."""
+        self.active_opportunity = opp
+        self.state = SwitchEngineState.QUOTING
+
+    @property
+    def quote_horizon_s(self) -> float:
+        """How long one quote rests before the next scan replaces it.
+
+        The engine rescans every ``config.scan_interval_seconds`` and requotes
+        then, so that caller-set interval - not an invented lifetime - is the
+        horizon the measured fill table must be read at.
+        """
+        return float(self.config.scan_interval_seconds)
+
+    def effective_switching_cost(self) -> float:
+        """Total switching cost in USD for the capital currently allocated."""
+        return calculate_switching_cost(
+            allocated_capital=self.allocated_capital_usd,
+            unquote_gas_usd=self.config.unquote_gas_usd,
+            merge_gas_usd=self.config.merge_gas_usd,
+            crossing_spread_friction_pct=self.config.crossing_spread_friction_pct,
+        )
+
+    def _record_decision(self, decision: SwitchDecision) -> None:
+        self.last_decision = decision
+        if decision.should_switch:
+            logger.info(f"🚀 Switching hurdle satisfied: {decision.reason}")
+        else:
+            logger.info(f"⏳ Switching hurdle not met: {decision.reason}")
+
+    def rescan_and_evaluate(
+        self,
+        current_yield_fallback: Optional[float] = None,
+        exclude_condition_ids: Optional[set[str]] = None,
+    ) -> SwitchDecision:
+        """Re-scan the rewards universe and evaluate a migration from the active market.
+
+        When the active market is still listed, its scanner-measured yield is
+        refreshed so both sides of the comparison come from the same scan.
+        ``current_yield_fallback`` (the runner's live measured yield) is used
+        only when the active market has dropped out of the rewards universe.
+        """
+        ranked = self.scanner.scan_and_rank_markets(
+            allocated_capital_usd=self.allocated_capital_usd,
+            quote_horizon_s=self.quote_horizon_s,
+        )
+        active = self.active_opportunity
+        if active is not None:
+            measured = next(
+                (opp for opp in ranked if opp.condition_id == active.condition_id),
+                None,
+            )
+            if measured is not None:
+                self.refresh_active_market(measured)
+            elif current_yield_fallback is not None:
+                active.net_expected_yield = float(current_yield_fallback)
+                self.state = SwitchEngineState.QUOTING
+        self.check_opportunity_switch(ranked, exclude_condition_ids=exclude_condition_ids)
+        assert self.last_decision is not None
+        return self.last_decision
+
     def check_opportunity_switch(
         self,
         ranked_opportunities: Optional[list[MarketOpportunity]] = None,
+        exclude_condition_ids: Optional[set[str]] = None,
     ) -> tuple[bool, Optional[MarketOpportunity], str]:
-        """Scan opportunities and evaluate if top candidate exceeds switching hurdle against active market."""
+        """Scan opportunities and evaluate if top candidate exceeds switching hurdle against active market.
+
+        ``exclude_condition_ids`` drops candidates the caller already refused
+        (for example a neg-risk market a live engine cannot settle) so the next
+        best market is considered instead of stalling on the same top entry.
+        """
         self.state = SwitchEngineState.SCANNING
         now = time.time()
         self.last_scan_time = now
 
         if ranked_opportunities is None:
             ranked_opportunities = self.scanner.scan_and_rank_markets(
-                bankroll_usd=self.bankroll_usd,
-                concentration_pct=self.concentration_pct,
+                allocated_capital_usd=self.allocated_capital_usd,
+                quote_horizon_s=self.quote_horizon_s,
             )
 
+        if exclude_condition_ids:
+            ranked_opportunities = [
+                opp
+                for opp in ranked_opportunities
+                if opp.condition_id not in exclude_condition_ids
+            ]
+
+        active = self.active_opportunity
         if not ranked_opportunities:
-            self.state = SwitchEngineState.QUOTING if self.active_opportunity else SwitchEngineState.IDLE
-            return False, None, "No active reward market opportunities found."
+            self.state = SwitchEngineState.QUOTING if active else SwitchEngineState.IDLE
+            reason = "No active reward market opportunities found."
+            self._record_decision(
+                SwitchDecision(
+                    timestamp=now,
+                    from_condition_id=active.condition_id if active else None,
+                    from_question=active.question if active else "",
+                    to_condition_id=None,
+                    to_question="",
+                    y_net_from=active.net_expected_yield if active else 0.0,
+                    y_net_to=0.0,
+                    expected_gain_per_day=0.0,
+                    switching_cost_usd=0.0,
+                    amortized_cost_per_day=0.0,
+                    hurdle_threshold=0.0,
+                    should_switch=False,
+                    reason=reason,
+                    candidate=None,
+                )
+            )
+            return False, None, reason
 
         top_candidate = ranked_opportunities[0]
 
         # If no market is currently quoted, adopt the top candidate immediately
-        if self.active_opportunity is None:
+        if active is None:
             self.state = SwitchEngineState.IDLE
-            return True, top_candidate, "Initial market selection"
+            reason = "Initial market selection"
+            self._record_decision(
+                SwitchDecision(
+                    timestamp=now,
+                    from_condition_id=None,
+                    from_question="",
+                    to_condition_id=top_candidate.condition_id,
+                    to_question=top_candidate.question,
+                    y_net_from=0.0,
+                    y_net_to=top_candidate.net_expected_yield,
+                    expected_gain_per_day=top_candidate.net_expected_yield,
+                    switching_cost_usd=0.0,
+                    amortized_cost_per_day=0.0,
+                    hurdle_threshold=0.0,
+                    should_switch=True,
+                    reason=reason,
+                    candidate=top_candidate,
+                )
+            )
+            return True, top_candidate, reason
 
         # If top candidate is the same market we are already quoting
-        if top_candidate.condition_id == self.active_opportunity.condition_id:
-            self.active_opportunity = top_candidate  # Refresh metrics
-            self.state = SwitchEngineState.QUOTING
-            return False, top_candidate, "Current market remains #1 opportunity"
+        if top_candidate.condition_id == active.condition_id:
+            self.refresh_active_market(top_candidate)
+            reason = "Current market remains #1 opportunity"
+            self._record_decision(
+                SwitchDecision(
+                    timestamp=now,
+                    from_condition_id=active.condition_id,
+                    from_question=active.question,
+                    to_condition_id=top_candidate.condition_id,
+                    to_question=top_candidate.question,
+                    y_net_from=active.net_expected_yield,
+                    y_net_to=top_candidate.net_expected_yield,
+                    expected_gain_per_day=0.0,
+                    switching_cost_usd=0.0,
+                    amortized_cost_per_day=0.0,
+                    hurdle_threshold=0.0,
+                    should_switch=False,
+                    reason=reason,
+                    candidate=top_candidate,
+                )
+            )
+            return False, top_candidate, reason
 
         # Calculate switching cost
-        alloc_cap = self.bankroll_usd * self.concentration_pct
-        switch_cost = calculate_switching_cost(
-            allocated_capital=alloc_cap,
-            unquote_gas_usd=self.config.unquote_gas_usd,
-            merge_gas_usd=self.config.merge_gas_usd,
-            crossing_spread_friction_pct=self.config.crossing_spread_friction_pct,
-        )
+        switch_cost = self.effective_switching_cost()
+        if self.config.amortize_costs:
+            amortized_cost = switch_cost * (
+                24.0 / max(0.1, self.config.amortization_horizon_hours)
+            )
+        else:
+            amortized_cost = switch_cost
 
         # Evaluate hurdle
         should_switch, threshold, reason = evaluate_switching_hurdle(
-            y_net_current=self.active_opportunity.net_expected_yield,
+            y_net_current=active.net_expected_yield,
             y_net_candidate=top_candidate.net_expected_yield,
             switching_cost=switch_cost,
             switch_hurdle_pct=self.config.switch_hurdle_pct,
@@ -228,12 +416,25 @@ class OpportunisticSwitchingEngine:
         )
 
         self.state = SwitchEngineState.QUOTING
-        if should_switch:
-            logger.info(f"🚀 Switching hurdle satisfied: {reason}")
-            return True, top_candidate, reason
-        else:
-            logger.info(f"⏳ Switching hurdle not met: {reason}")
-            return False, top_candidate, reason
+        self._record_decision(
+            SwitchDecision(
+                timestamp=now,
+                from_condition_id=active.condition_id,
+                from_question=active.question,
+                to_condition_id=top_candidate.condition_id,
+                to_question=top_candidate.question,
+                y_net_from=active.net_expected_yield,
+                y_net_to=top_candidate.net_expected_yield,
+                expected_gain_per_day=top_candidate.net_expected_yield - active.net_expected_yield,
+                switching_cost_usd=switch_cost,
+                amortized_cost_per_day=amortized_cost,
+                hurdle_threshold=threshold,
+                should_switch=should_switch,
+                reason=reason,
+                candidate=top_candidate,
+            )
+        )
+        return should_switch, top_candidate, reason
 
     def execute_market_switch(
         self,
@@ -255,7 +456,7 @@ class OpportunisticSwitchingEngine:
         y_from = old_opp.net_expected_yield if old_opp else 0.0
         y_to = new_market.net_expected_yield
 
-        alloc_cap = self.bankroll_usd * self.concentration_pct
+        alloc_cap = self.allocated_capital_usd
         cost = calculate_switching_cost(
             allocated_capital=alloc_cap,
             unquote_gas_usd=self.config.unquote_gas_usd,

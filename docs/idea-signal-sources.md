@@ -2,7 +2,7 @@
 
 What each `ideas/<slug>/prepare.sql` reads, the window it reads, and the row
 count it actually produced. Built with
-`scripts/build_idea_signals.py --slug <slug>`; every table below passed the
+the retired idea-signal builder (`--slug <slug>`); every table below passed the
 runner's validation (required `asset_id`/`ts_ms`, numeric signals, no duplicate
 `(asset_id, ts_ms)`).
 

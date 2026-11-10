@@ -1789,16 +1789,13 @@ def test_dynamic_budget_percentage_allocation_and_isolation():
                 engine.close()
 
 
-def test_real_money_trader_cli_budget_args():
+def test_trading_runner_cli_budget_args():
     """Verify CLI argument parsing and normalization for --budget-pct and --max-budget."""
     import sys
-    scripts_dir = str(Path(__file__).resolve().parent.parent / "scripts")
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    import run_real_money_trader
-    parse_args = run_real_money_trader.parse_args
 
-    test_args = ["run_real_money_trader.py", "--budget-pct", "0.20", "--max-budget", "70.0", "--initial-cash", "50.0"]
+    from polymarketbot.trading.runner import parse_args
+
+    test_args = ["runner", "--budget-pct", "0.20", "--max-budget", "70.0", "--initial-cash", "50.0"]
     with patch.object(sys, "argv", test_args):
         args = parse_args()
         assert args.budget_pct == 0.20
@@ -1806,7 +1803,7 @@ def test_real_money_trader_cli_budget_args():
         assert args.initial_cash == 50.0
 
     # Test defaults
-    with patch.object(sys, "argv", ["run_real_money_trader.py"]):
+    with patch.object(sys, "argv", ["runner"]):
         args_default = parse_args()
         assert args_default.budget_pct == 1.0
         assert args_default.max_budget is None

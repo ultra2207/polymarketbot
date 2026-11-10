@@ -2,20 +2,13 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from polymarketbot.data.schema import CLOB_EVENTS  # noqa: E402
-from scripts.validate_tape import (  # noqa: E402
+from polymarketbot.data.schema import CLOB_EVENTS
+from polymarketbot.data.tape_validation import (
     BookState,
     compare_books,
     hour_parquet_parts,

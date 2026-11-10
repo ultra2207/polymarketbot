@@ -39,6 +39,16 @@ runs have already wasted hours here.
   relying on reactive notifications to wake execution when subagents finish.
 
 
+## Where code lives
+
+- **`scripts/` is for temporary, throwaway tooling only.** One-off probes, migration
+  helpers, and experiments live there and are deleted when their question is answered.
+- **Anything run repeatedly lives in `src/polymarketbot/` and is invoked with
+  `python -m`.** The live paper soak is `polymarketbot.paper.main`, not a script:
+  `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10`.
+- A long-lived entry point that grows past a few hundred lines is a design error: split
+  it into modules under its package, where each decision rule is testable without I/O.
+
 ## Time budget — hard rule
 
 - **Nothing runs longer than 60 seconds until it has been proven at 60 seconds or
@@ -176,17 +186,43 @@ This is the standing refinement loop for the three live paper strategies:
   `log.info` / `log.warning` / `log.error`; no bare `print()` in application or script code.
 - `polymarketbot.logs` writes every record to `data/logs/app.log` **and** to a
   per-source-file log (for example `data/logs/polymarketbot.paper_trading.engine.log`,
-  `data/logs/scripts.run_live_paper_soak.log`). Timestamps are IST.
+  `data/logs/polymarketbot.paper.main.log`). Timestamps are IST.
 - All file sinks rotate at `LOG_ROTATION` (default `10 MB`), retain
   `LOG_RETENTION` rotations (default `3`), and compress rotated files. Do not add an
   unrotated log file.
 - A long run must remain diagnosable from the logs alone: state, fills, allocations,
   errors, and the periodic equity snapshot go through loguru, not stdout.
 
+### Latency contract (no zero-latency money)
+
+Every action that changes cash, inventory, or order state on the venue pays one measured
+round trip before it takes effect. This is not optional:
+
+- `place`, `cancel`, `amend/rebalance`, taker `buy`/`sell` are queued through
+  `PendingVenueAction` / `_submit_venue_action` and applied only once
+  `now >= submitted_ts + measured RTT`. The RTT is the live `GET /time` measurement
+  (`last_clob_rtt_ms`), falling back to the persisted probe p50 in
+  `data/derived/local_latency.json`; if neither exists, the action is refused and logged —
+  never executed at 0 ms.
+- An action lands against the book/state that exists at landing time. Using the snapshot
+  that triggered the decision is forbidden.
+- A cancel is only complete when it lands: the resting order stays live and fillable for
+  the duration of its flight. Fills in that window are real.
+- On-chain actions (`merge`, `split`, `redeem`) pay the measured RPC round trip plus the
+  measured block interval. If the block interval is not measured, the action is not
+  assumed instantaneous.
+- Each landed action is logged with submitted→landing seconds and the price/quantity it
+  actually executed at.
+
 ### The loop
 
-1. **Soak.** Run the live paper trader for exactly 30 minutes:
-   `MALLOC_ARENA_MAX=2 uv run python scripts/run_live_paper_soak.py --capital 3000 --duration 1800 --interval 10`
+1. **Soak.** Run the live paper trader for exactly 30 minutes. The canonical command,
+   used verbatim every cycle (the operator watches its output live):
+
+   ```
+   uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --fresh --db data/paper_soak_telemetry.db
+   ```
+
    Run this as a **normal foreground command** with a **2000-second timeout** — not as a
    background job, not as a named service, and **not through a PTY**. Use plain
    `uv run python ...`; the harness PTY path is buggy and has hung runs. The dashboard
@@ -198,10 +234,13 @@ This is the standing refinement loop for the three live paper strategies:
    logs, and graceful SIGINT/SIGTERM, so a kill still leaves inspectable progress. Never
    launch it silently; the dashboard is logged every interval and
    `data/paper_soak_telemetry.db` grows every interval.
+   - Gas is **measured at startup** from the live Polygon gas oracle (`fast.maxFee`) and
+     the live POL/USD ticker; both must resolve or CtfMinter and on-chain settlement refuse
+     to run. `--gas-usd` is an override, never a substitute for a measurement.
    - Inspect the live dashboard output directly while it runs. Do not wait 30 minutes to
      discover it produced nothing.
    - On completion, record the window (start/end UTC), starting/ending equity per pillar,
-     fills, and any errors from `data/logs/scripts.run_live_paper_soak.log`.
+     fills, and any errors from `data/logs/polymarketbot.paper.main.log`.
 
 2. **Audit + fix.** Dispatch **3 subagents in parallel**, one per strategy, each reading the
    **last 30-minute run only** (the exact window from step 1) plus the code path that
@@ -229,6 +268,14 @@ This is the standing refinement loop for the three live paper strategies:
    is to be fixed, not deferred. The orchestrator only mediates shared-file/cross-strategy
    conflicts, verifies the integrated result, and restarts the soak.
 
+   **Hard 30-minute limit per auditor.** An auditor that has not returned a complete,
+   compiling fix within 30 minutes is treated as irrecoverably stuck (observed: one
+   circling a single gate for 43 minutes without applying an edit). The orchestrator
+   must then **kill it and finish the slice itself**: read its transcript for whatever
+   diagnosis it produced, verify the tree compiles, apply the missing fix, and continue
+   the loop. Do not wait for a stalled auditor and do not spawn a replacement for the
+   same slice.
+
 3. **Integrate.** Orchestrator checks the three diffs for conflicts, compiles the tree,
    runs a bounded smoke if the changes touch a shared path, records what changed, and
    returns to step 1. Every audit cycle ends with the loop restarted; do not stop after
@@ -244,8 +291,11 @@ This is the standing refinement loop for the three live paper strategies:
   `docs/local-pc-india-analysis.md` before using a high-RTT host for live CTF.
 - Keep one compute process at a time; the soak is that process. Auditors read files and the
   SQLite/log outputs, they do not launch duplicate soak runs.
-- Never kill the soak blind: check the per-file log and `paper_soak_telemetry.db` row growth
-  first. If it produced nothing after 300 seconds, stop and fix the code.
-- State the expected cost of the soak up front (3 engines, 3 radars, 6 threads, 10-second
-  snapshots, roughly 180 dashboard records and 180 snapshot rows per 30-minute run).
+- Never kill the soak blind: check `data/logs/polymarketbot.paper.main.log` and the row
+  growth in `data/paper_engine.db` first. If it produced nothing after 300 seconds, stop and
+  fix the code.
+- State the expected cost of the soak up front: one process, one incremental universe walk
+  (20 keyset pages per tick), one rotating 12k-token book window per tick, one trade-tape
+  walk, UMA log windows per settlement pass, and one SQLite snapshot per interval. A
+  30-minute run at `--interval 10` writes ~180 snapshot rows per pillar.
 

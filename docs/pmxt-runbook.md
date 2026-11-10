@@ -26,7 +26,7 @@ Run from the repo root. `--dest` must be the external drive.
 
 ```bash
 # forward-test window first - this is the part that gates the go/no-go
-uv run scripts/download.py --only pmxt \
+uv run python -m polymarketbot.data.builders.download --only pmxt \
   --pmxt-start 2026-06-01T00 --pmxt-end 2026-08-10T23 \
   --dest E:/polymarket_pmxt --yes
 ```
@@ -34,7 +34,7 @@ uv run scripts/download.py --only pmxt \
 Then the earlier validation window:
 
 ```bash
-uv run scripts/download.py --only pmxt \
+uv run python -m polymarketbot.data.builders.download --only pmxt \
   --pmxt-start 2026-04-13T19 --pmxt-end 2026-05-31T23 \
   --dest E:/polymarket_pmxt --yes
 ```

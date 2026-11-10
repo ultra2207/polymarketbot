@@ -5,10 +5,10 @@ actually trade, each joined to the Kalshi market that states the same claim,
 with the six-hour book-event count and the measured freshness of the Polymarket
 mid against the Kalshi book.
 
-Built by `scripts/build_kalshi_mapping_active.py`:
+Built by the retired active-mapping builder (superseded by `python -m polymarketbot.data.kalshi_mapping --artifact v2`):
 
 ```
-.venv/Scripts/python.exe scripts/build_kalshi_mapping_active.py
+python -m polymarketbot.data.kalshi_mapping --artifact v1
 ```
 
 Direction is reversed versus `kalshi_mapping_v2.parquet`: v2 started from every
@@ -185,7 +185,7 @@ Deliberate rejects, to show the bar:
 ## Reproduction
 
 ```
-.venv/Scripts/python.exe scripts/build_kalshi_mapping_active.py
+python -m polymarketbot.data.kalshi_mapping --artifact v1
 # writes data/derived/kalshi_mapping_active_v2.parquet (13 rows, 18 columns:
 # 15 v2 columns + pm_events_6h + match_method + match_note)
 ```

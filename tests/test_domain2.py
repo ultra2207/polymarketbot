@@ -194,6 +194,19 @@ def test_settlement_worker_redemption():
         status="confirmed",
     )
 
+    # A measured chain endpoint: 2s blocks on top of a ~0ms local RPC probe.
+    class FakeChainClient:
+        def _rpc(self, method, params):
+            if method == "eth_blockNumber":
+                return "0x64"
+            if method == "eth_getBlockByNumber":
+                if params[0] == "0x64":
+                    return {"number": "0x64", "timestamp": "0x3e8"}
+                return {"number": "0x63", "timestamp": "0x3e6"}
+            raise AssertionError(f"unexpected RPC method {method}")
+
+    mock_ctf.chain_client = FakeChainClient()
+
     worker = Domain2SettlementWorker(ctf_client=mock_ctf, dry_run=True)
     cid = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 
@@ -213,13 +226,30 @@ def test_settlement_worker_redemption():
     assert len(res1) == 0
     mock_ctf.redeem_positions.assert_not_called()
 
-    # 2. Check after expiry: triggers redemption
+    # 2. After expiry the redemption is only queued: the position is untouched
+    #    until the measured RPC round trip + block interval has elapsed.
     res2 = worker.check_and_settle_ready_positions(now_ts=1500)
-    assert len(res2) == 1
-    assert res2[0].success is True
+    assert len(res2) == 0
+    assert pos.is_redeemed is False
+    assert len(worker._pending_redemptions) == 1
+    pending = worker._pending_redemptions[0]
+    assert pending.block_interval_s == 2.0
+    assert pending.due_ts == pytest.approx(1500 + pending.flight_s)
+    mock_ctf.redeem_positions.assert_not_called()
+
+    # 3. Still in flight: nothing lands and nothing is broadcast.
+    res3 = worker.check_and_settle_ready_positions(now_ts=1500.5)
+    assert res3 == []
+    mock_ctf.redeem_positions.assert_not_called()
+
+    # 4. After the flight the redemption lands and only then is it marked done.
+    res4 = worker.check_and_settle_ready_positions(now_ts=1600)
+    assert len(res4) == 1
+    assert res4[0].success is True
     assert pos.is_redeemed is True
     assert pos.redeem_tx_hash == "0xtxredeem"
     mock_ctf.redeem_positions.assert_called_once()
+    assert worker._pending_redemptions == []
 
 
 def test_harvester_engine_emergency_dispute_flow():
@@ -388,7 +418,13 @@ def test_harvester_universe_scan_and_optimal_execution():
         min_price=0.90,
     )
 
-    assert len(cands) > 100  # Broad coverage across universe
+    # The manifest is a static file and the scan filters on wall-clock hours, so a
+    # raw candidate count decays as markets fall outside the 72 h window. Assert
+    # the documented filter contract instead of a universe size that changes
+    # while the test sits unused.
+    assert cands
+    assert all(0.0 < c.price <= 1.0 for c in cands)
+    assert all(0.25 <= c.hours_to_resolution <= 72.0 for c in cands)
     # Run optimization on first 25 candidates
     res = harvester.execute_optimal_portfolio(cands[:25])
     assert res.solver_status in ("OPTIMAL", "FEASIBLE")

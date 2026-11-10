@@ -19,7 +19,10 @@ from polymarketbot.rewards.scoring import (  # noqa: E402
     compute_book_side_scores,
     compute_minimum_score,
 )
-from polymarketbot.simulator.engine import NativePaperTradingEngine  # noqa: E402
+from polymarketbot.simulator.engine import (  # noqa: E402
+    MissingBookPriceError,
+    NativePaperTradingEngine,
+)
 
 DAILY_RATE = 28.80
 EPOCH_BUDGET = DAILY_RATE / 1440.0
@@ -212,7 +215,7 @@ class TestCompetitorQMin:
                 asks=[],
                 timestamp=TS,
             )
-            mid_yes = engine.book_yes.mid_price
+            mid_yes = 0.50
             comp_q1, comp_q2 = compute_book_side_scores(
                 [OrderQuote(side="BUY", outcome="YES", price=0.495, size=100.0)],
                 mid_yes,
@@ -220,13 +223,14 @@ class TestCompetitorQMin:
             )
             expected_comp = compute_minimum_score(comp_q1, comp_q2, mid_yes)
 
-            res = engine.process_reward_epoch(timestamp=TS)
-
             assert comp_q1 > 0.0
             assert comp_q2 == pytest.approx(0.0)
             assert expected_comp == pytest.approx(comp_q1 / 3.0)
-            assert res["competing_score"] == pytest.approx(expected_comp, abs=0.01)
-            assert res["competing_score"] < comp_q1 * 0.5
+
+            # The one-sided book has no live mid, so the engine refuses to score an
+            # epoch against an invented 0.50 instead of reporting a competing score.
+            with pytest.raises(MissingBookPriceError):
+                engine.process_reward_epoch(timestamp=TS)
         finally:
             engine.close()
 

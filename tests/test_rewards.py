@@ -4,16 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.rewards.engine import (
-    LiquidityRewardsBotEngine,
-    MarketRewardParameters,
-)
-from polymarketbot.rewards.inventory import AvellanedaStoikovModel
 from polymarketbot.rewards.merger import (
     CompleteSetPosition,
     build_ctf_merge_transaction,
 )
-from polymarketbot.rewards.queue import OrderBookQueueSimulator
 from polymarketbot.rewards.scoring import (
     OrderQuote,
     calculate_epoch_payout,
@@ -145,54 +139,6 @@ def test_epoch_payout_and_floor() -> None:
     assert net == 0.0
 
 
-def test_avellaneda_stoikov_inventory_skew() -> None:
-    as_model = AvellanedaStoikovModel(
-        gamma=0.02,
-        volatility=0.25,
-        max_inventory=1000.0,
-        touch_spread_cents=1.0,
-        tick_size=0.01,
-    )
-
-    # When q = 0: quote symmetrically at 1.0c touch (mid - 0.5c, mid + 0.5c)
-    mid = 0.50
-    q0 = as_model.compute_quotes(
-        mid_price=mid,
-        inventory_q=0.0,
-        base_quote_size=200.0,
-        max_spread_cents=3.5,
-    )
-    assert q0.bid_price < mid < q0.ask_price
-    assert q0.bid_size == 200.0
-    assert q0.ask_size == 200.0
-    assert q0.is_bid_active is True
-    assert q0.is_ask_active is True
-
-    # When q > 0 (long YES): skew to flatten
-    # - Widen accumulating side (bid): bid drops lower
-    # - Tighten reducing side (ask): ask drops closer to mid
-    q_long = as_model.compute_quotes(
-        mid_price=mid,
-        inventory_q=600.0,
-        base_quote_size=200.0,
-        max_spread_cents=3.5,
-    )
-    assert q_long.bid_price <= q0.bid_price  # Widen/drop bid
-    assert q_long.ask_price <= q0.ask_price  # Tighten ask closer to mid
-    assert q_long.ask_size > q_long.bid_size  # Offer more on reducing side
-
-    # When q reaches max_inventory: bid deactivated
-    q_max = as_model.compute_quotes(
-        mid_price=mid,
-        inventory_q=1000.0,
-        base_quote_size=200.0,
-        max_spread_cents=3.5,
-    )
-    assert q_max.is_bid_active is False
-    assert q_max.bid_size == 0.0
-    assert q_max.is_ask_active is True
-
-
 def test_complete_set_merge_logic() -> None:
     pos = CompleteSetPosition(auto_merge_threshold=10.0)
     assert CompleteSetPosition().auto_merge_threshold == 100.0
@@ -303,101 +249,348 @@ def test_competitor_depth_ladder_and_jensens_inequality() -> None:
     assert (ladder_score / lumped_score) == pytest.approx(1.3687, rel=1e-3)
 
 
-def test_order_book_queue_and_fills() -> None:
-    sim = OrderBookQueueSimulator(cancellation_rate_per_min=0.10)
 
-    # Place bid with 500 shares competing depth ahead
-    order = sim.sync_quote(
-        order_id="bid_1",
-        side="BUY",
-        outcome="YES",
-        price=0.49,
-        size=100.0,
-        competing_depth_at_price=500.0,
-        current_epoch=1,
-    )
-    assert order.queue_ahead == 500.0
+# ---------------------------------------------------------------------------
+# Allocator: measured inputs, USD activation lots, KKT water-filling
+# ---------------------------------------------------------------------------
 
-    # Small trade of 200 shares sells at 0.49: doesn't reach us
-    fills1 = sim.process_trade(
-        trade_side="SELL",
-        trade_price=0.49,
-        trade_volume=200.0,
-        current_mid=0.50,
-        next_mid_60s=0.50,
-        current_epoch=1,
-    )
-    assert len(fills1) == 0
-    assert order.queue_ahead == 300.0
-
-    # Aggressive trade sells through our price at 0.48: crosses our quote!
-    fills2 = sim.process_trade(
-        trade_side="SELL",
-        trade_price=0.48,
-        trade_volume=150.0,
-        current_mid=0.50,
-        next_mid_60s=0.485,
-        current_epoch=2,
-        next_mid_300s=0.480,
-        next_mid_3600s=0.470,
-        decay_ratio=0.15,
-    )
-    assert len(fills2) == 1
-    f = fills2[0]
-    assert f.is_cross is True
-    assert f.fill_price == 0.49
-    assert f.fill_size == 100.0
-    # Spread captured: (0.50 mid - 0.49 fill) * 100 = 1.00 USD
-    assert f.spread_captured == pytest.approx(1.0)
-    # Multi-horizon markout losses:
-    # 60s: (0.49 - 0.485) * 100 = 0.50 USD
-    assert f.adverse_selection_60s == pytest.approx(0.50)
-    # 300s: max((0.49 - 0.480) * 100 = 1.00, 1.0 * 0.15 = 0.15) = 1.00 USD
-    assert f.adverse_selection_300s == pytest.approx(1.00)
-    # 3600s: max((0.49 - 0.470) * 100 = 2.00, 1.0 * 0.15 = 0.15) = 2.00 USD
-    assert f.adverse_selection_3600s == pytest.approx(2.00)
-    assert f.adverse_selection_loss == pytest.approx(2.00)
+from polymarketbot.rewards.allocator import (  # noqa: E402
+    PROTOCOL_MIN_DAILY_PAYOUT_USD,
+    LiquidityRewardsAllocator,
+)
 
 
-def test_engine_epoch_simulation() -> None:
-    mkt = MarketRewardParameters(
-        condition_id="0x7586a96520578acaaaa4ea84a2582f197f84255da1f3392a7aa300386c187b37",
-        question="Test Market",
-        rate_per_day=500.0,
-        rewards_min_size=100.0,
-        rewards_max_spread=3.0,
-        initial_mid=0.50,
-        category="politics",
-        competing_qualifying_depth=5000.0,
-        competing_touch_depth=1000.0,
+def _candidate(**over) -> dict:
+    base = {
+        "condition_id": "0xc",
+        "question": "q",
+        "daily_pool": 500.0,
+        "competing_score": 1000.0,
+        "max_spread": 3.0,
+        "min_size": 20.0,
+        "real_mid": 0.40,
+        "quote_price": 0.39,
+        "spread_offset_cents": 1.0,
+    }
+    base.update(over)
+    return base
+
+
+def test_alpha_is_measured_and_zero_outside_the_band() -> None:
+    allocator = LiquidityRewardsAllocator()
+    # 1c inside a 3c band: ((3 - 1)/3)^2
+    assert allocator.calculate_alpha(3.0, 1.0) == pytest.approx(4.0 / 9.0)
+    # A quote at or past the band scores nothing: no clamped positive default.
+    assert allocator.calculate_alpha(3.0, 3.0) == 0.0
+    assert allocator.calculate_alpha(3.0, 4.0) == 0.0
+    # A candidate that cannot state its resting distance is not scoreable.
+    bare = _candidate(spread_offset_cents=None, quote_price=None)
+    result = allocator.optimize_allocation_milp([bare], bankroll_usd=100.0)
+    assert result.allocations == []
+    assert result.solver_name == "NO_VIABLE_MARKETS"
+
+
+def test_activation_lot_is_shares_at_the_mid_not_dollars() -> None:
+    """min_size is a share count; the optimizer budget is USD."""
+    allocator = LiquidityRewardsAllocator()
+    # 200 shares at mid 0.10 is a $20 lot: it must fit a $100 bankroll, which
+    # the old share-as-dollar floor (200 > 100) wrongly rejected.
+    cheap = _candidate(min_size=200.0, real_mid=0.10, quote_price=0.09)
+    result = allocator.optimize_allocation_milp([cheap], bankroll_usd=100.0)
+    assert result.active_markets_count == 1
+    assert result.allocations[0].allocated_capital >= 200.0 * 0.10
+    assert result.allocations[0].quote_size >= 200.0
+
+
+def test_protocol_floor_is_the_only_payout_hurdle() -> None:
+    allocator = LiquidityRewardsAllocator()
+    alpha = allocator.calculate_alpha(3.0, 1.0)
+    # A pool that cannot pay the documented $1.00/day floor is not fundable.
+    assert allocator.calculate_min_floor_capital(1.0, 1000.0, alpha) == float("inf")
+    # A pool that can: c = D / (alpha * (P - 1)).
+    assert allocator.calculate_min_floor_capital(3.0, 1000.0, alpha) == pytest.approx(
+        1000.0 / (alpha * (3.0 - PROTOCOL_MIN_DAILY_PAYOUT_USD))
     )
 
-    engine = LiquidityRewardsBotEngine(
-        market=mkt,
-        quote_size=100.0,
-        risk_gamma=0.01,
-        max_inventory=1000.0,
-        seed=123,
+
+def test_water_filling_equalises_marginal_yield_across_markets() -> None:
+    """The fallback must spread capital, not dump the bankroll into one market."""
+    allocator = LiquidityRewardsAllocator()
+    alpha = allocator.calculate_alpha(3.0, 1.0)
+    parsed = [
+        {
+            "cand": _candidate(condition_id=f"0x{i}"),
+            "P": 500.0,
+            "D": 1000.0,
+            "alpha": alpha,
+            "c_min": 20.0 * 0.40,
+            "c_floor": 0.0,
+            "min_size": 20.0,
+            "mid": 0.40,
+        }
+        for i in range(3)
+    ]
+    result = allocator._solve_water_filling(parsed, 1000.0, 990.0, 10.0)
+    assert result.active_markets_count == 3
+    caps = [a.allocated_capital for a in result.allocations]
+    assert sum(caps) == pytest.approx(990.0, rel=1e-6)
+    for cap in caps:
+        assert cap == pytest.approx(330.0, rel=1e-6)
+    margins = [
+        allocator.marginal_payout(cap, 500.0, 1000.0, alpha) for cap in caps
+    ]
+    for margin in margins[1:]:
+        assert margin == pytest.approx(margins[0], rel=1e-6)
+
+
+def test_reserve_ceiling_is_total_exposure_not_a_bankroll_fraction() -> None:
+    """The reserve cap is the notional that could fill at once, never 35 %."""
+    from polymarketbot.rewards.allocator import calculate_endogenous_reserve
+
+    # Three $100 exposures at 0.5 pay-out each: h_i = 50, so no more than $150
+    # of inventory can fill simultaneously. A 35 % ceiling on this bankroll
+    # would have been $35,000 - a number with no measurement behind it.
+    allocations = [
+        {"allocated_capital": 100.0, "mid_price": 0.5} for _ in range(3)
+    ]
+    reserve = calculate_endogenous_reserve(
+        allocations=allocations,
+        bankroll_usd=100_000.0,
+        base_gas_buffer_usd=0.0,
+        jump_shock_factor=1.0,
+    )
+    assert reserve <= 150.0 + 1e-6
+    # The gas floor still holds when it is the larger term: the reserve never
+    # drops below the buffer that guarantees the merge calls can be paid for.
+    floor = calculate_endogenous_reserve(
+        allocations=[{"allocated_capital": 1.0, "mid_price": 0.5}],
+        bankroll_usd=100_000.0,
+        base_gas_buffer_usd=25.0,
+        jump_shock_factor=0.0,
+    )
+    assert floor >= 25.0
+    assert floor <= 150.0
+    # And the cap scales with the exposure it is derived from.
+    doubled = [
+        {"allocated_capital": 200.0, "mid_price": 0.5} for _ in range(3)
+    ]
+    assert calculate_endogenous_reserve(
+        allocations=doubled,
+        bankroll_usd=100_000.0,
+        base_gas_buffer_usd=0.0,
+        jump_shock_factor=1.0,
+    ) > reserve
+
+
+def _measured_regime(condition_id: str = "0xtest"):
+    """A tape regime shaped like a measured one (window, prints, statistics)."""
+    from polymarketbot.rewards.tape_regime import MarketRegime, NS_PER_HOUR
+
+    window_end_ns = 1_794_306_326_926_867_001
+    return MarketRegime(
+        condition_id=condition_id,
+        window_start_ns=window_end_ns - int(24.0 * NS_PER_HOUR),
+        window_end_ns=window_end_ns,
+        trades=500,
+        trades_per_min=0.35,
+        mean_trade_size_shares=40.0,
+        size_cv=1.2,
+        realised_vol_bps_per_min=100.0,
+        jump_freq=0.02,
+        span_minutes=60.0,
+        required_sample=100,
+        jump_band_cents=3.0,
     )
 
-    # Run 1 epoch (1440 minutes)
-    report = engine.simulate_epoch(epoch_idx=1, n_minutes=1440)
 
-    assert report.epoch_index == 1
-    assert report.daily_rate == 500.0
-    assert report.allocated_capital > 0.0
-    assert report.gross_rewards >= 0.0
-    assert report.net_pnl == pytest.approx(
-        report.net_rewards
-        + report.spread_captured
-        - report.adverse_selection
-        - report.inventory_decay
-        - report.gas_fees,
-        rel=1e-2,
+# Measured inputs every yield estimate now needs: the caller's capital, the
+# market's published tick, the quote lifetime, and the market's tape regime.
+# (tick 0.01, flow 20 shares, 300 s) is a measured cell of
+# data/derived/ctf_quote_fill_horizon.json, and (300 s, tick 0.01) is a measured
+# cell of data/derived/ctf_maker_markout.json.
+MEASURED_INPUTS = dict(
+    allocated_capital_usd=1000.0,
+    tick_size=0.01,
+    quote_horizon_s=300.0,
+    regime=_measured_regime(),
+)
+
+
+def test_expected_yield_uses_measured_distance_and_mid() -> None:
+    """No 0.5c / 0.50 defaults: an unmeasured quote earns no estimate."""
+    from polymarketbot.rewards.scanner import calculate_expected_yield
+
+    base = dict(
+        daily_rate=500.0,
+        max_spread_cents=3.0,
+        min_size=20.0,
+        competing_score=1000.0,
+        gas_fee_per_merge=0.01,
+        merge_threshold=30.0,
+        **MEASURED_INPUTS,
     )
-    assert isinstance(report.passed_payout_floor, bool)
-    assert report.adverse_selection >= 0.0
-    assert report.adverse_selection_60s >= 0.0
-    assert report.adverse_selection_300s >= 0.0
-    assert report.adverse_selection_3600s >= 0.0
-    assert report.gas_fees >= 0.0
+    unmeasured = calculate_expected_yield(**base)
+    assert unmeasured["maker_score"] == 0.0
+    assert unmeasured["net_expected_yield"] == 0.0
+
+    measured = calculate_expected_yield(**base, spread_cents=1.0, mid_price=0.40)
+    assert measured["maker_score"] > 0.0
+    # The score is a function of the distance it was given, not of 0.5c.
+    nearer = calculate_expected_yield(**base, spread_cents=0.5, mid_price=0.40)
+    assert nearer["maker_score"] > measured["maker_score"]
+
+
+def test_one_sided_quote_is_scored_at_a_third() -> None:
+    """The venue's one-sided penalty applies to the scanner, not just paper."""
+    from polymarketbot.rewards.scanner import calculate_expected_yield
+
+    common = dict(
+        daily_rate=500.0,
+        max_spread_cents=3.0,
+        min_size=20.0,
+        competing_score=1000.0,
+        gas_fee_per_merge=0.01,
+        merge_threshold=30.0,
+        spread_cents=1.0,
+        mid_price=0.40,
+        **MEASURED_INPUTS,
+    )
+    two_sided = calculate_expected_yield(**common, quote_sides=2)
+    one_sided = calculate_expected_yield(**common, quote_sides=1)
+    # Same capital: the one-sided plan puts it all in one leg (twice the shares)
+    # but is paid a third of that leg's raw score, so it earns 2/3 of what the
+    # same money earns split across both sides (625 alpha vs 937.5 alpha).
+    assert one_sided["maker_score"] == pytest.approx(
+        two_sided["maker_score"] * 2.0 / 3.0
+    )
+    # Outside the [0.10, 0.90] band a one-sided quote is paid nothing at all.
+    outside = calculate_expected_yield(**{**common, "mid_price": 0.95}, quote_sides=1)
+    assert outside["maker_score"] == 0.0
+
+
+def test_unmeasured_gas_refuses_the_yield_estimate(monkeypatch) -> None:
+    """A rate-limited RPC must not price merges at a fabricated $0.015."""
+    import polymarketbot.trading.ctf as ctf_mod
+    from polymarketbot.rewards.scanner import calculate_expected_yield
+
+    def boom():
+        raise RuntimeError("eth_blockNumber rate limited")
+
+    monkeypatch.setattr(ctf_mod, "estimate_merge_cost_usd", boom)
+    metrics = calculate_expected_yield(
+        daily_rate=500.0,
+        max_spread_cents=3.0,
+        min_size=20.0,
+        spread_cents=1.0,
+        mid_price=0.40,
+        competing_score=1000.0,
+        **MEASURED_INPUTS,
+    )
+    assert metrics["gas_measured"] is False
+    assert metrics["net_expected_yield"] == float("-inf")
+    assert metrics["passed_payout_floor"] is False
+
+
+# ---------------------------------------------------------------------------
+# Expected total yield: accrual while unfilled + measured fill yield
+#
+# Window 9 measured the defect this pins. The optimiser ranked markets by the
+# marginal yield of the accrual alone, which is largest where the competing
+# score ``D`` is smallest - it funded ``D = 4.0 shares`` books claiming 52.9 %
+# of a pool. It also logged an instantaneous implied rate ($104 -> $472.91/day
+# between ticks) against an equity delta ($5.95 / 30 min ~ $286/day), a 1.65x
+# "disagreement" that was only ever a point estimate versus a time average.
+# ---------------------------------------------------------------------------
+
+
+def test_optimizer_prefers_the_market_that_actually_keeps_its_yield() -> None:
+    """An empty book's thin ``D`` loses to a book whose fills do not cost money.
+
+    Both candidates claim the same pool. The empty book (``D = 4``) has the
+    larger marginal accrual; the liquid one (``D = 400``) is where a fill keeps
+    the spread instead of paying the measured markout. Once the fill side is
+    priced, the ranking is the *total* yield and the empty book no longer wins
+    on its denominator alone.
+    """
+    allocator = LiquidityRewardsAllocator()
+    empty = _candidate(
+        condition_id="0xempty",
+        competing_score=4.0,
+        # A book with no queue: every fill is adverse (drift > distance to mid).
+        fill_yield_usd_per_usd_per_day=-6.0,
+        stay_fraction=0.5,
+        p_fill=0.5,
+    )
+    liquid = _candidate(
+        condition_id="0xliquid",
+        competing_score=400.0,
+        # A deep book: a fill earns the distance to the mid, net of markout.
+        fill_yield_usd_per_usd_per_day=0.05,
+        stay_fraction=0.9999,
+        p_fill=1e-4,
+    )
+
+    accrual_only = allocator.optimize_allocation_milp(
+        [dict(empty, fill_yield_usd_per_usd_per_day=None, stay_fraction=None, p_fill=None),
+         dict(liquid, fill_yield_usd_per_usd_per_day=None, stay_fraction=None, p_fill=None)],
+        bankroll_usd=200.0,
+    )
+    assert accrual_only.allocations, "accrual-only mode must still fund something"
+    # The defect: on the accrual alone the empty book ranks first.
+    assert accrual_only.allocations[0].condition_id == "0xempty"
+
+    priced = allocator.optimize_allocation_milp([empty, liquid], bankroll_usd=200.0)
+    assert priced.allocations, "a priced fill side must still fund something"
+    assert priced.allocations[0].condition_id == "0xliquid"
+    assert priced.allocations[0].expected_fill_yield_usd_per_day > 0.0
+    assert priced.allocations[0].expected_total_yield_usd_per_day == pytest.approx(
+        priced.allocations[0].daily_reward_payout * 0.9999
+        + priced.allocations[0].expected_fill_yield_usd_per_day,
+        abs=0.05,
+    )
+
+
+def test_water_filling_funds_nothing_whose_accrual_cannot_beat_its_own_fill_yield() -> None:
+    """The KKT inverse carries the fill term, so ``lambda <= fill`` is zero size."""
+    allocator = LiquidityRewardsAllocator()
+    alpha = allocator.calculate_alpha(3.0, 1.0)
+    parsed = [
+        {
+            "cand": _candidate(condition_id="0xneg"),
+            "P": 100.0,
+            "D": 100.0,
+            "alpha": alpha,
+            "c_min": 8.0,
+            "c_floor": 0.0,
+            "min_size": 20.0,
+            "mid": 0.40,
+            # Filling costs more than the whole pool pays: no size is funded.
+            "fill_side": (1.0, -1000.0),
+        },
+    ]
+    result = allocator._solve_water_filling(parsed, 100.0, 90.0, 10.0)
+    assert result.total_allocated == 0.0
+
+
+def test_fill_probability_is_read_from_the_measured_table_or_refused() -> None:
+    """A quote horizon outside the measured grid has no probability: refuse."""
+    from polymarketbot.paper.pillars.reward import expected_fill_yield
+
+    priced = expected_fill_yield(
+        tick=0.01, min_flow_shares=50.0, horizon_s=5.0,
+        quote_price=0.30, leg_mid=0.305,
+    )
+    assert priced is not None
+    # Measured cells, not invented ones: the probability is small, the adverse
+    # drift is the measured 0.10c/share, and the daily rate follows from them.
+    assert 0.0 < priced.p_fill < 1e-2
+    assert priced.markout_usd_per_share > 0.0
+    assert priced.fill_yield_usd_per_usd_per_day == pytest.approx(
+        priced.p_fill * (86_400.0 / priced.horizon_s) * priced.fill_edge_per_usd
+    )
+    assert priced.stay_fraction == pytest.approx(1.0 - priced.p_fill)
+    # No measured cell at this tick -> missing data, never a default.
+    assert expected_fill_yield(
+        tick=0.05, min_flow_shares=50.0, horizon_s=5.0,
+        quote_price=0.30, leg_mid=0.305,
+    ) is None

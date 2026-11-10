@@ -36,6 +36,23 @@ from polymarketbot.rewards.scoring import single_sided_score_fraction
 
 log = get_logger(__name__)
 
+_SECONDS_PER_DAY = 86_400.0
+
+
+def _as_float(value: Any, missing: float) -> float:
+    """``float(value)``, or ``missing`` when the field is absent.
+
+    Used only for fields whose absence is a documented mode (an accrual-only
+    study has no fill side), never to turn an unmeasured *measurement* into a
+    number: every such field stays ``None`` all the way to its consumer.
+    """
+    if value is None:
+        return float(missing)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(missing)
+
 
 @dataclass(frozen=True)
 class RewardQuote:
@@ -55,6 +72,129 @@ class RewardQuote:
     max_spread_cents: float
     min_size: float
     strategy: str = "RewardHarvester"
+    p_fill: Optional[float] = None
+    """Measured P(this bid is filled within one quote horizon). ``None`` = the
+    fill side was not priced for this quote (accrual-only study)."""
+    fill_yield_usd_per_usd_per_day: float = 0.0
+    """Expected fill-side yield of the capital behind this quote, USD per USD
+    per day, net of the measured adverse markout."""
+
+
+@dataclass(frozen=True)
+class MarketFillYield:
+    """The fill side of a reward quote's yield, from the measured L2 tape.
+
+    A reward bid earns its share of the daily pool only while it is **in-band
+    and unfilled**: a fill converts the resting capital into inventory, stops
+    the accrual on the filled part, and pays the measured adverse drift. Both
+    halves are measured, never assumed.
+    """
+
+    p_fill: float
+    """P(filled within ``horizon_s``), from ``ctf_quote_fill_horizon.json``."""
+    horizon_s: float
+    """The horizon the probability was measured at (pinned to support)."""
+    markout_usd_per_share: float
+    """Measured adverse drift of a filled leg, ``ctf_maker_markout.json``."""
+    fill_edge_per_usd: float
+    """``(leg_mid - quote - markout) / quote``: what one fill earns per dollar."""
+    fill_yield_usd_per_usd_per_day: float
+    """``p_fill * (86400 / horizon_s) * fill_edge_per_usd``: expected fill yield."""
+
+    @property
+    def stay_fraction(self) -> float:
+        """Share of one horizon the bid is expected to rest unfilled."""
+        return max(0.0, 1.0 - self.p_fill)
+
+
+_QUOTE_FILL_HORIZON: Any = None
+_QUOTE_FILL_HORIZON_TRIED = False
+_MAKER_MARKOUT: Any = None
+_MAKER_MARKOUT_TRIED = False
+
+
+def _fill_table() -> Any:
+    """The measured horizon fill table, or ``None`` when it is unusable.
+
+    Loaded from the same artifacts the CTF maker gate prices against
+    (``polymarketbot.paper.pillars.ctf``), so the two pillars cannot disagree
+    about how often a resting bid at the touch is filled.
+    """
+    global _QUOTE_FILL_HORIZON, _QUOTE_FILL_HORIZON_TRIED
+    if not _QUOTE_FILL_HORIZON_TRIED:
+        _QUOTE_FILL_HORIZON_TRIED = True
+        try:
+            from polymarketbot.paper.pillars.ctf import load_quote_fill_horizon
+
+            _QUOTE_FILL_HORIZON = load_quote_fill_horizon()
+        except Exception as exc:  # noqa: BLE001 - a missing measurement is data, not a crash
+            log.warning(
+                f"reward fill side unpriced: horizon fill measurement unavailable ({exc})"
+            )
+            _QUOTE_FILL_HORIZON = None
+    return _QUOTE_FILL_HORIZON
+
+
+def _markout_table() -> Any:
+    """The measured single-leg markout, or ``None`` when it is unusable."""
+    global _MAKER_MARKOUT, _MAKER_MARKOUT_TRIED
+    if not _MAKER_MARKOUT_TRIED:
+        _MAKER_MARKOUT_TRIED = True
+        try:
+            from polymarketbot.paper.pillars.ctf import load_maker_markout
+
+            _MAKER_MARKOUT = load_maker_markout()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                f"reward fill side unpriced: single-leg markout unavailable ({exc})"
+            )
+            _MAKER_MARKOUT = None
+    return _MAKER_MARKOUT
+
+
+def expected_fill_yield(
+    *,
+    tick: float,
+    min_flow_shares: float,
+    horizon_s: float,
+    quote_price: float,
+    leg_mid: float,
+) -> Optional[MarketFillYield]:
+    """Expected fill yield of one reward bid, from the two measured tape tables.
+
+    ``min_flow_shares`` is the size our own bid must be met with - the venue's
+    reward minimum in shares, which is also the smallest order that can rest
+    there - so the probability is read at the flow bucket that covers *our*
+    order, not at a threshold.
+
+    Returns ``None`` - and the caller must refuse the market rather than price
+    the quote on half a measurement - when either table has no measured cell
+    for this ``(horizon, tick)`` or for this required flow.
+    """
+    if not 0.0 < quote_price < 1.0 or not 0.0 < leg_mid < 1.0:
+        return None
+    fills = _fill_table()
+    if fills is None:
+        return None
+    pinned = fills.clamped_p_fill(float(horizon_s), float(tick), float(min_flow_shares))
+    if pinned is None:
+        return None
+    p_fill, priced_horizon = pinned
+    markouts = _markout_table()
+    if markouts is None:
+        return None
+    adverse = markouts.markout(priced_horizon, float(tick))
+    if adverse is None:
+        return None
+    edge_per_usd = (float(leg_mid) - float(quote_price) - float(adverse)) / float(quote_price)
+    per_day = p_fill * (_SECONDS_PER_DAY / max(1e-9, float(priced_horizon))) * edge_per_usd
+    return MarketFillYield(
+        p_fill=float(p_fill),
+        horizon_s=float(priced_horizon),
+        markout_usd_per_share=float(adverse),
+        fill_edge_per_usd=float(edge_per_usd),
+        fill_yield_usd_per_usd_per_day=float(per_day),
+    )
 
 
 def _cheaper_leg(
@@ -136,6 +276,7 @@ def reward_candidates(
     markets: list[Market],
     books: dict[str, dict[str, Any]],
     tape_prints: list[Print],
+    fill_horizon_s: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Allocator candidate dicts for every market quoting inside the band.
 
@@ -179,6 +320,7 @@ def reward_candidates(
     share, ``score_per_usd`` is score units per USDC.
     """
     candidates: list[dict[str, Any]] = []
+    unpriced = 0
     for market in markets:
         if market.daily_reward <= 0.0 or market.reward_max_spread_cents <= 0.0:
             continue
@@ -224,6 +366,23 @@ def reward_candidates(
         score = market_competing_score(market, books)
         if score is None:
             continue
+        min_size = max(market.reward_min_size, market.min_order)
+        fill_yield: Optional[MarketFillYield] = None
+        if fill_horizon_s is not None:
+            # With a stated quote horizon the fill side is mandatory: a bid
+            # whose chance of filling is unmeasured cannot be priced against
+            # the accrual it gives up when it fills, so the market is refused
+            # rather than valued on half a measurement.
+            fill_yield = expected_fill_yield(
+                tick=market.tick,
+                min_flow_shares=min_size,
+                horizon_s=float(fill_horizon_s),
+                quote_price=quote_price,
+                leg_mid=leg_mid,
+            )
+            if fill_yield is None:
+                unpriced += 1
+                continue
         candidates.append(
             {
                 "condition_id": market.condition_id,
@@ -231,7 +390,7 @@ def reward_candidates(
                 "daily_pool": market.daily_reward,
                 "competing_score": score,
                 "max_spread": market.reward_max_spread_cents,
-                "min_size": max(market.reward_min_size, market.min_order),
+                "min_size": min_size,
                 "real_mid": leg_mid,
                 # The score multiplier belongs to the distance *this* quote will
                 # actually rest at, so it is measured here, per candidate, and
@@ -249,7 +408,24 @@ def reward_candidates(
                 "quote_side": "bid",
                 "tick": market.tick,
                 "lot_price": quote_price,
+                # Expected fill side, both halves measured on the L2 tape. The
+                # optimiser maximises accrual + fill yield, so a book that never
+                # trades can no longer win on its thin competing score alone:
+                # the share it claims is only earned while the bid rests
+                # in-band and unfilled.
+                "p_fill": None if fill_yield is None else fill_yield.p_fill,
+                "stay_fraction": 1.0 if fill_yield is None else fill_yield.stay_fraction,
+                "fill_yield_usd_per_usd_per_day": (
+                    0.0 if fill_yield is None else fill_yield.fill_yield_usd_per_usd_per_day
+                ),
             }
+        )
+    if unpriced:
+        log.info(
+            f"reward candidates: refused {unpriced} market(s) whose fill probability "
+            f"is unmeasured at a {fill_horizon_s:.0f}s horizon for their tick and "
+            f"required flow (a resting bid priced without it claims an accrual it "
+            f"may not keep)"
         )
     return candidates
 
@@ -607,6 +783,10 @@ def quotes_from_allocation(
                 competing_score=float(candidate["competing_score"]),
                 max_spread_cents=float(candidate["max_spread"]),
                 min_size=min_size,
+                p_fill=candidate.get("p_fill"),
+                fill_yield_usd_per_usd_per_day=_as_float(
+                    candidate.get("fill_yield_usd_per_usd_per_day"), 0.0
+                ),
             )
         )
     return quotes
@@ -694,9 +874,16 @@ def commit_quotes(
     if cash <= 0.0 or not ideal:
         return []
     resting = resting or {}
+    # Rank by expected *total* yield per dollar, the same objective the
+    # optimizer maximised: the accrual alone would rank the emptiest book first,
+    # and an empty book is exactly where a fill - the other half of the yield -
+    # never happens.
     ordered = sorted(
         ideal,
-        key=lambda quote: quote.daily_payout / max(quote.price * quote.shares, 1e-9),
+        key=lambda quote: (
+            quote.daily_payout * (1.0 - _as_float(quote.p_fill, 0.0))
+            + quote.fill_yield_usd_per_usd_per_day * quote.price * quote.shares
+        ) / max(quote.price * quote.shares, 1e-9),
         reverse=True,
     )
     committed: list[RewardQuote] = []

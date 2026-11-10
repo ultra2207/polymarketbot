@@ -258,7 +258,15 @@ _OO_SPECS = (
     _spec(
         "DisputePrice",
         CONTRACT_OO_V2,
-        [("requester", "address"), ("disputer", "address")],
+        # Three indexed addresses. The deployed OOv2 declares ``proposer``
+        # indexed as well, so its topic0 is
+        # ``0x5165909c3d1c01c5d1e121ac6f6d01dda1ba24bc9e1f975b5a375339c15be7f3``.
+        # The old two-address list hashed to ``0xdb5d525c..4490``, a topic that
+        # occurs zero times on chain (measured over the whole
+        # ``data/tape/polygon_logs`` window, 2026-11-10), i.e. every dispute was
+        # silently undecodable and a disputed proposal kept pricing as if
+        # undisputed.
+        [("requester", "address"), ("proposer", "address"), ("disputer", "address")],
         [
             ("identifier", "bytes32"),
             ("timestamp", "uint256"),
@@ -270,12 +278,19 @@ _OO_SPECS = (
         "Settle",
         CONTRACT_OO_V2,
         [("requester", "address"), ("proposer", "address"), ("disputer", "address")],
+        # ``settlementPrice`` is not part of the deployed ABI: OOv2 emits
+        # ``Settle(...,int256 proposedPrice,uint256 expirationTime)``, topic0
+        # ``0x3f384afb4bd9f0aef0298c80399950011420eb33b0e1a750b20966270247b9a0``
+        # (272 such logs on chain in the same window, 0 of the old
+        # ``..,int256,int256)`` topic ``0x44b71f4d..5711``). ``disputed`` is
+        # read from the indexed ``disputer``, so nothing downstream depends on
+        # the trailing words.
         [
             ("identifier", "bytes32"),
             ("timestamp", "uint256"),
             ("ancillaryData", "bytes"),
             ("proposedPrice", "int256"),
-            ("settlementPrice", "int256"),
+            ("expirationTimestamp", "uint256"),
         ],
     ),
 )

@@ -50,16 +50,34 @@ def _market(**overrides: object) -> dict:
     return payload
 
 
-def _run_scan(markets: list[dict], **kwargs: object) -> list[dict]:
-    reset_scanner_telemetry()
-    with patch("requests.Session.get") as mock_get, patch(
-        "polymarketbot.rewards.scanner.get_real_l2_score",
-        return_value=(500.0, 1000.0, 0.60),
-    ):
+def _venue_get(markets: list[dict], tick: float = 0.01):
+    """Answer both endpoints the scan calls: reward campaigns and ``/tick-size``.
+
+    The tick is the grid the quote distance is measured on and the campaign rows
+    do not publish it, so the scanner reads it from the venue; a mock that
+    answers every URL with the campaign payload leaves it unmeasured and the
+    market is refused.
+    """
+
+    def _get(*args, **kwargs):
+        url = kwargs.get("url") if "url" in kwargs else (args[1] if len(args) > 1 else args[0])
         response = MagicMock()
         response.status_code = 200
-        response.json.return_value = {"data": markets}
-        mock_get.return_value = response
+        if "tick-size" in str(url):
+            response.json.return_value = {"minimum_tick_size": str(tick)}
+        else:
+            response.json.return_value = {"data": markets}
+        return response
+
+    return _get
+
+
+def _run_scan(markets: list[dict], **kwargs: object) -> list[dict]:
+    reset_scanner_telemetry()
+    with patch("requests.Session.get", side_effect=_venue_get(markets)), patch(
+        "polymarketbot.rewards.scanner.lp_screen.get_real_l2_score",
+        return_value=(500.0, 1000.0, 0.60),
+    ):
         return find_optimal_lp_markets(bankroll_usd=150.0, limit_output=5, **kwargs)
 
 
@@ -89,7 +107,7 @@ def test_find_optimal_rejects_unsafe_markets(overrides: dict) -> None:
     ranked = _run_scan([_market(**overrides)])
 
     assert ranked == []
-    assert scanner._SCANNER_CACHE  # the empty result is cached, not silently skipped
+    assert scanner.state._SCANNER_CACHE  # the empty result is cached, not silently skipped
 
 
 def test_find_optimal_accepts_valid_market() -> None:
@@ -147,33 +165,34 @@ def test_find_optimal_metadata_defaults_and_camel_case_aliases() -> None:
     assert candidate["accepting_orders"] is None
 
 
-def test_reported_depth_is_audited_sum_and_floor_is_flagged() -> None:
+@pytest.mark.parametrize(
+    "mocked_l2, expected_score, expected_shares",
+    [
+        # A thin book: the audited sum is reported as measured. There is no
+        # ``max(1000.0, rate * 40.0)`` floor any more - inflating a thin book to
+        # 1000 made every pool look equally contested.
+        ((10.0, 12.5, 0.60), 20.0, 25.0),
+        # A deep book: the same sum, no cap and no floor.
+        ((500.0, 1000.0, 0.60), 1000.0, 2000.0),
+    ],
+)
+def test_reported_depth_is_the_audited_sum(
+    mocked_l2: tuple[float, float, float],
+    expected_score: float,
+    expected_shares: float,
+) -> None:
     reset_scanner_telemetry()
-    with patch("requests.Session.get") as mock_get, patch(
-        "polymarketbot.rewards.scanner.get_real_l2_score",
-        return_value=(10.0, 12.5, 0.60),
+    with patch("requests.Session.get", side_effect=_venue_get([_market()])), patch(
+        "polymarketbot.rewards.scanner.lp_screen.get_real_l2_score",
+        return_value=mocked_l2,
     ):
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"data": [_market()]}
-        mock_get.return_value = response
         ranked = find_optimal_lp_markets(bankroll_usd=150.0, limit_output=5)
 
     assert len(ranked) == 1
     candidate = ranked[0]
-    # 12.5 shares per side, summed for both tokens -> 25.0 real qualifying shares.
-    assert candidate["qualifying_shares"] == pytest.approx(25.0)
-    assert candidate["competing_score"] == pytest.approx(100.0)
-    assert candidate["competing_score_floor_applied"] is True
-
-
-def test_reported_depth_floor_not_applied_when_audit_is_deeper() -> None:
-    ranked = _run_scan([_market()])
-
-    candidate = ranked[0]
-    assert candidate["qualifying_shares"] == pytest.approx(2000.0)
-    assert candidate["competing_score"] == pytest.approx(1000.0)
-    assert candidate["competing_score_floor_applied"] is False
+    assert candidate["qualifying_shares"] == pytest.approx(expected_shares)
+    assert candidate["competing_score"] == pytest.approx(expected_score)
+    assert "competing_score_floor_applied" not in candidate
 
 
 def _book_response(bids: list[dict], asks: list[dict]) -> MagicMock:
@@ -191,14 +210,14 @@ def test_crossed_book_is_not_scored() -> None:
         asks=[{"price": "0.52", "size": "100.0"}],
     )
 
-    assert get_real_l2_score(session, "999000001", 3.0) == (0.0, 0.0, 0.50)
-    assert "999000001" not in scanner._BOOK_CACHE
+    assert get_real_l2_score(session, "999000001", 3.0) == (None, None, None)
+    assert "999000001" not in scanner.state._BOOK_CACHE
 
 
 def test_crossed_book_falls_back_to_cached_value() -> None:
     reset_scanner_telemetry()
     token_id = "999000002"
-    scanner._BOOK_CACHE[token_id] = (time.time() - 60.0, (123.0, 456.0, 0.5))
+    scanner.state._BOOK_CACHE[token_id] = (time.time() - 60.0, (123.0, 456.0, 0.5))
     session = MagicMock()
     session.get.return_value = _book_response(
         bids=[{"price": "0.55", "size": "100.0"}],
@@ -216,7 +235,7 @@ def test_non_positive_max_spread_is_not_scored() -> None:
         asks=[{"price": "0.51", "size": "100.0"}],
     )
 
-    assert get_real_l2_score(session, "999000003", 0.0) == (0.0, 0.0, 0.50)
+    assert get_real_l2_score(session, "999000003", 0.0) == (None, None, None)
     session.get.assert_not_called()
 
 

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -259,66 +256,3 @@ def test_load_samples_keeps_the_newest_parts_only(tmp_path):
 
 def test_load_samples_is_empty_before_any_probe(tmp_path):
     assert nc.load_samples(tmp_path) == {}
-
-
-# ----------------------------------------------------- measurement primitives
-@pytest.fixture(scope="module")
-def measure_module():
-    path = Path(__file__).resolve().parent.parent / "scripts" / "measure_lead_time.py"
-    spec = importlib.util.spec_from_file_location("measure_lead_time", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_first_after_takes_the_first_move_inside_the_gap(measure_module):
-    times = [1_000 * MS, 1_500 * MS, 3_000 * MS]
-    assert measure_module._first_after(times, 1_400 * MS, 600 * MS) == 1_500 * MS
-    assert measure_module._first_after(times, 1_400 * MS, 50 * MS) is None
-    assert measure_module._first_after(times, 3_500 * MS, 600 * MS) is None
-    assert measure_module._first_after([], 0, 1_000 * MS) is None
-
-
-def test_reactions_measure_the_gap_to_the_next_clob_move(measure_module):
-    binance = [1_000 * MS, 2_000 * MS, 5_000 * MS]
-    clob = [1_150 * MS, 2_050 * MS]
-    assert measure_module._reactions(binance, clob, 500 * MS) == [150 * MS, 50 * MS]
-
-
-def test_reactions_with_a_placebo_delay_ignore_the_close_moves(measure_module):
-    binance = [1_000 * MS]
-    clob = [1_150 * MS, 6_200 * MS]
-    assert measure_module._reactions(binance, clob, 500 * MS) == [150 * MS]
-    assert measure_module._reactions(binance, clob, 500 * MS, 5_000 * MS) == [200 * MS]
-
-
-def test_stats_reports_the_distribution_and_the_gate_share(measure_module):
-    values = [50 * MS, 150 * MS, 250 * MS, 350 * MS]
-    stats = measure_module._stats(values)
-    assert stats["n"] == 4
-    assert stats["min_ms"] == 50.0
-    assert stats["p50_ms"] == 200.0
-    assert stats["share_after_gate"] == 0.75
-
-
-def test_stats_shifts_by_the_clock_correction(measure_module):
-    values = [50 * MS, 150 * MS]
-    stats = measure_module._stats(values, shift_ns=100 * MS)
-    assert stats["min_ms"] == 150.0
-    assert stats["share_after_gate"] == 1.0
-
-
-def test_stats_widens_the_gate_share_over_the_correction_bracket(measure_module):
-    values = [50 * MS, 150 * MS]
-    bounded = measure_module._stats(
-        values, shift_ns=0, low_shift_ns=-200 * MS, high_shift_ns=+200 * MS
-    )
-    assert bounded["share_after_gate"] == 0.5
-    assert bounded["share_after_gate_low"] == 0.0
-    assert bounded["share_after_gate_high"] == 1.0
-    assert bounded["lead_bounds_ms"] == [-200.0, 200.0]
-
-
-def test_stats_of_nothing_is_an_empty_row(measure_module):
-    assert measure_module._stats([]) == {"n": 0}

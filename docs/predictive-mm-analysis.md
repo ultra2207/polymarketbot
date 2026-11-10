@@ -122,7 +122,7 @@ event. This is the direction Moallemi & Yuan (2016) give queue position value:
 depth ahead of a resting order raises the adverse-selection cost of the fill it
 does receive.
 
-`scripts/calibrate_fill_model.py` fits the print-conditional fill probability
+`polymarketbot.tools.fill_calibration` fits the print-conditional fill probability
 on the same rows (6,817 level observations, 2,184 fills, 2026-11-04
 01:00-05:59 UTC), `logit P = 3.2769 - 1.1421*ratio - 0.5733*log1p(size)`,
 |z| > 14 on every coefficient. It is a ranking signal, not an absolute fill
@@ -240,12 +240,12 @@ be judged on PnL.
 * A/B harness: `scripts/backtest_predictive_gate.py`
 * Queue join / A/B: `scripts/analyze_queue_positions.py`
   (`data/derived/queue_gate_summary.txt`)
-* Fill model: `scripts/calibrate_fill_model.py` (`data/derived/fill_model.json`)
+* Fill model: `polymarketbot.tools.fill_calibration` (`data/derived/fill_model.json`)
 * Paper gate: `src/polymarketbot/paper_trading/engine.py`
 * Queue orchestrator: `src/polymarketbot/paper_trading/orchestrator.py`
 * Paper CLI: `scripts/run_paper_trading.py`
 * Tests: `tests/test_orchestrator.py`,
   `tests/test_paper_trading.py::test_price_only_ofi_gate_pulls_threatened_ask`
-* L3 build: `scripts/build_l3_queue.py`; the 29 political asset-hours and the
+* L3 build: `polymarketbot.data.l3_queue`; the 29 political asset-hours and the
   8 crypto asset-hours are under `data/derived/l3_queue/`.
 * Working record and Gate status: `docs/two-week-results.md`.

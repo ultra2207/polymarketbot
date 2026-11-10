@@ -53,8 +53,6 @@ from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.models import RiskConfig
 from polymarketbot.trading.base import (
     BaseMarketMakingEngine,
-    DEFAULT_FALLBACK_ASK,
-    DEFAULT_FALLBACK_BID,
     PositionView,
 )
 from polymarketbot.execution import PreSignedOrderCache, SelfTradeGuard
@@ -313,6 +311,28 @@ class MarkoutTracker:
             self.process_due()
 
 
+@dataclass
+class _CtfMergePreflight:
+    """Merge state snapshotted under the engine lock before settlement I/O."""
+
+    available_sets: float
+    sets_to_merge: float
+    now: float
+    addr: str
+    dry_run: bool
+
+
+@dataclass
+class _CtfMergeOutcome:
+    """Receipt plus post-merge chain re-read produced by the unlocked I/O phase."""
+
+    result: MergeExecutionResult
+    apply: bool
+    chain_yes: Optional[float] = None
+    chain_no: Optional[float] = None
+    balance_read_error: Optional[BaseException] = None
+
+
 class RealMoneyTradingEngine(BaseMarketMakingEngine):
     """Production Real-Money Trading Engine for Polymarket CLOB."""
 
@@ -324,15 +344,15 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         clob_client: Optional[LiveClobClient] = None,
         ctf_client: Optional[PolygonCtfClient] = None,
         initial_cash: float = 100.0,
-        quote_size: float = 20.0,
-        spread_offset_cents: float = 0.50,
-        daily_reward_rate: float = 20.0,
-        rewards_max_spread_cents: float = 1.0,
-        rewards_min_size: float = 20.0,
+        quote_size: Optional[float] = None,
+        spread_offset_cents: Optional[float] = None,
+        daily_reward_rate: Optional[float] = None,
+        rewards_max_spread_cents: Optional[float] = None,
+        rewards_min_size: Optional[float] = None,
         auto_merge_threshold: Optional[float] = None,
         gas_fee_merge: Optional[float] = None,
         institutional_mode: bool = True,
-        gamma: float = 0.02,
+        gamma: Optional[float] = None,
         competing_score_override: Optional[float] = None,
         db_path: Union[str, Path] = "data/real_money_trading.db",
         ledger_path: Union[str, Path] = "data/real_money_trading_ledger.json",
@@ -496,6 +516,11 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         self._book_ts: dict[str, float] = {"YES": 0.0, "NO": 0.0}
         self._last_reward_sync: float = 0.0
         self._last_merge_ts: float = 0.0
+        # Conditions with a settlement between claim and apply. The SQLite
+        # PENDING row is the durable guard; this set keeps the in-process
+        # claim -> receipt window single-flight without holding `self._lock`
+        # across network I/O.
+        self._settlement_inflight: set[str] = set()
         self._deskew_order: Optional[dict[str, Any]] = None
         self._last_deskew_attempt_ts: float = 0.0
         self._last_risk_block_ts: float = 0.0
@@ -1120,7 +1145,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         if tok not in self._best_bids or tok not in self._best_asks:
             return None
         bid, ask = self.get_best_bid_ask(tok)
-        if not (0.0 < bid < 1.0 and 0.0 < ask < 1.0):
+        if bid is None or ask is None or not (0.0 < bid < 1.0 and 0.0 < ask < 1.0):
             return None
         mid = (bid + ask) / 2.0
         return mid if 0.0 < mid < 1.0 else None
@@ -1194,7 +1219,9 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         reserve_buffer = total_eq * float(min_reserve_pct)
         return max(0.0, free_cash - reserve_buffer)
 
-    def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
+    def get_best_bid_ask(
+        self, token_side: str
+    ) -> Tuple[Optional[float], Optional[float]]:
         tok = token_side.upper()
         if tok in self._best_bids and tok in self._best_asks:
             return self._best_bids[tok], self._best_asks[tok]
@@ -1205,10 +1232,8 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             a_comp = self._best_asks[comp]
             if 0.0 < b_comp < 1.0 and 0.0 < a_comp < 1.0:
                 return round(1.0 - a_comp, 4), round(1.0 - b_comp, 4)
-        return (
-            self._best_bids.get(tok, DEFAULT_FALLBACK_BID),
-            self._best_asks.get(tok, DEFAULT_FALLBACK_ASK),
-        )
+        # No fabricated price: quote callers must skip when either side is missing.
+        return self._best_bids.get(tok), self._best_asks.get(tok)
 
     def credit_reward(self, amount: float, condition_id: str, note: str = "") -> None:
         """Credit modelled rewards to simulated cash only.
@@ -1374,23 +1399,28 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                     f"{'INCLUDES' if self._locked_already_in_balance else 'EXCLUDES'} locked collateral"
                 )
 
-        # Score quote for rewards
+        # Score quote for rewards. With no book there is no mid to score against;
+        # the quote is still recorded, with a zero (unmeasured) score.
         b_tok, a_tok = self.get_best_bid_ask(tok)
-        mid_tok = (b_tok + a_tok) / 2.0
-        spread_cents = abs(price - mid_tok) * 100.0
-        score = quadratic_order_score(
-            max_spread_cents=self.rewards_max_spread,
-            spread_cents=spread_cents,
-            size=requested_size,
-            min_size=self.rewards_min_size,
-        )
+        score = 0.0
+        v_queue_value = 0.0
+        if b_tok is not None and a_tok is not None:
+            mid_tok = (b_tok + a_tok) / 2.0
+            spread_cents = abs(price - mid_tok) * 100.0
+            score = quadratic_order_score(
+                max_spread_cents=self.rewards_max_spread,
+                spread_cents=spread_cents,
+                size=requested_size,
+                min_size=self.rewards_min_size,
+            )
 
-        vq_res = self.migration_engine.queue_model.evaluate_queue_value(
-            quote_size=requested_size,
-            queue_ahead=0.0,
-            half_spread_cents=max(0.1, spread_cents),
-            token_mid_price=mid_tok,
-        )
+            vq_res = self.migration_engine.queue_model.evaluate_queue_value(
+                quote_size=requested_size,
+                queue_ahead=0.0,
+                half_spread_cents=max(0.1, spread_cents),
+                token_mid_price=mid_tok,
+            )
+            v_queue_value = vq_res.net_queue_value_usd
 
         self.active_quotes[qid] = {
             "quote_id": qid,
@@ -1403,7 +1433,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
             "size_matched": 0.0,
             "queue_ahead": 0.0,
             "score": round(score, 4),
-            "v_queue": round(vq_res.net_queue_value_usd, 4),
+            "v_queue": round(v_queue_value, 4),
             "timestamp": ts,
             "status": "LIVE",
             "is_dry_run": res.is_dry_run,
@@ -1556,7 +1586,7 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
     def _marketable_price(self, token_side: str, side: str) -> Optional[float]:
         bid, ask = self.get_best_bid_ask(token_side)
         price = ask if str(side).upper() == "BUY" else bid
-        if not (0.0 < price < 1.0):
+        if price is None or not (0.0 < price < 1.0):
             return None
         return price
 
@@ -1872,31 +1902,53 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
         The inventory and cash mutation is driven exclusively by a confirmed
         merge receipt plus its actual gas cost. Every refusal path leaves state
         untouched.
+
+        Three phases keep ``self._lock`` off every I/O call: claim (snapshot
+        state and the per-condition single-flight marker, lock held), execute
+        (pending-settlement DB read, route lookup, chain preflight, broadcast
+        and receipt parsing, lock released), apply (re-acquire the lock, mutate,
+        persist, drop the marker).
+        """
+        preflight = self._claim_ctf_merge(amount_sets)
+        if preflight is None:
+            return None
+        try:
+            outcome = self._execute_ctf_merge(preflight)
+        except BaseException:
+            self._release_ctf_merge_marker()
+            raise
+        if outcome is None:
+            self._release_ctf_merge_marker()
+            return None
+        return self._apply_ctf_merge(preflight, outcome)
+
+    def _release_ctf_merge_marker(self) -> None:
+        """Drop this condition's in-flight marker (idempotent, lock-safe)."""
+        with self._lock:
+            self._settlement_inflight.discard(self.condition_id)
+
+    def _claim_ctf_merge(
+        self, amount_sets: Optional[float]
+    ) -> Optional[_CtfMergePreflight]:
+        """Phase 1: under the lock, snapshot merge state and claim the marker.
+
+        Nothing here touches SQLite, the chain or the venue: every blocking call
+        runs in :meth:`_execute_ctf_merge` with the lock released. The marker is
+        claimed last, so a local refusal never has to release it.
         """
         with self._lock:
+            if self.condition_id in self._settlement_inflight:
+                logger.debug(
+                    f"CTF merge skipped: a settlement for {self.condition_id[:14]} "
+                    "is already in flight"
+                )
+                return None
+
             if not self.dry_run and not bool(
                 getattr(self.ctf_client, "is_settlement_enabled", False)
             ):
                 logger.error(
                     "CTF merge refused: live on-chain settlement is disabled for this client"
-                )
-                return None
-
-            # One settlement in flight per condition. A PENDING row means a
-            # signed transaction exists whose outcome is unknown; merging again
-            # would spend the same complete sets twice.
-            pending_rows = self._pending_settlement_rows()
-            if pending_rows is None:
-                logger.error(
-                    "CTF merge refused: cannot prove that no settlement is already pending"
-                )
-                return None
-            if pending_rows:
-                oldest = pending_rows[0]
-                logger.error(
-                    f"CTF merge refused: settlement tx {oldest.get('tx_hash')} "
-                    f"({oldest.get('kind')} {oldest.get('amount')}) for {self.condition_id[:14]} "
-                    f"is still PENDING; resolve it by hash before merging again"
                 )
                 return None
 
@@ -1935,172 +1987,243 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                 )
                 return None
 
-            addr = str(getattr(self.clob_client, "maker_address", "") or "")
-            route = SettlementRoute.CTF_MERGE
-            meta: Optional[dict] = None
-            if not self.dry_run:
-                if not addr:
-                    logger.error(
-                        "Settlement aborted: maker address is unknown, cannot verify the ledger"
-                    )
-                    return None
-                route, meta = self._resolve_settlement_route()
-                if route is SettlementRoute.UNSUPPORTED:
-                    logger.error(
-                        "Settlement refused: market has no supported merge route "
-                        "(version/neg-risk metadata missing); refusing to broadcast blind"
-                    )
-                    return None
-                if route is SettlementRoute.CTF_MERGE:
-                    try:
-                        chain_yes = float(self.ctf_client.get_position_balance(self.asset_id_yes, addr))
-                        chain_no = float(self.ctf_client.get_position_balance(self.asset_id_no, addr))
-                    except Exception as e:
-                        logger.error(f"Settlement aborted: on-chain token balances are unverifiable: {e}")
-                        return None
-                    if chain_yes + 1e-9 < sets_to_merge or chain_no + 1e-9 < sets_to_merge:
-                        logger.error(
-                            f"Settlement aborted: chain balances YES={chain_yes:.6f} NO={chain_no:.6f} "
-                            f"cannot back {sets_to_merge:.6f} sets"
-                        )
-                        return None
+            self._settlement_inflight.add(self.condition_id)
+            return _CtfMergePreflight(
+                available_sets=available_sets,
+                sets_to_merge=sets_to_merge,
+                now=now,
+                addr=str(getattr(self.clob_client, "maker_address", "") or ""),
+                dry_run=bool(self.dry_run),
+            )
 
+    def _execute_ctf_merge(
+        self, preflight: _CtfMergePreflight
+    ) -> Optional[_CtfMergeOutcome]:
+        """Phase 2: every settlement I/O call, with no engine lock held.
+
+        Returns None for a refusal (already logged), otherwise the receipt plus
+        any post-merge chain re-read for phase 3 to apply under the lock.
+        """
+        # One settlement in flight per condition. A PENDING row means a signed
+        # transaction exists whose outcome is unknown; merging again would
+        # spend the same complete sets twice.
+        pending_rows = self._pending_settlement_rows()
+        if pending_rows is None:
+            logger.error(
+                "CTF merge refused: cannot prove that no settlement is already pending"
+            )
+            return None
+        if pending_rows:
+            oldest = pending_rows[0]
+            logger.error(
+                f"CTF merge refused: settlement tx {oldest.get('tx_hash')} "
+                f"({oldest.get('kind')} {oldest.get('amount')}) for {self.condition_id[:14]} "
+                f"is still PENDING; resolve it by hash before merging again"
+            )
+            return None
+
+        addr = preflight.addr
+        sets_to_merge = preflight.sets_to_merge
+        route = SettlementRoute.CTF_MERGE
+        meta: Optional[dict] = None
+        if not preflight.dry_run:
+            if not addr:
+                logger.error(
+                    "Settlement aborted: maker address is unknown, cannot verify the ledger"
+                )
+                return None
+            route, meta = self._resolve_settlement_route()
+            if route is SettlementRoute.UNSUPPORTED:
+                logger.error(
+                    "Settlement refused: market has no supported merge route "
+                    "(version/neg-risk metadata missing); refusing to broadcast blind"
+                )
+                return None
             if route is SettlementRoute.CTF_MERGE:
-                res = self.ctf_client.merge_positions(
-                    condition_id=self.condition_id,
-                    amount_shares=sets_to_merge,
-                    token_ids=(self.asset_id_yes, self.asset_id_no),
+                try:
+                    chain_yes = float(self.ctf_client.get_position_balance(self.asset_id_yes, addr))
+                    chain_no = float(self.ctf_client.get_position_balance(self.asset_id_no, addr))
+                except Exception as e:
+                    logger.error(f"Settlement aborted: on-chain token balances are unverifiable: {e}")
+                    return None
+                if chain_yes + 1e-9 < sets_to_merge or chain_no + 1e-9 < sets_to_merge:
+                    logger.error(
+                        f"Settlement aborted: chain balances YES={chain_yes:.6f} NO={chain_no:.6f} "
+                        f"cannot back {sets_to_merge:.6f} sets"
+                    )
+                    return None
+
+        if route is SettlementRoute.CTF_MERGE:
+            res = self.ctf_client.merge_positions(
+                condition_id=self.condition_id,
+                amount_shares=sets_to_merge,
+                token_ids=(self.asset_id_yes, self.asset_id_no),
+            )
+        else:
+            ok, reason = verify_route(
+                route,
+                self.condition_id,
+                addr,
+                self.ctf_client.chain_client,
+                meta=meta,
+            )
+            if not ok:
+                logger.error(f"Settlement refused ({route.value}): {reason}")
+                return None
+            try:
+                amount_6dp = amount_to_6dp(sets_to_merge)
+            except ValueError as e:
+                logger.error(f"Settlement aborted: invalid amount {sets_to_merge!r}: {e}")
+                return None
+            try:
+                if route is SettlementRoute.ROUTER_MERGE:
+                    calldata = build_router_merge(self.condition_id, amount_6dp)
+                    target = ROUTER
+                elif route is SettlementRoute.NEGRISK_MERGE:
+                    calldata = build_negrisk_merge(self.condition_id, amount_6dp)
+                    target = NEGRISK_ADAPTER
+                else:
+                    logger.error(f"Settlement aborted: unhandled route {route}")
+                    return None
+            except ValueError as e:
+                logger.error(
+                    f"Settlement aborted: cannot encode {route.value} calldata "
+                    f"for {self.condition_id}: {e}"
+                )
+                return None
+            logger.info(
+                f"[{route.value}] Broadcasting merge of {sets_to_merge:.6f} sets "
+                f"({amount_6dp} base units) to {target[:10]}..."
+            )
+            res = self.ctf_client.execute_settlement(
+                calldata,
+                to_address=target,
+                condition_id=self.condition_id,
+                amount_shares=sets_to_merge,
+            )
+        if not res.success:
+            if getattr(res, "status", "failed") == "pending":
+                logger.warning(
+                    f"CTF mergePositions pending for {self.condition_id[:14]}: "
+                    f"{res.error or 'no receipt yet'}; the signed tx {res.tx_hash} is stored "
+                    "and will be resolved by hash. No retry, no state change."
                 )
             else:
-                ok, reason = verify_route(
-                    route,
-                    self.condition_id,
-                    addr,
-                    self.ctf_client.chain_client,
-                    meta=meta,
-                )
-                if not ok:
-                    logger.error(f"Settlement refused ({route.value}): {reason}")
-                    return None
-                try:
-                    amount_6dp = amount_to_6dp(sets_to_merge)
-                except ValueError as e:
-                    logger.error(f"Settlement aborted: invalid amount {sets_to_merge!r}: {e}")
-                    return None
-                try:
-                    if route is SettlementRoute.ROUTER_MERGE:
-                        calldata = build_router_merge(self.condition_id, amount_6dp)
-                        target = ROUTER
-                    elif route is SettlementRoute.NEGRISK_MERGE:
-                        calldata = build_negrisk_merge(self.condition_id, amount_6dp)
-                        target = NEGRISK_ADAPTER
-                    else:
-                        logger.error(f"Settlement aborted: unhandled route {route}")
-                        return None
-                except ValueError as e:
-                    logger.error(
-                        f"Settlement aborted: cannot encode {route.value} calldata "
-                        f"for {self.condition_id}: {e}"
-                    )
-                    return None
-                logger.info(
-                    f"[{route.value}] Broadcasting merge of {sets_to_merge:.6f} sets "
-                    f"({amount_6dp} base units) to {target[:10]}..."
-                )
-                res = self.ctf_client.execute_settlement(
-                    calldata,
-                    to_address=target,
-                    condition_id=self.condition_id,
-                    amount_shares=sets_to_merge,
-                )
-            if not res.success:
-                if getattr(res, "status", "failed") == "pending":
-                    logger.warning(
-                        f"CTF mergePositions pending for {self.condition_id[:14]}: "
-                        f"{res.error or 'no receipt yet'}; the signed tx {res.tx_hash} is stored "
-                        "and will be resolved by hash. No retry, no state change."
-                    )
-                    return res
                 logger.critical(
                     f"CTF mergePositions failed for {self.condition_id[:14]}: {res.error or 'unknown error'}; "
                     "no inventory or cash change applied"
                 )
-                return res
+            return _CtfMergeOutcome(result=res, apply=False)
 
-            self._last_merge_ts = now
-            self.shares_yes = max(0.0, self.shares_yes - sets_to_merge)
-            self.shares_no = max(0.0, self.shares_no - sets_to_merge)
-            self.cash += float(res.usdc_unlocked) - float(res.gas_fee_usd)
-            self.total_gas_fees += float(res.gas_fee_usd)
-            self.total_merges += 1
-            self.merges_history.append(res)
-
-            if not self.dry_run and route is SettlementRoute.CTF_MERGE:
-                try:
-                    self.shares_yes = float(
-                        self.ctf_client.get_position_balance(self.asset_id_yes, addr)
-                    )
-                    self.shares_no = float(
-                        self.ctf_client.get_position_balance(self.asset_id_no, addr)
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"Post-merge on-chain balance re-read failed ({e}); keeping the local decrement "
-                        f"(YES {self.shares_yes:.4f}, NO {self.shares_no:.4f})"
-                    )
-
-            # Persist to SQLite
-            cur = self._conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO ctf_merges (
-                    timestamp, condition_id, complete_sets, usdc_gross, gas_fee,
-                    net_cash, realized_gain, cash_after
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now,
-                    self.condition_id,
-                    sets_to_merge,
-                    res.usdc_unlocked,
-                    res.gas_fee_usd,
-                    res.usdc_unlocked - res.gas_fee_usd,
-                    0.0,
-                    self.cash,
-                ),
-            )
-            self._conn.commit()
-            self.flush_ledger()
-
-            # Measurement: one row per confirmed merge, keyed by tx hash so a
-            # retried call cannot double-count it. Never raises into settlement.
+        # Post-merge chain re-read stays in the unlocked phase; phase 3 applies
+        # whatever it returned and falls back to the local decrement on failure.
+        chain_yes: Optional[float] = None
+        chain_no: Optional[float] = None
+        balance_read_error: Optional[BaseException] = None
+        if not preflight.dry_run and route is SettlementRoute.CTF_MERGE:
             try:
-                tx_hash = str(getattr(res, "tx_hash", "") or "")
-                dedupe_key = (
-                    f"tx:{tx_hash}" if tx_hash else f"at:{self.condition_id}:{now:.3f}"
+                chain_yes = float(
+                    self.ctf_client.get_position_balance(self.asset_id_yes, addr)
                 )
-                note = (
-                    f"merge key={dedupe_key} sets={sets_to_merge:.4f} "
-                    f"{'dry-run' if self.dry_run else 'live'}"
+                chain_no = float(
+                    self.ctf_client.get_position_balance(self.asset_id_no, addr)
                 )
-                existing = self._conn.execute(
-                    "SELECT 1 FROM rebalances WHERE pathway = 'MERGE' AND note = ? LIMIT 1",
-                    (note,),
-                ).fetchone()
-                if existing is None:
-                    self._insert_rebalance_row(
-                        pathway="MERGE",
-                        crossed_cents=0.0,
-                        taker_fee_usd=0.0,
-                        gas_usd=float(res.gas_fee_usd or 0.0),
-                        inventory_before=float(available_sets),
-                        inventory_after=max(0.0, float(available_sets) - sets_to_merge),
-                        note=note,
-                    )
-            except Exception as e:  # measurement only; never raises into settlement
-                logger.warning(f"Merge cost measurement failed: {e}")
+            except Exception as e:
+                balance_read_error = e
+        return _CtfMergeOutcome(
+            result=res,
+            apply=True,
+            chain_yes=chain_yes,
+            chain_no=chain_no,
+            balance_read_error=balance_read_error,
+        )
 
-            return res
+    def _apply_ctf_merge(
+        self, preflight: _CtfMergePreflight, outcome: _CtfMergeOutcome
+    ) -> MergeExecutionResult:
+        """Phase 3: re-acquire the lock, apply the confirmed result, drop the marker."""
+        with self._lock:
+            try:
+                res = outcome.result
+                if not outcome.apply:
+                    return res
+
+                sets_to_merge = preflight.sets_to_merge
+                now = preflight.now
+                self._last_merge_ts = now
+                self.shares_yes = max(0.0, self.shares_yes - sets_to_merge)
+                self.shares_no = max(0.0, self.shares_no - sets_to_merge)
+                self.cash += float(res.usdc_unlocked) - float(res.gas_fee_usd)
+                self.total_gas_fees += float(res.gas_fee_usd)
+                self.total_merges += 1
+                self.merges_history.append(res)
+
+                if outcome.chain_yes is not None:
+                    self.shares_yes = outcome.chain_yes
+                if outcome.chain_no is not None:
+                    self.shares_no = outcome.chain_no
+                if outcome.balance_read_error is not None:
+                    logger.warning(
+                        f"Post-merge on-chain balance re-read failed ({outcome.balance_read_error}); "
+                        f"keeping the local decrement (YES {self.shares_yes:.4f}, NO {self.shares_no:.4f})"
+                    )
+
+                # Persist to SQLite
+                cur = self._conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO ctf_merges (
+                        timestamp, condition_id, complete_sets, usdc_gross, gas_fee,
+                        net_cash, realized_gain, cash_after
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now,
+                        self.condition_id,
+                        sets_to_merge,
+                        res.usdc_unlocked,
+                        res.gas_fee_usd,
+                        res.usdc_unlocked - res.gas_fee_usd,
+                        0.0,
+                        self.cash,
+                    ),
+                )
+                self._conn.commit()
+                self.flush_ledger()
+
+                # Measurement: one row per confirmed merge, keyed by tx hash so a
+                # retried call cannot double-count it. Never raises into settlement.
+                try:
+                    tx_hash = str(getattr(res, "tx_hash", "") or "")
+                    dedupe_key = (
+                        f"tx:{tx_hash}" if tx_hash else f"at:{self.condition_id}:{now:.3f}"
+                    )
+                    note = (
+                        f"merge key={dedupe_key} sets={sets_to_merge:.4f} "
+                        f"{'dry-run' if preflight.dry_run else 'live'}"
+                    )
+                    existing = self._conn.execute(
+                        "SELECT 1 FROM rebalances WHERE pathway = 'MERGE' AND note = ? LIMIT 1",
+                        (note,),
+                    ).fetchone()
+                    if existing is None:
+                        self._insert_rebalance_row(
+                            pathway="MERGE",
+                            crossed_cents=0.0,
+                            taker_fee_usd=0.0,
+                            gas_usd=float(res.gas_fee_usd or 0.0),
+                            inventory_before=float(preflight.available_sets),
+                            inventory_after=max(
+                                0.0, float(preflight.available_sets) - sets_to_merge
+                            ),
+                            note=note,
+                        )
+                except Exception as e:  # measurement only; never raises into settlement
+                    logger.warning(f"Merge cost measurement failed: {e}")
+
+                return res
+            finally:
+                self._settlement_inflight.discard(self.condition_id)
 
     def trigger_ctf_split(self, amount_usdc: float) -> dict[str, Any]:
         """Split collateral into YES+NO. Only simulated: no on-chain split exists here."""
@@ -2882,13 +3005,22 @@ class RealMoneyTradingEngine(BaseMarketMakingEngine):
                 pass
             self._conn = None
 
+    def _accounting_snapshot(self) -> Tuple[float, float, float]:
+        """Free cash, locked collateral and inventory value from one locked pass.
+
+        ``get_cash()`` already recomputes locked collateral, so reading equity
+        through it as well would sum the same resting BUY notional a second
+        time. Callers that need all three take them here instead.
+        """
+        cash_val = self.get_cash()
+        locked_val = self.locked_cash
+        return cash_val, locked_val, self._inventory_value()
+
     def flush_ledger(self) -> None:
         """Write atomic state snapshot to SQLite and JSON ledger."""
-        equity_val = self.get_equity()
-        cash_val = self.get_cash()
+        cash_val, locked_val, inventory_val = self._accounting_snapshot()
+        equity_val = cash_val + locked_val + inventory_val
         pos = self.get_position(self.condition_id)
-        locked_val = self.get_locked_cash()
-        inventory_val = equity_val - cash_val - locked_val
         total_pnl_val = equity_val - self.initial_equity
 
         cur = self._conn.cursor()

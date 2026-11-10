@@ -327,4 +327,4 @@ USDC.e; the two are 1:1 in practice but are different contracts.
    makers, directional traders and liquidity providers with one request per wallet.
 
 Implementation: `src/polymarketbot/gamma.py`, `src/polymarketbot/dataapi.py`,
-`src/polymarketbot/fees.py`, `scripts/enrich_market_metadata.py`.
+`src/polymarketbot/fees.py`, `python -m polymarketbot.data.builders.enrich_market_metadata`.

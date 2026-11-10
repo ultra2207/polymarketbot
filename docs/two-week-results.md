@@ -75,7 +75,7 @@ longer on the hourly path.
 
 ## 5. Fill model (measured, 29 asset-hours)
 
-`scripts/calibrate_fill_model.py`, window 2026-11-04 01:00–05:59 UTC:
+`polymarketbot.tools.fill_calibration`, window 2026-11-04 01:00–05:59 UTC:
 
 * 6,880 print events → **6,817 observations, 2,184 fills (base 32.0 %)**.
 * P(fill) by pre-event queue ratio: 0.634 / 0.634 / 0.498 / 0.423 / 0.285 /
@@ -88,7 +88,7 @@ longer on the hourly path.
 
 ## 6. Market scorecard (last 2 UTC hours)
 
-`scripts/score_markets.py`, window 2026-11-05 05:00–07:00 UTC: **2,511
+`polymarketbot.tools.market_scorecard`, window 2026-11-05 05:00–07:00 UTC: **2,511
 conditions**, 21.6 M quote points, 4,422 trades, markout matched 88.6 %.
 
 * **76 of 129 scored conditions pass Gate 1 — and all 76 are flagged

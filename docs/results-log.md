@@ -683,7 +683,7 @@ makers: a small top slice earns the spread and everyone below pays it. The top d
 
 `data/raw/sii/trades.parquet` is 45.85 GB / 212 partitions. Every analysis rescanned it.
 
-`scripts/build_wallet_token.py` materialises per-(wallet, token, month) sums once, into
+`polymarketbot.data.builders.build_wallet_token` materialises per-(wallet, token, month) sums once, into
 `data/processed/wallet_token/` — 6 months, 261 M pairs, 14.6 GB, built in 13 minutes,
 resumable per month.
 

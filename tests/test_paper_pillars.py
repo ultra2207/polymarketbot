@@ -583,8 +583,8 @@ def _gate(*args, **kwargs):
 def test_ctf_maker_prices_the_pair_as_a_three_outcome_bet():
     # A rebate-paying schedule and a zero-markout measurement keep this test
     # about the EV arithmetic.  0.8 fee rate at a 25 % rebate share pays
-    # 0.25 * 0.8 * 0.25 = 0.05/share against a 0.01 one-tick unwind, so both
-    # naked legs are self-financing and the quote may be emitted.
+    # 0.25 * 0.8 * 0.25 = 0.05/share, which covers a naked leg whose cheapest
+    # exit is a hold to resolution at the measured zero drift.
     market = _market(fee_rate=0.8, rebate_rate=0.25)
     p = 0.5
     quote = _gate(
@@ -595,15 +595,21 @@ def test_ctf_maker_prices_the_pair_as_a_three_outcome_bet():
     assert quote is not None
     assert quote.fill_prob_yes == pytest.approx(p)
     assert quote.markout_usd == pytest.approx(0.0)
-    # Both legs rest one tick over the bid; the unwind costs exactly that tick.
-    assert quote.unwind_cost_yes == pytest.approx(market.tick)
-    assert quote.unwind_cost_no == pytest.approx(market.tick)
-    surplus = quote.rebate_yes - quote.unwind_cost_yes - quote.markout_usd
-    assert surplus > 0.0 and quote.rebate_no - quote.unwind_cost_no > 0.0
+    # The dump exit is one tick of slippage PLUS the taker fee paid to cross
+    # the spread.  Charging only the tick understated it by the whole fee.
+    dump_yes = market.tick + taker_fee(1, 0.39, market.fee_schedule)
+    assert quote.unwind_cost_yes == pytest.approx(dump_yes)
+    assert quote.unwind_cost_no == pytest.approx(
+        market.tick + taker_fee(1, 0.5, market.fee_schedule)
+    )
+    # Only the cheaper of (dump, hold-to-resolution) is incurred.
+    surplus = quote.rebate_yes - min(quote.unwind_cost_yes, quote.markout_usd)
+    surplus_no = quote.rebate_no - min(quote.unwind_cost_no, quote.markout_usd)
+    assert surplus > 0.0 and surplus_no > 0.0
     assert quote.edge_usd == pytest.approx(
         p * p * quote.edge_if_both_fill
         + p * (1 - p) * surplus
-        + p * (1 - p) * (quote.rebate_no - quote.unwind_cost_no - quote.markout_usd)
+        + p * (1 - p) * surplus_no
     )
     # A pair above par is refused outright: nothing is left to lock.
     assert _gate(
@@ -614,13 +620,14 @@ def test_ctf_maker_prices_the_pair_as_a_three_outcome_bet():
 
 
 def test_ctf_maker_refuses_a_naked_leg_that_does_not_cover_its_measured_costs():
-    """A rebate above the unwind is not enough: the measured markout must fit too.
+    """The cheaper exit must still fit inside the rebate.
 
     This is the 12:53 window's defect stated as a test.  There, the 0.25c rebate
-    beat the 0.1c one-tick unwind at tick 0.001, so 68-150 orders rested on
-    99.7 % of the pillar's cash and none filled.  At the measured drift of a
-    single leg (~0.19c over a 400 s life) the same quote loses on its most
-    likely non-zero outcome, and the gate must refuse it however large the lock.
+    beat the 0.1c one-tick *slippage* because the gate charged only slippage:
+    it omitted both the taker fee paid to dump the leg and the drift paid to
+    hold it.  Charging only the tick let 68-150 orders rest on 99.7 % of the
+    pillar's cash with none of them filling.  The gate must charge the cheaper
+    of the two real exits, and refuse while that exceeds the rebate.
     """
     market = _market(tick=0.001, fee_rate=0.04, rebate_rate=0.25)
     # Live measured Politics schedule (rate 0.04, rebate 0.25) at a price near
@@ -628,13 +635,15 @@ def test_ctf_maker_refuses_a_naked_leg_that_does_not_cover_its_measured_costs():
     books = (_book(0.489, 0.492), _book(0.499, 0.502))
     rebate = ctf.maker_fee_rebate(0.490, 1.0, market.fee_schedule)
     assert rebate > market.tick  # the old gate accepted on this alone
+    # A drift a whole cent above the rebate: holding to resolution costs more
+    # than the rebate pays, and dumping costs more still.
     refused = _gate(
         market, *books, 100.0, requote_horizon_s=400.0, fill_probability=0.5,
-        markout_model=_markout((400.0, 0.001, 0.0016, 3975)),
+        markout_model=_markout((400.0, 0.001, 0.0100, 3975)),
     )
     assert refused is None
     # The same quote clears when the drift is measured to be zero, so the
-    # refusal is the measured markout and not an unrelated floor.
+    # refusal is the measured cost and not an unrelated floor.
     accepted = _gate(
         market, *books, 100.0, requote_horizon_s=400.0, fill_probability=0.5,
         markout_model=_markout((400.0, 0.001, 0.0, 3975)),
@@ -645,13 +654,13 @@ def test_ctf_maker_refuses_a_naked_leg_that_does_not_cover_its_measured_costs():
 def test_ctf_maker_refuses_when_the_single_leg_markout_is_unmeasured(monkeypatch):
     """No measured drift for this horizon means no quote, and it says so."""
     warnings: list[str] = []
-    monkeypatch.setattr(ctf, "logger", type("R", (), {
+    monkeypatch.setattr(ctf.markout, "logger", type("R", (), {
         "warning": lambda _s, m: warnings.append(m),
         "info": lambda _s, m: None,
         "error": lambda _s, m: None,
     })())
-    monkeypatch.setattr(ctf, "_UNMEASURED_MARKOUT_LOGGED", set())
-    monkeypatch.setattr(ctf, "_QUOTE_AUDIT", {
+    monkeypatch.setattr(ctf.markout, "_UNMEASURED_MARKOUT_LOGGED", set())
+    monkeypatch.setattr(ctf.parity, "_QUOTE_AUDIT", {
         "logged_at": 0.0, "evaluated": 0, "accepted": 0, "refused": {},
         "best_refusal": None,
     })
@@ -664,12 +673,12 @@ def test_ctf_maker_refuses_when_the_single_leg_markout_is_unmeasured(monkeypatch
     ) is None
     assert any("no single-leg markout is measured there" in message for message in warnings)
     # An absent measurement is missing data, not a free exit.
-    monkeypatch.setattr(ctf, "_default_maker_markout", lambda: None)
+    monkeypatch.setattr(ctf.markout, "_default_maker_markout", lambda: None)
     assert _gate(
         market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
         requote_horizon_s=400.0, fill_probability=0.5,
     ) is None
-    assert ctf._QUOTE_AUDIT["refused"].get("markout_model_missing") == 1
+    assert ctf.parity._QUOTE_AUDIT["refused"].get("markout_model_missing") == 1
 
 
 def test_ctf_maker_requires_a_measured_requote_horizon():
@@ -709,16 +718,16 @@ def test_ctf_maker_logs_the_six_ev_components_of_every_quote(monkeypatch):
     what any of them was priced at, so "zero fills" could not be attributed.
     """
     lines: list[str] = []
-    monkeypatch.setattr(ctf, "logger", type("R", (), {
+    monkeypatch.setattr(ctf.maker, "logger", type("R", (), {
         "warning": lambda _s, m: None,
         "info": lambda _s, m: lines.append(m),
         "error": lambda _s, m: None,
     })())
-    monkeypatch.setattr(ctf, "_QUOTE_AUDIT", {
+    monkeypatch.setattr(ctf.parity, "_QUOTE_AUDIT", {
         "logged_at": 0.0, "evaluated": 0, "accepted": 0, "refused": {},
         "best_refusal": None,
     })
-    monkeypatch.setattr(ctf, "_ACCEPTED_QUOTES_LOGGED", set())
+    monkeypatch.setattr(ctf.parity, "_ACCEPTED_QUOTES_LOGGED", set())
     market = _market(fee_rate=0.8, rebate_rate=0.25)
     quote = _gate(
         market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
@@ -744,12 +753,12 @@ def test_ctf_maker_logs_the_six_ev_components_of_every_quote(monkeypatch):
 def test_ctf_maker_audit_states_the_best_refusal_when_nothing_quotes(monkeypatch):
     """A window that quotes nothing must publish the nearest miss's components."""
     lines: list[str] = []
-    monkeypatch.setattr(ctf, "logger", type("R", (), {
+    monkeypatch.setattr(ctf.parity, "logger", type("R", (), {
         "warning": lambda _s, m: None,
         "info": lambda _s, m: lines.append(m),
         "error": lambda _s, m: None,
     })())
-    monkeypatch.setattr(ctf, "_QUOTE_AUDIT", {
+    monkeypatch.setattr(ctf.parity, "_QUOTE_AUDIT", {
         "logged_at": 0.0, "evaluated": 0, "accepted": 0, "refused": {},
         "best_refusal": None,
     })
@@ -757,7 +766,7 @@ def test_ctf_maker_audit_states_the_best_refusal_when_nothing_quotes(monkeypatch
     assert _gate(
         market, _book(0.489, 0.492), _book(0.499, 0.502), 100.0,
         requote_horizon_s=400.0, fill_probability=0.5,
-        markout_model=_markout((400.0, 0.001, 0.0016, 3975)),
+        markout_model=_markout((400.0, 0.001, 0.0100, 3975)),
     ) is None
     summary = ctf.log_quote_audit(force=True)
     if summary is None:
@@ -793,9 +802,9 @@ def test_ctf_maker_pins_a_scan_gap_wider_than_the_measured_horizon(monkeypatch):
         def error(self, message):  # pragma: no cover - not exercised
             pass
 
-    monkeypatch.setattr(ctf, "logger", Recorder())
-    monkeypatch.setattr(ctf, "_UNMEASURED_HORIZON_LOGGED", set())
-    monkeypatch.setattr(ctf, "_HORIZON_CLAMP_LOGGED", set())
+    monkeypatch.setattr(ctf.fill_model, "logger", Recorder())
+    monkeypatch.setattr(ctf.fill_model, "_UNMEASURED_HORIZON_LOGGED", set())
+    monkeypatch.setattr(ctf.fill_model, "_HORIZON_CLAMP_LOGGED", set())
     model = ctf.QuoteFillHorizon(
         cells=((5.0, 0.001, 5.0, 0.0002), (225.0, 0.001, 5.0, 0.0064))
     )
@@ -829,11 +838,11 @@ def test_ctf_maker_still_refuses_a_horizon_below_the_measured_support(monkeypatc
     which is the direction that fabricates an edge.
     """
     warnings: list[str] = []
-    monkeypatch.setattr(ctf, "logger", type("R", (), {"warning": lambda _s, m: warnings.append(m),
-                                                      "info": lambda *_a: None,
-                                                      "error": lambda *_a: None})())
-    monkeypatch.setattr(ctf, "_UNMEASURED_HORIZON_LOGGED", set())
-    monkeypatch.setattr(ctf, "_HORIZON_CLAMP_LOGGED", set())
+    monkeypatch.setattr(ctf.fill_model, "logger", type("R", (), {"warning": lambda _s, m: warnings.append(m),
+                                                                 "info": lambda *_a: None,
+                                                                 "error": lambda *_a: None})())
+    monkeypatch.setattr(ctf.fill_model, "_UNMEASURED_HORIZON_LOGGED", set())
+    monkeypatch.setattr(ctf.fill_model, "_HORIZON_CLAMP_LOGGED", set())
     model = ctf.QuoteFillHorizon(cells=((5.0, 0.01, 5.0, 0.0002), (225.0, 0.01, 5.0, 0.6)))
     market = _market()
     assert _gate(market, _book(0.39, 0.41), _book(0.50, 0.52), 100.0,
@@ -1041,7 +1050,7 @@ def test_ctf_onchain_leg_never_probes_the_head_when_a_reason_is_supplied(monkeyp
         probed["n"] += 1
         return "should not be called"
 
-    monkeypatch.setattr(ctf, "_live_head_error", boom)
+    monkeypatch.setattr(ctf.onchain, "_live_head_error", boom)
     with pytest.raises(ctf.OnChainRefused):
         ctf.resolve_on_chain_timing(
             "redeem",
@@ -1307,7 +1316,8 @@ def test_reward_markout_has_no_invented_constant():
 def test_horizon_fill_probability_interpolates_only_between_measured_cells() -> None:
     """A gap that falls between measured horizons must be priced, not refused:
     the operating scan gap (sweep ticks x tick) is rarely a measured value.
-    Interpolation is linear in time and validated at 5.31 % worst held-out error,
+    Interpolation is linear in time and validated on the exact-price series at a
+    25.71 % worst held-out error (the looser at-or-below series measured 5.31 %),
     so the midpoint of two cells is their mean, and anything outside the
     measured support still refuses rather than extrapolating."""
     model = ctf.QuoteFillHorizon(cells=(
@@ -1366,3 +1376,246 @@ def test_ctf_maker_refuses_an_edge_below_the_shadow_yield():
         market, *books, 100.0, requote_horizon_s=5.0, fill_probability=0.5,
         markout_model=_markout((5.0, 0.01, 0.0, 1000)),
     ) is None
+
+
+# ------------------------------- settlement radar (tick must not block)
+class _SlowGamma:
+    """Gamma whose row fetch takes the venue's time, not ours."""
+
+    def __init__(self, rows: list[dict], delay_s: float):
+        self.rows = rows
+        self.delay_s = delay_s
+        self.calls = 0
+
+    def markets(self, condition_ids):
+        self.calls += 1
+        time.sleep(self.delay_s)
+        wanted = {str(c).lower() for c in condition_ids}
+        return [
+            row for row in self.rows
+            if str(row.get("conditionId") or "").lower() in wanted
+        ]
+
+    @staticmethod
+    def parse_ids(value):
+        from polymarketbot.gamma import GammaClient
+
+        return GammaClient.parse_ids(value)
+
+
+def test_settlement_fetch_is_off_the_tick_and_coverage_still_advances(tmp_path, monkeypatch):
+    """A slow verdict-row fetch must not enter the tick stage.
+
+    Measured 2026-11-10 14:17 window: ``settlement=15.11s ... tick=18.76s`` and
+    ``settlement=22.06s ... tick=13.56s`` inside a 5 s tick, settling to
+    0.31-0.67 s once the one-per-minute cache refresh had run. The blocking
+    call was the Gamma row fetch for verdict conditions the walker does not
+    list; it now runs on the radar thread. This pins both halves: the stage
+    stays far below the interval while the fetch is in flight, and the market
+    is priced the moment the measurement lands.
+    """
+    now = time.time()
+    delay = 1.5
+    with _uma_tape([(FL26_CONDITION, FL26_QUESTION, 10**18, now, now + 1800.0)]) as glob:
+        model = _live_model(glob)
+        market = _verdict_market()
+        books = _fl26_books(yes_asks=[(0.9830, 54.0)], yes_bids=[(0.9990, 14469.67)])
+        row = {
+            "conditionId": market.condition_id,
+            "question": market.question,
+            "outcomes": '["Yes", "No"]',
+            "clobTokenIds": '["yes-fl26", "no-fl26"]',
+            "orderPriceMinTickSize": str(market.tick),
+            "orderMinSize": str(market.min_order),
+            "acceptingOrders": True,
+            "closed": False,
+            "negRisk": False,
+            "events": [{"id": "evt-fl26"}],
+            # A fee-free market, so the row parses to a zero schedule rather
+            # than to an unpriced one and the allocator reaches its ladder.
+            "feesEnabled": False,
+        }
+        monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
+        engine = _settlement_engine(tmp_path, market, books, model)
+        engine.gamma = _SlowGamma([row], delay)
+        # The walker does NOT list the verdict market: that is the whole point
+        # of the row fetch, and it is what made the stage block.
+        engine.walker = _FakeWalker([])
+        try:
+            started = time.monotonic()
+            engine._settlement(books)
+            cold = time.monotonic() - started
+            assert cold < delay / 3.0, (
+                f"the settlement stage waited {cold:.2f}s on a {delay:.1f}s fetch"
+            )
+            assert engine.ledger.positions("SettlementHarvester") == []
+            assert FL26_CONDITION in engine._radar_want
+
+            # One radar cycle absorbs the latency, off the tick.
+            engine._fetch_verdict_rows([FL26_CONDITION], time.time())
+            rows, markets = engine._radar_snapshot()
+            assert FL26_CONDITION in rows and FL26_CONDITION in markets
+
+            started = time.monotonic()
+            engine._settlement(books)
+            warm = time.monotonic() - started
+            assert warm < delay / 3.0, f"the priced stage took {warm:.2f}s"
+            # Coverage advanced: the market that had no row now prices and is
+            # granted capital by the risk-adjusted allocator.
+            pending = [action.kind for action in engine.actions.pending()]
+            assert pending == ["settle_buy"], pending
+            granted = engine.actions.pending()[0].payload["max_cost"]
+            assert granted > 0.0
+        finally:
+            engine.ledger.close()
+
+
+# ------------------------------- window 9: concentration, priced
+WIN9_CONDITION = "0xbcd8bf70c6"
+WIN9_QUESTION = "Will the window-9 condition resolve YES?"
+WIN9_LADDER = [
+    (0.8100, 20.0), (0.8300, 20.0), (0.8600, 25.0), (0.8700, 84.61),
+    (0.8800, 83.33), (0.9600, 19.83), (0.9700, 300.0), (0.9800, 496.32),
+]
+
+
+def _win9_tracker() -> BayesianDisputeTracker:
+    """282 proposals, 0 disputed: the measured window-9 posterior (1.0530 %)."""
+    tracker = BayesianDisputeTracker()
+    tracker.seed_measured(
+        MeasuredDisputeCounts(proposals=282, disputes=0, source="window 9 tape")
+    )
+    return tracker
+
+
+_MEASURED_Q = 0.00133477   # data/derived/uma/outcome_accuracy.json, 2026-11-10
+
+
+def _policy(confidence: float):
+    from polymarketbot.paper.settlement_risk import SettlementTailPolicy
+
+    return SettlementTailPolicy(
+        risk_appetite_usd=150.0, tail_confidence=confidence, source="test"
+    )
+
+
+def _evidence():
+    from polymarketbot.trading.domain2.tail_evidence import evidence_from_counts
+
+    return evidence_from_counts(
+        70, 0, disputed=0, source="test", challenge_trials=134664, challenges=158
+    )
+
+
+def test_window9_treasury_is_sized_by_the_tail_budget_not_by_a_variance_charge(
+    tmp_path, monkeypatch
+):
+    """The measured window-9 book is sized by the *tail*, and the band decides.
+
+    Measured 2026-11-10 14:25 (window 9): one tick, one condition, 8 fills,
+    1,049.1 shares at 0.81-0.98, cash $1,000.00 -> $0.00.
+
+    The loss in that position is total (LGD = 1) but rare: the measured
+    verdict-reversal bound is 0.001335, so at a 95 % band one condition costs
+    ``0.001335 * 1,000 / 0.05 = $26.70`` of a $150 appetite and **cash** - not
+    the risk - limits the tick.  Tighten the band to 99.5 % and the same appetite
+    pays for only ``0.005 * 150 / 0.001335 = $562``: the tail budget truncates
+    the ladder and the unspent cash is free for the next market.
+
+    Same formula in both cases.  The band is the stated preference that moves
+    the answer, which is why it is an input and not a constant.
+    """
+    now = time.time()
+    with _uma_tape([(WIN9_CONDITION, WIN9_QUESTION, 10**18, now, now + 1800.0)]) as glob:
+        model = SettlementFairValueModel(
+            dispute_tracker=_win9_tracker(),
+            tape=UmaVerdictTape(glob=glob, overlay_path=""),
+        )
+        model.refresh(force=True)
+        market = _verdict_market(
+            condition_id=WIN9_CONDITION,
+            question=WIN9_QUESTION,
+            token_ids=("yes-w9", "no-w9"),
+            tick=0.01,
+            uma_status="proposed",
+            outcome_prices=(),
+        )
+        books = {
+            "yes-w9": {
+                "asks": [{"price": str(p), "size": str(s)} for p, s in WIN9_LADDER],
+                "bids": [],
+            },
+            "no-w9": {"asks": [], "bids": []},
+        }
+        monkeypatch.setattr(settlement, "model", lambda **kwargs: model)
+        monkeypatch.setattr(engine_mod.venue, "tape", lambda http, **kwargs: [])
+        engine = _settlement_engine(tmp_path, market, books, model)
+        engine._tail_evidence = _evidence()
+        clock = [1000.0]
+        engine.actions = ActionBook(lambda: 0.01, clock=lambda: clock[0])
+        try:
+            # ---- a 95 % band: cash is the binding limit ---------------------
+            engine._tail_policy = _policy(0.95)
+            engine._tick()
+            pending = list(engine.actions.pending())
+            assert [a.kind for a in pending] == ["settle_buy"]
+            granted = pending[0].payload["max_cost"]
+            assert 990.0 < granted <= 1000.0, granted
+            clock[0] += 1.0
+            engine._land(books, [])
+            lots = engine.ledger.positions("SettlementHarvester")
+            assert len(lots) == 1
+            all_in = sum(lot.cost_usd for lot in lots)
+            # The book's shortfall is inside the appetite on the measured tail,
+            # and nowhere near it: cash - not risk - stopped the tick.
+            assert all_in * _MEASURED_Q / 0.05 < 150.0
+            # Par is the oracle's, so the position is still marked at the
+            # measured value rather than at the ask it paid.
+            assert lots[0].par_value == pytest.approx(0.98947, abs=1e-4)
+        finally:
+            engine.ledger.close()
+
+    # ---- a 99.5 % band: the tail budget is now what truncates -------------
+    with _uma_tape([(WIN9_CONDITION, WIN9_QUESTION, 10**18, now, now + 1800.0)]) as glob:
+        model = SettlementFairValueModel(
+            dispute_tracker=_win9_tracker(),
+            tape=UmaVerdictTape(glob=glob, overlay_path=""),
+        )
+        model.refresh(force=True)
+        market = _verdict_market(
+            condition_id=WIN9_CONDITION,
+            question=WIN9_QUESTION,
+            token_ids=("yes-w9", "no-w9"),
+            tick=0.01,
+            uma_status="proposed",
+            outcome_prices=(),
+        )
+        books = {
+            "yes-w9": {
+                "asks": [{"price": str(p), "size": str(s)} for p, s in WIN9_LADDER],
+                "bids": [],
+            },
+            "no-w9": {"asks": [], "bids": []},
+        }
+        monkeypatch.setattr(settlement, "model", lambda **kwargs: model)
+        engine = _settlement_engine(tmp_path, market, books, model)
+        engine._tail_evidence = _evidence()
+        clock = [1000.0]
+        engine.actions = ActionBook(lambda: 0.01, clock=lambda: clock[0])
+        try:
+            engine._tail_policy = _policy(0.995)
+            engine._tick()
+            pending = list(engine.actions.pending())
+            assert [a.kind for a in pending] == ["settle_buy"]
+            granted = pending[0].payload["max_cost"]
+            # (1 - 0.995) * 150 / 0.001335 = $562 of notional, not $1,000.
+            assert 500.0 < granted < 620.0, granted
+            clock[0] += 1.0
+            engine._land(books, [])
+            lots = engine.ledger.positions("SettlementHarvester")
+            all_in = sum(lot.cost_usd for lot in lots)
+            assert all_in < 620.0
+            assert all_in * _MEASURED_Q / 0.005 <= 150.0 * (1.0 + 1e-3)
+            assert engine.ledger.cash("SettlementHarvester") > 380.0
+        finally:
+            engine.ledger.close()

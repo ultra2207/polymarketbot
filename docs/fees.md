@@ -61,7 +61,7 @@ per-market and survives exceptions the date-based schedule cannot express.
 
 ### The measured table
 
-`scripts/validate_fee_model.py` compares the era fallback with Gamma across **1,937,137
+`python -m polymarketbot.tools.validate_fee_model` compares the era fallback with Gamma across **1,937,137
 markets**. The 16 types below cover the entire scheduled universe, each with exactly one
 `(rate, exponent, rebate)` triple:
 

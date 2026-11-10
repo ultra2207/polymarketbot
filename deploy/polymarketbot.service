@@ -25,13 +25,13 @@ Environment=DUCKDB_THREADS=2
 # Default (Leading to Dec 1): 24/7 Zero-Capital Live Paper Trading Soak across the 3 active production strategies
 #   Allocates $1,000 each to Domain2ARR, CtfSplitter, and SettlementHarvester ($3,000 Total).
 #   (LatencySniper is archived due to taker fee drag and cross-region latency decay).
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
+ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 
 # Alternate modes (override via systemctl edit polymarketbot):
 #   Preflight Verification:
-#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/preflight_verification.py
+#     ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.tools.preflight
 #   Real Money Quoting (Blocked until Dec 1st - Requires --live, --yes, and populated credentials):
-#     ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_real_money_trader.py --live --yes --budget-pct 0.20
+#     ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.trading.runner --live --yes --budget-pct 0.20
 
 # Reliability & Crash Recovery
 Restart=always

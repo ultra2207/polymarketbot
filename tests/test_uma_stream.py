@@ -143,8 +143,8 @@ def propose_price(block: int = 101, log_index: int = 0, tx: str = "0x" + "a2" * 
 def dispute_price(block: int = 102, log_index: int = 0, tx: str = "0x" + "a3" * 32) -> dict:
     return _log(
         address=OO,
-        signature="DisputePrice(address,address,bytes32,uint256,bytes,int256)",
-        topics=[_topic_address(REQUESTER), _topic_address(DISPUTER)],
+        signature="DisputePrice(address,address,address,bytes32,uint256,bytes,int256)",
+        topics=[_topic_address(REQUESTER), _topic_address(PROPOSER), _topic_address(DISPUTER)],
         data=_encode(
             ["bytes32", "uint256", "bytes", "int256"],
             [IDENTIFIER, 1_760_000_000, ANCILLARY_BYTES, 10**18],
@@ -339,8 +339,8 @@ def test_poll_decodes_lifecycle_and_dedupes(tmp_path: Path) -> None:
     dispute = by_event["DisputePrice"]
     assert dispute["disputer"] == DISPUTER
     assert dispute["disputed"] is True
-    assert dispute["proposer"] is None
-    assert dispute["settlement_price"] is None
+    assert dispute["proposer"] == PROPOSER
+    assert dispute["expiry"] is None
 
     # condition_id/slug/question resolved from the universe manifest by exact
     # question text; the question itself came from the ancillary data.

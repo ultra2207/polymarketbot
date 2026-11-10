@@ -2,7 +2,7 @@
 #
 # All times are UTC. The collector is a single process with one asyncio event
 # loop and one writer thread; each stream owns its own reconnecting socket or
-# polling loop. See scripts/run_data_collector.py.
+# polling loop. See src/polymarketbot/data/collector.py.
 
 root: data/tape
 flush_seconds: 60          # WAL fsync cadence

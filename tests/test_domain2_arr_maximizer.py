@@ -18,7 +18,11 @@ from __future__ import annotations
 import math
 import pytest
 
-from polymarketbot.oracle.base import GroundTruthOutcome, OracleCategory, OracleStatus
+from polymarketbot.trading.domain2.types import (
+    GroundTruthOutcome,
+    OracleCategory,
+    OracleStatus,
+)
 from polymarketbot.rewards.queue_valuation import PolygonPoSEnvironment
 from polymarketbot.trading.domain2.ortools_allocator import (
     Domain2Allocation,

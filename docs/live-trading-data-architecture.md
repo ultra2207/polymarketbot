@@ -6,7 +6,7 @@ trader records that the public collector cannot. Companion to
 
 **Status 2026-11-05 (v2):** implemented in
 `src/polymarketbot/trading/session_recorder.py` and wired into
-`scripts/run_real_money_trader.py` via `--record-live-data`
+`polymarketbot.trading.runner` via `--record-live-data`
 (`--no-record-live-data` disables; default on for live, off for dry-run).
 The engine emits quote/risk events through a no-op-by-default
 `event_hook`. v2 adds the authenticated CLOB user WebSocket
@@ -27,8 +27,8 @@ The public collector was not modified.
 
 | Process | What it does | Writes | Runs during live? |
 |---|---|---|---|
-| Public collector (`scripts/run_data_collector.py`) | 9 streams: CLOB books/trades, Binance, Deribit, Polygon, UMA, news, whales, Kalshi, universe | `data/tape/` (5.5–5.8 GB/day) | yes, separate process |
-| Live runner (`scripts/run_real_money_trader.py`) | one `RealMoneyTradingEngine` for one condition; `LivePolymarketFeed`; `LiveClobClient` REST; risk; merges | `data/real_money_trading.db` (SQLite), `real_money_trading_ledger.json`, logs | yes |
+| Public collector (`python -m polymarketbot.data.collector`) | 9 streams: CLOB books/trades, Binance, Deribit, Polygon, UMA, news, whales, Kalshi, universe | `data/tape/` (5.5–5.8 GB/day) | yes, separate process |
+| Live runner (`polymarketbot.trading.runner`) | one `RealMoneyTradingEngine` for one condition; `LivePolymarketFeed`; `LiveClobClient` REST; risk; merges | `data/real_money_trading.db` (SQLite), `real_money_trading_ledger.json`, logs | yes |
 | Paper runner | `PaperTradingEngine`, multi-market, simulated fills/queue | paper ledger JSON, logs | separate |
 | Monitor / watchdog | collector health; restart if dead | `data/logs/collector_alerts.log`, watchdog log | yes |
 

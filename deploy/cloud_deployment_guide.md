@@ -214,13 +214,13 @@ sudo journalctl -u polymarketbot -f -o cat
 
 By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across the 3 active production pillars ($1,000 each = $3,000 total):
 ```ini
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
+ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 ```
 
 ### Preflight Health Audit (Run before or after starting daemon):
 ```bash
 cd /opt/polymarketbot
-uv run python scripts/preflight_verification.py
+uv run python -m polymarketbot.tools.preflight
 ```
 
 To switch to a different operational mode, run:
@@ -233,13 +233,13 @@ Paste your override in the opened editor:
 [Service]
 ExecStart=
 # --- Option 1: 3-Strategy Live Paper Soak Daemon ($3,000 virtual capital) ---
-ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_live_paper_soak.py --capital 3000
+ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 
 # --- Option 2: Preflight Verification Health Audit ---
-# ExecStart=/opt/polymarketbot/.venv/bin/python scripts/preflight_verification.py
+# ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.tools.preflight
 
 # --- Option 3: Live Real Money Quoter (BLOCKED until Dec 1st - requires real capital) ---
-# ExecStart=/opt/polymarketbot/.venv/bin/python scripts/run_real_money_trader.py --live --yes --budget-pct 0.20
+# ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.trading.runner --live --yes --budget-pct 0.20
 ```
 
 Reload and restart:

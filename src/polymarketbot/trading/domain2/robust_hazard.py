@@ -29,9 +29,13 @@ of evolving market regimes:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from scipy.stats import beta as _beta_dist
 
 from polymarketbot.logs import get_logger
 from polymarketbot.rewards.queue_valuation import CTFGasProfile, PolygonPoSEnvironment
@@ -51,6 +55,89 @@ DEFAULT_REINVESTMENT_LATENCY_HOURS: float = 0.15      # Empirical capital recycl
 HOURS_PER_YEAR: float = 8760.0                        # 365 days * 24 hours
 DEFAULT_DVM_VOTE_DELAY_HOURS: float = 72.0            # UMA DVM governance vote cycle duration
 DEFAULT_CTF_REDEEM_GAS_UNITS: int = 82_000            # Polygon PoS CTF.redeemPositions gas units
+
+# Measured dispute outcomes (the same sources the Domain 2 audit reads).
+# `uma_events` is the table registered by data/streams/uma.py (UMA_EVENTS); the
+# derived report is the audit snapshot of that same tape.
+UMA_EVENTS_GLOB: str = "data/tape/uma_events/**/*.parquet"
+DISPUTE_AUDIT_REPORT_PATH: str = "data/derived/domain2_audit_report.json"
+# Documented fallback prior: only used before any measured outcome exists.
+FALLBACK_PRIOR_ALPHA: float = 1.0
+FALLBACK_PRIOR_BETA: float = 1000.0
+# Existing 95% minimax confidence level (previously expressed as 1.96 sigma).
+CREDIBLE_INTERVAL: float = 0.95
+
+
+@dataclass(frozen=True)
+class MeasuredDisputeCounts:
+    """Observed UMA proposal/dispute counts and the file that supplied them."""
+
+    proposals: int
+    disputes: int
+    source: str
+
+
+def measured_dispute_counts(
+    report_path: str = DISPUTE_AUDIT_REPORT_PATH,
+    tape_glob: str = UMA_EVENTS_GLOB,
+) -> Optional[MeasuredDisputeCounts]:
+    """Observed proposal/dispute counts from the UMA tape, else the audit report.
+
+    The tape query mirrors ``scripts/domain2_empirical_audit.py``: a proposal is
+    a ``ProposePrice`` event and a dispute is any event carrying
+    ``disputed = true`` (``DisputePrice`` or a disputed ``Settle``). The derived
+    report is a snapshot of that same tape, so it is only a fallback.
+    """
+    try:
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            # A dispute is counted only on a proposal that is in the *same*
+            # population, joined by the OO request key.  Counting every
+            # ``disputed`` Settle row against every ProposePrice row mixes two
+            # populations: measured 2026-11-10, the tape's 10 disputed Settles
+            # belong to requests made in January and February (0 key overlap
+            # with the 331 proposals collected), so the naive ratio read
+            # 10/331 = 3.0 % instead of the measured 0/331.
+            row = con.execute(
+                "WITH p AS (SELECT DISTINCT requester, identifier, request_timestamp "
+                "  FROM read_parquet(?) WHERE event = 'ProposePrice'), "
+                " s AS (SELECT requester, identifier, request_timestamp, "
+                "  BOOL_OR(disputed IS TRUE) AS disputed "
+                "  FROM read_parquet(?) WHERE event IN ('Settle', 'DisputePrice') "
+                "  GROUP BY 1, 2, 3) "
+                "SELECT COUNT(*), COUNT(*) FILTER (WHERE coalesce(s.disputed, FALSE)) "
+                "FROM p LEFT JOIN s USING (requester, identifier, request_timestamp)",
+                [tape_glob, tape_glob],
+            ).fetchone()
+        finally:
+            con.close()
+        proposals = int((row or (0, 0))[0] or 0)
+        disputes = int((row or (0, 0))[1] or 0)
+        if proposals > 0:
+            return MeasuredDisputeCounts(
+                proposals=proposals,
+                disputes=min(disputes, proposals),
+                source=f"uma_events tape ({tape_glob}), joined on the request key",
+            )
+    except Exception as exc:  # noqa: BLE001 - the report is the documented fallback
+        logger.warning("UMA dispute tape unavailable ({}); trying audit report", exc)
+
+    try:
+        payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        audit = payload.get("uma_oracle_audit") or {}
+        proposals = int(audit.get("propose_price_count") or 0)
+        disputes = int(audit.get("disputed_true_count") or 0)
+        if proposals > 0:
+            return MeasuredDisputeCounts(
+                proposals=proposals,
+                disputes=min(disputes, proposals),
+                source=str(report_path),
+            )
+    except Exception as exc:  # noqa: BLE001 - no measurement must not invent one
+        logger.warning("UMA dispute audit report unavailable: {}", exc)
+    return None
 
 
 def calculate_physical_cycle_time(
@@ -326,18 +413,51 @@ class DynamicSettlementDelayModel:
         )
 
 
+def redemption_gas_usd(
+    gas_price_gwei: Optional[float] = None,
+    pol_usd_price: Optional[float] = None,
+    gas_units: int = DEFAULT_CTF_REDEEM_GAS_UNITS,
+) -> float:
+    """CTF.redeemPositions gas in USD from the shared Polygon PoS model.
+
+    ``gas_price_gwei`` is the live effective price the CTF pillar measures
+    (``trading.ctf.get_dynamic_gas_price_gwei``: base + priority), so it is fed
+    in as ``base_fee_gwei`` with a zero tip to avoid charging it twice;
+    ``pol_usd_price`` is ``trading.ctf.get_dynamic_pol_usd_price``. Missing
+    measurements fall back to ``PolygonPoSEnvironment``'s empirical defaults.
+    No gas dollar constant is duplicated here.
+    """
+    defaults = PolygonPoSEnvironment()
+    env = PolygonPoSEnvironment(
+        base_fee_gwei=float(gas_price_gwei) if gas_price_gwei is not None else defaults.base_fee_gwei,
+        priority_fee_gwei=0.0 if gas_price_gwei is not None else defaults.priority_fee_gwei,
+        pol_usd_rate=float(pol_usd_price) if pol_usd_price is not None else defaults.pol_usd_rate,
+    )
+    return DynamicSettlementDelayModel(pos_env=env).compute_redemption_gas_usd(gas_units)
+
+
 @dataclass
 class BayesianCategoryState:
-    """Online Beta-Binomial conjugate tracker for category-specific dispute/reversal rates."""
+    """Online Beta-Binomial posterior for category-specific dispute/reversal rates."""
 
-    alpha: float = 1.0   # Prior pseudocount for disputes/reversals
-    beta: float = 1000.0 # Prior pseudocount for clean settlements (baseline 0.1% dispute rate)
-    decay_gamma: float = 0.998  # Exponential forgetting factor for non-stationary market drift
+    alpha: float = FALLBACK_PRIOR_ALPHA   # Disputes/reversals + the bound's uniform prior
+    beta: float = FALLBACK_PRIOR_BETA     # Clean settlements + the bound's uniform prior
+    observations: int = 0                 # Measured outcomes folded into the posterior
+    _upper_key: Optional[Tuple[float, float]] = field(default=None, init=False, repr=False)
+    _upper_value: float = field(default=0.0, init=False, repr=False)
 
     def record_observation(self, reversed_or_disputed: bool) -> None:
-        """Update posterior beliefs with exponential memory discounting."""
-        self.alpha = self.decay_gamma * self.alpha + (1.0 if reversed_or_disputed else 0.0)
-        self.beta = self.decay_gamma * self.beta + (0.0 if reversed_or_disputed else 1.0)
+        """Conjugate Beta-Binomial update.
+
+        There is no forgetting factor: no measured half-life exists for dispute
+        rates in this repo, so the posterior stays stationary instead of
+        decaying on an unmeasured constant.
+        """
+        if reversed_or_disputed:
+            self.alpha += 1.0
+        else:
+            self.beta += 1.0
+        self.observations += 1
 
     @property
     def posterior_mean(self) -> float:
@@ -346,11 +466,19 @@ class BayesianCategoryState:
 
     @property
     def posterior_upper_95(self) -> float:
-        """Conservative 95% upper credible bound for Minimax robust allocation."""
-        mean = self.posterior_mean
-        var = (self.alpha * self.beta) / (((self.alpha + self.beta) ** 2) * (self.alpha + self.beta + 1.0))
-        std_err = math.sqrt(max(1e-9, var))
-        return min(0.50, mean + 1.96 * std_err)
+        """Exact 95% upper credible bound (Beta quantile), capped for robustness.
+
+        For ``seed_measured`` counts this is the Clopper-Pearson binomial upper
+        bound; the old 1.96-sigma normal approximation is replaced because it
+        degenerates at zero observed disputes.
+        """
+        key = (self.alpha, self.beta)
+        if self._upper_key != key:
+            self._upper_value = min(
+                0.50, float(_beta_dist.ppf(CREDIBLE_INTERVAL, self.alpha, self.beta))
+            )
+            self._upper_key = key
+        return self._upper_value
 
 
 class BayesianDisputeTracker:
@@ -358,13 +486,69 @@ class BayesianDisputeTracker:
 
     def __init__(self) -> None:
         self._categories: Dict[str, BayesianCategoryState] = {}
-        # Global fallback state
-        self._global_state = BayesianCategoryState(alpha=1.0, beta=1000.0)
+        # Documented fallback: replaced by measured outcomes before first use.
+        self._global_state = BayesianCategoryState()
+
+    @classmethod
+    def from_measured_sources(
+        cls,
+        report_path: str = DISPUTE_AUDIT_REPORT_PATH,
+        tape_glob: str = UMA_EVENTS_GLOB,
+    ) -> "BayesianDisputeTracker":
+        """Tracker seeded from the UMA tape (else the audit report).
+
+        With no measurement the documented fallback prior stays in place; this
+        is the only path on which it is returned.
+        """
+        tracker = cls()
+        counts = measured_dispute_counts(report_path=report_path, tape_glob=tape_glob)
+        if counts is None:
+            logger.warning(
+                "No measured UMA dispute outcomes (tape={}, report={}); using the "
+                "documented fallback prior alpha={} beta={}",
+                tape_glob,
+                report_path,
+                FALLBACK_PRIOR_ALPHA,
+                FALLBACK_PRIOR_BETA,
+            )
+            return tracker
+        tracker.seed_measured(counts)
+        return tracker
+
+    def seed_measured(self, counts: MeasuredDisputeCounts) -> None:
+        """Replace the fallback prior with the measured Beta posterior.
+
+        ``alpha = 1 + disputes`` and ``beta = 1 + (proposals - disputes)`` is the
+        exact Clopper-Pearson construction for the 95% upper bound; the ``1``s
+        are that bound's uniform prior, not a risk assumption. The measured
+        sample size drives the width, so the haircut tracks observed disputes.
+        """
+        clean = max(0, counts.proposals - counts.disputes)
+        self._categories.clear()
+        self._global_state = BayesianCategoryState(
+            alpha=1.0 + float(counts.disputes),
+            beta=1.0 + float(clean),
+            observations=int(counts.proposals),
+        )
+        logger.info(
+            "Bayesian dispute posterior seeded from {}: {} proposals, {} disputed, "
+            "mean={:.4%}, upper95={:.4%}",
+            counts.source,
+            counts.proposals,
+            counts.disputes,
+            self._global_state.posterior_mean,
+            self._global_state.posterior_upper_95,
+        )
 
     def get_state(self, category: str) -> BayesianCategoryState:
         cat = category.lower().strip()
         if cat not in self._categories:
-            self._categories[cat] = BayesianCategoryState()
+            # Hierarchical prior: a new category inherits the current pooled
+            # posterior (measured when available, documented fallback otherwise).
+            self._categories[cat] = BayesianCategoryState(
+                alpha=self._global_state.alpha,
+                beta=self._global_state.beta,
+            )
         return self._categories[cat]
 
     def record_outcome(self, category: str, reversed_or_disputed: bool) -> None:

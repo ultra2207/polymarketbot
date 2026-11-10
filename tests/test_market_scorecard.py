@@ -1,4 +1,4 @@
-"""Tests for scripts/score_markets.py.
+"""Tests for polymarketbot.tools.market_scorecard.
 
 Three layers:
 
@@ -15,7 +15,6 @@ No tape, no network: the fixture is three tiny parquet files in ``tmp_path``.
 from __future__ import annotations
 
 import datetime as dt
-import importlib.util
 import json
 from pathlib import Path
 
@@ -23,6 +22,8 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+
+from polymarketbot.tools import market_scorecard
 
 NS = 1_000_000_000
 DATE = "2026-11-05"
@@ -39,12 +40,7 @@ ASSET_WIDE = "222"
 
 @pytest.fixture(scope="module")
 def score():
-    path = Path(__file__).resolve().parent.parent / "scripts" / "score_markets.py"
-    spec = importlib.util.spec_from_file_location("score_markets_module", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
+    return market_scorecard
 
 
 # ------------------------------------------------------------------- fixture

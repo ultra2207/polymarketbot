@@ -26,7 +26,7 @@ import os
 import sqlite3
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -48,6 +48,7 @@ from polymarketbot.rewards.microstructure import (
 from polymarketbot.rewards.queue_valuation import (
     CapitalMigrationEngine,
     HurdleDecision,
+    LiquidationRoute,
     SwitchingCostDecomposition,
 )
 from polymarketbot.rewards.scoring import (
@@ -67,8 +68,71 @@ from polymarketbot.trading.pending_settlements import (
 logger = get_logger("trading.base")
 
 
-DEFAULT_FALLBACK_BID: float = 0.49
-DEFAULT_FALLBACK_ASK: float = 0.51
+# Kept for import compatibility. There is deliberately no fabricated price:
+# a missing book is represented by ``None`` and every quoting path must skip
+# rather than trade against an invented 0.49/0.51 mark.
+
+MARKET_ECONOMICS_PATH: Path = Path("data/derived/market_economics.json")
+"""Measured market economics. Absent file means the provisional defaults apply."""
+
+
+@dataclass(frozen=True)
+class MarketEconomics:
+    """Economic parameters for a market-making engine.
+
+    Every field is a **provisional default pending measurement**. The values
+    reproduce the constants that used to be hardcoded in
+    :meth:`BaseMarketMakingEngine.__init__` so that a deployment without a
+    measured ``data/derived/market_economics.json`` behaves exactly as before;
+    they are not calibrated estimates. When the JSON file exists, its keys (the
+    field names below) override the defaults.
+    """
+
+    quote_size: float = 20.0  # provisional default pending measurement
+    spread_offset_cents: float = 0.50  # provisional default pending measurement
+    daily_reward_rate: float = 20.0  # provisional default pending measurement
+    rewards_max_spread_cents: float = 1.0  # provisional default pending measurement
+    rewards_min_size: float = 20.0  # provisional default pending measurement
+    gamma: float = 0.02  # A-S risk aversion; provisional default pending measurement
+    q_soft_threshold: float = 15.0  # provisional default pending measurement
+    q_hard_threshold: float = 100.0  # provisional default pending measurement
+    max_holding_seconds: float = 300.0  # provisional default pending measurement
+    ofi_threshold: float = 850.0  # provisional default pending measurement
+    drift_threshold_cents: float = 1.5  # provisional default pending measurement
+    daily_loss_limit_usd: float = 15.0  # provisional default pending measurement
+    max_drawdown_usd: float = 30.0  # provisional default pending measurement
+    days_to_resolution: float = 7.0  # provisional default pending measurement
+
+    @classmethod
+    def load(cls, path: Union[str, Path] = MARKET_ECONOMICS_PATH) -> "MarketEconomics":
+        """Load measured economics from ``path``, or fall back to the defaults.
+
+        Unknown keys and non-finite values raise ``ValueError`` so a malformed
+        measurement file fails closed instead of silently trading on a typo.
+        """
+        economics_path = Path(path)
+        if not economics_path.exists():
+            logger.info(
+                f"No market economics at {economics_path}; using provisional defaults"
+            )
+            return cls()
+
+        payload = json.loads(economics_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"{economics_path} must contain a JSON object")
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(payload) - known)
+        if unknown:
+            raise ValueError(f"{economics_path} has unknown keys: {unknown}")
+
+        values: Dict[str, float] = {}
+        for key, raw in payload.items():
+            value = float(raw)
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError(f"{economics_path} has non-finite {key}={raw!r}")
+            values[key] = value
+        logger.info(f"Loaded market economics from {economics_path}")
+        return cls(**values)
 
 
 @dataclass
@@ -99,15 +163,15 @@ class BaseMarketMakingEngine:
         condition_id: str,
         asset_id_yes: str = "TOKEN_YES",
         asset_id_no: str = "TOKEN_NO",
-        quote_size: float = 20.0,
-        spread_offset_cents: float = 0.50,
-        daily_reward_rate: float = 20.0,
-        rewards_max_spread_cents: float = 1.0,
-        rewards_min_size: float = 20.0,
+        quote_size: Optional[float] = None,
+        spread_offset_cents: Optional[float] = None,
+        daily_reward_rate: Optional[float] = None,
+        rewards_max_spread_cents: Optional[float] = None,
+        rewards_min_size: Optional[float] = None,
         auto_merge_threshold: Optional[float] = None,
         gas_fee_merge: Optional[float] = None,
         institutional_mode: bool = True,
-        gamma: float = 0.02,
+        gamma: Optional[float] = None,
         competing_score_override: Optional[float] = None,
         db_path: Union[str, Path] = "data/trading.db",
         ledger_path: Union[str, Path] = "data/trading_ledger.json",
@@ -117,15 +181,31 @@ class BaseMarketMakingEngine:
         risk_manager: Optional[RiskManager] = None,
         price_jump_threshold_cents: Optional[float] = None,
         cooldown_duration_seconds: Optional[float] = None,
+        economics: Optional[MarketEconomics] = None,
     ) -> None:
+        # Every economic knob comes from measured economics; explicit kwargs are
+        # caller overrides and take precedence over the loaded file.
+        economics = economics or MarketEconomics.load()
         self.condition_id = condition_id
         self.asset_id_yes = asset_id_yes
         self.asset_id_no = asset_id_no
-        self.quote_size = float(quote_size)
-        self.spread_offset_cents = float(spread_offset_cents)
-        self.daily_reward_rate = float(daily_reward_rate)
-        self.rewards_max_spread = float(rewards_max_spread_cents)
-        self.rewards_min_size = float(rewards_min_size)
+        self.quote_size = float(
+            economics.quote_size if quote_size is None else quote_size
+        )
+        self.spread_offset_cents = float(
+            economics.spread_offset_cents if spread_offset_cents is None else spread_offset_cents
+        )
+        self.daily_reward_rate = float(
+            economics.daily_reward_rate if daily_reward_rate is None else daily_reward_rate
+        )
+        self.rewards_max_spread = float(
+            economics.rewards_max_spread_cents
+            if rewards_max_spread_cents is None
+            else rewards_max_spread_cents
+        )
+        self.rewards_min_size = float(
+            economics.rewards_min_size if rewards_min_size is None else rewards_min_size
+        )
         self.price_jump_threshold_cents = (
             float(price_jump_threshold_cents) if price_jump_threshold_cents is not None else None
         )
@@ -148,7 +228,7 @@ class BaseMarketMakingEngine:
             )
 
         self.institutional_mode = bool(institutional_mode)
-        self.gamma = float(gamma)
+        self.gamma = float(economics.gamma if gamma is None else gamma)
         self.competing_score_override = (
             float(competing_score_override) if competing_score_override is not None else None
         )
@@ -163,14 +243,20 @@ class BaseMarketMakingEngine:
         self.deskew_optimizer = deskew_optimizer or DynamicDeSkewOptimizer(
             gamma=self.gamma,
             gas_cost_merge_usd=self.gas_fee_merge,
-            q_soft_threshold=15.0,
-            q_hard_threshold=100.0,
-            max_holding_seconds=300.0,
+            q_soft_threshold=economics.q_soft_threshold,
+            q_hard_threshold=economics.q_hard_threshold,
+            max_holding_seconds=economics.max_holding_seconds,
         )
 
         # Microstructure Sentinels for OFI & Micro-Price Drift
-        self.microstructure_yes = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
-        self.microstructure_no = MicrostructureEngine(ofi_threshold=850.0, drift_threshold_cents=1.5)
+        self.microstructure_yes = MicrostructureEngine(
+            ofi_threshold=economics.ofi_threshold,
+            drift_threshold_cents=economics.drift_threshold_cents,
+        )
+        self.microstructure_no = MicrostructureEngine(
+            ofi_threshold=economics.ofi_threshold,
+            drift_threshold_cents=economics.drift_threshold_cents,
+        )
 
         # Capital Migration & Switching Hurdle Engine
         self.migration_engine = migration_engine or CapitalMigrationEngine()
@@ -192,8 +278,8 @@ class BaseMarketMakingEngine:
                 price_jump_window_seconds=60.0,
                 price_jump_threshold_cents=2.0,
                 cooldown_duration_seconds=300.0,
-                daily_loss_limit_usd=15.0,
-                max_drawdown_usd=30.0,
+                daily_loss_limit_usd=economics.daily_loss_limit_usd,
+                max_drawdown_usd=economics.max_drawdown_usd,
             )
         )
         self.risk_manager.register_unquote_callback(self._on_risk_unquote)
@@ -218,7 +304,7 @@ class BaseMarketMakingEngine:
         self.min_reprice_ticks: int = 1
         # Real time-to-resolution for the A-S variance term. The live engine replaces
         # this from the market's end date; the default matches the research model.
-        self.days_to_resolution: float = 7.0
+        self.days_to_resolution: float = float(economics.days_to_resolution)
 
         # Epoch & Telemetry State
         self.epoch_index: int = 0
@@ -670,22 +756,31 @@ class BaseMarketMakingEngine:
         """Get total portfolio equity (cash + inventory market value)."""
         raise NotImplementedError
 
-    def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
-        """Get best real bid and ask prices for target outcome token."""
+    def get_best_bid_ask(
+        self, token_side: str
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Best real bid/ask for this outcome, or ``(None, None)`` with no book.
+
+        There is no fabricated fallback price: callers must skip quoting when
+        either side is ``None`` instead of marking the market at 0.49/0.51.
+        """
         tok = token_side.upper()
-        if tok in self._best_bids and tok in self._best_asks:
-            return self._best_bids[tok], self._best_asks[tok]
+        bid = self._best_bids.get(tok)
+        ask = self._best_asks.get(tok)
+        if bid is not None and ask is not None:
+            return bid, ask
         # Cross-infer from complementary token if available
         comp = "NO" if tok == "YES" else "YES"
-        if comp in self._best_bids and comp in self._best_asks:
-            b_comp = self._best_bids[comp]
-            a_comp = self._best_asks[comp]
-            if 0.0 < b_comp < 1.0 and 0.0 < a_comp < 1.0:
-                return round(1.0 - a_comp, 4), round(1.0 - b_comp, 4)
-        return (
-            self._best_bids.get(tok, DEFAULT_FALLBACK_BID),
-            self._best_asks.get(tok, DEFAULT_FALLBACK_ASK),
-        )
+        b_comp = self._best_bids.get(comp)
+        a_comp = self._best_asks.get(comp)
+        if (
+            b_comp is not None
+            and a_comp is not None
+            and 0.0 < b_comp < 1.0
+            and 0.0 < a_comp < 1.0
+        ):
+            return round(1.0 - a_comp, 4), round(1.0 - b_comp, 4)
+        return None, None
 
     def credit_reward(self, amount: float, condition_id: str, note: str = "") -> None:
         """Hook for crediting settled liquidity rewards to portfolio cash."""
@@ -845,6 +940,12 @@ class BaseMarketMakingEngine:
         """
         b_yes, a_yes = self.get_best_bid_ask("YES")
         b_no, a_no = self.get_best_bid_ask("NO")
+        if b_yes is None or a_yes is None or b_no is None or a_no is None:
+            logger.debug(
+                f"No complete book for {self.condition_id}; reward score is zero"
+            )
+            return 0.0, 0.0, 0.0
+
         mid_yes = (b_yes + a_yes) / 2.0
         mid_no = (b_no + a_no) / 2.0
 
@@ -915,6 +1016,11 @@ class BaseMarketMakingEngine:
 
         b_yes, a_yes = self.get_best_bid_ask("YES")
         b_no, a_no = self.get_best_bid_ask("NO")
+        if b_yes is None or a_yes is None or b_no is None or a_no is None:
+            logger.debug(
+                f"No complete book for {self.condition_id}; skipping quote evaluation"
+            )
+            return
 
         mid_yes = (b_yes + a_yes) / 2.0
 
@@ -1035,6 +1141,11 @@ class BaseMarketMakingEngine:
             tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
             _, best_ask_no = self.get_best_bid_ask("NO")
             max_bid_yes = self.round_quote_price(best_ask_yes - tick, "YES")
+            if best_ask_no is None:
+                logger.debug(
+                    f"No NO book for {self.condition_id}; skipping tier-1 fade"
+                )
+                return
             max_bid_no = self.round_quote_price(best_ask_no - tick, "NO")
 
             if net_q > 0:
@@ -1164,6 +1275,11 @@ class BaseMarketMakingEngine:
 
             _, best_ask_no = self.get_best_bid_ask("NO")
             max_bid_yes = self.round_quote_price(best_ask_yes - tick, "YES")
+            if best_ask_no is None:
+                logger.debug(
+                    f"No NO book for {self.condition_id}; skipping neutral quoting"
+                )
+                return
             max_bid_no = self.round_quote_price(best_ask_no - tick, "NO")
             min_ask_yes = self.round_quote_price(best_bid_yes + tick, "YES")
 
@@ -1395,25 +1511,28 @@ class BaseMarketMakingEngine:
             timestamp=ts,
         )
 
-        # Continuous Capital Compounding via Governor
+        # Continuous Capital Compounding via Governor. Without a book there is no
+        # mid to size against, so the governor is skipped rather than fed a mark.
         b_yes, a_yes = self.get_best_bid_ask("YES")
-        mid_yes = (b_yes + a_yes) / 2.0
-        cand = {
-            "condition_id": self.condition_id,
-            "question": f"Market {self.condition_id[:12]}",
-            "daily_pool": self.daily_reward_rate,
-            "competing_score": max(1.0, competing_score),
-            "max_spread": self.rewards_max_spread,
-            "min_size": self.rewards_min_size,
-            "mid_yes": mid_yes,
-            "real_mid": mid_yes,
-        }
-        gov_actions = self.governor.evaluate_governor_cycle(
-            current_active_markets=[self.condition_id],
-            live_bankroll_usd=cash_val,
-            scanned_universe=[cand],
-            current_time=ts,
-        )
+        gov_actions = []
+        if b_yes is not None and a_yes is not None:
+            mid_yes = (b_yes + a_yes) / 2.0
+            cand = {
+                "condition_id": self.condition_id,
+                "question": f"Market {self.condition_id[:12]}",
+                "daily_pool": self.daily_reward_rate,
+                "competing_score": max(1.0, competing_score),
+                "max_spread": self.rewards_max_spread,
+                "min_size": self.rewards_min_size,
+                "mid_yes": mid_yes,
+                "real_mid": mid_yes,
+            }
+            gov_actions = self.governor.evaluate_governor_cycle(
+                current_active_markets=[self.condition_id],
+                live_bankroll_usd=cash_val,
+                scanned_universe=[cand],
+                current_time=ts,
+            )
         for act in gov_actions:
             if act.action_type == "RESIZE_QUOTE" and act.condition_id == self.condition_id:
                 logger.info(
@@ -1453,6 +1572,8 @@ class BaseMarketMakingEngine:
             q_ahead = float(q.get("queue_ahead", 0.0))
             tok = q.get("token_side", "YES")
             b_tok, a_tok = self.get_best_bid_ask(tok)
+            if b_tok is None or a_tok is None:
+                continue
             mid = (b_tok + a_tok) / 2.0
             px = float(q.get("price", mid))
             spread_c = abs(px - mid) * 100.0
@@ -1495,6 +1616,22 @@ class BaseMarketMakingEngine:
 
         b_yes, a_yes = self.get_best_bid_ask("YES")
         b_no, a_no = self.get_best_bid_ask("NO")
+        if b_yes is None or a_yes is None or a_no is None:
+            # Fail closed: without a real book the switching friction is unknown,
+            # so report an infinite cost instead of inventing a mid/liquidation.
+            logger.debug(
+                f"No complete book for {self.condition_id}; switching cost unknown"
+            )
+            decomp = SwitchingCostDecomposition(
+                queue_value_lost_usd=0.0,
+                liquidation_friction_usd=0.0,
+                gas_fees_usd=0.0,
+                opportunity_cost_downtime_usd=0.0,
+                total_switching_cost_usd=float("inf"),
+                liquidation_route=LiquidationRoute.ZERO_INVENTORY,
+            )
+            self.latest_switching_cost = decomp
+            return decomp
         mid_yes = (b_yes + a_yes) / 2.0
 
         bid_quote = self.active_quotes.get("BUY_YES")

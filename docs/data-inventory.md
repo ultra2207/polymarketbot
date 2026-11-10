@@ -28,10 +28,10 @@ What we hold, what we derive, and how to rebuild it. Sizes and row counts are fr
 | `labels_chain.parquet` | 1,117,152 | `build_labels.py` | normalised on-chain payout vectors |
 | `market_labels.parquet` | 4,049,900 | `build_labels.py` | markets + authoritative labels |
 | `market_categories.parquet` | 4,049,900 | `build_categories.py` | slug rules + Gamma tag overrides |
-| `gamma_category_overrides.parquet` | 106,566 | `enrich_categories_gamma.py` | tags→category for the residual |
+| `gamma_category_overrides.parquet` | 106,566 | `polymarketbot.data.builders.enrich_categories_gamma` | tags→category for the residual |
 | `market_trade_stats.parquet` | 2,435,871 | `build_market_stats.py` | first/last fill, fills, volume, v1/v2 |
 | `market_tick.parquet` | 163,908 | `build_tick_sizes.py` | tick from Dome (2025-10→2026-03) |
-| `market_metadata_gamma.parquet` | ~2.4 M (filling) | `enrich_market_metadata.py` | version, token/position ids, feeSchedule, tick, min order |
+| `market_metadata_gamma.parquet` | ~2.4 M (filling) | `polymarketbot.data.builders.enrich_market_metadata` | version, token/position ids, feeSchedule, tick, min order |
 | `markets_pit.parquet` | 4,049,855 | `build_universe.py` | **the point-in-time market table** |
 | `labels_api.parquet` | ~1.5 M (filling) | `fetch_labels_api.py` | 2026-04+ settlements from `/v2/tokens`; `final_price` validated 371/371 against on-chain payouts |
 | `screen_calibration_rows.parquet` | 152,895 | `screen_calibration.py` | scored token-entries behind the idea-#1 result |
@@ -52,10 +52,10 @@ What we hold, what we derive, and how to rebuild it. Sizes and row counts are fr
 | `verify_core.py` | Phase 1 integrity gate | — |
 | `build_labels.py` | on-chain payouts → labels | — |
 | `build_categories.py` | rule-based categories | — |
-| `enrich_categories_gamma.py` | tag-based reclassification | `--max-seconds` |
+| `polymarketbot.data.builders.enrich_categories_gamma` | tag-based reclassification | `--max-seconds` |
 | `build_market_stats.py` | 1.27 B-row aggregation | ~2 min |
 | `build_tick_sizes.py` | Dome tick sizes | ~2 s |
-| `enrich_market_metadata.py` | Gamma metadata, concurrent | `--max-seconds`, `--workers` |
+| `polymarketbot.data.builders.enrich_market_metadata` | Gamma metadata, concurrent | `--max-seconds`, `--workers` |
 | `build_universe.py` | assemble `markets_pit` | ~30 s |
 | `check_universe.py` | invariants + live spot-check | 24 URLs |
 | `cross_check_indexers.py` | SII vs moose per-tx | per-query timeout |
@@ -73,12 +73,12 @@ What we hold, what we derive, and how to rebuild it. Sizes and row counts are fr
 ## Rebuild order
 
 ```bash
-uv run scripts/build_labels.py
-uv run scripts/build_categories.py
-uv run scripts/build_market_stats.py
-uv run scripts/build_tick_sizes.py
-uv run scripts/enrich_market_metadata.py     # optional, slow, improves coverage
-uv run scripts/build_universe.py             # depends on the five above
+uv run python -m polymarketbot.data.builders.build_labels
+uv run python -m polymarketbot.data.builders.build_categories
+uv run python -m polymarketbot.data.builders.build_market_stats
+uv run python -m polymarketbot.data.builders.build_tick_sizes
+uv run python -m polymarketbot.data.builders.enrich_market_metadata     # optional, slow, improves coverage
+uv run python -m polymarketbot.data.builders.build_universe             # depends on the five above
 uv run pytest -q
-uv run scripts/check_universe.py --n 24
+uv run python -m polymarketbot.tools.check_universe --n 24
 ```

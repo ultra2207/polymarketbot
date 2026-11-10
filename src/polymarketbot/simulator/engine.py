@@ -10,7 +10,11 @@ Orchestrates:
    - Tier 2: Emergency active synthetic complete-set cross-hedging.
 5. Polymarket Quadratic Liquidity Rewards Scoring:
    - S(v, s) = ((v - s)/v)^2 * size across 1,440 daily epochs with $1.00 daily payout floor enforcement.
-6. Persistence to SQLite (data/native_paper_trading.db) and JSON ledger.
+6. Persistence to SQLite (data/native_paper_simulator.db) and JSON ledger.
+
+Prices come only from the live books: when a book has no two-sided quote, marks are
+skipped (equity excludes the position), and decisions that need the price are aborted
+via :class:`MissingBookPriceError` or an early return. No midpoint is ever invented.
 """
 
 from __future__ import annotations
@@ -54,11 +58,7 @@ from polymarketbot.rewards.scoring import (
     compute_minimum_score,
     quadratic_order_score,
 )
-from polymarketbot.trading.base import (
-    BaseMarketMakingEngine,
-    DEFAULT_FALLBACK_ASK,
-    DEFAULT_FALLBACK_BID,
-)
+from polymarketbot.trading.base import BaseMarketMakingEngine
 from polymarketbot.simulator.book import (
     DepthInfo,
     SyntheticOrderBook,
@@ -78,6 +78,14 @@ from polymarketbot.simulator.portfolio import (
 )
 
 log = get_logger("simulator.engine")
+
+
+class MissingBookPriceError(RuntimeError):
+    """A required price is unavailable because the live book has no two-sided quote.
+
+    Raised instead of substituting a made-up midpoint (0.49/0.50/0.51) or the
+    position's purchase price, so callers can skip the mark or abort the decision.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -167,18 +175,18 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         asset_id_yes: str = "TOKEN_YES",
         asset_id_no: str = "TOKEN_NO",
         initial_cash: float = 100.0,
-        quote_size: float = 20.0,
-        spread_offset_cents: float = 0.50,
-        daily_reward_rate: float = 20.0,
-        rewards_max_spread_cents: float = 1.0,
-        rewards_min_size: float = 20.0,
+        quote_size: Optional[float] = None,
+        spread_offset_cents: Optional[float] = None,
+        daily_reward_rate: Optional[float] = None,
+        rewards_max_spread_cents: Optional[float] = None,
+        rewards_min_size: Optional[float] = None,
         auto_merge_threshold: Optional[float] = None,
         gas_fee_merge: Optional[float] = None,
         institutional_mode: bool = True,
-        gamma: float = 0.02,
+        gamma: Optional[float] = None,
         competing_score_override: Optional[float] = None,
-        db_path: Union[str, Path] = "data/native_paper_trading.db",
-        ledger_path: Union[str, Path] = "data/native_paper_trading_ledger.json",
+        db_path: Union[str, Path] = "data/native_paper_simulator.db",
+        ledger_path: Union[str, Path] = "data/native_paper_simulator_ledger.json",
         deskew_optimizer: Optional[DynamicDeSkewOptimizer] = None,
         migration_engine: Optional[CapitalMigrationEngine] = None,
         governor: Optional[ContinuousOptimizationGovernor] = None,
@@ -241,30 +249,139 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
     def get_position(self, condition_id: Optional[str] = None):
         return self.portfolio.get_position(condition_id or self.condition_id)
 
+    # -------------------------------------------------------------------------
+    # Price Discovery (no fabricated fallbacks)
+    # -------------------------------------------------------------------------
+
+    def _book_top(self, token_side: str) -> Optional[Tuple[float, float]]:
+        """Two-sided top of book for one outcome token, or ``None`` when unpriced.
+
+        A missing side is completed from the binary complement of the opposite
+        token's live quote (YES ask = 1 - NO bid, and vice versa). Nothing is
+        invented: if neither book quotes the missing side, ``None`` is returned.
+        """
+        tok = str(token_side).upper()
+        book = self.book_yes if tok == "YES" else self.book_no
+        comp = self.book_no if tok == "YES" else self.book_yes
+        bid = book.best_bid_real
+        ask = book.best_ask_real
+        if bid is None and comp.best_ask_real is not None:
+            bid = round(1.0 - comp.best_ask_real, 4)
+        if ask is None and comp.best_bid_real is not None:
+            ask = round(1.0 - comp.best_bid_real, 4)
+        if bid is None or ask is None:
+            return None
+        return float(bid), float(ask)
+
+    def _mid_price(self, token_side: str) -> Optional[float]:
+        """Mid-price of one outcome token, or ``None`` when no two-sided quote exists.
+
+        Prefers the book's own effective mid (which includes our resting virtual
+        quotes), then the opposite book's mid complement, then the derived top.
+        """
+        tok = str(token_side).upper()
+        book = self.book_yes if tok == "YES" else self.book_no
+        if book.mid_price is not None:
+            return float(book.mid_price)
+        comp = self.book_no if tok == "YES" else self.book_yes
+        if comp.mid_price is not None:
+            return 1.0 - float(comp.mid_price)
+        top = self._book_top(tok)
+        if top is None:
+            return None
+        return (top[0] + top[1]) / 2.0
+
+    def _current_marks(self) -> Optional[Tuple[float, float]]:
+        """``(mid_yes, mid_no)`` for the traded market, or ``None`` when unpriced."""
+        mid_yes = self._mid_price("YES")
+        mid_no = self._mid_price("NO")
+        if mid_yes is None and mid_no is None:
+            return None
+        if mid_yes is None:
+            mid_yes = 1.0 - float(mid_no)
+        if mid_no is None:
+            mid_no = 1.0 - float(mid_yes)
+        return float(mid_yes), float(mid_no)
+
+    def _marked_portfolio_state(self) -> dict[str, Any]:
+        """Portfolio state marked only from live books.
+
+        Positions without a live two-sided price are left out of market value,
+        equity and unrealized PnL rather than being priced at cost or at an
+        invented midpoint; their condition ids are reported in
+        ``unmarked_positions`` and ``mark_basis`` states which basis was used.
+        """
+        marks: Dict[str, Tuple[float, float]] = {}
+        current = self._current_marks()
+        if current is not None:
+            marks[self.condition_id] = current
+
+        state = self.portfolio.get_state(marks)
+        market_value = 0.0
+        unrealized = 0.0
+        unmarked: List[str] = []
+        for cond_id, pos in self.portfolio.positions.items():
+            mark = marks.get(cond_id)
+            if mark is None:
+                if pos.shares_yes > 1e-9 or pos.shares_no > 1e-9:
+                    unmarked.append(cond_id)
+                continue
+            market_value += pos.get_market_value(*mark)
+            unrealized += pos.get_unrealized_pnl(*mark)
+
+        state["market_value"] = round(market_value, 4)
+        state["unrealized_pnl"] = round(unrealized, 4)
+        state["equity"] = round(self.portfolio.cash + market_value, 4)
+        state["total_pnl"] = round(state["equity"] - self.portfolio.initial_cash, 4)
+        state["mark_basis"] = "book_mid" if not unmarked else "book_mid_unpriced_positions_excluded"
+        state["unmarked_positions"] = unmarked
+        return state
+
     def get_equity(self, prices: Optional[dict[str, tuple[float, float]]] = None) -> float:
-        marks = prices or {
-            self.condition_id: (
-                self.book_yes.mid_price or 0.50,
-                self.book_no.mid_price or 0.50,
-            )
-        }
-        return self.portfolio.get_equity(marks)
+        if prices is not None:
+            return self.portfolio.get_equity(prices)
+        return self._marked_portfolio_state()["equity"]
+
+    def _position_equity(self) -> Tuple[float, str]:
+        """Equity using live book mids, with the basis stated in the label.
+
+        Positions with a live two-sided book are marked at mid. Any position without
+        one is valued at its own cost basis, and the returned label says so instead of
+        passing that value off as a market mark.
+        """
+        marks: Dict[str, Tuple[float, float]] = {}
+        current = self._current_marks()
+        if current is not None:
+            marks[self.condition_id] = current
+
+        equity = self.portfolio.cash
+        marked = 0
+        cost_based = 0
+        for cond_id, pos in self.portfolio.positions.items():
+            if pos.shares_yes <= 1e-9 and pos.shares_no <= 1e-9:
+                continue
+            mark = marks.get(cond_id)
+            if mark is not None:
+                equity += pos.get_market_value(*mark)
+                marked += 1
+            else:
+                equity += pos.shares_yes * pos.avg_cost_yes + pos.shares_no * pos.avg_cost_no
+                cost_based += 1
+
+        if cost_based and marked:
+            return equity, "book_mid_and_cost_basis"
+        if cost_based:
+            return equity, "cost_basis"
+        return equity, "book_mid" if marked else "cash_only"
 
     def get_best_bid_ask(self, token_side: str) -> Tuple[float, float]:
-        tok = token_side.upper()
-        book = self.book_yes if tok == "YES" else self.book_no
-        b = book.best_bid_real
-        a = book.best_ask_real
-        if b is None or a is None:
-            comp_book = self.book_no if tok == "YES" else self.book_yes
-            if b is None and comp_book.best_ask_real is not None:
-                b = round(1.0 - comp_book.best_ask_real, 4)
-            if a is None and comp_book.best_bid_real is not None:
-                a = round(1.0 - comp_book.best_bid_real, 4)
-        return (
-            b if b is not None else DEFAULT_FALLBACK_BID,
-            a if a is not None else DEFAULT_FALLBACK_ASK,
-        )
+        """Live two-sided top of book, raising when the market has no quote."""
+        top = self._book_top(token_side)
+        if top is None:
+            raise MissingBookPriceError(
+                f"condition {self.condition_id}: no two-sided quote for {token_side} token"
+            )
+        return top
 
     def credit_reward(self, amount: float, condition_id: str, note: str = "") -> None:
         self.portfolio.credit_reward(amount, condition_id=condition_id, note=note)
@@ -692,11 +809,21 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         ts = timestamp or time.time()
         pos = self.portfolio.get_position(self.condition_id)
 
-        # Get top-of-book prices
-        b_yes = self.book_yes.best_bid_real or 0.49
-        a_yes = self.book_yes.best_ask_real or 0.51
-        b_no = self.book_no.best_bid_real or (1.0 - a_yes)
-        a_no = self.book_no.best_ask_real or (1.0 - b_yes)
+        # Get top-of-book prices (live two-sided quotes only; no invented midpoints)
+        top_yes = self._book_top("YES")
+        top_no = self._book_top("NO")
+        if top_yes is None or top_no is None:
+            if self.active_quotes:
+                self.cancel_all_virtual_quotes()
+            log.debug(
+                f"Skipping quote evaluation for condition {self.condition_id}: "
+                f"no live two-sided book (YES={'priced' if top_yes else 'unpriced'}, "
+                f"NO={'priced' if top_no else 'unpriced'})"
+            )
+            return
+
+        b_yes, a_yes = top_yes
+        b_no, a_no = top_no
 
         mid_yes = (b_yes + a_yes) / 2.0
 
@@ -826,7 +953,14 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         try:
             pos_before = self.portfolio.get_position(self.condition_id)
             inventory_before = pos_before.shares_yes - pos_before.shares_no
-            crossed_cents = abs(target_price - self._deskew_mid_price(target_token)) * 100.0
+            mid_ref = self._deskew_mid_price(target_token)
+            if mid_ref is None:
+                log.error(
+                    f"Tier 2 de-skew aborted for condition {self.condition_id}: "
+                    f"no live two-sided price for {target_token} token"
+                )
+                return
+            crossed_cents = abs(target_price - mid_ref) * 100.0
 
             # Execute taker fill against portfolio
             tx = self.portfolio.process_fill(
@@ -1014,22 +1148,30 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             tracker = impact.quotes.get(qid)
             q_ahead = tracker.queue_ahead if tracker is not None else impact.compute_queue_ahead(quote_side, price, book=book)
             existing["queue_ahead"] = q_ahead
-            existing_mid = book.mid_price or 0.50
-            vq_res = self.migration_engine.queue_model.evaluate_queue_value(
-                quote_size=existing["size"],
-                queue_ahead=q_ahead,
-                half_spread_cents=max(0.1, abs(existing["price"] - existing_mid) * 100.0),
-                token_mid_price=existing_mid,
-            )
-            existing["v_queue"] = round(vq_res.net_queue_value_usd, 4)
+            existing_mid = self._mid_price(token_side)
+            if existing_mid is not None:
+                vq_res = self.migration_engine.queue_model.evaluate_queue_value(
+                    quote_size=existing["size"],
+                    queue_ahead=q_ahead,
+                    half_spread_cents=max(0.1, abs(existing["price"] - existing_mid) * 100.0),
+                    token_mid_price=existing_mid,
+                )
+                existing["v_queue"] = round(vq_res.net_queue_value_usd, 4)
             return
 
         # Price revision or new quote: queue resets
+        mid = self._mid_price(token_side)
+        if mid is None:
+            log.debug(
+                f"Skipping virtual quote {qid} for condition {self.condition_id}: "
+                f"no mid-price on the {token_side} book"
+            )
+            return
+
         tracker = impact.place_quote(side=quote_side, price=price, size=size, quote_id=qid, timestamp=ts)
         q_ahead = tracker.queue_ahead
 
         # Compute quadratic score: S(v, s) = ((v - s)/v)^2 * size
-        mid = book.mid_price or (self.book_yes.best_bid_real or 0.5)
         spread_cents = abs(price - mid) * 100.0
         score = quadratic_order_score(
             max_spread_cents=self.rewards_max_spread,
@@ -1101,8 +1243,10 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                 for qid, qdata in list(self.active_quotes.items()):
                     tok_side = qdata.get("token_side", "YES")
                     side = qdata.get("side", "BUY")
-                    px = qdata.get("price", 0.50)
-                    self._set_virtual_quote(tok_side, side, px, self.quote_size, ts)
+                    px = qdata.get("price")
+                    if px is None:
+                        continue
+                    self._set_virtual_quote(tok_side, side, float(px), self.quote_size, ts)
             self.evaluate_quotes(timestamp=ts)
             return True
 
@@ -1166,16 +1310,12 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         )
         self._conn.commit()
 
-    def _deskew_mid_price(self, token_side: str) -> float:
-        """Mid-price of the rebalanced token, using the same fallbacks as evaluate_quotes."""
-        b_yes = self.book_yes.best_bid_real or 0.49
-        a_yes = self.book_yes.best_ask_real or 0.51
-        if str(token_side).upper() == "NO":
-            bid = self.book_no.best_bid_real or (1.0 - a_yes)
-            ask = self.book_no.best_ask_real or (1.0 - b_yes)
-        else:
-            bid, ask = b_yes, a_yes
-        return (float(bid) + float(ask)) / 2.0
+    def _deskew_mid_price(self, token_side: str) -> Optional[float]:
+        """Mid-price of the rebalanced token from the live book, or ``None`` when unpriced."""
+        top = self._book_top(token_side)
+        if top is None:
+            return None
+        return (top[0] + top[1]) / 2.0
 
     @staticmethod
     def _merge_gas_usd(merge: Optional[MergeResult]) -> float:
@@ -1254,7 +1394,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         return res
 
     def liquidate_all_positions(self, timestamp: Optional[float] = None) -> dict[str, Any]:
-        """Liquidate all open positions to 100% USDC cash, accounting for all real-world closing costs.
+        """Liquidate all open positions into live bid depth, accounting for real closing costs.
 
         Rules:
         1. Cancels all active resting maker quotes across all tokens.
@@ -1262,8 +1402,12 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         3. For any residual directional tokens (unpaired YES or NO):
            - Sells aggressively into real CLOB bids by walking the order book depth ladder.
            - Deducts the full bid-ask spread crossing friction, depth slippage, and taker fees.
-        4. Recomputes ledger so open_positions == 0, unrealized_pnl == 0.0, and equity == cash.
-        5. Returns a comprehensive 100% cash-settlement liquidation report.
+           - Sells only the depth that exists: an unscathed lot with no live bids stays in
+             inventory and is reported under ``unliquidated_shares``; no clearing price is
+             invented to force a 100% cash result.
+        4. Recomputes the ledger so every sold lot is cash and reports the pre-liquidation
+           equity with its mark basis (``pre_liquidation_equity_basis``).
+        5. Returns a comprehensive liquidation report.
         """
         ts = timestamp or time.time()
         self.cancel_all_virtual_quotes()
@@ -1272,11 +1416,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         pre_liq_cash = self.portfolio.cash
         pos = self.portfolio.get_position(self.condition_id)
 
-        pre_shares_yes = pos.shares_yes
-        pre_shares_no = pos.shares_no
-        pre_equity = self.portfolio.get_equity(
-            {self.condition_id: (self.book_yes.mid_price or 0.50, self.book_no.mid_price or 0.50)}
-        )
+        pre_equity, pre_equity_basis = self._position_equity()
 
         merges_executed = []
         liquidation_fills = []
@@ -1290,155 +1430,59 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                 merges_executed.append(m_res)
                 total_gas_fees_liq += m_res.gas_fee_deducted
 
-        # Step 2: Liquidate residual YES shares if any
-        if pos.shares_yes > 1e-4:
-            shares_to_sell = pos.shares_yes
-            book = self.book_yes
-            real_bids = sorted(book._real_bids.items(), key=lambda x: x[0], reverse=True)
-            shares_rem = shares_to_sell
-            total_proceeds = 0.0
+        # Step 2: Liquidate residual directional tokens into live bids only.
+        # Never invent a clearing price: unsold depth is reported, not priced.
+        liquidated: Dict[str, float] = {"YES": 0.0, "NO": 0.0}
+        unliquidated: Dict[str, float] = {}
+        for outcome, book in (("YES", self.book_yes), ("NO", self.book_no)):
+            residual = self.portfolio.get_position(self.condition_id)
+            shares_to_sell = residual.shares_yes if outcome == "YES" else residual.shares_no
+            if shares_to_sell <= 1e-4:
+                continue
 
-            for px, sz in real_bids:
-                if sz <= 1e-6 or shares_rem <= 1e-6:
-                    continue
-                fill_amt = min(shares_rem, sz)
-                total_proceeds += fill_amt * px
-                shares_rem -= fill_amt
-                if shares_rem <= 1e-6:
-                    break
-
-            if shares_rem > 1e-6:
-                worst_bid = real_bids[-1][0] if real_bids else (book.best_bid_real or 0.50)
-                penalized_px = max(0.01, worst_bid - 0.01)
-                total_proceeds += shares_rem * penalized_px
-                shares_rem = 0.0
-
-            avg_sell_px = total_proceeds / shares_to_sell
-            mid_ref = book.mid_price or avg_sell_px
-            spread_loss = max(0.0, (mid_ref - avg_sell_px) * shares_to_sell)
-            spread_crossing_loss += spread_loss
-
-            inv_before = pos.shares_yes - pos.shares_no
-            self.portfolio.process_fill(
-                condition_id=self.condition_id,
-                side="SELL",
-                outcome="YES",
-                price=avg_sell_px,
-                size=shares_to_sell,
-                is_maker=False,
-                notes=f"Shutdown Taker Liquidation: Sold {shares_to_sell:.1f} YES @ avg ${avg_sell_px:.3f}",
-            )
-            self._record_rebalance(
-                ts=ts,
-                crossed_cents=abs(mid_ref - avg_sell_px) * 100.0,
-                taker_fee_usd=self._taker_fee_usd(shares_to_sell, avg_sell_px)[0],
-                gas_usd=0.0,
-                inventory_before=inv_before,
-                inventory_after=pos.shares_yes - pos.shares_no,
-                reason="Shutdown Taker Liquidation: sold residual YES",
-            )
-            fill_rec = FillRecord(
-                fill_id=str(uuid.uuid4())[:8],
-                timestamp=ts,
-                condition_id=self.condition_id,
-                token_side="YES",
-                side="SELL",
-                fill_price=avg_sell_px,
-                fill_size=shares_to_sell,
-                is_maker=False,
-                slippage_cents=(mid_ref - avg_sell_px) * 100.0,
-                notes="Shutdown Taker Liquidation",
-            )
-            self.fills_history.append(fill_rec)
-            liquidation_fills.append({
-                "outcome": "YES",
-                "shares": shares_to_sell,
-                "avg_price": avg_sell_px,
-                "gross_proceeds": total_proceeds,
-                "spread_crossing_loss": spread_loss,
-            })
-
-        # Step 3: Liquidate residual NO shares if any
-        if pos.shares_no > 1e-4:
-            shares_to_sell = pos.shares_no
-            book = self.book_no
-            real_bids = sorted(book._real_bids.items(), key=lambda x: x[0], reverse=True)
-            shares_rem = shares_to_sell
-            total_proceeds = 0.0
-
-            for px, sz in real_bids:
-                if sz <= 1e-6 or shares_rem <= 1e-6:
-                    continue
-                fill_amt = min(shares_rem, sz)
-                total_proceeds += fill_amt * px
-                shares_rem -= fill_amt
-                if shares_rem <= 1e-6:
-                    break
-
-            if shares_rem > 1e-6:
-                worst_bid = real_bids[-1][0] if real_bids else (book.best_bid_real or 0.50)
-                penalized_px = max(0.01, worst_bid - 0.01)
-                total_proceeds += shares_rem * penalized_px
-                shares_rem = 0.0
-
-            avg_sell_px = total_proceeds / shares_to_sell
-            mid_ref = book.mid_price or avg_sell_px
-            spread_loss = max(0.0, (mid_ref - avg_sell_px) * shares_to_sell)
-            spread_crossing_loss += spread_loss
-
-            inv_before = pos.shares_yes - pos.shares_no
-            self.portfolio.process_fill(
-                condition_id=self.condition_id,
-                side="SELL",
-                outcome="NO",
-                price=avg_sell_px,
-                size=shares_to_sell,
-                is_maker=False,
-                notes=f"Shutdown Taker Liquidation: Sold {shares_to_sell:.1f} NO @ avg ${avg_sell_px:.3f}",
-            )
-            self._record_rebalance(
-                ts=ts,
-                crossed_cents=abs(mid_ref - avg_sell_px) * 100.0,
-                taker_fee_usd=self._taker_fee_usd(shares_to_sell, avg_sell_px)[0],
-                gas_usd=0.0,
-                inventory_before=inv_before,
-                inventory_after=pos.shares_yes - pos.shares_no,
-                reason="Shutdown Taker Liquidation: sold residual NO",
-            )
-            fill_rec = FillRecord(
-                fill_id=str(uuid.uuid4())[:8],
-                timestamp=ts,
-                condition_id=self.condition_id,
-                token_side="NO",
-                side="SELL",
-                fill_price=avg_sell_px,
-                fill_size=shares_to_sell,
-                is_maker=False,
-                slippage_cents=(mid_ref - avg_sell_px) * 100.0,
-                notes="Shutdown Taker Liquidation",
-            )
-            self.fills_history.append(fill_rec)
-            liquidation_fills.append({
-                "outcome": "NO",
-                "shares": shares_to_sell,
-                "avg_price": avg_sell_px,
-                "gross_proceeds": total_proceeds,
-                "spread_crossing_loss": spread_loss,
-            })
+            sale = self._sell_residual_into_bids(outcome, shares_to_sell, book, ts)
+            shares_sold = sale["shares_sold"]
+            if shares_sold > 1e-6:
+                liquidated[outcome] = shares_sold
+                spread_crossing_loss += sale["spread_crossing_loss"]
+                liquidation_fills.append({
+                    "outcome": outcome,
+                    "shares": shares_sold,
+                    "avg_price": sale["avg_price"],
+                    "gross_proceeds": sale["gross_proceeds"],
+                    "spread_crossing_loss": sale["spread_crossing_loss"],
+                })
+            if sale["unsold_shares"] > 1e-6:
+                unliquidated[outcome] = sale["unsold_shares"]
+                log.warning(
+                    f"Shutdown liquidation left {sale['unsold_shares']:.2f} {outcome} unsold for "
+                    f"condition {self.condition_id}: no live bid depth (no price is invented)"
+                )
 
         self.flush_ledger()
         final_cash = self.portfolio.cash
-        net_realized_pnl = final_cash - initial_cash
+        # Unsold lots keep their cost basis in the total: reporting cash minus initial
+        # cash alone would count their purchase cost as a realized loss.
+        remaining_inventory_cost = sum(
+            held.shares_yes * held.avg_cost_yes + held.shares_no * held.avg_cost_no
+            for held in self.portfolio.positions.values()
+        )
+        net_realized_pnl = final_cash + remaining_inventory_cost - initial_cash
         net_return_pct = (net_realized_pnl / initial_cash) * 100.0 if initial_cash > 0 else 0.0
+        pos_after = self.portfolio.get_position(self.condition_id)
+        open_positions = 1 if (pos_after.shares_yes > 1e-4 or pos_after.shares_no > 1e-4) else 0
 
         return {
             "initial_cash": initial_cash,
             "pre_liquidation_equity": pre_equity,
+            "pre_liquidation_equity_basis": pre_equity_basis,
             "pre_liquidation_cash": pre_liq_cash,
-            "shares_yes_liquidated": pre_shares_yes,
-            "shares_no_liquidated": pre_shares_no,
+            "shares_yes_liquidated": liquidated["YES"],
+            "shares_no_liquidated": liquidated["NO"],
+            "unliquidated_shares": unliquidated,
+            "remaining_inventory_cost": remaining_inventory_cost,
             "final_cash_settlement": final_cash,
-            "final_open_positions_count": 0,
+            "final_open_positions_count": open_positions,
             "total_realized_pnl": net_realized_pnl,
             "net_return_pct": net_return_pct,
             "spread_crossing_loss": spread_crossing_loss,
@@ -1446,6 +1490,93 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             "liquidation_costs_total": spread_crossing_loss + total_gas_fees_liq,
             "merges_executed": len(merges_executed),
             "fills_executed": len(liquidation_fills),
+        }
+
+    def _sell_residual_into_bids(
+        self,
+        outcome: str,
+        shares: float,
+        book: SyntheticOrderBook,
+        ts: float,
+    ) -> dict[str, Any]:
+        """Sell residual inventory into the live bid ladder, without inventing prices.
+
+        Walks the visible real bids and sells only what that depth can absorb. A lot
+        with no live bids, or depth that runs out, leaves the remainder in inventory
+        (reported as ``unsold_shares``) instead of clearing it at a made-up price.
+        """
+        real_bids = sorted(book._real_bids.items(), key=lambda x: x[0], reverse=True)
+        shares_remaining = float(shares)
+        total_proceeds = 0.0
+
+        for px, sz in real_bids:
+            if sz <= 1e-6 or shares_remaining <= 1e-6:
+                continue
+            fill_amt = min(shares_remaining, sz)
+            total_proceeds += fill_amt * px
+            shares_remaining -= fill_amt
+            if shares_remaining <= 1e-6:
+                break
+
+        shares_sold = float(shares) - shares_remaining
+        if shares_sold <= 1e-6:
+            return {
+                "shares_sold": 0.0,
+                "unsold_shares": float(shares),
+                "avg_price": None,
+                "gross_proceeds": 0.0,
+                "spread_crossing_loss": 0.0,
+            }
+
+        avg_sell_px = total_proceeds / shares_sold
+        mid_ref = book.mid_price
+        spread_loss = (
+            max(0.0, (mid_ref - avg_sell_px) * shares_sold) if mid_ref is not None else 0.0
+        )
+        slippage_cents = (mid_ref - avg_sell_px) * 100.0 if mid_ref is not None else 0.0
+        note_suffix = "" if mid_ref is not None else "; mid unavailable"
+
+        inv_before = self.portfolio.get_position(self.condition_id)
+        inventory_before = inv_before.shares_yes - inv_before.shares_no
+        self.portfolio.process_fill(
+            condition_id=self.condition_id,
+            side="SELL",
+            outcome=outcome,
+            price=avg_sell_px,
+            size=shares_sold,
+            is_maker=False,
+            notes=f"Shutdown Taker Liquidation: Sold {shares_sold:.1f} {outcome} @ avg ${avg_sell_px:.3f}",
+        )
+        pos_after = self.portfolio.get_position(self.condition_id)
+        self._record_rebalance(
+            ts=ts,
+            crossed_cents=abs(slippage_cents),
+            taker_fee_usd=self._taker_fee_usd(shares_sold, avg_sell_px)[0],
+            gas_usd=0.0,
+            inventory_before=inventory_before,
+            inventory_after=pos_after.shares_yes - pos_after.shares_no,
+            reason=f"Shutdown Taker Liquidation: sold residual {outcome}{note_suffix}",
+        )
+        self.fills_history.append(
+            FillRecord(
+                fill_id=str(uuid.uuid4())[:8],
+                timestamp=ts,
+                condition_id=self.condition_id,
+                token_side=outcome,
+                side="SELL",
+                fill_price=avg_sell_px,
+                fill_size=shares_sold,
+                is_maker=False,
+                slippage_cents=slippage_cents,
+                notes="Shutdown Taker Liquidation",
+            )
+        )
+        return {
+            "shares_sold": shares_sold,
+            "unsold_shares": shares_remaining,
+            "avg_price": avg_sell_px,
+            "gross_proceeds": total_proceeds,
+            "spread_crossing_loss": spread_loss,
         }
 
     # -------------------------------------------------------------------------
@@ -1461,8 +1592,10 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                 continue
             q_ahead = float(q.get("queue_ahead", 0.0))
             tok = q.get("token_side", "YES")
-            book = self.book_yes if tok == "YES" else self.book_no
-            mid = book.mid_price or 0.50
+            mid = self._mid_price(tok)
+            if mid is None:
+                # No live mid: the quote's queue value is unknown, so it contributes nothing.
+                continue
             px = float(q.get("price", mid))
             spread_c = abs(px - mid) * 100.0
             val = self.migration_engine.queue_model.evaluate_queue_value(
@@ -1506,13 +1639,25 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         2. Inventory liquidation friction (direct crossing vs synthetic completion)
         3. Complete set CTF merge gas
         4. Opportunity cost during unquoted transit / qualification downtime
+
+        Raises:
+            MissingBookPriceError: when the live books do not quote both tokens.
         """
         pos = self.portfolio.get_position(self.condition_id)
         net_q = pos.shares_yes - pos.shares_no
 
-        mid_yes = self.book_yes.mid_price or 0.50
-        bid_yes = self.book_yes.best_bid_real or max(0.01, mid_yes - 0.01)
-        ask_no = self.book_no.best_ask_real or (1.00 - bid_yes)
+        top_yes = self._book_top("YES")
+        top_no = self._book_top("NO")
+        if top_yes is None or top_no is None:
+            raise MissingBookPriceError(
+                f"condition {self.condition_id}: switching cost needs a live two-sided "
+                f"quote on both tokens (YES={'priced' if top_yes else 'unpriced'}, "
+                f"NO={'priced' if top_no else 'unpriced'})"
+            )
+
+        mid_yes = (top_yes[0] + top_yes[1]) / 2.0
+        bid_yes = top_yes[0]
+        ask_no = top_no[1]
 
         bid_quote = self.active_quotes.get("BUY_YES")
         ask_quote = self.active_quotes.get("BUY_NO") or self.active_quotes.get("SELL_YES")
@@ -1548,7 +1693,12 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         holding_horizon_hours: float = 4.0,
         daily_yield_a: Optional[float] = None,
     ) -> Tuple[bool, HurdleDecision, SwitchingCostDecomposition]:
-        """Evaluate Net Alpha Hurdle: Delta_Yield * Tau >= Cost_switch."""
+        """Evaluate Net Alpha Hurdle: Delta_Yield * Tau >= Cost_switch.
+
+        Raises:
+            MissingBookPriceError: propagated from :meth:`compute_switching_cost` when
+                the live books do not quote both tokens.
+        """
         y_a = daily_yield_a if daily_yield_a is not None else self.get_current_daily_yield()
         cost = self.compute_switching_cost(daily_yield=y_a)
         decision = self.migration_engine.evaluate_switching_hurdle(
@@ -1737,12 +1887,21 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                      min(Q_one, Q_two)                            outside [0.10, 0.90]
             Payout_epoch = (Q_min_user / (Q_min_user + Q_min_competing)) * (R_daily / 1440)
             Enforces: Projected daily payout must be >= $1.00; otherwise payout = $0.00.
+
+        Raises:
+            MissingBookPriceError: when the YES book has no live mid-price; scoring is
+                skipped instead of being run against an invented midpoint.
         """
         ts = timestamp or time.time()
+
+        mid_yes = self._mid_price("YES")
+        if mid_yes is None:
+            raise MissingBookPriceError(
+                f"condition {self.condition_id}: reward epoch needs a live YES mid-price"
+            )
+
         self.epoch_index += 1
         self.last_epoch_ts = ts
-
-        mid_yes = self.book_yes.mid_price or 0.50
 
         # Official two-sided scoring for our own resting quotes (never Q1 + Q2)
         q_one, q_two = compute_book_side_scores(
@@ -1833,8 +1992,8 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             "competing_score": max(1.0, competing_score),
             "max_spread": self.rewards_max_spread,
             "min_size": self.rewards_min_size,
-            "mid_yes": self.book_yes.mid_price or 0.50,
-            "real_mid": self.book_yes.mid_price or 0.50,
+            "mid_yes": mid_yes,
+            "real_mid": mid_yes,
         }
         gov_actions = self.governor.evaluate_governor_cycle(
             current_active_markets=[self.condition_id],
@@ -1873,13 +2032,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
 
     def flush_ledger(self) -> None:
         """Write atomic state snapshot to SQLite and JSON ledger."""
-        marks = {
-            self.condition_id: (
-                self.book_yes.mid_price or 0.5,
-                self.book_no.mid_price or 0.5,
-            )
-        }
-        state = self.portfolio.get_state(marks)
+        state = self._marked_portfolio_state()
 
         # Snapshot in SQLite
         cur = self._conn.cursor()
@@ -1949,13 +2102,7 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
         or interrupted mid-write.
         """
         if ledger_data is None:
-            marks = {
-                self.condition_id: (
-                    self.book_yes.mid_price or 0.5,
-                    self.book_no.mid_price or 0.5,
-                )
-            }
-            state = self.portfolio.get_state(marks)
+            state = self._marked_portfolio_state()
             ledger_data = {
                 "updated_at": time.time(),
                 "condition_id": self.condition_id,
@@ -1981,19 +2128,17 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
                     pass
 
     def get_telemetry(self) -> dict[str, Any]:
-        """Comprehensive real-time telemetry dictionary for dashboards and CLI runners."""
-        marks = {
-            self.condition_id: (
-                self.book_yes.mid_price or 0.50,
-                self.book_no.mid_price or 0.50,
-            )
-        }
-        port_state = self.portfolio.get_state(marks)
+        """Comprehensive real-time telemetry dictionary for dashboards and CLI runners.
+
+        Price fields are ``None`` when the live book has no two-sided quote; no
+        stand-in midpoint is reported.
+        """
+        port_state = self._marked_portfolio_state()
         pos = self.portfolio.get_position(self.condition_id)
 
-        mid_yes = self.book_yes.mid_price or 0.50
-        bb_yes = self.book_yes.best_bid_real or 0.0
-        ba_yes = self.book_yes.best_ask_real or 1.0
+        mid_yes = self._mid_price("YES")
+        bb_yes = self.book_yes.best_bid_real
+        ba_yes = self.book_yes.best_ask_real
 
         v_queue_total = self.compute_resting_queue_value()
         equity_val = max(1e-4, port_state["equity"])
@@ -2021,6 +2166,8 @@ class NativePaperTradingEngine(BaseMarketMakingEngine):
             "realized_pnl": port_state["realized_pnl"],
             "unrealized_pnl": port_state["unrealized_pnl"],
             "total_pnl": port_state["total_pnl"],
+            "mark_basis": port_state["mark_basis"],
+            "unmarked_positions": port_state["unmarked_positions"],
             "shares_yes": pos.shares_yes,
             "shares_no": pos.shares_no,
             "net_exposure": pos.net_exposure,

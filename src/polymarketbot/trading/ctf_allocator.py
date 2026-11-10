@@ -9,7 +9,9 @@ In CTF Minting / Merging parity arbitrage:
   capital requires sweeping deeper into the book at progressively worse prices (slippage).
 - Polymarket taker fees are non-linear:
       Fee(shares, price) = shares * rate * (price * (1 - price))^exponent * (1 - vip_rebate)
-- Gas friction is fixed per batch: ~85,000 gas units (~$0.00125 - $0.00140).
+- Gas friction is fixed per batch: the measured per-merge cost comes from the
+  repo's gas tape (``data/derived/market_scorecard.csv:merge_gas_pol``); only a
+  market absent from that measurement falls back to a gas-unit estimate.
 
 As deployed capital C increases:
 1. Gross proceeds R(C) is strictly concave (piecewise-linear concave due to descending bids).
@@ -37,22 +39,33 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
-from polymarketbot.fees import FeeSchedule, taker_fee
+from polymarketbot.fees import FeeSchedule
 from polymarketbot.logs import get_logger
+from polymarketbot.trading.ctf import (
+    get_dynamic_gas_price_gwei,
+    get_dynamic_pol_usd_price,
+)
 from polymarketbot.trading.ctf_split_arbitrage import (
     TYPICAL_SPLIT_GAS_UNITS,
     VIP_TIER_REBATES,
     compute_leg_taker_fee,
     estimate_polygon_eip1559_gas_usd,
+    load_measured_merge_gas_pol,
 )
 
 logger = get_logger("ctf_allocator")
 
+# Fallback only: ``compute_gas_cost_usd`` prices merges from the per-condition
+# measured ``merge_gas_pol`` in data/derived/market_scorecard.csv. These units
+# are used solely for markets the scorecard/gas tape did not measure.
 TYPICAL_MERGE_GAS_UNITS = 78_000
+
+# The scorecard is rebuilt from the ever-updating Polygon gas tape; a lazily
+# loaded table is re-read on this cadence. Operational refresh, not a threshold.
+_MERGE_GAS_REFRESH_S = 300.0
 
 # C12: malformed venue payloads are dropped, but the drop is surfaced at WARNING
 # at most once per minute per channel instead of silently disappearing.
@@ -68,13 +81,6 @@ def _rate_limited_warning(channel: str, message: str) -> None:
             return
         _last_warn_at[channel] = now
     logger.warning(message)
-
-
-# C10: gas/POL defaults are the venue-oracle fallbacks (40 Gwei, $0.092/POL).
-# The live soak measures the oracles once per refresh and passes the measured
-# values into compute_sweep_curve, so the per-market hot path does no I/O.
-DEFAULT_GAS_PRICE_GWEI = 40.0
-DEFAULT_POL_USD_PRICE = 0.092
 
 
 class ArbitrageDirection(str, Enum):
@@ -107,17 +113,19 @@ class OrderBookLevel:
 
 @dataclass
 class ParityLegDepth:
-    """L2 depth and pricing metadata for one outcome leg."""
+    """L2 depth and pricing metadata for one outcome leg.
+
+    ``fee_schedule`` is the market's *published* taker schedule.  It is
+    ``None`` when Gamma supplied none, and a leg without one cannot be priced:
+    the allocator refuses the market instead of assuming a rate.
+    """
 
     token_id: str
     condition_id: str
     title: str = ""
     side: str = "BID"                    # "BID" (for mint) or "ASK" (for merge)
     levels: list[OrderBookLevel] = field(default_factory=list)
-    fee_rate: float = 0.02
-    fee_exponent: float = 1.0
     fee_schedule: Optional[FeeSchedule] = None
-    is_maker: bool = False               # If True, incurs 0% taker fee
     _sorted_cache: Optional[list[OrderBookLevel]] = field(default=None, repr=False, compare=False)
 
     @classmethod
@@ -128,10 +136,7 @@ class ParityLegDepth:
         side: str,
         raw_levels: Sequence[Any],
         title: str = "",
-        fee_rate: float = 0.02,
-        fee_exponent: float = 1.0,
         fee_schedule: Optional[FeeSchedule] = None,
-        is_maker: bool = False,
     ) -> "ParityLegDepth":
         """Instantiate ParityLegDepth directly from raw CLOB dictionaries or tuples."""
         levels: list[OrderBookLevel] = []
@@ -166,10 +171,7 @@ class ParityLegDepth:
             title=title,
             side=side.upper(),
             levels=levels,
-            fee_rate=fee_rate,
-            fee_exponent=fee_exponent,
             fee_schedule=fee_schedule,
-            is_maker=is_maker,
         )
 
     def sorted_levels(self) -> list[OrderBookLevel]:
@@ -193,10 +195,9 @@ class ParityLegDepth:
         ]
         return self._sorted_cache
 
-    def get_fee_schedule(self) -> FeeSchedule:
-        if self.fee_schedule is not None:
-            return self.fee_schedule
-        return FeeSchedule(rate=self.fee_rate, exponent=self.fee_exponent, taker_only=True)
+    def get_fee_schedule(self) -> Optional[FeeSchedule]:
+        """The market's published taker schedule, or ``None`` when unmeasured."""
+        return self.fee_schedule
 
 
 @dataclass
@@ -235,14 +236,12 @@ class SingleMarketSweepResult:
     optimal_capital: float                   # C* = capital to fund S*
     optimal_gross_profit: float
     optimal_net_fees: float
-    optimal_rebates: float
     optimal_net_profit: float                # Pi(C*) = gross - fees - gas
     optimal_roi_bps: float
     marginal_return_at_opt: float            # dPi/dC at C*
     breakeven_shares: float                  # Minimum shares needed to cover fixed gas
     breakeven_capital: float                 # Minimum capital needed to cover fixed gas
-    is_viable: bool                          # True if optimal_net_profit >= min_net_edge_usd
-    taker_leg_index: Optional[int] = None
+    is_viable: bool                          # True if optimal_net_profit > 0 after gas
     summary: str = ""
 
     def evaluate_at_shares(self, shares: float) -> Tuple[float, float, float]:
@@ -343,36 +342,95 @@ class MarginalCtfAllocator:
         self,
         vip_tier: str = "bronze",
         hurdle_rate: float = 0.0,
-        min_net_edge_usd: float = 0.0015,
-        default_gas_price_gwei: float = DEFAULT_GAS_PRICE_GWEI,
-        default_pol_usd_price: float = DEFAULT_POL_USD_PRICE,
         gas_units_split: int = TYPICAL_SPLIT_GAS_UNITS,
         gas_units_merge: int = TYPICAL_MERGE_GAS_UNITS,
+        measured_merge_gas_pol: Optional[Dict[str, float]] = None,
     ) -> None:
         self.vip_tier = vip_tier.lower()
         if self.vip_tier not in VIP_TIER_REBATES:
             raise ValueError(f"Invalid vip_tier '{vip_tier}'. Allowed: {list(VIP_TIER_REBATES.keys())}")
         self.hurdle_rate = max(0.0, hurdle_rate)
-        self.min_net_edge_usd = max(0.0, min_net_edge_usd)
-        self.default_gas_price_gwei = default_gas_price_gwei
-        self.default_pol_usd_price = default_pol_usd_price
         self.gas_units_split = gas_units_split
         self.gas_units_merge = gas_units_merge
+        # Per-condition measured merge gas (POL). ``None`` defers the one-time
+        # scorecard load to the first priced market; the hot path then does no I/O.
+        self._measured_merge_gas_pol: Optional[Dict[str, float]] = (
+            {str(k).lower(): float(v) for k, v in measured_merge_gas_pol.items()}
+            if measured_merge_gas_pol is not None
+            else None
+        )
+        # An injected table is authoritative; only a lazily loaded scorecard is
+        # refreshed from the ever-updating gas tape.
+        self._merge_gas_pol_from_scorecard = measured_merge_gas_pol is None
+        self._merge_gas_pol_loaded_ts = time.time()
+        # Last measured oracle observations, reused when a caller has no fresh
+        # value. Never a hand-set literal: both start as the measured oracle call.
+        self._last_measured_gas_gwei: Optional[float] = None
+        self._last_measured_pol_usd: Optional[float] = None
 
     @property
     def vip_rebate_rate(self) -> float:
         return VIP_TIER_REBATES.get(self.vip_tier, 0.0)
+
+    def _merge_gas_pol(self, condition_id: str) -> Optional[float]:
+        if self._merge_gas_pol_from_scorecard and (
+            self._measured_merge_gas_pol is None
+            or time.time() - self._merge_gas_pol_loaded_ts >= _MERGE_GAS_REFRESH_S
+        ):
+            # The scorecard is rebuilt from the ever-updating gas tape, so it is
+            # re-read on a cadence instead of being frozen at first use.
+            self._measured_merge_gas_pol = load_measured_merge_gas_pol()
+            self._merge_gas_pol_loaded_ts = time.time()
+        return self._measured_merge_gas_pol.get(condition_id.lower())
+
+    def _gas_price_gwei(self, measured: Optional[float]) -> float:
+        if measured is not None:
+            self._last_measured_gas_gwei = float(measured)
+        elif self._last_measured_gas_gwei is None:
+            # The scorecard's measured merge gas (POL) implies the gas-tape base
+            # fee: merge_gas_pol = units * gwei * 1e-9. Prefer that repo
+            # measurement over an oracle round-trip.
+            if self._measured_merge_gas_pol is None:
+                self._measured_merge_gas_pol = load_measured_merge_gas_pol()
+            sample_pol = next(iter(self._measured_merge_gas_pol.values()), None)
+            if sample_pol is not None:
+                # The scorecard priced 78,000 units, so invert on that basis.
+                self._last_measured_gas_gwei = sample_pol / (TYPICAL_MERGE_GAS_UNITS * 1e-9)
+            else:
+                self._last_measured_gas_gwei = float(get_dynamic_gas_price_gwei())
+        return self._last_measured_gas_gwei
+
+    def _pol_usd(self, measured: Optional[float]) -> float:
+        if measured is not None:
+            self._last_measured_pol_usd = float(measured)
+        elif self._last_measured_pol_usd is None:
+            self._last_measured_pol_usd = float(get_dynamic_pol_usd_price())
+        return self._last_measured_pol_usd
 
     def compute_gas_cost_usd(
         self,
         direction: ArbitrageDirection = ArbitrageDirection.MINT_SPLIT,
         gas_price_gwei: Optional[float] = None,
         pol_usd_price: Optional[float] = None,
+        condition_id: Optional[str] = None,
     ) -> float:
+        """Gas friction for one batch.
+
+        Merges are priced from the per-condition measured ``merge_gas_pol``
+        (data/derived/market_scorecard.csv) times the measured POL/USD oracle.
+        Only a market the gas tape did not measure falls back to gas units.
+        """
+        if direction == ArbitrageDirection.MERGE_UNWIND and condition_id:
+            measured_pol = self._merge_gas_pol(condition_id)
+            if measured_pol is not None:
+                return round(measured_pol * self._pol_usd(pol_usd_price), 6)
+
         units = self.gas_units_split if direction == ArbitrageDirection.MINT_SPLIT else self.gas_units_merge
-        gwei = gas_price_gwei if gas_price_gwei is not None else self.default_gas_price_gwei
-        px = pol_usd_price if pol_usd_price is not None else self.default_pol_usd_price
-        return estimate_polygon_eip1559_gas_usd(gas_units=units, gas_price_gwei=gwei, pol_usd_price=px)
+        return estimate_polygon_eip1559_gas_usd(
+            gas_units=units,
+            gas_price_gwei=self._gas_price_gwei(gas_price_gwei),
+            pol_usd_price=self._pol_usd(pol_usd_price),
+        )
 
     def compute_sweep_curve(
         self,
@@ -393,7 +451,7 @@ class MarginalCtfAllocator:
         And locates the global maximum S* where M(S*) = hurdle_rate (or 0).
         """
         k = len(legs)
-        gas_cost = self.compute_gas_cost_usd(direction, gas_price_gwei, pol_usd_price)
+        gas_cost = self.compute_gas_cost_usd(direction, gas_price_gwei, pol_usd_price, condition_id)
 
         if k < 2:
             return SingleMarketSweepResult(
@@ -407,7 +465,6 @@ class MarginalCtfAllocator:
                 optimal_capital=0.0,
                 optimal_gross_profit=0.0,
                 optimal_net_fees=0.0,
-                optimal_rebates=0.0,
                 optimal_net_profit=0.0,
                 optimal_roi_bps=0.0,
                 marginal_return_at_opt=0.0,
@@ -500,18 +557,25 @@ class MarginalCtfAllocator:
                 is_leg_maker = False
                 if execution_mode == ExecutionMode.SELECTIVE_MAKER:
                     is_leg_maker = (leg_i != taker_leg_index)
-                elif legs[leg_i].is_maker:
-                    is_leg_maker = True
 
                 if is_leg_maker:
                     active_fees.append(0.0)
                 else:
-                    gross_f, reb, net_f = compute_leg_taker_fee(
+                    fee = compute_leg_taker_fee(
                         shares=1.0,  # per-share unit fee
                         price=price,
                         fee_schedule=legs[leg_i].get_fee_schedule(),
                         vip_tier=self.vip_tier,
                     )
+                    if fee is None:
+                        # Gamma published no fee schedule for this market, so its
+                        # taker fee is unknown. Pricing the edge off an invented
+                        # rate would fabricate it; refuse the market instead.
+                        return self._empty_result(
+                            market_id, condition_id, direction, execution_mode, gas_cost,
+                            "taker fee schedule unmeasured on at least one taker leg",
+                        )
+                    gross_f, reb, net_f = fee
                     active_fees.append(net_f)
 
             # Financial economics of this tranche
@@ -603,10 +667,12 @@ class MarginalCtfAllocator:
                     breakeven_capital = round(breakeven_shares * t.capital_per_set, 4)
                     break
 
-        is_viable = (
-            optimal_shares > 0.0
-            and optimal_net_profit >= self.min_net_edge_usd
-        )
+        # The economic gate is the hurdle rate above, applied to every tranche:
+        # a candidate is viable when the depth sweep it funded still nets a
+        # positive dollar amount after the fixed gas.  There is no separate
+        # hand-set dollar threshold - a dollar figure that is not the measured
+        # hurdle would be an invented threshold.
+        is_viable = optimal_shares > 0.0 and optimal_net_profit > 0.0
 
         roi_bps = (
             round((optimal_net_profit / optimal_capital) * 10_000.0, 2)
@@ -632,14 +698,12 @@ class MarginalCtfAllocator:
             optimal_capital=optimal_capital,
             optimal_gross_profit=round(optimal_gross_profit, 4),
             optimal_net_fees=round(optimal_net_fees, 4),
-            optimal_rebates=round(optimal_net_fees * self.vip_rebate_rate, 4),
             optimal_net_profit=optimal_net_profit,
             optimal_roi_bps=roi_bps,
             marginal_return_at_opt=marginal_at_opt,
             breakeven_shares=breakeven_shares,
             breakeven_capital=breakeven_capital,
             is_viable=is_viable,
-            taker_leg_index=taker_leg_index,
             summary=summary,
         )
 
@@ -655,10 +719,11 @@ class MarginalCtfAllocator:
         2. No market is allocated more than its optimal depth C* (preventing negative marginal return).
         3. Markets unable to amortize their fixed batch gas friction are pruned.
         """
-        # Filter strictly viable candidates (optimal net profit >= min_net_edge_usd)
+        # Filter strictly viable candidates (positive net profit after gas at
+        # the hurdle-rate-bounded optimum S*).
         viable_candidates = [
             c for c in candidates
-            if c.is_viable and c.optimal_capital > 0.0 and c.optimal_net_profit >= self.min_net_edge_usd
+            if c.is_viable and c.optimal_capital > 0.0 and c.optimal_net_profit > 0.0
         ]
 
         if not viable_candidates or total_budget <= 0.0:
@@ -722,7 +787,7 @@ class MarginalCtfAllocator:
                 alloc_c = market_allocations_usd[m_idx]
                 if alloc_c > 0.0:
                     shares, net_pnl, _ = cand.evaluate_at_capital(alloc_c)
-                    if net_pnl < self.min_net_edge_usd:
+                    if net_pnl <= 0.0:
                         # Market is underfunded and cannot clear gas friction; prune it
                         pruned_market_ids.append(cand.market_id)
                         active_set.pop(m_idx)
@@ -744,6 +809,9 @@ class MarginalCtfAllocator:
                 continue
 
             shares, net_pnl, cur_margin = cand.evaluate_at_capital(alloc_c)
+            # The booked allocation must clear the same gate as the candidate
+            # filter/prune loop: a funded size whose net P&L after gas is not
+            # positive moves cash for no gain.
             if net_pnl <= 0.0 or shares <= 0.0:
                 continue
 
@@ -821,7 +889,6 @@ class MarginalCtfAllocator:
             optimal_capital=0.0,
             optimal_gross_profit=0.0,
             optimal_net_fees=0.0,
-            optimal_rebates=0.0,
             optimal_net_profit=0.0,
             optimal_roi_bps=0.0,
             marginal_return_at_opt=0.0,

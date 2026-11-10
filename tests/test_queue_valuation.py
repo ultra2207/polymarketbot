@@ -44,7 +44,18 @@ def test_queue_priority_valuation() -> None:
     # Front of queue must have strictly higher fill probability and value than back
     assert val_front.fill_probability > val_back.fill_probability
     assert val_front.net_queue_value_usd > val_back.net_queue_value_usd
-    assert val_front.net_queue_value_usd > 1.0  # Front of queue captures significant half-spread
+    # Front-of-queue value is re-derived from the measured isotonic P(fill) for a
+    # zero-ratio queue (data/derived/fill_model.json), not a hand-set threshold.
+    p_front = model.calculate_fill_probability(0.0, 100.0)
+    assert p_front < 1.0
+    # Kyle's lambda is price change per 1000 shares, so a 100-share fill pays
+    # lambda * 100 / 1000 dollars per share of adverse selection.
+    expected_front = (
+        100.0
+        * (0.015 - model.kyle_lambda * 100.0 / 1000.0)
+        * p_front
+    )
+    assert val_front.net_queue_value_usd == pytest.approx(expected_front, abs=1e-4)
 
 
 def test_synthetic_liquidation_dominance() -> None:

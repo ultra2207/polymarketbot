@@ -33,7 +33,7 @@ A market is in the universe at `t` when **all** of these hold:
 Rule 2 is the zero-volume filter, and it comes from the **tape**, not from
 `markets.parquet.volume`. `volume` is a latest-snapshot value; using it would leak the
 future into every historical universe. `first_fill_ts` is computed by
-`scripts/build_market_stats.py` from fills only.
+`polymarketbot.data.builders.build_market_stats` from fills only.
 
 Rule 3 is why `end_date < created_at` markets never appear: if `end_date < created_at <= t`
 then `end_date <= t`, so they are excluded automatically. That anomaly affects 32,720
@@ -85,7 +85,7 @@ Precedence is Gamma (per-market, authoritative) → Dome snapshots (2025-10-14 �
 | `assumed` | 1,617,256 | 2021–2023 and never-traded markets, flagged |
 | `dome` | 9 | Gamma had no value and Dome did |
 
-The Gamma enrichment (`scripts/enrich_market_metadata.py`) closed what used to be a
+The Gamma enrichment (`python -m polymarketbot.data.builders.enrich_market_metadata`) closed what used to be a
 3.9 M-market assumption. Never treat `assumed` as knowledge: 165/200 sampled markets are
 `0.001`, so the old `0.01` default was wrong more often than right.
 
@@ -117,7 +117,7 @@ keyset pagination caps at 100 rows/page.
 
 - rules: `configs/categories.yaml` (ordered; first match wins)
 - code: `src/polymarketbot/universe/categories.py`
-- enrichment: `scripts/enrich_categories_gamma.py` fetches **Gamma tags only for markets the
+- enrichment: `python -m polymarketbot.data.builders.enrich_categories_gamma` fetches **Gamma tags only for markets the
   rules could not classify** (107 k candidates since 2024, ~1,100 requests) and reruns the
   same rules over tag labels.
 
@@ -154,13 +154,13 @@ them separately if Phase 6b needs them.
 
 ## 8. Reproduce
 ```bash
-uv run scripts/build_labels.py          # labels_chain + market_labels
-uv run scripts/build_categories.py      # market_categories
-uv run scripts/build_market_stats.py    # per-condition tape stats (1.27 B rows)
-uv run scripts/build_tick_sizes.py      # market_tick (Dome)
-uv run scripts/build_universe.py        # markets_pit
+uv run python -m polymarketbot.data.builders.build_labels          # labels_chain + market_labels
+uv run python -m polymarketbot.data.builders.build_categories      # market_categories
+uv run python -m polymarketbot.data.builders.build_market_stats    # per-condition tape stats (1.27 B rows)
+uv run python -m polymarketbot.data.builders.build_tick_sizes      # market_tick (Dome)
+uv run python -m polymarketbot.data.builders.build_universe        # markets_pit
 uv run pytest -q                        # 41 universe invariants
-uv run scripts/check_universe.py --n 24 # invariants + live Gamma spot-check
+uv run python -m polymarketbot.tools.check_universe --n 24 # invariants + live Gamma spot-check
 ```
 
 Order matters: `build_universe.py` reads the other four outputs.
@@ -172,7 +172,7 @@ Order matters: `build_universe.py` reads the other four outputs.
 - **`end_date` leaks the future.** SII ships only the latest value, and deadlines can be
   extended after creation. A market whose deadline was extended appears in
   `universe_at(t)` for longer than it truly was open. There is no free point-in-time
-  `end_date` history; the Gamma daily snapshots (`scripts/snapshot_gamma.py`) close this gap
+  `end_date` history; the Gamma daily snapshots (`polymarketbot.data.gamma_snapshot`) close this gap
   going forward.
 - **6,386 markets traded before their recorded `created_at`** (median 3.6 h; 5,191 of
   them in 2025; six cases are ~3 years off and are clearly metadata errors). We keep

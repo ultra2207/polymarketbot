@@ -184,7 +184,7 @@ about the economics of this venue as measured:
    baseline) beats joining the touch (+\$0.032/condition) because it scores more
    of the pool and gets filled less.
 3. **`inert` is a bug report, not a result.** Six modules need a signal: the
-   `prepare.sql` pipeline exists (`scripts/build_idea_signals.py`) and one agent
+   `prepare.sql` pipeline exists (the retired idea-signal builder) and one agent
    is authoring six of them, but the modules that read `sibling_*`,
    `depth_imbalance` or `threat` cannot be judged until those land.
 
@@ -245,7 +245,7 @@ works on volume needs three pieces of infrastructure the harness did not have:
 
 | piece | why |
 |---|---|
-| `scripts/build_highvol_universe.py` | ranks conditions by **all** event types (a `book`-only count measures re-snapshots, not flow), and takes tokens from the tape when a market is newer than the Gamma snapshot |
+| `polymarketbot.data.builders.build_highvol_universe` | ranks conditions by **all** event types (a `book`-only count measures re-snapshots, not flow), and takes tokens from the tape when a market is newer than the Gamma snapshot |
 | `--synthetic-prints` | the trade feed only covers the collector's subscriptions, so the busiest markets have **zero** print rows and could never fill; prints are rebuilt from level decreases (price_change deltas, or consecutive book snapshots for feeds that only send full books) |
 | `--metric tape_net` | the replay's own ladder is mutated by every synthetic print, which moves the mid and manufactures markout: ladder median **+312 bps** where the tape shows **-361 bps**, and a "profit" of **+$863** that is really adverse selection. Tape-priced P&L (size x markout x price read from the untouched tape) is the only honest currency here |
 

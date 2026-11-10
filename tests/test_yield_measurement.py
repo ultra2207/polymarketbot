@@ -7,21 +7,15 @@ no RPC, no network.
 from __future__ import annotations
 
 import sqlite3
-import sys
 import time
-from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
+from polymarketbot.reports.market_yield import build_report
 from polymarketbot.rewards.deskew import DeSkewDecision, DeSkewPathway
 from polymarketbot.trading.client import OrderPlacementResult
 from polymarketbot.trading.ctf import MergeExecutionResult
 from polymarketbot.trading.engine import MarkoutTracker, RealMoneyTradingEngine
-from scripts.report_market_yield import build_report
 
 
 class FakeCredentials:

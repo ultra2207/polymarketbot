@@ -222,7 +222,7 @@ def test_unknown_fee_type_falls_back_to_era():
 def test_observed_fee_types_match_era_end_state():
     """Contract: the era table's final rates must equal what Gamma reports.
 
-    `fee_types` is measured from 1,937,137 markets (scripts/validate_fee_model.py).
+    `fee_types` is measured from 1,937,137 markets (python -m polymarketbot.tools.validate_fee_model).
     If an era edit and the observed schedules disagree, every PnL number is
     wrong in one of the two eras, so fail loudly here.
     """
@@ -313,3 +313,138 @@ def test_turnover_needed_for_gold_is_out_of_reach_at_small_size():
     from polymarketbot.fees import turnover_needed_for_tier
     turns = turnover_needed_for_tier(200_000, 2_000, 0.5, "crypto")
     assert turns > 80, "reaching Gold at $2k capital would need an implausible turnover"
+
+
+# ---------------------------------------------------------------------------
+# Venue schedules (2026-11-10)
+# ---------------------------------------------------------------------------
+def test_us_taker_tier_ladder_matches_the_published_table() -> None:
+    from polymarketbot.fees import us_taker_coefficient, us_taker_tiers
+
+    assert [(name, theta) for name, _floor, theta in us_taker_tiers()] == [
+        ("tier_1", 0.095),
+        ("tier_2", 0.085),
+        ("tier_3", 0.075),
+        ("tier_4", 0.0695),
+    ]
+    # Boundaries are inclusive on the upper tier's floor.
+    assert us_taker_coefficient(0.0) == pytest.approx(0.095)
+    assert us_taker_coefficient(9_999.99) == pytest.approx(0.095)
+    assert us_taker_coefficient(10_000.0) == pytest.approx(0.085)
+    assert us_taker_coefficient(49_999.99) == pytest.approx(0.085)
+    assert us_taker_coefficient(50_000.0) == pytest.approx(0.075)
+    assert us_taker_coefficient(249_999.99) == pytest.approx(0.075)
+    assert us_taker_coefficient(250_000.0) == pytest.approx(0.0695)
+
+
+def test_unmeasured_us_volume_is_refused_not_assumed() -> None:
+    """Pricing an unknown tier at either end is a guess: 0.095 vs 0.0695 is a
+    36.7 % fee difference on the same trade."""
+    from polymarketbot.fees import us_taker_coefficient
+
+    assert us_taker_coefficient(None) is None
+    with pytest.raises(ValueError):
+        us_taker_coefficient(-1.0)
+
+
+def test_us_fee_matches_the_documented_worked_examples() -> None:
+    """docs.polymarket.us/fees, Theta 0.0695: 1,000 contracts at 0.10 -> 6.26,
+    0.65 -> 15.81, 0.30 -> 14.60, 0.90 -> 6.26. Exact cents: the published rule
+    rounds to the cent, half to even, so a binary-float value of 14.595 or
+    6.255 must land on the documented side of the tie."""
+    from polymarketbot.fees import us_taker_fee
+
+    assert us_taker_fee(1_000, 0.10, 0.0695) == pytest.approx(6.26)
+    assert us_taker_fee(1_000, 0.65, 0.0695) == pytest.approx(15.81)
+    assert us_taker_fee(1_000, 0.30, 0.0695) == pytest.approx(14.60)
+    assert us_taker_fee(1_000, 0.90, 0.0695) == pytest.approx(6.26)
+    # Documented maximum for a 100-lot at p = 0.50 is 1.74.
+    assert us_taker_fee(100, 0.50, 0.0695) == pytest.approx(1.74)
+
+
+def test_us_tier_one_under_charges_by_a_third_if_priced_as_tier_four() -> None:
+    from polymarketbot.fees import us_taker_fee
+
+    cheap = us_taker_fee(1_000, 0.50, 0.095)
+    best = us_taker_fee(1_000, 0.50, 0.0695)
+    # Cent rounding perturbs the exact coefficient ratio at the 4th digit.
+    assert cheap / best == pytest.approx(0.095 / 0.0695, rel=1e-3)
+    assert cheap / best > 1.36
+
+
+def test_us_combo_uses_the_coefficient_in_force_at_the_trade_time() -> None:
+    from polymarketbot.fees import us_combo_taker_fee
+
+    before = us_combo_taker_fee(1_000, 0.10, 0.0695, "2026-11-10T12:00:00-05:00")
+    after = us_combo_taker_fee(1_000, 0.10, 0.0695, "2026-11-11T14:00:00-05:00")
+    assert before > after  # 0.085 on (1-p)^4 drops to 0.06
+    # Fee = C * p * [theta(1-p) + fixed(1-p)^4]
+    expected_before = 1_000 * 0.10 * (0.0695 * 0.90 + 0.085 * 0.90 ** 4)
+    expected_after = 1_000 * 0.10 * (0.0695 * 0.90 + 0.06 * 0.90 ** 4)
+    assert before == pytest.approx(round(expected_before, 2))
+    assert after == pytest.approx(round(expected_after, 2))
+
+
+def test_venue_is_resolved_from_the_endpoint() -> None:
+    from polymarketbot.fees import VENUE_GLOBAL, VENUE_US, venue_for_host
+
+    assert venue_for_host("https://clob.polymarket.com") == VENUE_GLOBAL
+    assert venue_for_host("https://api.polymarket.us/v1") == VENUE_US
+    assert venue_for_host("") == VENUE_GLOBAL
+
+
+def test_global_category_table_still_matches_the_published_rates() -> None:
+    """The global schedule is per category; the US Theta ladder must not leak
+    into it. Rates from docs.polymarket.com/trading/fees, read 2026-11-10."""
+    from datetime import datetime, timezone
+
+    from polymarketbot.fees import us_taker_fee
+
+    when = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    published = {
+        "crypto": 0.07,
+        "sports": 0.05,
+        "finance": 0.04,
+        "politics": 0.04,
+        "economics": 0.05,
+        "culture": 0.05,
+        "weather": 0.05,
+        "other": 0.05,
+        "mentions": 0.04,
+        "tech": 0.04,
+        "geopolitics": 0.0,
+        "combos": 0.05,
+    }
+    for category, rate in published.items():
+        assert era_schedule(category, when).rate == pytest.approx(rate), category
+    # 100 shares at p = 0.50: politics 1.00, crypto 1.75 (both published).
+    politics = era_schedule("politics", when)
+    crypto = era_schedule("crypto", when)
+    assert taker_fee(100, 0.50, politics) == pytest.approx(1.00, abs=0.005)
+    assert taker_fee(100, 0.50, crypto) == pytest.approx(1.75, abs=0.005)
+    # The US schedule is a different object with a different rounding rule.
+    assert us_taker_fee(100, 0.50, 0.0695) == pytest.approx(1.74)
+
+
+def test_global_taker_rebate_ladder_and_weighted_volume() -> None:
+    """Tier 0 is 0 % and covers every volume below $2,000 of weighted volume,
+    which is this bot's current state - so booking no rebate is exact today and
+    an unmeasured volume must refuse rather than assume the top tier."""
+    from polymarketbot.fees import taker_rebate_rate, weighted_taker_volume
+
+    assert taker_rebate_rate(0.0) == pytest.approx(0.0)
+    assert taker_rebate_rate(1_999.99) == pytest.approx(0.0)
+    assert taker_rebate_rate(2_000.0) == pytest.approx(0.03)
+    assert taker_rebate_rate(20_000.0) == pytest.approx(0.08)
+    assert taker_rebate_rate(200_000.0) == pytest.approx(0.18)
+    assert taker_rebate_rate(1_000_000.0) == pytest.approx(0.32)
+    assert taker_rebate_rate(4_000_000.0) == pytest.approx(0.44)
+    assert taker_rebate_rate(10_000_000.0) == pytest.approx(0.50)
+    assert taker_rebate_rate(None) is None
+
+    # Published example: $400 of Politics at 0.40 -> 400 * 0.60 * 1.3 = 312 wV.
+    assert weighted_taker_volume(400.0, 0.40, "politics") == pytest.approx(312.0)
+    # Published example: $50 of Crypto at 0.05 -> 50 * 0.95 * 2.3 = 109.25 wV.
+    assert weighted_taker_volume(50.0, 0.05, "crypto") == pytest.approx(109.25)
+    # Fee-free markets earn no weighted volume however large the trade.
+    assert weighted_taker_volume(1_000_000.0, 0.40, "geopolitics") == pytest.approx(0.0)

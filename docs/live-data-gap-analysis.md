@@ -82,7 +82,7 @@ Required before leaving it for two weeks:
 
 1. Install the watchdog every 5 minutes (as the logged-in user):
    ```
-   schtasks /create /tn PolymarketCollector /tr "\"C:\Users\Sivasai\Documents\GitHub\polymarketbot\.venv\Scripts\python.exe\" \"C:\Users\Sivasai\Documents\GitHub\polymarketbot\scripts\watchdog_collector.py\" --once" /sc minute /mo 5 /f
+   schtasks /create /tn PolymarketCollector /tr "\"C:\Users\Sivasai\Documents\GitHub\polymarketbot\.venv\Scripts\python.exe\" -m polymarketbot.ops.watchdog --once" /sc minute /mo 5 /f
    ```
    It detects a live `run_data_collector.py` (including the uv trampoline
    parent/child), starts one detached when none exists, and logs to
@@ -127,7 +127,7 @@ source. Gamma `/markets?condition_ids=` returns the event object and
 40,000/40,000 markets and `feeType` for 39,446/40,000 — but 509 of the 647
 traded conditions were created after the snapshot, so the manifest dropped the
 fields and the scorecard's snapshot join left them n/a.
-`scripts/refresh_universe_metadata.py` now fetches the live manifest in 25
+`polymarketbot.data.refresh_universe_metadata` now fetches the live manifest in 25
 Gamma requests, writes `data/derived/universe_metadata.parquet`, and backfills
 `event_id`/`event_title`/`fee_type`/`resolution_source`/`tick_size` into the
 manifest. The 2026-11-05 scorecard window reports **832/834** traded conditions

@@ -15,7 +15,6 @@ from polymarketbot.logs import get_logger
 
 if TYPE_CHECKING:
     from polymarketbot.trading.liquidity_router import InterDomainLiquidityRouter
-    from polymarketbot.oracle.pipeline import ExogenousOraclePipeline
 from polymarketbot.trading.client import LiveClobClient
 from polymarketbot.trading.ctf import PolygonCtfClient
 from polymarketbot.rewards.queue_valuation import PolygonPoSEnvironment
@@ -63,7 +62,6 @@ class Domain2SettlementHarvester:
         order_placer: Optional[Domain2ClobOrderPlacer] = None,
         pricing_engine: Optional[SettlementMakerPricingEngine] = None,
         router: Optional[InterDomainLiquidityRouter] = None,
-        oracle_pipeline: Optional[ExogenousOraclePipeline] = None,
     ):
         self.clob_client = clob_client
         self.ctf_client = ctf_client
@@ -74,13 +72,6 @@ class Domain2SettlementHarvester:
         if self.router is not None and hasattr(self.router, "register_domain2"):
             self.router.register_domain2(self)
         self.pos_env = pos_env or PolygonPoSEnvironment()
-
-        # Real-World Exogenous Ground-Truth Oracle Pipeline
-        if oracle_pipeline is not None:
-            self.oracle_pipeline = oracle_pipeline
-        else:
-            from polymarketbot.oracle.pipeline import create_default_oracle_pipeline
-            self.oracle_pipeline = create_default_oracle_pipeline()
 
         # Mathematical Global Optima Allocator (Google OR-Tools)
         self.allocator = allocator or Domain2OrtoolsAllocator(pos_env=self.pos_env)
@@ -398,7 +389,6 @@ class Domain2SettlementHarvester:
         manifest_path: str = "data/tape/manifest_current.json",
         max_hours_ahead: float = 48.0,
         min_price: float = 0.90,
-        evaluate_oracle: bool = False,
     ) -> List[Domain2Candidate]:
         """Scan active Polymarket universe to discover settlement and basis harvesting candidates.
 
@@ -489,15 +479,6 @@ class Domain2SettlementHarvester:
                 pos_env=self.pos_env,
                 resolution_source=res_source,
             )
-
-            # Evaluate against real-world exogenous oracle pipeline to harvest In-Play Conclusion Gap
-            if evaluate_oracle and self.oracle_pipeline is not None:
-                outcome = self.oracle_pipeline.evaluate_candidate(
-                    cand, resolution_source=res_source
-                )
-                if outcome and outcome.is_deterministic_conclusion:
-                    cand.apply_ground_truth(outcome)
-                    cand.is_uma_proposed = True
 
             candidates.append(cand)
 

@@ -9,8 +9,8 @@ recover an answer costs minutes to hours and teaches nothing new.
 Every source file that logs gets its own rotating file under ``data/logs/``
 *and* every record is also appended to ``data/logs/app.log``.  The per-file
 record is keyed by the source file of the *caller* (not by the label passed to
-``get_logger``), so two modules that both use the label ``paper_trading`` still
-write separate ``engine.log`` / ``client.log`` files.
+``get_logger``), so two modules that both use the label ``paper`` still
+write separate ``engine.log`` / ``main.log`` files.
 
 One process can host several loggers (the collector imports every stream
 module). Sinks are keyed by source file and filtered, not replaced: a later
@@ -89,9 +89,9 @@ def _source_slug(frame: Any) -> tuple[str, str]:
     """Return ``(absolute_source_path, unique_slug)`` for a caller frame.
 
     The slug is a dotted module path relative to the repository root, so
-    ``src/polymarketbot/paper_trading/engine.py`` becomes
-    ``polymarketbot.paper_trading.engine`` and ``scripts/run_soak.py`` becomes
-    ``scripts.run_soak``.
+    ``src/polymarketbot/paper/engine.py`` becomes
+    ``polymarketbot.paper.engine`` and ``src/polymarketbot/paper/main.py``
+    becomes ``polymarketbot.paper.main``.
     """
     raw = frame.f_code.co_filename
     if raw.startswith("<"):

@@ -587,7 +587,12 @@ class SimulatedPortfolio:
         """
         val = 0.0
         for cond_id, pos in self.positions.items():
-            mark_yes, mark_no = marks.get(cond_id, (pos.avg_cost_yes or 0.5, pos.avg_cost_no or 0.5))
+            pair = marks.get(cond_id)
+            if pair is None:
+                # No measured mark: exclude the position rather than valuing it
+                # at cost or a fabricated 0.50.
+                continue
+            mark_yes, mark_no = pair
             val += pos.get_market_value(mark_yes, mark_no)
         return val
 
@@ -595,7 +600,10 @@ class SimulatedPortfolio:
         """Calculate total unrealized mark-to-market PnL across all markets."""
         unrealized = 0.0
         for cond_id, pos in self.positions.items():
-            mark_yes, mark_no = marks.get(cond_id, (pos.avg_cost_yes or 0.5, pos.avg_cost_no or 0.5))
+            pair = marks.get(cond_id)
+            if pair is None:
+                continue
+            mark_yes, mark_no = pair
             unrealized += pos.get_unrealized_pnl(mark_yes, mark_no)
         return unrealized
 
@@ -610,12 +618,14 @@ class SimulatedPortfolio:
     def get_state(self, marks: Optional[Dict[str, Tuple[float, float]]] = None) -> dict[str, Any]:
         """Serialize complete portfolio snapshot for ledger and UI dashboards."""
         marks = marks or {}
+        unmarked = [cid for cid in self.positions if cid not in marks]
         market_val = self.get_market_value(marks)
         unrealized_pnl = self.get_unrealized_pnl(marks)
         equity = self.cash + market_val
         total_pnl = equity - self.initial_cash
 
         return {
+            "unmarked_positions": unmarked,
             "initial_cash": round(self.initial_cash, 2),
             "cash": round(self.cash, 4),
             "market_value": round(market_val, 4),

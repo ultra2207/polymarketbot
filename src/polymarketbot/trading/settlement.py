@@ -39,6 +39,8 @@ read-only ``eth_call`` probes so a settlement is never sent blind.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
@@ -540,6 +542,220 @@ def _ctf_balance(chain_client: "ChainClient", holder: str, token_id: int) -> int
     return _eth_call_uint(chain_client, CTF, data)
 
 
+# ---------------------------------------------------------------------------
+# Resolution evidence - the authority for writing a position off
+# ---------------------------------------------------------------------------
+class CtfOutcomeStatus(str, Enum):
+    """On-chain outcome of one held CTF position token."""
+
+    WON = "won"
+    LOST = "lost"
+    UNRESOLVED = "unresolved"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class CtfOutcomeEvidence:
+    """Read-only resolution evidence for one held CTF outcome token."""
+
+    status: CtfOutcomeStatus
+    unit_payout: float
+    payout_denominator: int
+    reason: str
+
+    @property
+    def verified(self) -> bool:
+        """True only when the chain resolved the condition and mapped the token."""
+        return self.status in (CtfOutcomeStatus.WON, CtfOutcomeStatus.LOST)
+
+    @property
+    def verified_loss(self) -> bool:
+        """True only for a chain-verified zero payout; never for missing data."""
+        return self.status is CtfOutcomeStatus.LOST
+
+
+def _ctf_token_ids(condition_id: str, meta: dict | None) -> list[int]:
+    """Binary CTF position ids, from Gamma metadata when it is present."""
+    clob_ids = (meta or {}).get("clob_token_ids")
+    if clob_ids:
+        token_ids = [_token_id(token) for token in clob_ids][:2]
+        if token_ids:
+            return token_ids
+    return [
+        derive_ctf_position_id(condition_id, 1),
+        derive_ctf_position_id(condition_id, 2),
+    ]
+
+
+def _ctf_payout_denominator(chain_client: "ChainClient", condition_id: str) -> int:
+    data = (
+        "0x"
+        + CTF_PAYOUT_DENOMINATOR_SELECTOR
+        + _word_bytes32(condition_id, "condition_id").hex()
+    )
+    return _eth_call_uint(chain_client, CTF, data)
+
+
+def _ctf_payout_numerator(
+    chain_client: "ChainClient", condition_id: str, outcome_index: int
+) -> int:
+    data = (
+        "0x"
+        + CTF_PAYOUT_NUMERATOR_SELECTOR
+        + _word_bytes32(condition_id, "condition_id").hex()
+        + _word_uint(outcome_index, "outcome_index").hex()
+    )
+    return _eth_call_uint(chain_client, CTF, data)
+
+
+def verify_ctf_outcome(
+    condition_id: str,
+    token_id: str | int,
+    chain_client: "ChainClient",
+    *,
+    meta: dict | None = None,
+) -> CtfOutcomeEvidence:
+    """Chain-verified outcome for one held CTF token, without trusting Gamma.
+
+    Uses the same read-only primitives as ``verify_route``'s ``CTF_REDEEM``
+    branch: ``payoutDenominator`` proves the condition resolved, and
+    ``payoutNumerators`` give this token's payout per share. An unresolved
+    condition, an unmappable token, or any ``eth_call`` failure returns
+    ``UNRESOLVED``/``UNKNOWN`` - never a loss - so a caller cannot write a
+    position off from absent market data.
+    """
+    try:
+        _word_bytes32(condition_id, "condition_id")
+    except ValueError as exc:
+        return CtfOutcomeEvidence(CtfOutcomeStatus.UNKNOWN, 0.0, 0, str(exc))
+    try:
+        held = _token_id(token_id)
+    except ValueError as exc:
+        return CtfOutcomeEvidence(CtfOutcomeStatus.UNKNOWN, 0.0, 0, f"invalid token id: {exc}")
+
+    try:
+        denominator = _ctf_payout_denominator(chain_client, condition_id)
+    except Exception as exc:  # noqa: BLE001 - RPC failure is not resolution evidence
+        return CtfOutcomeEvidence(
+            CtfOutcomeStatus.UNKNOWN, 0.0, 0, f"CTF payoutDenominator check failed: {exc}"
+        )
+    if denominator == 0:
+        return CtfOutcomeEvidence(
+            CtfOutcomeStatus.UNRESOLVED,
+            0.0,
+            0,
+            "condition has not been resolved on CTF (payoutDenominator == 0)",
+        )
+
+    try:
+        token_ids = _ctf_token_ids(condition_id, meta)
+    except (TypeError, ValueError) as exc:
+        return CtfOutcomeEvidence(
+            CtfOutcomeStatus.UNKNOWN, 0.0, denominator, f"invalid clob_token_ids in metadata: {exc}"
+        )
+    try:
+        outcome_index = token_ids.index(held)
+    except ValueError:
+        return CtfOutcomeEvidence(
+            CtfOutcomeStatus.UNKNOWN,
+            0.0,
+            denominator,
+            f"held token {held} is not one of the market's CTF position ids",
+        )
+
+    try:
+        numerator = _ctf_payout_numerator(chain_client, condition_id, outcome_index)
+    except Exception as exc:  # noqa: BLE001 - RPC failure is not resolution evidence
+        return CtfOutcomeEvidence(
+            CtfOutcomeStatus.UNKNOWN, 0.0, denominator, f"CTF payoutNumerators check failed: {exc}"
+        )
+
+    if numerator > 0:
+        return CtfOutcomeEvidence(
+            CtfOutcomeStatus.WON,
+            numerator / denominator,
+            denominator,
+            f"CTF resolved: outcome {outcome_index} pays {numerator}/{denominator}",
+        )
+    return CtfOutcomeEvidence(
+        CtfOutcomeStatus.LOST,
+        0.0,
+        denominator,
+        f"CTF resolved: outcome {outcome_index} pays 0/{denominator}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# On-chain flight - the latency a merge/split/redeem pays before it lands
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class OnchainFlight:
+    """Measured time an on-chain settlement call needs before it can land.
+
+    A broadcast cannot change state before one RPC round trip is spent and
+    before the next block is produced. Both components are measured from the
+    endpoint the write will be sent to; a component that cannot be measured is
+    named in ``gaps`` and contributes no time, so callers queue the action and
+    log the gap instead of assuming the latency away.
+    """
+
+    rpc_rtt_s: float = 0.0
+    block_interval_s: float = 0.0
+    gaps: tuple[str, ...] = ()
+
+    @property
+    def total_s(self) -> float:
+        return self.rpc_rtt_s + self.block_interval_s
+
+    @property
+    def measured(self) -> bool:
+        return not self.gaps
+
+
+def measure_onchain_flight(chain_client: Any) -> OnchainFlight:
+    """Measure one RPC round trip and the current block interval.
+
+    Read-only: ``eth_blockNumber`` times the client's own hot path (including
+    its rate-limit spacing and failover), and the two most recent block
+    timestamps give the interval the next transaction has to wait for. A probe
+    failure is reported in ``gaps``, never silently treated as zero latency.
+    """
+    rpc = getattr(chain_client, "_rpc", None)
+    if rpc is None:
+        return OnchainFlight(gaps=("no RPC client available",))
+
+    gaps: list[str] = []
+    rtt_s = 0.0
+    head_number: int | None = None
+    started = time.perf_counter()
+    try:
+        head_number = int(str(rpc("eth_blockNumber", [])), 16)
+        rtt_s = time.perf_counter() - started
+    except Exception as exc:  # noqa: BLE001 - a failed probe is a measured gap
+        gaps.append(f"RPC round trip unmeasured: {exc}")
+
+    block_interval_s = 0.0
+    try:
+        head = rpc(
+            "eth_getBlockByNumber",
+            [hex(head_number) if head_number is not None else "latest", False],
+        )
+        if not isinstance(head, dict) or "timestamp" not in head:
+            raise ValueError("latest block has no timestamp")
+        number = int(str(head.get("number")), 16)
+        parent = rpc("eth_getBlockByNumber", [hex(number - 1), False])
+        if not isinstance(parent, dict) or "timestamp" not in parent:
+            raise ValueError("parent block has no timestamp")
+        delta = int(str(head["timestamp"]), 16) - int(str(parent["timestamp"]), 16)
+        if delta <= 0:
+            raise ValueError(f"non-positive block interval {delta}s")
+        block_interval_s = float(delta)
+    except Exception as exc:  # noqa: BLE001 - a failed probe is a measured gap
+        gaps.append(f"block interval unmeasured: {exc}")
+
+    return OnchainFlight(rtt_s, block_interval_s, tuple(gaps))
+
+
 def verify_route(
     route: SettlementRoute | str,
     condition_id: str,
@@ -621,12 +837,7 @@ def verify_route(
 
         # 1. On-Chain Resolution Check: payoutDenominator must be > 0
         try:
-            denom_data = (
-                "0x"
-                + CTF_PAYOUT_DENOMINATOR_SELECTOR
-                + _word_bytes32(condition_id, "condition_id").hex()
-            )
-            payout_denom = _eth_call_uint(chain_client, CTF, denom_data)
+            payout_denom = _ctf_payout_denominator(chain_client, condition_id)
         except Exception as exc:  # noqa: BLE001
             return False, f"CTF payoutDenominator check failed: {exc}"
 
@@ -634,34 +845,17 @@ def verify_route(
             return False, "condition has not been resolved on CTF (payoutDenominator == 0)"
 
         # 2. Check token balances
-        token_ids: list[int] = []
-        clob_ids = (meta or {}).get("clob_token_ids")
-        if clob_ids:
-            try:
-                token_ids = [_token_id(token) for token in clob_ids][:2]
-            except (TypeError, ValueError) as exc:
-                return False, f"invalid clob_token_ids in metadata: {exc}"
-        if not token_ids:
-            try:
-                token_ids = [
-                    derive_ctf_position_id(condition_id, 1),
-                    derive_ctf_position_id(condition_id, 2),
-                ]
-            except ValueError as exc:
-                return False, str(exc)
+        try:
+            token_ids = _ctf_token_ids(condition_id, meta)
+        except (TypeError, ValueError) as exc:
+            return False, f"invalid clob_token_ids in metadata: {exc}"
 
         total_balance = 0
         winning_balance = 0
         for idx, token_id in enumerate(token_ids):
             try:
                 bal = _ctf_balance(chain_client, holder, token_id)
-                num_data = (
-                    "0x"
-                    + CTF_PAYOUT_NUMERATOR_SELECTOR
-                    + _word_bytes32(condition_id, "condition_id").hex()
-                    + _word_uint(idx, "outcome_index").hex()
-                )
-                num = _eth_call_uint(chain_client, CTF, num_data)
+                num = _ctf_payout_numerator(chain_client, condition_id, idx)
             except Exception as exc:  # noqa: BLE001
                 return False, f"CTF balance/numerator check failed: {exc}"
 

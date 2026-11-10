@@ -14,7 +14,7 @@ single-event markets (elections, indices, sports) were never fetched.
 
 The stream therefore polls the tickers listed in the Polymarket -> Kalshi
 mapping (``data/derived/kalshi_mapping.parquet``, built by
-``scripts/build_kalshi_mapping.py``) in batches of 100: one ``tickers=``
+``python -m polymarketbot.data.kalshi_mapping``) in batches of 100: one ``tickers=``
 request returns 100 markets in ~480 KB, i.e. ~0.5 MB per poll instead of 48 MB.
 A full-library sweep still exists as a fallback when the mapping is missing.
 
@@ -760,7 +760,11 @@ class MappingCache:
         self._loader = loader
         self._clock = clock
         self._tickers: tuple[str, ...] = ()
-        self._mtime: float | None = None
+        # st_mtime alone collides on filesystems whose reported precision is
+        # coarser than two consecutive writes (observed on NTFS: the file cache
+        # kept serving the previous tuple after an in-place rewrite). The size
+        # disambiguates same-timestamp rewrites.
+        self._signature: tuple[int, int] | None = None
         self._next_check = 0.0
 
     def get(self) -> tuple[str, ...]:
@@ -769,14 +773,15 @@ class MappingCache:
             return self._tickers
         self._next_check = now + self.refresh_seconds
         try:
-            mtime = self.path.stat().st_mtime
+            stat = self.path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
         except OSError:
             self._tickers = ()
-            self._mtime = None
+            self._signature = None
             return self._tickers
-        if self._mtime != mtime:
+        if self._signature != signature:
             self._tickers = tuple(self._loader(self.path))
-            self._mtime = mtime
+            self._signature = signature
         return self._tickers
 
 

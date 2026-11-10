@@ -397,6 +397,34 @@ def test_cooldown_escalates_then_caps_and_resets_on_success() -> None:
     assert pool.mark_rate_limited(DRPC) == pytest.approx(60.0)  # ladder reset
 
 
+def test_rate_limit_cools_every_endpoint_sharing_one_credential() -> None:
+    eth = "https://eth-mainnet.g.alchemy.com/v2/sharedkey"
+    polygon_host = "https://polygon-mainnet.g.alchemy.com/v2/sharedkey"
+    other_key = "https://polygon-mainnet.g.alchemy.com/v2/differentkey"
+    clock = _Clock()
+    pool = polygon.ProviderPool(
+        [eth, polygon_host, other_key, DRPC],
+        cooldown_base_s=60.0,
+        clock=clock,
+        rng=lambda: 0.5,
+    )
+    assert polygon.rate_limit_key(eth) == polygon.rate_limit_key(polygon_host)
+    assert polygon.rate_limit_key(eth) != polygon.rate_limit_key(other_key)
+
+    assert pool.mark_rate_limited(eth) == pytest.approx(60.0)
+    # The sibling host answers from the same quota, so it must rest too.
+    assert {h.url for h in pool.available()} == {other_key, DRPC}
+    # Its own 429 continues the shared ladder rather than restarting at 60 s.
+    assert pool.mark_rate_limited(polygon_host) == pytest.approx(120.0)
+    assert {h.url for h in pool.available()} == {other_key, DRPC}
+
+    # A success on the sibling proves the credential recovered: the ladder
+    # resets, so the next 429 starts at the base again.
+    clock.advance(130.0)
+    pool.mark_ok(polygon_host)
+    assert pool.mark_rate_limited(eth) == pytest.approx(60.0)
+
+
 def test_cooling_provider_is_skipped_until_its_cooldown_expires() -> None:
     clock = _Clock()
     pool = polygon.ProviderPool(

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
+from polymarketbot.fill_model import FillModel, get_fill_model
 from polymarketbot.logs import get_logger
 
 logger = get_logger("queue_valuation")
@@ -228,18 +229,63 @@ class QueuePriorityValuationModel:
         kyle_lambda: float = 0.00015,                  # Kyle's lambda price impact parameter
         volatility_annualized: float = 0.45,           # Implied probability volatility
         annual_capital_hurdle_rate: float = 0.12,      # 12% cost of capital
+        fill_model: Optional[FillModel] = None,        # Measured model; defaults to data/derived/fill_model.json
     ) -> None:
         self.trade_rate = max(1.0, trade_arrival_rate_shares_sec)
         self.cancel_rate = max(0.001, cancellation_rate_intensity)
         self.kyle_lambda = kyle_lambda
         self.volatility = volatility_annualized
         self.r_cost = annual_capital_hurdle_rate / (365.25 * 86_400.0)
+        self.fill_model = fill_model
 
-    def calculate_fill_probability(self, queue_ahead: float, quote_size: float) -> float:
-        """Calculate fill probability before price drift moves market away."""
-        eff_depth = max(0.0, queue_ahead)
-        decay_factor = math.exp(-self.cancel_rate * (eff_depth / self.trade_rate))
-        return max(0.01, min(0.99, decay_factor))
+    def calculate_fill_probability(
+        self,
+        queue_ahead: Optional[float],
+        quote_size: float,
+        level_size_shares: Optional[float] = None,
+    ) -> float:
+        """Print-conditional P(fill) for a quote at a level with a measured queue.
+
+        Feeds the measured model exactly its declared features
+        (``data/derived/fill_model.json``, ``logistic.features``)::
+
+            ratio = pre_q_ahead / pre_size_at_level
+            size  = pre_size_at_level          # displayed depth at that level
+
+        ``level_size_shares`` is the displayed depth at the quote's own price
+        level; ``queue_ahead`` is the resting size ahead of the new quote at
+        that price. Both are measured from the live L2 book.
+
+        When the L2 book cannot supply the level depth (``level_size_shares``
+        is ``None``, e.g. quoting inside an empty touch), the measured isotonic
+        ratio buckets are used instead of extrapolating the logistic: ratio 0
+        when nothing is ahead, otherwise ratio 1 because level depth >= queue
+        ahead is the only bound available. GAP: there is no live per-pool level
+        depth on that path, so the size feature is not evaluated.
+
+        Only when ``queue_ahead`` itself is unknown (``None``) is the
+        exponential clearance proxy used, bounded by the measured fill-rate
+        support of the same file rather than hand-set 0.01/0.99 caps.
+
+        Deliberate deviation: the numerator includes better-price depth (the
+        soak's ``queue_ahead_shares`` is strict ``spread < quote``), so the
+        ratio can exceed the level-local calibration; it is clamped at 1.0 and
+        the measured floor P=0.2339 is a conservative bound on time-to-fill,
+        not the calibrated level-local probability.
+        """
+        if quote_size <= 0.0:
+            return 0.0
+        model = self.fill_model or get_fill_model()
+        if queue_ahead is None:
+            proxy = math.exp(-self.cancel_rate * float(quote_size) / self.trade_rate)
+            return min(model.p_ceiling, max(model.p_floor, proxy))
+        ahead = max(0.0, float(queue_ahead))
+        if level_size_shares is None or level_size_shares <= 0.0:
+            return model.p_fill_by_ratio(0.0 if ahead <= 0.0 else 1.0)
+        # The measured covariate domain requires q_ahead <= size_at_level;
+        # callers whose queue measure includes better-price depth can exceed it.
+        size_at_level = max(float(level_size_shares), ahead)
+        return model.p_fill(ahead / size_at_level, size_at_level)
 
     def evaluate_queue_value(
         self,
@@ -247,9 +293,15 @@ class QueuePriorityValuationModel:
         queue_ahead: float,
         half_spread_cents: float,
         token_mid_price: float = 0.50,
-        rolling_ofi: float = 0.0,
+        level_size_shares: Optional[float] = None,
     ) -> QueueValuationResult:
-        """Evaluate the embedded economic option value of resting queue position."""
+        """Evaluate the embedded economic option value of resting queue position.
+
+        Deviation: ``queue_ahead`` includes better-price depth (strict
+        ``spread < quote``), so the fill ratio is clamped at 1.0 and the measured
+        floor P=0.2339 is a conservative time-to-fill bound, not the calibrated
+        level-local probability.
+        """
         if quote_size <= 0.0:
             return QueueValuationResult(
                 queue_ahead=queue_ahead,
@@ -263,16 +315,30 @@ class QueuePriorityValuationModel:
             )
 
         half_spread_usd = half_spread_cents / 100.0
-        p_fill = self.calculate_fill_probability(queue_ahead, quote_size)
-        expected_wait_sec = (max(0.0, queue_ahead) + 0.5 * quote_size) / self.trade_rate
+        p_fill = self.calculate_fill_probability(queue_ahead, quote_size, level_size_shares)
+        # FIFO: only the shares already ahead of us wait for the trade flow.
+        # GAP: data/derived/l3_queue has per-print survival/replenishment latency
+        # but no derived seconds-to-clear table, so no measured depletion model.
+        expected_wait_sec = max(0.0, queue_ahead) / self.trade_rate
 
-        # Kyle's lambda adverse selection conditioned on fill
-        ofi_impact = 1.0 + max(0.0, abs(rolling_ofi) / 1000.0)
-        adverse_selection_usd = self.kyle_lambda * math.sqrt(quote_size) * self.volatility * ofi_impact
+        # Kyle's lambda adverse selection conditioned on fill. The parameter is
+        # fitted as price change per 1000 shares of signed flow
+        # (QueueParameterFit.observe_sweep), so the expected impact of a fill of
+        # `quote_size` shares is lambda * Q / 1000 dollars per share. The
+        # previous `lambda * sqrt(Q) * volatility` mixed units -- annualised
+        # volatility has no place in a per-fill impact -- and with the measured
+        # inputs of the 2026-11-09 soak (lambda ~ 1e-3, vol 8.5-14) it exceeded
+        # the half spread on every reward quote, flooring net_edge_per_share at
+        # zero. Queue priority was therefore valued at exactly $0, cancels
+        # looked free, and the harvester re-quoted on every radar snapshot.
+        adverse_selection_usd = self.kyle_lambda * float(quote_size) / 1000.0
         net_edge_per_share = max(0.0, half_spread_usd - adverse_selection_usd)
 
         gross_value = quote_size * net_edge_per_share * p_fill
-        capital_notional = quote_size * max(0.05, min(0.95, token_mid_price))
+        # Capital at risk is the measured mid, not a clamped stand-in: a quote
+        # on a 0.02 token ties up 0.02 USDC per share, and inflating that to
+        # 0.05 overstates the opportunity cost by 2.5x.
+        capital_notional = quote_size * max(0.0, min(1.0, token_mid_price))
         opp_cost = capital_notional * self.r_cost * expected_wait_sec
 
         net_value = max(0.0, gross_value - opp_cost)
@@ -451,11 +517,16 @@ class CapitalMigrationEngine:
         half_spread_cents: float,
         mid_price: float = 0.50,
         queue_model: Optional[QueuePriorityValuationModel] = None,
+        level_size_bid: Optional[float] = None,
+        level_size_ask: Optional[float] = None,
     ) -> float:
         """Value of FIFO queue priority surrendered upon cancellation.
 
         ``queue_model`` lets the caller inject a model fitted from measured
-        microstructure instead of the constructor default.
+        microstructure instead of the constructor default. ``level_size_bid`` /
+        ``level_size_ask`` are the displayed depths at the quote price levels
+        (the fill model's ``pre_size_at_level``); omitting them falls back to
+        the measured isotonic ratio buckets (GAP: no level depth measured).
         """
         model = queue_model or self.queue_model
         val_bid = model.evaluate_queue_value(
@@ -463,6 +534,7 @@ class CapitalMigrationEngine:
             queue_ahead=queue_ahead_bid,
             half_spread_cents=half_spread_cents,
             token_mid_price=mid_price,
+            level_size_shares=level_size_bid,
         ).net_queue_value_usd
 
         val_ask = model.evaluate_queue_value(
@@ -470,6 +542,7 @@ class CapitalMigrationEngine:
             queue_ahead=queue_ahead_ask,
             half_spread_cents=half_spread_cents,
             token_mid_price=mid_price,
+            level_size_shares=level_size_ask,
         ).net_queue_value_usd
 
         return val_bid + val_ask
@@ -479,8 +552,14 @@ class CapitalMigrationEngine:
         daily_yield_a: float,
         latency_seconds: float = 4.5,
     ) -> float:
-        """Forgone yield during unquoted transit and 3.5s qualification timer."""
-        return daily_yield_a * (latency_seconds / 86_400.0)
+        """Forgone yield over the measured unquoted interval.
+
+        ``latency_seconds`` is the whole interval the market is unquoted, so a
+        cancel-then-place move must pass both measured flights plus the venue's
+        3.5 s qualification timer. The default is a placeholder; measured callers
+        always supply the round trip they actually observe.
+        """
+        return daily_yield_a * (max(0.0, latency_seconds) / 86_400.0)
 
     def compute_switching_cost(
         self,
@@ -531,9 +610,13 @@ class CapitalMigrationEngine:
             gas_fees = 0.0
 
         # 4. Downtime Opportunity Cost
+        # A migration is sequential: the old quote must pay its cancel flight,
+        # the new quote pays its placement flight, and only then does the venue
+        # 3.5 s qualification timer start. One transit latency cannot cover the
+        # unquoted interval of a cancel-then-place move.
         opp_cost = self.compute_downtime_cost(
             daily_yield_a=daily_yield_a,
-            latency_seconds=transit_latency_seconds,
+            latency_seconds=2.0 * max(0.0, transit_latency_seconds) + 3.5,
         )
 
         # Baseline switching friction (network transit, order cancel/replacement latency)

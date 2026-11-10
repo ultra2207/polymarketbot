@@ -1,4 +1,4 @@
-"""Operator-runner gating and honesty tests for scripts/run_real_money_trader.py.
+"""Operator-runner gating and honesty tests for polymarketbot.trading.runner.
 
 No network: every client, feed and engine is a local fake.
 """
@@ -6,22 +6,13 @@ No network: every client, feed and engine is a local fake.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import re
-import runpy
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER_PATH = REPO_ROOT / "scripts" / "run_real_money_trader.py"
-
-_spec = importlib.util.spec_from_file_location("run_real_money_trader_under_test", RUNNER_PATH)
-assert _spec is not None and _spec.loader is not None
-runner = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(runner)
+from polymarketbot.trading import runner
 
 END_DATE = "2030-01-01T00:00:00Z"
 
@@ -455,7 +446,7 @@ def test_live_with_unready_preflight_aborts_without_downgrade(monkeypatch, tmp_p
     FakeLiveFeed.instances.clear()
     _install_live_fakes(monkeypatch, _market_info)
 
-    exit_code = asyncio.run(runner.run_real_money_trader_async(_live_args(tmp_path)))
+    exit_code = asyncio.run(runner.run_live_runner_async(_live_args(tmp_path)))
 
     assert exit_code == 1
     assert len(NotReadyEngine.created) == 1
@@ -480,7 +471,7 @@ def test_live_neg_risk_market_is_refused(monkeypatch, tmp_path):
     NotReadyEngine.created.clear()
     _install_live_fakes(monkeypatch, lambda: {**_market_info(), "neg_risk": True})
 
-    exit_code = asyncio.run(runner.run_real_money_trader_async(_live_args(tmp_path)))
+    exit_code = asyncio.run(runner.run_live_runner_async(_live_args(tmp_path)))
 
     assert exit_code == 2
     assert NotReadyEngine.created == []
@@ -490,14 +481,14 @@ def test_live_without_settlement_is_refused_unless_allowed(monkeypatch, tmp_path
     NotReadyEngine.created.clear()
     _install_live_fakes(monkeypatch, _market_info, ctf_cls=NoSettlementCtf)
 
-    exit_code = asyncio.run(runner.run_real_money_trader_async(_live_args(tmp_path)))
+    exit_code = asyncio.run(runner.run_live_runner_async(_live_args(tmp_path)))
     assert exit_code == 2
     assert NotReadyEngine.created == []
 
     # The explicit override proceeds to preflight (which is not ready in the fake).
     NotReadyEngine.created.clear()
     exit_code = asyncio.run(
-        runner.run_real_money_trader_async(_live_args(tmp_path, "--allow-no-settlement"))
+        runner.run_live_runner_async(_live_args(tmp_path, "--allow-no-settlement"))
     )
     assert exit_code == 1
     assert len(NotReadyEngine.created) == 1
@@ -521,7 +512,7 @@ def test_shutdown_unconfirmed_cancel_retries_then_exits_3(monkeypatch, tmp_path)
     monkeypatch.setattr(runner, "CANCEL_RETRY_BACKOFF_SECONDS", 0.0)
 
     args = _live_args(tmp_path, "--duration", "0.05", "--poll-interval", "0.05")
-    exit_code = asyncio.run(runner.run_real_money_trader_async(args))
+    exit_code = asyncio.run(runner.run_live_runner_async(args))
 
     engine = LoopEngine.created[0]
     assert exit_code == 3
@@ -547,7 +538,7 @@ def test_startup_seeds_books_with_quoting_disabled_and_enables_after_ws(monkeypa
     )
 
     args = _live_args(tmp_path, "--duration", "0.05", "--poll-interval", "0.05")
-    exit_code = asyncio.run(runner.run_real_money_trader_async(args))
+    exit_code = asyncio.run(runner.run_live_runner_async(args))
 
     engine = RecordingEngine.created[0]
     assert exit_code == 0
@@ -564,7 +555,7 @@ def test_baseline_refusal_aborts_before_feed_start(monkeypatch, tmp_path):
     FakeLiveFeed.instances.clear()
     _install_live_fakes(monkeypatch, _market_info, engine_cls=RefusingBaselineEngine)
 
-    exit_code = asyncio.run(runner.run_real_money_trader_async(_live_args(tmp_path)))
+    exit_code = asyncio.run(runner.run_live_runner_async(_live_args(tmp_path)))
 
     assert exit_code == 2
     engine = RefusingBaselineEngine.created[0]
@@ -690,7 +681,7 @@ def test_new_flags_and_no_removed_attributes():
 
 
 def test_module_imports_without_running_main():
-    namespace = runpy.run_path(str(RUNNER_PATH), run_name="not_main")
+    namespace = vars(runner)
     assert callable(namespace["main"])
     assert callable(namespace["require_live_confirmation"])
     assert callable(namespace["resolve_market_details"])

@@ -58,15 +58,6 @@ from polymarketbot.trading.ctf_allocator import (
     SingleMarketSweepResult,
 )
 from polymarketbot.trading.ctf_split_arbitrage import (
-    CtfCrossSplitArbitrageEngine,
-    CtfSplitArbConfig,
-    CtfSplitExecutionPlan,
-    CtfSplitExecutionResult,
-    CtfSplitLeg,
-    CtfSplitOpportunity,
-    OrderBatchLeg,
-    SplitTransactionPayload,
-    encode_split_positions_calldata,
     estimate_polygon_eip1559_gas_usd,
 )
 from polymarketbot.trading.engine import RealMoneyTradingEngine
@@ -108,21 +99,6 @@ from polymarketbot.trading.negrisk_engine import (
     compute_taker_fee,
     estimate_conversion_gas_usd,
 )
-from polymarketbot.trading.virtual_queue_book import (
-    CancellationDecision,
-    CancellationModel,
-    CancellationUrgency,
-    DynamicQueueDepletionTracker,
-    FastL2Book,
-    OrderBookLevel,
-    OrderSide,
-    QueueAwareCancellationPolicy,
-    QueueCancellationConfig,
-    QueuePositionTracker,
-    RateLimitTokenBucket,
-    TrackedOrder,
-    VirtualQueueOrderBookEngine,
-)
 
 __all__ = [
     "ASInventoryConfig",
@@ -136,9 +112,6 @@ __all__ = [
     "BinanceQuoteDecision",
     "BinanceSpotFeed",
     "BlackScholesBinaryEngine",
-    "CancellationDecision",
-    "CancellationModel",
-    "CancellationUrgency",
     "CashInventoryManager",
     "ClobAuthCredentials",
     "CoherenceChecker",
@@ -149,18 +122,10 @@ __all__ = [
     "ConversionPlanner",
     "compute_taker_fee",
     "CrossVenueLeadLagKalmanFilter",
-    "CtfCrossSplitArbitrageEngine",
-    "CtfSplitArbConfig",
-    "CtfSplitExecutionPlan",
-    "CtfSplitExecutionResult",
-    "CtfSplitLeg",
-    "CtfSplitOpportunity",
     "DynamicASCalibrator",
-    "DynamicQueueDepletionTracker",
     "estimate_conversion_gas_usd",
     "ExitCostComparison",
     "ExitPathway",
-    "FastL2Book",
     "HighFrequencyEWMAVolEstimator",
     "HighFrequencyVolEstimator",
     "HorizonRegime",
@@ -183,17 +148,11 @@ __all__ = [
     "NegRiskMarket",
     "NegRiskOpportunity",
     "OpportunityType",
-    "OrderBookLevel",
     "OrderPlacementResult",
-    "OrderSide",
     "OutcomeLeg",
     "PolygonCtfClient",
     "PolymarketTopBook",
-    "QueueAwareCancellationPolicy",
-    "QueueCancellationConfig",
-    "QueuePositionTracker",
     "QuotePair",
-    "RateLimitTokenBucket",
     "RealMoneyTradingEngine",
     "SimpleCashInventoryManager",
     "SnipeDecision",
@@ -201,14 +160,11 @@ __all__ = [
     "StrategyCapacityModel",
     "get_default_strategy_models",
     "TakerOrder",
-    "TrackedOrder",
     "VIP_REBATE_RATES",
-    "VirtualQueueOrderBookEngine",
     # Institutional Strategy Nomenclature
     "StrategyName",
     "CapitalRouter",
     "LatencySniperEngine",
-    "CtfSplitterEngine",
     "RewardHarvesterEngine",
     # Marginal CTF Capital Allocator
     "ArbitrageDirection",
@@ -223,6 +179,5 @@ __all__ = [
 
 # Canonical Strategy Engine Aliases
 LatencySniperEngine = BinanceLatencySniperEngine
-CtfSplitterEngine = CtfCrossSplitArbitrageEngine
 RewardHarvesterEngine = RealMoneyTradingEngine
 

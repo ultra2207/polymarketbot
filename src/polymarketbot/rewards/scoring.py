@@ -142,11 +142,19 @@ def compute_book_side_scores(
     return q_one, q_two
 
 
+# Documented protocol constants of the two-sided rule below: inside the
+# midpoint band a one-sided maker is paid at 1/c of its raw score, outside the
+# band it is paid nothing at all.
+TWO_SIDED_MIDPOINT_LOW = 0.10
+TWO_SIDED_MIDPOINT_HIGH = 0.90
+SINGLE_SIDED_PENALTY = 3.0
+
+
 def compute_minimum_score(
     q_one: float,
     q_two: float,
     midpoint: float,
-    c_penalty: float = 3.0,
+    c_penalty: float = SINGLE_SIDED_PENALTY,
 ) -> float:
     """Calculate Q_min applying two-sided vs single-sided rules.
 
@@ -158,10 +166,33 @@ def compute_minimum_score(
        Liquidity must be strictly two-sided:
        Q_min = min(Q_one, Q_two)
     """
-    if 0.10 <= midpoint <= 0.90:
+    if TWO_SIDED_MIDPOINT_LOW <= midpoint <= TWO_SIDED_MIDPOINT_HIGH:
         return max(min(q_one, q_two), max(q_one, q_two) / c_penalty)
     else:
         return min(q_one, q_two)
+
+
+def single_sided_score_fraction(
+    midpoint: float, c_penalty: float = SINGLE_SIDED_PENALTY
+) -> float:
+    """Fraction of its raw quadratic score a one-sided maker is actually paid.
+
+    Substituting ``q_two = 0`` into :func:`compute_minimum_score` gives
+    ``Q_min = q_one / c`` inside the two-sided midpoint band and ``Q_min = 0``
+    outside it. Every caller that prices a quote resting on **one** side of a
+    binary market (a lone bid on the cheaper leg, say) must multiply its raw
+    score ``alpha * shares`` by this fraction; using the raw score instead
+    claims three times the payout, and claims a payout at all in the markets
+    where the venue pays nothing.
+
+    ``midpoint`` is the market's YES price, which is the leg mid when the quoted
+    leg is YES and ``1 - leg mid`` when it is NO; either way the band reduces to
+    ``0.10 <= leg mid`` for the cheaper leg, because that leg prices at or below
+    0.50 by construction.
+    """
+    if not TWO_SIDED_MIDPOINT_LOW <= midpoint <= TWO_SIDED_MIDPOINT_HIGH:
+        return 0.0
+    return 1.0 / float(c_penalty)
 
 
 def normalize_sample_score(

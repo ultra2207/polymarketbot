@@ -5,6 +5,7 @@ Defines data structures for the UMA Settlement Basis & Resolution Discount Harve
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Dict, Any
@@ -191,3 +192,52 @@ class DynamicSettlementDelayMetrics:
     effective_turnover_latency_hours: float
     redemption_gas_usd: float
 
+
+class OracleCategory(str, Enum):
+    """Categorization of a prediction market's real-world event."""
+    CRYPTO = "CRYPTO"
+    SPORTS = "SPORTS"
+    WEATHER = "WEATHER"
+    POLITICS = "POLITICS"
+    MACRO = "MACRO"
+    OTHER = "OTHER"
+
+
+class OracleStatus(str, Enum):
+    """Real-world lifecycle status of an event."""
+    PENDING = "PENDING"
+    IN_PLAY = "IN_PLAY"
+    CONCLUDED = "CONCLUDED"
+    DISPUTED = "DISPUTED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class GroundTruthOutcome:
+    """Ground truth resolution state attached to a scanning candidate.
+
+    Carries the externally verified conclusion (event status, winning outcome and
+    the probability/hazard pair the allocator prices with) for a market whose
+    real-world event has finished before its on-chain proposal exists.
+    """
+    event_id: str
+    category: OracleCategory
+    status: OracleStatus
+    concluded: bool
+    winning_outcome: Optional[str] = None
+    p_hat: float = 0.5
+    h_reversal: float = 0.0
+    confidence: float = 1.0
+    resolution_source_url: str = ""
+    ancillary_details: Dict[str, Any] = field(default_factory=dict)
+    timestamp_s: float = field(default_factory=time.time)
+    observed_at: Optional[Any] = None
+
+    @property
+    def is_deterministic_conclusion(self) -> bool:
+        """True if the event has physically concluded and winner is certain."""
+        return (
+            self.status == OracleStatus.CONCLUDED
+            and self.concluded
+            and (self.p_hat >= 0.999 or self.p_hat <= 0.001)
+        )

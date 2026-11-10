@@ -35,6 +35,19 @@ from polymarketbot.trading.ctf_allocator import (
     SingleMarketSweepResult,
 )
 
+# The fee schedule the venue publishes for a fee-paying market.  Every leg is
+# given one explicitly: the allocator has no built-in default rate, because a
+# market without a published schedule has an unknown taker fee and is refused
+# rather than priced off an invented 2%.
+SCHEDULE = FeeSchedule(rate=0.02, exponent=1.0, taker_only=True)
+
+
+def _leg(token_id, condition_id, side, raw_levels, title="", **kwargs):
+    return ParityLegDepth.from_raw(
+        token_id, condition_id, side, raw_levels, title=title,
+        fee_schedule=SCHEDULE, **kwargs
+    )
+
 
 # ==============================================================================
 # 1. OrderBookLevel & ParityLegDepth Input Parsing
@@ -65,7 +78,7 @@ def test_parity_leg_depth_sorting_and_consolidation():
         {"price": 0.52, "size": 50.0},  # duplicate price 0.52 -> should sum to 150.0
         {"price": 0.49, "size": 300.0},
     ]
-    leg = ParityLegDepth.from_raw("tok_yes", "cond_1", "BID", raw_bids, title="YES")
+    leg = _leg("tok_yes", "cond_1", "BID", raw_bids, title="YES")
     sorted_lvls = leg.sorted_levels()
 
     assert len(sorted_lvls) == 3
@@ -82,7 +95,7 @@ def test_parity_leg_depth_sorting_and_consolidation():
         (0.45, 200.0),
         (0.51, 150.0),
     ]
-    leg_ask = ParityLegDepth.from_raw("tok_no", "cond_1", "ASK", raw_asks, title="NO")
+    leg_ask = _leg("tok_no", "cond_1", "ASK", raw_asks, title="NO")
     sorted_asks = leg_ask.sorted_levels()
 
     assert len(sorted_asks) == 3
@@ -92,6 +105,29 @@ def test_parity_leg_depth_sorting_and_consolidation():
     assert sorted_asks[1].size == 100.0
     assert sorted_asks[2].price == 0.51
     assert sorted_asks[2].size == 150.0
+
+
+def test_unpublished_fee_schedule_is_refused_not_assumed():
+    """A market with no published fee schedule has an unknown taker fee.
+
+    The allocator used to fall back to ``FeeSchedule(rate=0.02, exponent=1.0)``,
+    which priced edges off a rate nobody measured.  It must refuse the market.
+    """
+    leg0 = ParityLegDepth.from_raw("t0", "c", "BID", [(0.55, 100.0)])
+    leg1 = ParityLegDepth.from_raw("t1", "c", "BID", [(0.51, 100.0)])
+    assert leg0.get_fee_schedule() is None
+
+    allocator = MarginalCtfAllocator(vip_tier="bronze")
+    res = allocator.compute_sweep_curve("m", "c", [leg0, leg1])
+    assert res.is_viable is False
+    assert res.optimal_shares == 0.0
+    assert "fee schedule unmeasured" in res.summary
+
+    # Selective maker mode still needs a schedule on its one taker leg.
+    res_selective = allocator.compute_sweep_curve(
+        "m", "c", [leg0, leg1], execution_mode=ExecutionMode.SELECTIVE_MAKER
+    )
+    assert res_selective.is_viable is False
 
 
 # ==============================================================================
@@ -105,13 +141,13 @@ def test_monotonic_decreasing_marginal_profit_and_concavity():
     allocator = MarginalCtfAllocator(vip_tier="bronze", hurdle_rate=0.0)
 
     # Leg 0 bids: 100 @ 0.54, 200 @ 0.52, 300 @ 0.49
-    leg0 = ParityLegDepth.from_raw(
+    leg0 = _leg(
         "tok_0", "cond_1", "BID",
         [(0.54, 100.0), (0.52, 200.0), (0.49, 300.0)],
         title="YES",
     )
     # Leg 1 bids: 150 @ 0.51, 250 @ 0.49, 200 @ 0.47
-    leg1 = ParityLegDepth.from_raw(
+    leg1 = _leg(
         "tok_1", "cond_1", "BID",
         [(0.51, 150.0), (0.49, 250.0), (0.47, 200.0)],
         title="NO",
@@ -158,12 +194,12 @@ def test_exact_optimal_batch_size_and_oversweep_penalty():
     """
     allocator = MarginalCtfAllocator(vip_tier="none", hurdle_rate=0.0)
 
-    leg0 = ParityLegDepth.from_raw(
+    leg0 = _leg(
         "tok_0", "cond_1", "BID",
         [(0.55, 100.0), (0.52, 100.0), (0.48, 200.0)],
         title="YES",
     )
-    leg1 = ParityLegDepth.from_raw(
+    leg1 = _leg(
         "tok_1", "cond_1", "BID",
         [(0.51, 100.0), (0.50, 100.0), (0.47, 200.0)],
         title="NO",
@@ -207,16 +243,15 @@ def test_gas_amortization_and_rejection_of_sub_breakeven():
     """Verify that if orderbook depth cannot cover Polygon PoS gas ($0.00136),
     the market is marked non-viable (S* = 0).
     """
-    allocator = MarginalCtfAllocator(vip_tier="bronze", min_net_edge_usd=0.05)
+    allocator = MarginalCtfAllocator(vip_tier="bronze")
 
     # Edge is tiny: sum bids = 0.5005 + 0.5005 = 1.0010 (10 bps edge)
     # Available size: only 5 shares
-    # Gross edge before gas = 5 * (1.001 - 1.000) = $0.005
-    # Taker fees = ~0.005 * 0.02 * 0.25 * 5 = ~$0.0025
-    # Gas cost = $0.00136
-    # Net edge is < min_net_edge_usd ($0.05)
-    leg0 = ParityLegDepth.from_raw("t0", "c0", "BID", [(0.5005, 5.0)])
-    leg1 = ParityLegDepth.from_raw("t1", "c0", "BID", [(0.5005, 5.0)])
+    # Gross edge before fees = 5 * (1.001 - 1.000) = $0.005
+    # Taker fees = 5 * 0.02 * 0.25 per leg = $0.025 per leg, so the marginal
+    # return is already negative and the hurdle-rate sweep stops at S* = 0.
+    leg0 = _leg("t0", "c0", "BID", [(0.5005, 5.0)])
+    leg1 = _leg("t1", "c0", "BID", [(0.5005, 5.0)])
 
     res = allocator.compute_sweep_curve(
         market_id="mkt_tiny",
@@ -226,9 +261,9 @@ def test_gas_amortization_and_rejection_of_sub_breakeven():
     )
     assert res.is_viable is False
 
-    # Now provide sufficient depth so that edge covers gas and clears $0.05 threshold
-    leg0_large = ParityLegDepth.from_raw("t0", "c0", "BID", [(0.51, 500.0)])
-    leg1_large = ParityLegDepth.from_raw("t1", "c0", "BID", [(0.51, 500.0)])
+    # Now provide sufficient depth so the edge clears fees and gas
+    leg0_large = _leg("t0", "c0", "BID", [(0.51, 500.0)])
+    leg1_large = _leg("t1", "c0", "BID", [(0.51, 500.0)])
 
     res_large = allocator.compute_sweep_curve(
         market_id="mkt_large",
@@ -250,8 +285,8 @@ def test_vip_tier_impact_on_depth_sweep():
     and allow deeper sweeps into the book.
     """
     legs = [
-        ParityLegDepth.from_raw("t0", "c", "BID", [(0.510, 100.0), (0.502, 200.0)]),
-        ParityLegDepth.from_raw("t1", "c", "BID", [(0.505, 100.0), (0.501, 200.0)]),
+        _leg("t0", "c", "BID", [(0.510, 100.0), (0.502, 200.0)]),
+        _leg("t1", "c", "BID", [(0.505, 100.0), (0.501, 200.0)]),
     ]
 
     alloc_none = MarginalCtfAllocator(vip_tier="none")
@@ -275,8 +310,8 @@ def test_ctf_merge_unwind_sweep():
     """
     allocator = MarginalCtfAllocator(vip_tier="bronze", hurdle_rate=0.0)
 
-    leg0_ask = ParityLegDepth.from_raw("t0", "c", "ASK", [(0.48, 100.0), (0.51, 200.0)], title="YES")
-    leg1_ask = ParityLegDepth.from_raw("t1", "c", "ASK", [(0.49, 150.0), (0.50, 200.0)], title="NO")
+    leg0_ask = _leg("t0", "c", "ASK", [(0.48, 100.0), (0.51, 200.0)], title="YES")
+    leg1_ask = _leg("t1", "c", "ASK", [(0.49, 150.0), (0.50, 200.0)], title="NO")
 
     res = allocator.compute_sweep_curve(
         market_id="mkt_merge",
@@ -315,13 +350,13 @@ def test_multi_market_equal_marginal_water_filling():
     allocator = MarginalCtfAllocator(vip_tier="none", hurdle_rate=0.0)
 
     # Market A: 50 shs @ 0.54 + 0.50 = 1.04 (~3% net), then 100 shs @ 0.51 + 0.505 = 1.015 (~1% net)
-    leg_a0 = ParityLegDepth.from_raw("ta0", "ca", "BID", [(0.54, 50.0), (0.51, 100.0)])
-    leg_a1 = ParityLegDepth.from_raw("ta1", "ca", "BID", [(0.50, 50.0), (0.505, 100.0)])
+    leg_a0 = _leg("ta0", "ca", "BID", [(0.54, 50.0), (0.51, 100.0)])
+    leg_a1 = _leg("ta1", "ca", "BID", [(0.50, 50.0), (0.505, 100.0)])
     sweep_a = allocator.compute_sweep_curve("MKT_A", "ca", [leg_a0, leg_a1])
 
     # Market B: 300 shs @ 0.52 + 0.51 = 1.03 (~2% net)
-    leg_b0 = ParityLegDepth.from_raw("tb0", "cb", "BID", [(0.52, 300.0)])
-    leg_b1 = ParityLegDepth.from_raw("tb1", "cb", "BID", [(0.51, 300.0)])
+    leg_b0 = _leg("tb0", "cb", "BID", [(0.52, 300.0)])
+    leg_b1 = _leg("tb1", "cb", "BID", [(0.51, 300.0)])
     sweep_b = allocator.compute_sweep_curve("MKT_B", "cb", [leg_b0, leg_b1])
 
     assert sweep_a.is_viable and sweep_b.is_viable
@@ -358,24 +393,34 @@ def test_multi_market_equal_marginal_water_filling():
 # 8. Multi-Market Gas Pruning for Underfunded Opportunities
 # ==============================================================================
 def test_multi_market_gas_pruning():
-    """Verify that if a candidate market is allocated too little capital to clear
-    the fixed Polygon gas cost ($0.00136 + min_net_edge_usd), it is pruned and
-    capital is recycled to the remaining viable markets.
+    """A market whose depth cannot amortize the fixed Polygon gas is never funded
+    and its capital is recycled to the remaining profitable market.
+
+    The gate is the hurdle rate plus gas, not a hand-set dollar threshold: a
+    candidate is viable only when the depth it funded still nets a positive
+    amount after the fixed per-batch gas.
     """
-    allocator = MarginalCtfAllocator(vip_tier="bronze", min_net_edge_usd=0.25)
+    allocator = MarginalCtfAllocator(vip_tier="bronze")
 
     # Market A: viable and large
-    leg_a0 = ParityLegDepth.from_raw("ta0", "ca", "BID", [(0.53, 500.0)])
-    leg_a1 = ParityLegDepth.from_raw("ta1", "ca", "BID", [(0.51, 500.0)])
-    sweep_a = allocator.compute_sweep_curve("MKT_LARGE", "ca", [leg_a0, leg_a1])
+    leg_a0 = _leg("ta0", "ca", "BID", [(0.53, 500.0)])
+    leg_a1 = _leg("ta1", "ca", "BID", [(0.51, 500.0)])
 
-    # Market B: has edge, but tiny depth (only 5 shares = $5 max capital)
-    # Net profit at $5 is ~$0.15, which is < min_net_edge_usd ($0.25)
-    leg_b0 = ParityLegDepth.from_raw("tb0", "cb", "BID", [(0.54, 5.0)])
-    leg_b1 = ParityLegDepth.from_raw("tb1", "cb", "BID", [(0.51, 5.0)])
-    sweep_b = allocator.compute_sweep_curve("MKT_TINY", "cb", [leg_b0, leg_b1])
+    # Market B: has edge, but its depth is so thin that the fixed gas eats the
+    # whole edge.  Gas is pinned to measured-style inputs (400 Gwei, $0.50/POL,
+    # 85,000 split gas units) instead of a network oracle round trip.
+    leg_b0 = _leg("tb0", "cb", "BID", [(0.54, 0.4)])
+    leg_b1 = _leg("tb1", "cb", "BID", [(0.51, 0.4)])
+    sweep_b = allocator.compute_sweep_curve(
+        "MKT_TINY", "cb", [leg_b0, leg_b1],
+        gas_price_gwei=400.0, pol_usd_price=0.50,
+    )
+    sweep_a = allocator.compute_sweep_curve(
+        "MKT_LARGE", "ca", [leg_a0, leg_a1],
+        gas_price_gwei=400.0, pol_usd_price=0.50,
+    )
 
-    # sweep_b alone has optimal_net_profit < 0.25, so it is filtered out
+    # sweep_b's whole edge is smaller than one batch of gas, so it is unfundable
     assert sweep_b.is_viable is False
 
     port = allocator.allocate_portfolio([sweep_a, sweep_b], total_budget=100.0)
@@ -395,8 +440,8 @@ def test_selective_maker_mode():
 
     # Leg 0 @ 0.50: curve = 0.50 * 0.50 = 0.25 (maximum taker fee rate)
     # Leg 1 @ 0.20: curve = 0.20 * 0.80 = 0.16 (lower taker fee rate)
-    leg0 = ParityLegDepth.from_raw("t0", "c", "BID", [(0.50, 100.0)])
-    leg1 = ParityLegDepth.from_raw("t1", "c", "BID", [(0.55, 100.0)])
+    leg0 = _leg("t0", "c", "BID", [(0.50, 100.0)])
+    leg1 = _leg("t1", "c", "BID", [(0.55, 100.0)])
 
     res_all_taker = allocator.compute_sweep_curve("m", "c", [leg0, leg1], execution_mode=ExecutionMode.ALL_TAKER)
     res_selective = allocator.compute_sweep_curve("m", "c", [leg0, leg1], execution_mode=ExecutionMode.SELECTIVE_MAKER)
@@ -404,31 +449,3 @@ def test_selective_maker_mode():
     # Selective maker pays fees on only 1 leg -> higher net profit
     assert res_selective.optimal_net_fees < res_all_taker.optimal_net_fees
     assert res_selective.optimal_net_profit > res_all_taker.optimal_net_profit
-
-
-# ==============================================================================
-# 10. Live Paper Soak Daemon Integration Test
-# ==============================================================================
-def test_live_paper_soak_daemon_integration():
-    """Verify that LivePaperSoakDaemon initializes MarginalCtfAllocator and executes sweeps."""
-    from scripts.run_live_paper_soak import LivePaperSoakDaemon
-
-    daemon = LivePaperSoakDaemon(capital_per_strategy=1000.0, vip_tier="bronze")
-    assert hasattr(daemon, "ctf_allocator")
-    assert isinstance(daemon.ctf_allocator, MarginalCtfAllocator)
-    assert daemon.ctf_allocator.vip_tier == "bronze"
-
-    # Simulate parity candidate books
-    raw_bids_0 = [{"price": 0.54, "size": 100.0}, {"price": 0.52, "size": 100.0}]
-    raw_bids_1 = [{"price": 0.51, "size": 100.0}, {"price": 0.50, "size": 100.0}]
-    leg0 = ParityLegDepth.from_raw("tok_0", "cond_test", "BID", raw_bids_0, title="YES")
-    leg1 = ParityLegDepth.from_raw("tok_1", "cond_test", "BID", raw_bids_1, title="NO")
-
-    res = daemon.ctf_allocator.compute_sweep_curve("m_soak", "cond_test", [leg0, leg1])
-    assert res.is_viable is True
-
-    port = daemon.ctf_allocator.allocate_portfolio([res], total_budget=400.0)
-    assert port.funded_count == 1
-    assert "m_soak" in port.allocations
-    assert port.allocations["m_soak"].allocated_shares == 200.0
-

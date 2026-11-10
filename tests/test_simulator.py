@@ -43,6 +43,10 @@ from polymarketbot.simulator.matcher import (
     SyntheticOrderBook,
     VirtualQuote,
 )
+from polymarketbot.simulator.engine import (
+    MissingBookPriceError,
+    NativePaperTradingEngine,
+)
 
 
 # =============================================================================
@@ -489,3 +493,142 @@ def test_order_matcher_multi_quote_priority():
     assert fills[1].fill_size == 30.0
     assert q2.size == 20.0
 
+
+
+# =============================================================================
+# 5. NativePaperTradingEngine price honesty (no fabricated midpoints)
+# =============================================================================
+CONDITION_ID = "0xPRICE_HONESTY"
+
+
+def _honesty_engine(tmp_path, **overrides) -> NativePaperTradingEngine:
+    kwargs = {
+        "condition_id": CONDITION_ID,
+        "initial_cash": 100.0,
+        "quote_size": 10.0,
+        "db_path": tmp_path / "honesty.db",
+        "ledger_path": tmp_path / "honesty.json",
+    }
+    kwargs.update(overrides)
+    return NativePaperTradingEngine(**kwargs)
+
+
+def _buy_yes(engine: NativePaperTradingEngine, price: float, size: float) -> None:
+    engine.portfolio.process_fill(
+        condition_id=CONDITION_ID,
+        side="BUY",
+        outcome="YES",
+        price=price,
+        size=size,
+        is_maker=True,
+    )
+
+
+def test_engine_equity_excludes_position_without_live_book(tmp_path):
+    engine = _honesty_engine(tmp_path)
+    try:
+        _buy_yes(engine, price=0.40, size=10.0)
+
+        # No book: the position is not marked at its 0.40 purchase price.
+        assert engine.get_equity() == pytest.approx(engine.portfolio.cash)
+        state = engine._marked_portfolio_state()
+        assert state["mark_basis"] == "book_mid_unpriced_positions_excluded"
+        assert state["unmarked_positions"] == [CONDITION_ID]
+        assert state["unrealized_pnl"] == pytest.approx(0.0)
+
+        telemetry = engine.get_telemetry()
+        assert telemetry["mid_price_yes"] is None
+        assert telemetry["best_bid_yes"] is None
+        assert telemetry["best_ask_yes"] is None
+        assert telemetry["unmarked_positions"] == [CONDITION_ID]
+    finally:
+        engine.close()
+
+
+def test_engine_marks_position_from_live_book(tmp_path):
+    engine = _honesty_engine(tmp_path)
+    try:
+        engine.update_orderbook_snapshot(
+            "YES",
+            bids=[{"price": 0.49, "size": 100.0}],
+            asks=[{"price": 0.51, "size": 100.0}],
+        )
+        _buy_yes(engine, price=0.40, size=10.0)
+
+        mid = engine._mid_price("YES")
+        assert mid is not None
+        assert engine.get_equity() == pytest.approx(engine.portfolio.cash + 10.0 * mid)
+        state = engine._marked_portfolio_state()
+        assert state["mark_basis"] == "book_mid"
+        assert state["unmarked_positions"] == []
+        assert engine.get_telemetry()["mid_price_yes"] == pytest.approx(mid)
+    finally:
+        engine.close()
+
+
+def test_engine_get_best_bid_ask_raises_without_live_quote(tmp_path):
+    engine = _honesty_engine(tmp_path)
+    try:
+        with pytest.raises(MissingBookPriceError):
+            engine.get_best_bid_ask("YES")
+
+        engine.update_orderbook_snapshot(
+            "YES",
+            bids=[{"price": 0.49, "size": 100.0}],
+            asks=[{"price": 0.51, "size": 100.0}],
+        )
+        assert engine.get_best_bid_ask("YES") == pytest.approx((0.49, 0.51))
+        # The NO side is the binary complement of the live YES book.
+        assert engine.get_best_bid_ask("NO") == pytest.approx((0.49, 0.51))
+    finally:
+        engine.close()
+
+
+def test_engine_skips_quotes_and_switching_cost_without_two_sided_book(tmp_path):
+    engine = _honesty_engine(tmp_path)
+    try:
+        engine.update_orderbook_snapshot("YES", bids=[{"price": 0.49, "size": 100.0}], asks=[])
+
+        assert engine.active_quotes == {}
+        with pytest.raises(MissingBookPriceError):
+            engine.compute_switching_cost(daily_yield=20.0)
+    finally:
+        engine.close()
+
+
+def test_engine_liquidation_never_invents_a_clearing_price(tmp_path):
+    engine = _honesty_engine(tmp_path)
+    try:
+        _buy_yes(engine, price=0.40, size=10.0)
+        res = engine.liquidate_all_positions()
+
+        # No live bids: the lot stays in inventory instead of being cleared at 0.50.
+        assert res["unliquidated_shares"] == {"YES": pytest.approx(10.0)}
+        assert res["fills_executed"] == 0
+        assert res["final_open_positions_count"] == 1
+        assert res["pre_liquidation_equity_basis"] == "cost_basis"
+        pos = engine.portfolio.get_position(CONDITION_ID)
+        assert pos.shares_yes == pytest.approx(10.0)
+        assert engine.portfolio.cash == pytest.approx(res["initial_cash"] - 10.0 * 0.40)
+    finally:
+        engine.close()
+
+
+def test_engine_liquidation_sells_only_visible_bid_depth(tmp_path):
+    engine = _honesty_engine(tmp_path)
+    try:
+        engine.update_orderbook_snapshot(
+            "YES",
+            bids=[{"price": 0.49, "size": 4.0}],
+            asks=[{"price": 0.51, "size": 100.0}],
+        )
+        _buy_yes(engine, price=0.40, size=10.0)
+        res = engine.liquidate_all_positions()
+
+        assert res["shares_yes_liquidated"] == pytest.approx(4.0)
+        assert res["unliquidated_shares"] == {"YES": pytest.approx(6.0)}
+        assert res["final_open_positions_count"] == 1
+        pos = engine.portfolio.get_position(CONDITION_ID)
+        assert pos.shares_yes == pytest.approx(6.0)
+    finally:
+        engine.close()

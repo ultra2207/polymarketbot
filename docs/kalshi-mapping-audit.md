@@ -9,7 +9,7 @@ Everything below is a measurement unless it appears under **Inferred**.
 
 ## 1. What v1 was
 
-`scripts/build_kalshi_mapping.py` crawls open Kalshi *events*, prefilters them
+`polymarketbot.data.kalshi_mapping` crawls open Kalshi *events*, prefilters them
 against the Polymarket questions, fetches the markets of the survivors and
 scores each Polymarket × Kalshi title pair with
 `polymarketbot.data.kalshi_mapping.score_pair` (structure + token Jaccard).
@@ -238,13 +238,13 @@ series_ticker, window, polymarket_question, kalshi_event_ticker
 
 ```bash
 # audit numbers, v2 artifact (caches reused; ~20 s, 2 requests)
-.venv/Scripts/python.exe scripts/build_kalshi_mapping.py --artifact v2 --extra-series 0
+.venv/Scripts/python.exe -m polymarketbot.data.kalshi_mapping --artifact v2 --extra-series 0
 
 # cold rebuild: re-crawl open events, re-fetch macro/crypto series, ~180 requests
-.venv/Scripts/python.exe scripts/build_kalshi_mapping.py --artifact v2 --refresh --refresh-markets
+.venv/Scripts/python.exe -m polymarketbot.data.kalshi_mapping --artifact v2 --refresh --refresh-markets
 
 # v1 (legacy behaviour) is unchanged
-.venv/Scripts/python.exe scripts/build_kalshi_mapping.py
+.venv/Scripts/python.exe -m polymarketbot.data.kalshi_mapping
 ```
 
 The 25-pair sample is reproducible with `random.seed(20261106)` over the v1

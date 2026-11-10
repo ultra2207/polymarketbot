@@ -1,0 +1,33 @@
+# Settlement harvester: the risk appetite, stated once.
+#
+# The harvester buys the token a *live* UMA proposal claims will pay 1.00, at an
+# ask below par, and holds it to redemption.  Its loss branch is "the final
+# payout differs from the verdict the proposal asserted", and that branch loses
+# the whole all-in cost of the position (LGD = 1).
+#
+# These two numbers are **inputs a human states**, not measurements, which is
+# why they live here, are required, are logged on every allocation, and have no
+# default anywhere in the code: the allocator refuses to size a book without
+# them.  Nothing else in this file is a policy knob - the tail probability and
+# the loss given failure are both measured, and the ladder sets the size.
+
+settlement_harvester:
+  # The most the book may lose in the worst (1 - tail_confidence) band, in USD.
+  # This is the risk appetite.  It is absolute, so the size does not move with
+  # the bankroll: the same appetite buys the same tail, whatever the book's
+  # equity happens to be.
+  risk_appetite_usd: 150.0
+
+  # The confidence band the loss is stated at.  `0.995` means "the loss in the
+  # worst 0.5 % of outcomes".
+  #
+  # The band has to be tight enough to *see* the loss.  A verdict reversal is
+  # measured at 0.13 %, so a 95 % band - the worst 5 % of outcomes - contains
+  # no failure mass at all, the shortfall it reports is a smoothed number, and
+  # the budget stops binding (it would pay for $5,619 of notional against a
+  # $1,000 treasury).  At 99.5 % the same appetite pays for ~$525 of notional,
+  # which is the control this trade actually needs.  The band is also bounded
+  # from above by the tail itself: the shortfall formula is exact only while
+  # sum_c q_c <= 1 - tail_confidence, so a band tighter than the total failure
+  # mass makes the allocator refuse rather than mis-price.
+  tail_confidence: 0.995

@@ -1,8 +1,27 @@
 """Polymarket fee model.
 
-Formula (docs, verified 2026-11-01):
+Two venues publish two different schedules (both re-read 2026-11-10):
 
-    fee = C x rate x (p x (1 - p)) ^ exponent
+* ``global`` (clob.polymarket.com, what this bot trades) and ``us``
+  (polymarket.us, a separate exchange) do not share a formula.
+
+    global: fee = C x rate x (p x (1 - p)) ^ exponent   (rate per category)
+    us:     fee = Theta x C x p x (1 - p)               (Theta per account tier,
+                                                         re-set daily from the
+                                                         trailing 30-day taker
+                                                         volume; cents, half-even)
+
+  A tier-1 US account pays Theta 0.095 against 0.0695 for tier 4, so pricing a
+  US venue with the global table under-charges by 36.7 %. ``venue_for_host``
+  picks the schedule and ``us_taker_coefficient`` refuses an unmeasured volume.
+
+* The global Taker Rebate Program returns a share of the fee by tier
+  (``taker_rebate_rate``); it is modelled here but deliberately not credited in
+  paper PnL: the bot's own 30-day weighted volume is unmeasured, and tier 0 is
+  exactly 0 %, so booking nothing is correct today. Any taker-heavy sizing must
+  pass a measured volume through ``weighted_taker_volume`` first.
+
+Global taker formula (docs.polymarket.com/trading/fees):
 
 * `C` is shares traded, `p` is price.
 * Makers pay zero; only takers pay.
@@ -21,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_EVEN, ROUND_HALF_UP
 from functools import lru_cache
 from pathlib import Path
 
@@ -84,9 +103,14 @@ def _eras(path: str | Path = CONFIG) -> tuple[_Era, ...]:
     return tuple(sorted(out, key=lambda x: x.effective_from))
 
 
-def _round_fee(value: float, dp: int = 5) -> float:
+def _dec(value: float | int) -> Decimal:
+    """Exact decimal for a published parameter (0.0695, 0.30, 1000)."""
+    return Decimal(str(value))
+
+
+def _round_fee(value: float, dp: int = 5, mode: str = ROUND_HALF_UP) -> float:
     q = Decimal(1).scaleb(-dp)  # 0.00001 for dp=5
-    return float(Decimal(repr(value)).quantize(q, rounding=ROUND_HALF_UP))
+    return float(Decimal(repr(value)).quantize(q, rounding=mode))
 
 
 def taker_fee(shares: float, price: float, schedule: FeeSchedule,
@@ -112,7 +136,7 @@ def maker_fee_rebate(
     price: float,
     shares: float,
     schedule: FeeSchedule,
-    maker_rebate_share_pct: float | None = 0.20,
+    maker_rebate_share_pct: float | None = None,
     rounding_dp: int | None = None,
 ) -> float:
     """Rebate paid to maker filling a resting limit order from taker fee pool.
@@ -121,15 +145,15 @@ def maker_fee_rebate(
         F_taker = taker_fee(shares, price, schedule)
     The resting maker receives volume share rebate:
         R_maker = gamma_rebate * F_taker
-    typically 20% to 50% of the taker fee pool.
 
     Args:
         price: Execution price between 0.0 and 1.0.
         shares: Number of filled shares.
-        schedule: Market FeeSchedule.
-        maker_rebate_share_pct: Override maker rebate share fraction. If 0.20 (the default)
-            and schedule.rebate_rate > 0, schedule.rebate_rate is preferred. A
-            Gamma-sourced schedule with no rebateRate pays the maker nothing.
+        schedule: Market FeeSchedule. Its measured ``rebate_rate`` is
+            authoritative (Gamma ``rebateRate`` or the published era table).
+        maker_rebate_share_pct: Explicit override share. ``None`` (the default)
+            uses ``schedule.rebate_rate``; a schedule that pays no rebate yields
+            zero rather than fabricating the old 20% model default.
         rounding_dp: Rounding decimal places (defaults to config formula rounding_dp).
 
     Returns:
@@ -140,18 +164,7 @@ def maker_fee_rebate(
     if not 0.0 <= price <= 1.0:
         raise ValueError(f"price out of range: {price}")
 
-    if maker_rebate_share_pct is not None and maker_rebate_share_pct != 0.20:
-        gamma = float(maker_rebate_share_pct)
-    elif schedule.rebate_rate > 0.0:
-        gamma = float(schedule.rebate_rate)
-    elif schedule.source == "gamma":
-        # The venue's own feeSchedule is authoritative. If it reports no
-        # rebateRate, do not invent the 20% model default: doing so would
-        # fabricate maker edge on markets that pay none.
-        gamma = 0.0
-    else:
-        gamma = float(maker_rebate_share_pct if maker_rebate_share_pct is not None else 0.20)
-
+    gamma = float(maker_rebate_share_pct) if maker_rebate_share_pct is not None else float(schedule.rebate_rate)
     if gamma <= 0.0:
         return 0.0
 
@@ -166,7 +179,7 @@ def effective_maker_price(
     side: str,
     schedule: FeeSchedule | None = None,
     maker_rebate_usd: float | None = None,
-    maker_rebate_share_pct: float | None = 0.20,
+    maker_rebate_share_pct: float | None = None,
 ) -> float:
     """Calculate the net effective price for a maker fill after volume share rebate.
 
@@ -454,3 +467,184 @@ def turnover_needed_for_tier(threshold: float, capital: float,
     if per_unit <= 0:
         return float("inf")
     return threshold / per_unit
+
+
+# ---------------------------------------------------------------------------
+# Venue schedules
+# ---------------------------------------------------------------------------
+# Two live schedules exist and they are not interchangeable:
+#
+#   global (clob.polymarket.com)  `fee = C * feeRate * p(1-p)`, one feeRate per
+#                                 market category, rounded to 5 decimals.
+#   us (polymarket.us)            `fee = Theta * C * p(1-p)`, Theta set per
+#                                 account by trailing 30-day taker volume and
+#                                 re-derived daily, rounded to the cent with
+#                                 banker's rounding.
+#
+# Applying the global rate on a US venue under-charges by up to 36.7 %
+# (Theta 0.095 vs 0.0695), so the US path refuses to price a tier when the
+# trailing volume is unknown instead of assuming the best one.
+
+VENUE_GLOBAL = "global"
+VENUE_US = "us"
+
+
+def venue_for_host(url: str) -> str:
+    """Which published fee schedule applies to ``url``.
+
+    The US exchange is a separate venue with its own schedule; anything that
+    resolves to Polymarket's global CLOB uses the per-category table.
+    """
+    return VENUE_US if "polymarket.us" in (url or "").lower() else VENUE_GLOBAL
+
+
+def _venue_config(venue: str, path: str | Path = CONFIG) -> dict:
+    venues = _config(path).get("venues") or {}
+    if venue not in venues:
+        raise KeyError(f"no published fee schedule for venue {venue!r}")
+    return venues[venue]
+
+
+def us_taker_tiers(path: str | Path = CONFIG) -> tuple[tuple[str, float, float], ...]:
+    """Published ``(name, min_trailing_30d_taker_volume_usd, theta)`` ladder."""
+    config = _venue_config(VENUE_US, path)
+    return tuple(
+        (str(tier["name"]), float(tier["min_30d_taker_volume_usd"]), float(tier["theta"]))
+        for tier in config.get("taker_tiers") or ()
+    )
+
+
+def us_taker_coefficient(
+    trailing_30d_taker_volume_usd: float | None,
+    path: str | Path = CONFIG,
+) -> float | None:
+    """Theta for a measured trailing 30-day taker volume, or ``None``.
+
+    ``None`` means the tier is unknown. It is a refusal, never the lowest or the
+    highest coefficient: an unmeasured volume must not be priced as if the
+    account were the best tier.
+    """
+    if trailing_30d_taker_volume_usd is None:
+        return None
+    volume = float(trailing_30d_taker_volume_usd)
+    if volume < 0.0:
+        raise ValueError(f"trailing volume cannot be negative: {volume}")
+    tiers = us_taker_tiers(path)
+    if not tiers:
+        return None
+    theta = None
+    for _name, threshold, candidate in sorted(tiers, key=lambda row: row[1]):
+        if volume >= threshold:
+            theta = candidate
+    return theta
+
+
+def weighted_taker_volume(
+    trade_size_usd: float,
+    entry_price: float,
+    category: str,
+    bonuses: float = 1.0,
+    path: str | Path = CONFIG,
+) -> float | None:
+    """Global Taker Rebate Program weighted volume for one taker trade.
+
+    ``wV = trade_size_usd * (1 - entry_price) * category_weight * bonuses``
+
+    Returns ``None`` for a category the published weights do not cover, and for
+    a fee-free market: only taker trades that pay a fee earn wV, so a geopolitics
+    fill contributes nothing however large it is.
+    """
+    rates = (_config(path).get("venues") or {}).get("global", {}).get("taker_rebates") or {}
+    weights = rates.get("weighted_volume_weights") or {}
+    cat = fee_category(category, path)
+    if cat not in weights:
+        return None
+    weight = float(weights[cat])
+    if weight <= 0.0 or era_schedule(category, datetime.now(timezone.utc), path).rate <= 0.0:
+        return 0.0
+    if trade_size_usd <= 0.0:
+        return 0.0
+    return float(trade_size_usd) * (1.0 - float(entry_price)) * weight * float(bonuses)
+
+
+def taker_rebate_rate(
+    trailing_30d_weighted_volume: float | None,
+    path: str | Path = CONFIG,
+) -> float | None:
+    """Global taker rebate share for a measured 30-day weighted volume.
+
+    ``None`` means unmeasured. It is a refusal, never the 0 % tier: booking no
+    rebate is conservative, but *claiming* a tier we cannot observe is a guess.
+    """
+    if trailing_30d_weighted_volume is None:
+        return None
+    volume = float(trailing_30d_weighted_volume)
+    if volume < 0.0:
+        raise ValueError(f"weighted volume cannot be negative: {volume}")
+    rates = (_config(path).get("venues") or {}).get("global", {}).get("taker_rebates") or {}
+    tiers = rates.get("tiers") or []
+    if not tiers:
+        return None
+    share = None
+    for tier in sorted(tiers, key=lambda row: float(row["min_30d_weighted_volume"])):
+        if volume >= float(tier["min_30d_weighted_volume"]):
+            share = float(tier["rebate"])
+    return share
+
+
+def us_taker_fee(shares: float, price: float, theta: float,
+                 path: str | Path = CONFIG) -> float:
+    """US taker fee: ``Theta * C * p * (1 - p)``, rounded to the cent, half-even.
+
+    Documented worked examples (docs.polymarket.us/fees, Theta 0.0695):
+    1,000 at 0.10 -> 6.26; 1,000 at 0.65 -> 15.81; 1,000 at 0.30 -> 14.60.
+    """
+    if shares <= 0.0 or theta <= 0.0:
+        return 0.0
+    if not 0.0 <= price <= 1.0:
+        raise ValueError(f"price out of range: {price}")
+    rounding = _venue_config(VENUE_US, path)["rounding"]
+    # Decimal, not float: 0.0695 * 1000 * 0.30 * 0.70 is exactly 14.595, a tie
+    # that banker's rounding sends to 14.60. Computed in binary floating point it
+    # lands at 14.594999999999999 and silently rounds to 14.59, so the published
+    # tie-break rule would never fire.
+    raw = (_dec(theta) * _dec(shares) * _dec(price) * (1 - _dec(price)))
+    q = Decimal(1).scaleb(-int(rounding["dp"]))
+    return float(raw.quantize(q, rounding=ROUND_HALF_EVEN))
+
+
+def us_combo_taker_fee(
+    shares: float,
+    price: float,
+    theta: float,
+    when: datetime | str | None = None,
+    path: str | Path = CONFIG,
+) -> float:
+    """US combo taker fee: ``C * p * [Theta(1-p) + fixed * (1-p)^4]``.
+
+    The fixed coefficient on ``(1-p)^4`` drops from 0.085 to 0.06 at the
+    published change time; the coefficient in force at ``when`` is used, so a
+    combo priced across the cutover is priced by its own timestamp.
+    """
+    if shares <= 0.0 or theta <= 0.0:
+        return 0.0
+    if not 0.0 <= price <= 1.0:
+        raise ValueError(f"price out of range: {price}")
+    config = _venue_config(VENUE_US, path)
+    combo = config["combo"]
+    cutover = datetime.fromisoformat(str(combo["change_effective_from"]))
+    if when is None:
+        moment = datetime.now(timezone.utc)
+    elif isinstance(when, str):
+        moment = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    else:
+        moment = when
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    fixed = (float(combo["fixed_power4_after"]) if moment >= cutover
+             else float(combo["fixed_power4_before"]))
+    one_minus = 1 - _dec(price)
+    raw = (_dec(shares) * _dec(price)
+           * (_dec(theta) * one_minus + _dec(fixed) * one_minus ** 4))
+    q = Decimal(1).scaleb(-int(config["rounding"]["dp"]))
+    return float(raw.quantize(q, rounding=ROUND_HALF_EVEN))

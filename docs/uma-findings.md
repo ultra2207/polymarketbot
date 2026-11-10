@@ -265,3 +265,185 @@ Limits, stated: 179 of the 234 proposals cannot be mapped at all (no `condition_
 the log, question text only, no network to Gamma); the 3.1 h proposal→resolution lag is
 measured on the 55 that resolved, not from a liveness field; and every number here is
 one 34 h window with one collector configuration.
+
+## 8. Live verdict feed: provider caps, not the chain (2026-11-09)
+
+The soak prices settlement candidates only from an oracle verdict (a final payout
+vector or an undisputed UMA proposal), so the verdict feed *is* the pillar. On the
+2026-11-09 21:20 IST soak it had been dead for 83 h: `_poll_uma_proposals_live`
+issued one `eth_getLogs` of 2,048 blocks, dRPC's free plan rejected it
+(`ranges over 10000 blocks are not supported on free plan`, code 35), and the
+cursor was held forever — `5,724` markets had no fair value.
+
+Measured free-endpoint `eth_getLogs` limits (head ~97,024,000, 3 UMA addresses,
+no key, 2026-11-09). "OK" means the range was served:
+
+| endpoint | 100 | 500 | 1k | 2k | 5k | 10k | >10k |
+|---|---|---|---|---|---|---|---|
+| publicnode | OK | OK | OK | OK | OK | OK | `exceed maximum block range: 10000` |
+| drpc | OK | reject | reject | reject | reject | reject | code 35 |
+| 1rpc | reject | reject | reject | reject | reject | reject | reject |
+| ankr / polygon-rpc | head unavailable (key required) | | | | | | |
+| Alchemy (`.env` key) | `429 Monthly capacity limit exceeded` | | | | | | |
+
+So the walk now asks each provider for its own largest window (one lifetime probe
+at 10,000, halving to a 100-block floor, persisted in
+`data/derived/uma/uma_poll_cursor.json`), advances a persisted cursor only past
+blocks a provider confirmed, re-walks the *same* block on a smaller window
+after a rejection (no gaps), rests a 429'd provider for 120 s, and caps itself at
+6 requests per sweep. The tip is read 2 blocks behind head because publicnode
+rejects a `toBlock` of the newest block (`invalid block range params`).
+
+Two further defects were found on the same path:
+- the decode read the question from `ancillary_data` (0x-hex) instead of
+  `ancillary_text`, so `ancillary_title` matched nothing and every log was
+  skipped even when the request succeeded;
+- `refresh()` rebuilt the index from parquet alone, so with a stale/empty tape
+  every live-polled verdict was erased once per refresh interval.
+
+Live re-run (publicnode, no key): 2 windows of 10,000 blocks in 0.82 s covered
+97,014,238-97,024,238 (26 h) and yielded 1 verdict —
+`Will Karen Bass win the 2025 Los Angeles mayoral election?` at 0.0 (NO) with
+0.92 h of liveness left; a catch-up sweep of 1 new block costs one 100-block
+request. Proof of the queue path is `tests/test_uma_verdict_poll.py`.
+
+## 9. Outcome accuracy, and the loss budget the harvester sizes on (2026-11-10)
+
+The harvester buys the token a live proposal claims will pay 1.00 and holds it
+to redemption, so its loss branch is **"the final payout differs from the verdict
+the proposal asserted"**. That is not the dispute hazard: a wrong proposal that
+nobody disputes finalises wrongly, and a disputed one can be upheld. Measured
+directly, on two channels.
+
+### 9a. Direct: proposal claim vs final payout
+
+`data/derived/uma/outcome_accuracy.py` joins the tape's `ProposePrice` rows to
+Gamma's final payout by the question text in the ancillary data, over every
+closed market whose end date falls in 2026-10-25..2026-11-13 (134,664 markets
+fetched; Gamma caps one filter at offset 2,000, so the window is walked in
+six-hour end-date slices).
+
+| | count |
+|---|---|
+| proposals parsed from the tape | 331 |
+| proposals whose final payout is observable | 70 |
+| claim matched the final payout | **70 / 70** |
+| mismatched | **0** |
+| upper 95 % credible bound on the reversal rate | 0.026971 |
+
+70 is a small sample for a rare event: on its own it bounds the rate at 2.7 %,
+which is weak, so the second channel is what the sizing uses.
+
+### 9b. Mechanistic, at venue scale: the challenge rate
+
+A reversal **cannot** happen without a challenge, so `P(reversal) <=
+P(challenged)` holds by construction, and Gamma records every dispute in the
+market's own `umaResolutionStatuses` sequence.
+
+| | count |
+|---|---|
+| closed + resolved markets observed | 134,664 |
+| markets whose resolution sequence contains a dispute | **158** |
+| challenge rate | 0.001173 |
+| upper 95 % credible bound (**the tail used for sizing**) | **0.001335** |
+
+The residual this bound does not cover is an admin/emergency resolution that
+flips an undisputed proposal without a dispute entry; that channel is not
+observable in the fetched population, which is why §9a's direct number is
+reported beside it rather than discarded.
+
+An exact on-chain join was tried first and is not available here: walking
+10,000-block windows for `ProposePrice` plus the three configured adapters'
+resolve events (`data/derived/uma/chain_outcome_accuracy.py`) decoded 136
+proposals but **0** adapter resolves in the same 1.5 days - the CTF adapter that
+settles Polymarket's questions is not among the addresses this repo collects. So
+the text join and the challenge-rate bound are the evidence, not a chain join.
+
+**This supersedes the 1.0530 % figure.** That number came from a zero-event
+Beta(1, 1000) prior over 282 proposals; the venue-scale measurement has 158
+events and bounds the same quantity 7.9x tighter. Direction: the trade is
+*safer* than the old bound implied, not riskier.
+
+### 9c. A defect this exposed: the dispute count was mixed across populations
+
+`robust_hazard.measured_dispute_counts` counted every `disputed` Settle row
+against every `ProposePrice` row. The tape's 10 disputed Settles belong to
+requests made in January and February (their request keys have **0** overlap with
+the 331 proposals collected in the window), so the naive ratio read 10/331 =
+3.0 % - a 23x overstatement that would have made the trade unfundable. Fixed by
+joining on the OO request key `(requester, identifier, request_timestamp)`;
+measured now: 335 proposals, 0 disputed. Pinned in
+`tests/test_robust_hazard.py`.
+
+### 9d. The loss budget
+
+`MarginalSettlementAllocator.optimize_tail_budget` maximises expected profit
+subject to an **expected-shortfall budget**, not a variance charge:
+
+```
+max_x  expected_profit(x)
+s.t.   sum_i all_in_i(x) <= cash
+       ES_alpha(L)       <= risk_appetite_usd
+       0 <= x_i <= ladder depth_i
+
+ES_alpha = sum_c q_c * L_c / (1 - alpha)
+```
+
+over resolution clusters `c` (one UMA question / one negRisk event: every
+position on a source fails together), with `L_c` the all-in cost the failure
+branch loses (LGD = 1) and `q_c` the measured bound above. The form is exact
+while `sum_c q_c <= 1 - alpha`, a condition the allocator checks and refuses
+otherwise.
+
+Window 9 (2026-11-10 14:25, the measured 0.81-0.98 ladder, 1,049.09 shares,
+$997.67 of depth), `uv run python scripts/settlement_tail_budget_check.py`:
+
+| rule | cost | E[profit] | loss at the stated band | binding |
+|---|---|---|---|---|
+| risk-neutral water-fill (old) | $997.67 | $38.05 | - | cash + depth |
+| mean-variance, lambda = 1/equity (replaced) | $768.11 (recorded: $786.96) | $36.06 | - | - |
+| **tail budget, 99.5 %, $150** | **$522.06** | **$33.92** | **$150.00** | **tail budget** |
+| tail budget, same at 2x the tail | $275.88 | $29.46 | $150.00 | tail budget |
+| tail budget, 95 % band, $150 | $997.67 | $38.05 | $26.70 | cash + depth |
+| tail budget, 99.5 %, + 0.0924 $/$/day hurdle | $522.06 | $33.92 | $150.00 | tail budget |
+
+Kelly on the same fill (`f* = q - (1-q)/b`, `b = (1-p-fee)/(p+fee)`):
++0.446 at the old 1.0530 % bound, +0.925 at the measured 0.1432 % bound, and its
+**sign flips at q = 0.01902** - 13.3x the measured tail, which the old zero-event
+bound could not exclude. That instability is why Kelly is not the rule.
+
+Two facts the framework makes explicit rather than hiding:
+
+* **The band must be tight enough to see the loss.** A 0.14 % event is invisible
+  to a 95 % band: the shortfall there is a smooth $26.70 and the budget stops
+  binding. At 99.5 % it binds, which is why `configs/risk.yaml` states 0.995.
+* **Diversification is the resolution source, and the shortfall is linear in it.**
+  Two legs of one source add to one cluster loss; two distinct sources at the
+  same dollars give the same shortfall. What the split changes is the *joint*
+  failure probability: 0.001432 for one source vs 0.00000205 for two (699x).
+  That is reported as an output; it is not a constraint.
+
+Capital velocity enters as a *hurdle*, not a charge: the engine passes the
+reward book's measured KKT shadow yield (`_shadow_yield`, 0.0066-0.0924
+USD/USD/day) and a tranche whose profit per capital-day is below it is dropped
+with that reason. Window 9 earns about 0.78 USD/USD/day, so it clears the top of
+the measured range and nothing is dropped. When no shadow yield has been
+measured the log says the alternative use is **UNPRICED** rather than pricing it
+at zero.
+
+The risk appetite ($150) and the band (0.995) are the only preferences in the
+system. Both live in `configs/risk.yaml`, are logged on every allocation, and
+have no default: `paper/settlement_risk.py` refuses without them and the engine
+allocates nothing.
+
+### Reproduce
+
+```
+uv run python data/derived/uma/outcome_accuracy.py        # 9a + 9b artifact
+uv run python scripts/settlement_tail_budget_check.py     # 9d table
+uv run pytest tests/test_marginal_settlement_allocator.py tests/test_paper_pillars.py
+```
+
+Artifact: `data/derived/uma/outcome_accuracy.json` (counts + source),
+`data/derived/uma/gamma_closed_window.parquet` (134,664 closed markets),
+`data/derived/uma/prop_vs_final.parquet` (70 joined proposals).

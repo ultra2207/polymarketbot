@@ -8,7 +8,7 @@ Numbers are from this repo on 2026-11-06; each states its sample.
 | Piece | Where | State |
 |---|---|---|
 | REST auth (Ed25519/RSA-PSS, auto-detect) | `src/polymarketbot/kalshi_auth.py` | working; **demo key only** |
-| Auth probe | `scripts/kalshi_probe.py --host demo\|prod` | exit 0 accepted, 1 rejected |
+| Auth probe | `polymarketbot.tools.kalshi_probe --host demo\|prod` | exit 0 accepted, 1 rejected |
 | Market/trade poller | collector stream `kalshi` | running, 107 mapped tickers + global trade window |
 | Full bid ladders, 5 s | collector stream `kalshi_books` | running since 2026-11-06 00:58 IST |
 | 1-minute candles, 90 d | `data/raw/kalshi/candles/month=YYYY-MM/ticker=<t>.parquet` | 484 files, 2.09 M bars, 20 MB, 141 tickers (107 mapped + 34 v1 leftovers) |
@@ -65,13 +65,13 @@ exception class.
 
 ```bash
 # collector (10 streams incl. kalshi + kalshi_books); 300 s first-run cap applies
-.venv/Scripts/python.exe scripts/run_data_collector.py --duration 0 --allow-long
+.venv/Scripts/python.exe -m polymarketbot.data.collector --duration 0 --allow-long
 
 # healthy? newest health partition, stream counters, per-stream rows
-.venv/Scripts/python.exe scripts/monitor_collector.py
+.venv/Scripts/python.exe -m polymarketbot.ops.monitor
 
 # candles: resumable, one (ticker, month) per file; ~220-290 s per 30 tickers
-.venv/Scripts/python.exe scripts/backfill_kalshi_candles.py --offset 0 --limit 30 --days 90
+.venv/Scripts/python.exe -m polymarketbot.data.kalshi_backfill --offset 0 --limit 30 --days 90
 
 # paper engine with the cross-venue signal (threshold unmeasured: 0.01 is a placeholder)
 .venv/Scripts/python.exe scripts/run_paper_trading.py --markets 1 --duration 600 \
@@ -80,7 +80,7 @@ exception class.
 ```
 
 Supervision: Windows task `\PolymarketCollector` runs
-`scripts/watchdog_collector.py --once` **every 2 hours**; it starts the collector
+`.venv/Scripts/python.exe -m polymarketbot.ops.watchdog --once` **every 2 hours**; it starts the collector
 if none is running and never kills a live one. The collector was last restarted
 2026-11-06 00:58 IST to pick up the 10-stream config and the v2 mapping.
 
@@ -122,7 +122,7 @@ snapshot): `yes_best_bid/ask`, `no_best_bid/ask`, `mid`, `spread`, top sizes,
   the auth probe and both streams do.
 * **Mapping decay** — v1 was built against a 2026-10 universe; only 55 of its
   233 rows still existed on 2026-11-05. Rebuild v2 when events settle:
-  `scripts/build_kalshi_mapping.py --artifact v2 --refresh --refresh-markets`
+  `polymarketbot.data.kalshi_mapping --artifact v2 --refresh --refresh-markets`
   (~180 requests cold).
 * **Empty books** — illiquid mapped tickers return empty ladders; the stream
   counts them (`empty_books`) and writes null mids, by design.
