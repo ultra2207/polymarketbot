@@ -6,7 +6,10 @@ import time
 from typing import Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.strategy.reward.scoring import quadratic_order_score
+from polymarketbot.strategy.reward.scoring import (
+    order_spread_cents,
+    quadratic_order_score,
+)
 from polymarketbot.strategy.venue.clob import ClobAPIError
 
 logger = get_logger("real_money_engine")
@@ -171,7 +174,11 @@ class QuoteMixin:
         v_queue_value = 0.0
         if b_tok is not None and a_tok is not None:
             mid_tok = (b_tok + a_tok) / 2.0
-            spread_cents = abs(price - mid_tok) * 100.0
+            # The distance the venue scores from (``s``) is signed by side: a bid
+            # at or above the mid, and an ask at or below it, sit at s = 0 and
+            # score full, not at the absolute distance. Same function the paper
+            # pillar scores with.
+            spread_cents = order_spread_cents(price, mid_tok, side)
             score = quadratic_order_score(
                 max_spread_cents=self.rewards_max_spread,
                 spread_cents=spread_cents,

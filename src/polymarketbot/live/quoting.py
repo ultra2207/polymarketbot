@@ -11,7 +11,11 @@ import time
 from typing import List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
-from polymarketbot.strategy.reward.deskew import DeSkewDecision, DeSkewPathway
+from polymarketbot.strategy.reward.deskew import (
+    DeSkewDecision,
+    DeSkewPathway,
+    DynamicThresholdCalculator,
+)
 from polymarketbot.strategy.reward.scoring import (
     OrderQuote,
     compute_book_side_scores,
@@ -19,6 +23,25 @@ from polymarketbot.strategy.reward.scoring import (
 )
 
 logger = get_logger("trading.base")
+
+
+def _reservation_price(
+    mid_yes: float,
+    net_q: float,
+    gamma: float,
+    days_to_resolution: float,
+) -> float:
+    """Avellaneda-Stoikov reservation price for the YES leg.
+
+    ``r = mid - q * gamma * sigma^2`` where ``sigma^2`` is the shared
+    Wright-Fisher bounded variance (:meth:`DynamicThresholdCalculator.
+    calculate_bounded_variance`). The variance's time floor is the engine's own
+    one-hour minimum horizon, passed as ``tau`` so this live path keeps its
+    measured horizon while the formula itself is the strategy's.
+    """
+    tau = max(1.0 / 24.0, float(days_to_resolution))
+    variance = DynamicThresholdCalculator.calculate_bounded_variance(mid_yes, tau)
+    return max(0.01, min(0.99, mid_yes - (net_q * gamma * variance)))
 
 
 class QuotingMixin:
@@ -192,7 +215,20 @@ class QuotingMixin:
         self._execute_neutral_maker_quoting(mid_yes, b_yes, a_yes, ts)
 
     def _measure_reward_score(self) -> Optional[float]:
-        """Current official Q_min score, or None when it cannot be computed."""
+        """Current official Q_min score, or None when it cannot be computed.
+
+        ``None`` is the refusal the paper pillar reports for an unmeasured
+        book (:func:`polymarketbot.strategy.reward.accrual.measured_accrual`
+        returns ``None`` there too). A missing book is missing data: reporting
+        it as a measured ``0.0`` would claim the book was read and scored.
+        """
+        b_yes, a_yes = self.get_best_bid_ask("YES")
+        b_no, a_no = self.get_best_bid_ask("NO")
+        if b_yes is None or a_yes is None or b_no is None or a_no is None:
+            logger.debug(
+                f"No complete book for {self.condition_id}; reward Q_min unmeasured"
+            )
+            return None
         try:
             q_min, _q_one, _q_two = self.compute_quote_scores()
         except Exception as e:  # measurement must never break quoting
@@ -257,9 +293,9 @@ class QuotingMixin:
         if self.institutional_mode:
             pos = self.get_position(self.condition_id)
             net_q = pos.shares_yes - pos.shares_no
-            p = max(0.01, min(0.99, mid_yes))
-            variance = (p * (1.0 - p)) / max(1.0 / 24.0, float(self.days_to_resolution))
-            r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
+            r_yes = _reservation_price(
+                mid_yes, net_q, self.gamma, self.days_to_resolution
+            )
             offset = self.spread_offset_cents / 100.0
             tick = self.quote_tick_size if self.quote_tick_size > 0 else 0.001
             _, best_ask_no = self.get_best_bid_ask("NO")
@@ -392,9 +428,9 @@ class QuotingMixin:
             # Jane Street Institutional Dual-Cash Quoting (BUY YES + BUY NO)
             pos = self.get_position(self.condition_id)
             net_q = pos.shares_yes - pos.shares_no
-            p = max(0.01, min(0.99, mid_yes))
-            variance = (p * (1.0 - p)) / max(1.0 / 24.0, float(self.days_to_resolution))
-            r_yes = max(0.01, min(0.99, mid_yes - (net_q * self.gamma * variance)))
+            r_yes = _reservation_price(
+                mid_yes, net_q, self.gamma, self.days_to_resolution
+            )
 
             _, best_ask_no = self.get_best_bid_ask("NO")
             max_bid_yes = self.round_quote_price(best_ask_yes - tick, "YES")

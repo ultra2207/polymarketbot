@@ -9,10 +9,15 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 from polymarketbot.logs import get_logger
+from polymarketbot.strategy.reward.marginal import PROTOCOL_MIN_DAILY_PAYOUT_USD
 from polymarketbot.strategy.reward.queue import (
     HurdleDecision,
     LiquidationRoute,
     SwitchingCostDecomposition,
+)
+from polymarketbot.strategy.reward.scoring import (
+    PROTOCOL_EPOCH_SAMPLES,
+    calculate_epoch_payout,
 )
 
 logger = get_logger("trading.base")
@@ -50,23 +55,77 @@ class YieldMixin:
         return round(total_v, 4)
 
     def get_current_daily_yield(self) -> float:
-        """Calculate current daily reward payout ($/day) from the official Q_min score."""
-        user_score, _, _ = self.compute_quote_scores()
-        if user_score <= 0.0 and self.quote_size > 0.0 and self.rewards_max_spread > 0.0:
-            # Expected target quote score for current market. Single-sided estimate only:
-            # Q_min already accounts for the complementary side, so do not double it.
-            v = self.rewards_max_spread
-            s = self.spread_offset_cents
-            if s < v:
-                user_score = ((v - s) / v) ** 2 * self.quote_size
+        """Current daily reward payout in USD/day, or 0.0 when it is not payable.
 
-        comp_score = self.competing_score_override if self.competing_score_override is not None else 0.0
-        tot = user_score + comp_score
-        share_payout = (user_score / tot) * self.daily_reward_rate if tot > 0 else 0.0
+        The reward decision is the paper pillar's, not a second opinion:
+
+        * only the **resting** quotes are scored. The old fallback scored the
+          configured ``spread_offset_cents`` when nothing qualified, i.e. it
+          priced a quote that was not on the book; that number is not a
+          measurement and is gone.
+        * the published $1.00-per-day venue floor applies, so a sub-floor share
+          is reported as ``0.0`` rather than as a small cash amount the engine
+          would bank (:func:`calculate_epoch_payout` owns both the
+          normalisation and the floor).
+        * a missing book or a missing measured competing denominator is
+          **unmeasured**, not zero competition. Reading an absent denominator as
+          zero pays the whole pool on any size and would attract a quote into a
+          book nobody read, so it is refused exactly as
+          :func:`polymarketbot.strategy.reward.marginal.evaluate_market_payout`
+          refuses it.
+
+        Returns 0.0 in every refused case and logs whether the reading was
+        unmeasured (no complete book, no measured denominator) or a measured
+        zero (nothing resting, or resting quotes outside the qualifying
+        band/minimum size), so the two are never confused in the tape.
+        """
+        b_yes, a_yes = self.get_best_bid_ask("YES")
+        b_no, a_no = self.get_best_bid_ask("NO")
+        if b_yes is None or a_yes is None or b_no is None or a_no is None:
+            logger.debug(
+                f"Reward yield unmeasured for {self.condition_id}: no complete book; "
+                "reporting 0.0"
+            )
+            return 0.0
+
+        measured_competing = self.competing_score_override
+        if measured_competing is None or float(measured_competing) <= 0.0:
+            logger.debug(
+                f"Reward yield unmeasured for {self.condition_id}: no measured competing "
+                "score; reporting 0.0"
+            )
+            return 0.0
+
+        user_score, _, _ = self.compute_quote_scores()
+        if user_score <= 0.0:
+            resting = [
+                q
+                for q in self.active_quotes.values()
+                if float(q.get("size", 0.0) or 0.0) > 0.0
+            ]
+            logger.debug(
+                f"Reward yield zero for {self.condition_id}: "
+                + (
+                    "resting quote(s) outside the qualifying band/minimum size; reporting 0.0"
+                    if resting
+                    else "nothing resting to score; reporting 0.0"
+                )
+            )
+            return 0.0
+
+        # Same normalisation and the same documented daily floor the paper
+        # pillar prices with: a market paying under $1.00/day pays nothing.
+        _share, _gross_payout, net_payout = calculate_epoch_payout(
+            maker_epoch_score=user_score,
+            total_epoch_score=user_score + float(measured_competing),
+            rate_per_day=self.daily_reward_rate,
+        )
         if self._epoch_samples:
-            observed_daily = sum(self._epoch_samples[-1440:])
-            return max(share_payout, observed_daily)
-        return share_payout
+            observed_daily = sum(self._epoch_samples[-PROTOCOL_EPOCH_SAMPLES:])
+            if observed_daily < PROTOCOL_MIN_DAILY_PAYOUT_USD:
+                observed_daily = 0.0
+            return max(net_payout, observed_daily)
+        return net_payout
 
     def compute_switching_cost(
         self,

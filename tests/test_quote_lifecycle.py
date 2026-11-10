@@ -234,9 +234,22 @@ def test_daily_yield_does_not_double_single_sided_score(tmp_path):
         quote_size=20.0,
     )
     try:
-        expected_user_score = ((1.0 - 0.5) / 1.0) ** 2 * 20.0  # 5.0
+        # Only a resting quote is scored: 0.5c from the mid inside a 1c band,
+        # which scores 5.0 raw. Q_min pays a one-sided quote 1/c of it.
+        _set_book(eng, "YES", 0.49, 0.51)
+        _set_book(eng, "NO", 0.49, 0.51)
+        eng.active_quotes = {
+            "BUY_YES": {
+                "token_side": "YES",
+                "side": "BUY",
+                "price": 0.495,
+                "size": 20.0,
+                "timestamp": 0.0,
+            }
+        }
+        expected_user_score = ((1.0 - 0.5) / 1.0) ** 2 * 20.0 / 3.0
         expected_yield = (expected_user_score / (expected_user_score + 5.0)) * 20.0
-        assert expected_yield == pytest.approx(10.0)
+        assert expected_yield == pytest.approx(5.0)
         assert eng.get_current_daily_yield() == pytest.approx(expected_yield)
     finally:
         eng.close()

@@ -41,6 +41,11 @@ from polymarketbot.strategy.reward.queue import (
     HurdleDecision,
     SwitchingCostDecomposition,
 )
+from polymarketbot.strategy.reward.marginal import PROTOCOL_MIN_DAILY_PAYOUT_USD
+from polymarketbot.strategy.reward.scoring import (
+    PROTOCOL_EPOCH_SAMPLES,
+    normalize_sample_score,
+)
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.models import RiskConfig
 
@@ -481,22 +486,26 @@ class BaseMarketMakingEngine(StoreMixin, QuotingMixin, YieldMixin):
             competing_score = max(0.0, competing_score)
 
         total_pool_score = total_user_score + competing_score
-        pool_share_pct = (total_user_score / total_pool_score) * 100.0 if total_pool_score > 0 else 0.0
+        # The venue's sample normalisation and epoch budget are the reward
+        # pillar's (``strategy/reward/scoring.py``): one implementation, called
+        # from here rather than re-derived.
+        pool_share = normalize_sample_score(total_user_score, total_pool_score)
+        pool_share_pct = pool_share * 100.0
 
-        epoch_budget_usd = self.daily_reward_rate / 1440.0
-        raw_epoch_payout = (total_user_score / total_pool_score) * epoch_budget_usd if total_pool_score > 0 else 0.0
+        epoch_budget_usd = self.daily_reward_rate / float(PROTOCOL_EPOCH_SAMPLES)
+        raw_epoch_payout = pool_share * epoch_budget_usd
 
         # Rolling 24h of completed per-minute samples. The projection is the
-        # current run rate (one minute × 1440); the payout floor is applied to
-        # the *accrued* day instead, because Polymarket pays a maker only when
+        # current run rate (one minute × one epoch); the payout floor is applied
+        # to the *accrued* day instead, because Polymarket pays a maker only when
         # that maker's earnings in this market reach $1 on the day.
         self._epoch_samples.append(raw_epoch_payout)
-        if len(self._epoch_samples) > 1440:
-            del self._epoch_samples[:-1440]
-        projected_daily_usd = raw_epoch_payout * 1440.0
+        if len(self._epoch_samples) > PROTOCOL_EPOCH_SAMPLES:
+            del self._epoch_samples[:-PROTOCOL_EPOCH_SAMPLES]
+        projected_daily_usd = raw_epoch_payout * float(PROTOCOL_EPOCH_SAMPLES)
         accrued_daily_usd = sum(self._epoch_samples)
 
-        floor_met = accrued_daily_usd >= 1.00
+        floor_met = accrued_daily_usd >= PROTOCOL_MIN_DAILY_PAYOUT_USD
         actual_epoch_payout = raw_epoch_payout if floor_met else 0.0
 
         if actual_epoch_payout > 0:
