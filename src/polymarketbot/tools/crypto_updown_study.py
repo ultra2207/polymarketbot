@@ -28,7 +28,9 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+# This pipeline lives under src/polymarketbot/tools/, so the repo root is three
+# parents up (it started life in scripts/ and used parents[1]).
+ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
 from polymarketbot.logs import get_logger  # noqa: E402
@@ -1153,6 +1155,125 @@ def cmd_report2(args) -> None:
                      f"{r['boot_hi']:+.5f}] spr={r['median_spread']:.3f}")
 
 
+def cmd_bets(args) -> None:
+    """Bet-level economics of buying the favourite at/above a threshold.
+
+    The unit of risk is (market, token bought), not the fill. Every fill inside
+    one market shares that market's single outcome, so averaging over FILLS
+    over-weights the markets that traded a lot - and those are the ones that
+    were never in doubt. Measured on 2026-11-10 at ask >= 0.99: the fill-weighted
+    mean was +0.46 % of stake and the bet-weighted mean was -0.93 %, because
+    winning bets carried 18.3 fills each and losing bets 4.7.
+
+    A negative-skew carry cannot be sized off a mean at all, so this also reports
+    the Kelly fraction (which is the growth-optimal stake, and goes negative the
+    moment the loss rate crosses the break-even) and the expected shortfall.
+    """
+    import json as _json
+
+    con = duckdb.connect()
+    con.execute("set threads=4")
+    thr = float(args.threshold)
+    window_ms = int(args.window_s) * 1000
+    bets = con.sql(f"""
+        WITH m AS (
+            SELECT condition_id, window_end_ms, up_token,
+                   CAST(winner_up AS INTEGER) AS wup, interval_minutes, fee_rate
+            FROM '{OUT.as_posix()}/markets.parquet'
+        ),
+        t AS (
+            SELECT condition_id, asset_id, price, venue_ts_ms
+            FROM '{(TAPE / "clob_trades").as_posix()}/date=*/*/*.parquet'
+            WHERE price >= {thr} AND side = 'BUY'
+        )
+        SELECT m.condition_id, m.interval_minutes,
+               CAST(CASE WHEN t.asset_id = m.up_token THEN 1 ELSE 0 END AS INTEGER) AS bought_up,
+               count(*) AS fills, avg(t.price) AS px,
+               CAST(CASE WHEN t.asset_id = m.up_token THEN m.wup
+                         ELSE (CASE WHEN m.wup = 0 THEN 1 ELSE 0 END) END AS INTEGER) AS won
+        FROM t JOIN m USING (condition_id)
+        WHERE t.venue_ts_ms BETWEEN m.window_end_ms - {window_ms} AND m.window_end_ms
+        GROUP BY 1, 2, 3, 6
+    """).df()
+    if bets.empty:
+        log.warning(f"bets: no trades at ask >= {thr} in the final {args.window_s}s")
+        return
+
+    bets["won"] = bets.won.astype(int)
+    bets["gross"] = [(1.0 - p) if w else -p for p, w in zip(bets.px, bets.won)]
+    n_bets = len(bets)
+    n_loss = int((bets.won == 0).sum())
+    loss_rate = n_loss / n_bets
+
+    # Wilson interval: with a handful of losses the normal approximation is
+    # useless, and the tail is the whole question.
+    z = 1.96
+    den = 1 + z * z / n_bets
+    centre = (loss_rate + z * z / (2 * n_bets)) / den
+    half = z * ((loss_rate * (1 - loss_rate) / n_bets + z * z / (4 * n_bets * n_bets)) ** 0.5) / den
+    loss_ci = [max(0.0, centre - half), centre + half]
+
+    ev_bet = float(bets.gross.mean())
+    sd = float(bets.gross.std(ddof=1)) if n_bets > 1 else 0.0
+    se = sd / (n_bets ** 0.5) if n_bets > 1 else 0.0
+    ev_fill = float((bets.gross * bets.fills).sum() / bets.fills.sum())
+    px = float(bets.px.mean())
+    b_odds = (1.0 - px) / px
+    kelly = ((1 - loss_rate) * b_odds - loss_rate) / b_odds
+
+    ordered = bets.gross.sort_values().to_numpy()
+    def es(alpha: float) -> float:
+        k = max(1, int(round((1 - alpha) * len(ordered))))
+        return float(ordered[:k].mean())
+
+    out = {
+        "threshold": thr,
+        "window_s": int(args.window_s),
+        "unit": "one bet = (market, token bought); all fills in a market share one outcome",
+        "bets": n_bets,
+        "fills": int(bets.fills.sum()),
+        "losing_bets": n_loss,
+        "loss_rate": loss_rate,
+        "loss_rate_ci95": loss_ci,
+        "break_even_loss_rate": (1.0 - px) / 1.0,
+        "mean_px": px,
+        "ev_per_share_bet_weighted": ev_bet,
+        "ev_per_share_se": se,
+        "ev_per_share_ci95": [ev_bet - 1.96 * se, ev_bet + 1.96 * se],
+        "ev_per_share_fill_weighted": ev_fill,
+        "fill_weighting_bias": ev_fill - ev_bet,
+        "kelly_fraction": kelly,
+        "expected_shortfall_95": es(0.95),
+        "expected_shortfall_99": es(0.99),
+        "worst_bet": float(ordered[0]),
+        "fills_per_winning_bet": float(bets[bets.won == 1].fills.mean()) if (bets.won == 1).any() else None,
+        "fills_per_losing_bet": float(bets[bets.won == 0].fills.mean()) if n_loss else None,
+        "by_interval": {
+            str(int(k)): {
+                "bets": int(len(g)), "losing": int((g.won == 0).sum()),
+                "loss_rate": float(1 - g.won.mean()),
+                "ev_per_share_bet_weighted": float(g.gross.mean()),
+            }
+            for k, g in bets.groupby("interval_minutes")
+        },
+    }
+    (OUT / "bets.json").write_text(_json.dumps(out, indent=1, default=str))
+    log.info(
+        f"bets ask>={thr} last {args.window_s}s: {n_bets} bets / {out['fills']} fills, "
+        f"loss {n_loss} ({loss_rate:.2%}, 95% CI [{loss_ci[0]:.2%}, {loss_ci[1]:.2%}]), "
+        f"breakeven {out['break_even_loss_rate']:.2%}"
+    )
+    log.info(
+        f"  EV/share bet-weighted {ev_bet:+.5f} (CI [{out['ev_per_share_ci95'][0]:+.5f}, "
+        f"{out['ev_per_share_ci95'][1]:+.5f}]) vs fill-weighted {ev_fill:+.5f} "
+        f"-> fill weighting adds {out['fill_weighting_bias']:+.5f}"
+    )
+    log.info(
+        f"  Kelly {kelly:+.3f} (negative = do not bet), "
+        f"CVaR95 {out['expected_shortfall_95']:+.4f}, worst bet {out['worst_bet']:+.4f}"
+    )
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1167,5 +1288,9 @@ if __name__ == "__main__":
     sub.add_parser("report").set_defaults(fn=cmd_report)
     rp = sub.add_parser("report2"); rp.add_argument("--max-stale-ms", type=float, default=60000.0)
     rp.set_defaults(fn=cmd_report2)
+    bt = sub.add_parser("bets")
+    bt.add_argument("--threshold", type=float, default=0.99)
+    bt.add_argument("--window-s", type=int, default=300)
+    bt.set_defaults(fn=cmd_bets)
     a = ap.parse_args()
     a.fn(a)
