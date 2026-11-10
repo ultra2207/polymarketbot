@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.trading.domain2.settlement_allocator import (
+from polymarketbot.strategy.settlement.allocator import (
     SECONDS_PER_YEAR,
     MarginalSettlementAllocator,
     SettlementAllocation,
@@ -419,7 +419,7 @@ def test_candidate_priced_below_its_ask_is_not_funded():
 # Paper pillar <-> research allocator agreement
 #
 # The live pillar funds an ask when ``p_win - ask - taker_fee(1 share, ask) > 0``
-# (src/polymarketbot/paper/pillars/settlement.py).  The allocator must rank the
+# (src/polymarketbot/strategy/settlement/decision.py).  The allocator must rank the
 # same market with the same number, or "the optimizer says buy" and "the paper
 # trader bought nothing" describe two different economies.  The market below is
 # the one live verdict with an open book in the 2026-11-10 10:10 window:
@@ -432,7 +432,7 @@ F1_ASK = 0.999                 # best bid; the book held no ask in the window
 
 def _f1_market():
     from polymarketbot.fees import FeeSchedule
-    from polymarketbot.paper.venue import Market
+    from polymarketbot.strategy.venue.reads import Market
 
     return Market(
         condition_id="0xfd516863c645e716dd507bd159267c85362b9b9b4a8bc9af340c2dda3b3751d7",
@@ -457,8 +457,8 @@ def _f1_market():
 
 def test_paper_pillar_and_allocator_agree_on_the_marginal_edge():
     """One ask, one p_win, one edge number in both code paths."""
-    from polymarketbot.paper.pillars import settlement as paper
-    from polymarketbot.trading.domain2.settlement_fair_value import OracleVerdict
+    import polymarketbot.strategy.settlement.decision as paper
+    from polymarketbot.strategy.settlement.fair_value import OracleVerdict
 
     market = _f1_market()
     verdict = OracleVerdict(winning_index=1, p_win=P_WIN_F1, source="uma_tape",
@@ -487,8 +487,8 @@ def test_paper_pillar_and_allocator_agree_on_the_marginal_edge():
 
 def test_the_break_even_ask_is_the_price_that_would_have_funded():
     """The only number that distinguishes a correctly idle radar from a blind one."""
-    from polymarketbot.paper.pillars import settlement as paper
-    from polymarketbot.trading.domain2.settlement_fair_value import OracleVerdict
+    import polymarketbot.strategy.settlement.decision as paper
+    from polymarketbot.strategy.settlement.fair_value import OracleVerdict
 
     market = _f1_market()
     verdict = OracleVerdict(winning_index=1, p_win=P_WIN_F1, source="uma_tape",
@@ -560,7 +560,7 @@ def _fee_schedule():
 
 def _evidence(challenges: int = 158, trials: int = 134664, reversals: int = 0,
               direct_trials: int = 70):
-    from polymarketbot.trading.domain2.tail_evidence import evidence_from_counts
+    from polymarketbot.strategy.settlement.tail_evidence import evidence_from_counts
 
     return evidence_from_counts(
         direct_trials,
@@ -604,7 +604,7 @@ def _allocate(candidates, capital, *, appetite=APPETITE, confidence=CONFIDENCE,
 
 def test_tail_budget_requires_a_stated_appetite_and_a_measured_tail():
     """An absent appetite, band or measurement refuses; none of them defaults."""
-    from polymarketbot.trading.domain2.tail_evidence import UnmeasuredTail
+    from polymarketbot.strategy.settlement.tail_evidence import UnmeasuredTail
 
     cand = _risk_candidate()
     allocator = MarginalSettlementAllocator("tail_budget")
@@ -674,7 +674,7 @@ def test_a_2x_tail_error_changes_the_size_without_flipping_the_decision():
     admits, while every funded tranche keeps a positive expected profit and the
     same participation decision.  A Kelly solve sign-flips on the same change.
     """
-    from polymarketbot.trading.domain2.settlement_allocator import shortfall_usd
+    from polymarketbot.strategy.settlement.allocator import shortfall_usd
 
     cand = _risk_candidate()
     # An appetite that pays for exactly $500 of notional at the measured tail:
@@ -731,7 +731,7 @@ def test_two_markets_on_one_resolution_source_are_not_independent():
 
 def test_same_token_double_count_is_charged_not_hedged():
     """Two lots on ONE token are rho = +1, never a hedge against each other."""
-    from polymarketbot.trading.domain2.settlement_allocator import (
+    from polymarketbot.strategy.settlement.allocator import (
         LINK_COMPLEMENT,
         LINK_SAME_TOKEN,
         Position,
@@ -750,7 +750,7 @@ def test_same_token_double_count_is_charged_not_hedged():
 
 def test_a_held_position_is_charged_without_being_respent():
     """Prior inventory consumes the budget; its dollars are not spent twice."""
-    from polymarketbot.trading.domain2.settlement_allocator import HeldExposure
+    from polymarketbot.strategy.settlement.allocator import HeldExposure
 
     cand = _risk_candidate()
     prior = [
@@ -776,7 +776,7 @@ def test_a_held_position_is_charged_without_being_respent():
 
 def test_a_book_already_over_its_appetite_refuses_to_add():
     """When the held book alone breaches the budget, nothing new is funded."""
-    from polymarketbot.trading.domain2.settlement_allocator import HeldExposure
+    from polymarketbot.strategy.settlement.allocator import HeldExposure
 
     cand = _risk_candidate()
     prior = [

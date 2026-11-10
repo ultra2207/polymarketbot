@@ -1,7 +1,7 @@
-"""Measured on-chain inputs, copied out of ``polymarketbot.trading.ctf``.
+"""Measured on-chain inputs, copied out of ``polymarketbot.strategy.onchain.ctf``.
 
-``polymarketbot.trading.ctf`` stays in production because live settlement
-redemption needs it; archive code may not import ``polymarketbot.trading``, so
+``polymarketbot.strategy.onchain.ctf`` stays in production because live settlement
+redemption needs it; archive code may not import ``polymarketbot.live``, so
 the four measured-input helpers the archived CTF strategy prices with are
 copied here verbatim (only the repository-root depth changed):
 
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from polymarketbot.chain import ChainClient
+from polymarketbot.strategy.onchain.core import ChainClient
 from polymarketbot.logs import get_logger
 
 logger = get_logger("archive.ctf")

@@ -66,7 +66,7 @@ def _live_gas_price_gwei(http: requests.Session) -> Optional[float]:
     except Exception as exc:  # noqa: BLE001 - the RPC fallback is next
         log.debug(f"gas oracle unavailable ({exc}); falling back to RPC gas price")
     try:
-        from polymarketbot.chain import ChainClient
+        from polymarketbot.strategy.onchain.core import ChainClient
 
         raw = ChainClient()._rpc("eth_gasPrice", [])
         wei = int(raw, 16) if isinstance(raw, str) else int(raw)

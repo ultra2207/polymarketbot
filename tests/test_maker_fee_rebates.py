@@ -22,7 +22,7 @@ from polymarketbot.fees import (
     maker_rebate,
     taker_fee,
 )
-from polymarketbot.trading.engine import RealMoneyTradingEngine
+from polymarketbot.live.engine import RealMoneyTradingEngine
 
 
 # ---------------------------------------------------------------------------

@@ -104,7 +104,7 @@ def require_on_chain_timing(
 def _live_head_error() -> Optional[str]:
     """``None`` when the live head reads, else the refusal reason."""
     try:
-        from polymarketbot.chain import ChainClient
+        from polymarketbot.strategy.onchain.core import ChainClient
 
         head = int(ChainClient().block_number())
     except Exception as exc:  # noqa: BLE001 - an unreadable head is the signal

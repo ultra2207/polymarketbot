@@ -22,14 +22,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from polymarketbot.risk.models import CircuitBreakerReason
-from polymarketbot.trading.feed import OrderBookLevel
-from polymarketbot.trading.client import (
+from polymarketbot.strategy.venue.feed import OrderBookLevel
+from polymarketbot.strategy.venue.clob import (
     ClobAPIError,
     ClobAuthCredentials,
     LiveClobClient,
     build_clob_hmac_signature,
 )
-from polymarketbot.trading.ctf import (
+from polymarketbot.strategy.onchain.ctf import (
     DEFAULT_COLLATERAL_USDC,
     MERGE_POSITIONS_SELECTOR,
     REDEEM_POSITIONS_SELECTOR,
@@ -41,7 +41,7 @@ from polymarketbot.trading.ctf import (
     get_dynamic_gas_price_gwei,
     get_dynamic_pol_usd_price,
 )
-from polymarketbot.trading.engine import PreflightReport, RealMoneyTradingEngine
+from polymarketbot.live.engine import PreflightReport, RealMoneyTradingEngine
 
 SAMPLE_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204db7e716b78ac5c7807e8b88f211d733b"
 EXPECTED_ADDRESS = "0x4a6d2fa1266d0e22ae77f79f6e16f3e5f6294e93"
@@ -266,7 +266,7 @@ def test_polygon_ctf_dry_run_merge():
     """Verify safe dry-run execution of complete set merge."""
     ctf = PolygonCtfClient(dry_run=True)
     with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-         patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+         patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
         res = ctf.merge_positions(
             condition_id="0xTEST_CONDITION_ID",
             amount_shares=20.0,
@@ -323,7 +323,7 @@ def test_dynamic_gas_price_gwei_live_and_fallbacks():
 
 def test_dynamic_pol_usd_price_binance_rest_success():
     """Verify get_dynamic_pol_usd_price queries Binance POLUSDT and caches result."""
-    from polymarketbot.trading.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
 
     mock_resp = MagicMock()
     mock_resp.status_code = 200
@@ -345,7 +345,7 @@ def test_dynamic_pol_usd_price_binance_rest_success():
 
 def test_dynamic_pol_usd_price_cache_ttl():
     """Verify cache hits within cache_ttl_seconds avoid outbound HTTP requests."""
-    from polymarketbot.trading.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
 
     with _POL_PRICE_LOCK:
         _POL_PRICE_CACHE["price"] = 0.105
@@ -359,7 +359,7 @@ def test_dynamic_pol_usd_price_cache_ttl():
 
 def test_dynamic_pol_usd_price_matic_fallback():
     """Verify fallback to MATICUSDT when POLUSDT fails."""
-    from polymarketbot.trading.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
 
     with _POL_PRICE_LOCK:
         _POL_PRICE_CACHE["price"] = 0.092
@@ -386,7 +386,7 @@ def test_dynamic_pol_usd_price_matic_fallback():
 
 def test_dynamic_pol_usd_price_all_fail_fallback():
     """Verify fallback price is returned when all Binance queries fail."""
-    from polymarketbot.trading.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
+    from polymarketbot.strategy.onchain.ctf import _POL_PRICE_CACHE, _POL_PRICE_LOCK
 
     with _POL_PRICE_LOCK:
         _POL_PRICE_CACHE["price"] = 0.092
@@ -450,7 +450,7 @@ def test_real_money_engine_dynamic_merge_threshold_initialization():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine = RealMoneyTradingEngine(
                 condition_id="0xDYNAMIC_TEST_CID",
                 clob_client=clob,
@@ -469,7 +469,7 @@ def test_real_money_engine_dynamic_merge_threshold_initialization():
 
                 # Test updating gas and threshold dynamically with 100 Gwei and $0.45 POL (78,000 * 100e-9 * 0.45 = 0.00351 USD)
                 with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=100.0), \
-                     patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.45):
+                     patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.45):
                     gas_cost, threshold = engine.update_dynamic_gas_and_threshold()
                     assert gas_cost == 0.00351
                     assert threshold == 2.34
@@ -497,7 +497,7 @@ def test_preflight_check_unconfigured_account():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine = RealMoneyTradingEngine(
                 condition_id="0xDEMO_CID",
                 clob_client=clob,
@@ -568,7 +568,7 @@ class TestRealMoneyTradingEngine:
             ctf = PolygonCtfClient(dry_run=True)
 
             with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-                 patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+                 patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
                 eng = RealMoneyTradingEngine(
                     condition_id="0xREAL_TEST_COND",
                     asset_id_yes="1000000000000000000000000000000000000000000000000000000000000001",
@@ -899,7 +899,7 @@ def test_polygon_ctf_redeem_positions_calldata_and_simulation():
 
     # Dry-run execution
     with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-         patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+         patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
         res = ctf.redeem_positions(condition_id=cond_id, index_sets=[1, 2])
         assert isinstance(res, RedeemExecutionResult)
         assert res.success is True
@@ -960,7 +960,7 @@ def test_preflight_allowance_enforcement():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
              patch.object(clob, "get_allowances", return_value={"approved": False}), \
              patch.object(clob, "get_balance", return_value={"available": 100.0}), \
              patch.object(clob, "get_total_rewards", return_value={}), \
@@ -995,7 +995,7 @@ def test_initial_cash_calibration_no_premature_halt():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine = RealMoneyTradingEngine(
                 condition_id="0xTEST_CID",
                 clob_client=clob,
@@ -1026,7 +1026,7 @@ def test_real_money_max_drawdown_circuit_breaker():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine = RealMoneyTradingEngine(
                 condition_id="0xTEST_CID",
                 asset_id_yes=TOKEN_ID_YES,
@@ -1117,7 +1117,7 @@ def test_order_book_levels_dataclass_ingestion():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine = RealMoneyTradingEngine(
                 condition_id="0xTEST_CID",
                 asset_id_yes=TOKEN_ID_YES,
@@ -1176,7 +1176,7 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
         clob_dry = LiveClobClient(dry_run=True)
         ctf_dry = PolygonCtfClient(dry_run=True)
         with patch.object(ctf_dry, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine_dry = RealMoneyTradingEngine(
                 condition_id="0xTEST_DRY",
                 asset_id_yes=TOKEN_ID_YES,
@@ -1233,11 +1233,11 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
         order_sink: list = []
 
         with patch.object(ctf_live, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
              live_venue(clob_live, ctf_live, available=100.0, order_sink=order_sink), \
              patch.object(clob_live, "place_order") as mock_place:
 
-            from polymarketbot.trading.client import OrderPlacementResult
+            from polymarketbot.strategy.venue.clob import OrderPlacementResult
             mock_place.return_value = OrderPlacementResult(
                 success=True,
                 order_id="live_order_123",
@@ -1306,7 +1306,7 @@ def test_sync_live_orders_and_fills_partial_and_full():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092):
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092):
             engine = RealMoneyTradingEngine(
                 condition_id="0xTEST_SYNC",
                 asset_id_yes=TOKEN_ID_YES,
@@ -1424,7 +1424,7 @@ def test_safe_ctf_merge_complete_set_verification():
         ctf = PolygonCtfClient(dry_run=True)
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
-             patch("polymarketbot.trading.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
+             patch("polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", return_value=0.092), \
              patch.object(ctf, "merge_positions") as mock_merge:
 
             mock_merge.return_value = MergeExecutionResult(
@@ -1766,7 +1766,7 @@ def test_trading_runner_cli_budget_args():
     """Verify CLI argument parsing and normalization for --budget-pct and --max-budget."""
     import sys
 
-    from polymarketbot.trading.runner import parse_args
+    from polymarketbot.live.runner import parse_args
 
     test_args = ["runner", "--budget-pct", "0.20", "--max-budget", "70.0", "--initial-cash", "50.0"]
     with patch.object(sys, "argv", test_args):

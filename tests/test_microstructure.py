@@ -2,7 +2,7 @@
 
 import pytest
 
-from polymarketbot.rewards.microstructure import (
+from polymarketbot.strategy.reward.microstructure import (
     MicrostructureEngine,
     MultiAssetMicrostructureSentinel,
 )
@@ -222,7 +222,7 @@ def test_multi_asset_microstructure_sentinel():
 # ---------------------------------------------------------------------------
 
 def test_ofi_thin_vs_deep_pool():
-    from polymarketbot.rewards.microstructure import compute_dynamic_ofi_threshold
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_ofi_threshold
 
     # 1. Thin pool: 100 shares depth each side
     thin_thresh = compute_dynamic_ofi_threshold(bid_size=100.0, ask_size=100.0, volume_24h=5_000.0)
@@ -238,7 +238,7 @@ def test_ofi_thin_vs_deep_pool():
 
 
 def test_ofi_asymmetric_depth_harmonic_mean():
-    from polymarketbot.rewards.microstructure import compute_dynamic_ofi_threshold
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_ofi_threshold
 
     # Asymmetric book: Bid has 10,000 shares, Ask has only 50 shares
     # Harmonic mean should correctly reflect the fragile ask side: ~99.5 shares
@@ -247,7 +247,7 @@ def test_ofi_asymmetric_depth_harmonic_mean():
 
 
 def test_drift_threshold_feasibility_on_different_spreads():
-    from polymarketbot.rewards.microstructure import compute_dynamic_drift_threshold_cents
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_drift_threshold_cents
 
     # 1-cent spread (s = 1.0c) -> half spread = 0.50c
     drift_1c = compute_dynamic_drift_threshold_cents(mid_price=0.50, spread_cents=1.0)
@@ -261,7 +261,7 @@ def test_drift_threshold_feasibility_on_different_spreads():
 
 
 def test_drift_threshold_state_space_scaling_p_1_minus_p():
-    from polymarketbot.rewards.microstructure import compute_dynamic_drift_threshold_cents
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_drift_threshold_cents
 
     drift_50 = compute_dynamic_drift_threshold_cents(mid_price=0.50, spread_cents=2.0)
     drift_05 = compute_dynamic_drift_threshold_cents(mid_price=0.05, spread_cents=2.0)
@@ -270,7 +270,7 @@ def test_drift_threshold_state_space_scaling_p_1_minus_p():
 
 
 def test_volatility_breaker_jump_scaling_by_price_level():
-    from polymarketbot.rewards.microstructure import compute_dynamic_volatility_breaker_threshold
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_volatility_breaker_threshold
 
     jump_50 = compute_dynamic_volatility_breaker_threshold(mid_price=0.50, spread_cents=1.0)
     jump_05 = compute_dynamic_volatility_breaker_threshold(mid_price=0.05, spread_cents=1.0)
@@ -279,7 +279,7 @@ def test_volatility_breaker_jump_scaling_by_price_level():
 
 
 def test_cooldown_duration_fast_vs_macro_market():
-    from polymarketbot.rewards.microstructure import compute_dynamic_cooldown_duration
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_cooldown_duration
 
     # 15-minute market: remaining seconds = 900s
     # Strictly capped <= 5% of lifetime (45s max)
@@ -301,7 +301,7 @@ def test_cooldown_duration_fast_vs_macro_market():
 
 
 def test_cooldown_severity_scaling():
-    from polymarketbot.rewards.microstructure import compute_dynamic_cooldown_duration
+    from polymarketbot.strategy.reward.microstructure import compute_dynamic_cooldown_duration
 
     cd_marginal = compute_dynamic_cooldown_duration(
         jump_cents_observed=2.1,

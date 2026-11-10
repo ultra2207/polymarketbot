@@ -6,7 +6,7 @@ Verifies the mathematical rigor of the surviving Domain 2 hazard model:
    Implied Vol, Shannon Entropy)
 """
 
-from polymarketbot.trading.domain2.robust_hazard import BinaryVolatilityEstimator
+from polymarketbot.strategy.settlement.hazard import BinaryVolatilityEstimator
 
 
 # ==============================================================================

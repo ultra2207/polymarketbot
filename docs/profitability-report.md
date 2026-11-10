@@ -10,7 +10,7 @@ crediting itself.
 
 | Pillar | Mechanism | Measured return | Independent verification | Verdict |
 |---|---|---|---|---|
-| RewardHarvester | LP-incentive market making | **0.395 $/$/day** on cash | **none** — 0 venue payout receipts | **Not demonstrably profitable** |
+| RewardHarvester | LP-incentive market making | **0.115 $/$/day** honest (0.395 was one snapshot) | venue terms verified; **0 payout receipts** | **Terms real, magnitude unverified** |
 | SettlementHarvester | buy resolved-but-unfinalised below par | **+4.91 % per cycle** at par (VWAP 0.9510); **0.0726 $/$/day** on observed cadence | 8 fills, cash 97.1 % idle | **Edge real, capacity-bound** |
 | CtfMinter (a) complete-set mint | buy YES ask + NO ask | 0 of 76,097 markets below par | full-universe census | **Dead** |
 | CtfMinter (b) maker parity bundle | rest bids so bid_YES + bid_NO < 1 | best 0.0589 $/$/day vs 0.0924 hurdle | 2,172 real books, 0 accepted | **Dead** |
@@ -26,6 +26,38 @@ between settlement/CTF and the hurdle are real measurements; the hurdle's own
 validity is not established.
 
 ## 1. RewardHarvester
+
+### 1.0 Revision after the documentation audit
+
+The terms were verified against `docs.polymarket.com/programs/liquidity-rewards`
+and `/maker-rebates` on 2026-11-10, and our implementation was compared line by
+line. **The program is real and our formula matches it**: order score
+$S=((v-s)/v)^2 b$, two-sided rule $Q_{\min}=\max(\min(Q_1,Q_2),\max(Q_1,Q_2)/c)$
+with $c=3.0$ inside mid ∈ [0.10, 0.90], one-sided scores 0 outside the band,
+1,440 samples per UTC-day epoch, paid daily at 00:00 UTC, minimum $1. What does
+**not** match is the denominator:
+
+| Item | Venue | Ours | Effect |
+|---|---|---|---|
+| Competing score $D$ | mean over 1,440 samples/day | **one book snapshot**, extrapolated | **manufactures the yield** |
+| Denominator sum | $\sum Q_{\min}$ | $Q_1+Q_2$ | conservative by 1.0–4.0× (safe) |
+| Spread origin | size-cutoff-adjusted mid | raw mid | direction unknown, logged |
+| Minimum rest | none (scores whatever rests at the sample) | **3.5 s invented** | removed |
+
+Measured program size today: **$113,232.88/day across 11,381 funded markets**
+(382 pages / 190,631 rows). The claimed $767.79/day is **0.678 %** of the entire
+program — arithmetically possible, but it implies every liquidity provider on
+Polymarket collectively rests under $295k against that pool. The same pipeline's
+out-of-sample window says **11.5 %/day**, not 38.4 %. The honest number is
+therefore **0.115 $/$/day**, and the 39.5 % figure is a single-snapshot artefact.
+
+Defects found and fixed in this pass: the rebate was hardcoded to `0.0` in
+`client.py` and never read `GET /rebates/current`; the maker rebate was credited
+through a **non-existent** `reward.maker_rebate`, which raised `AttributeError`
+on every fee-paying fill *after* booking the fill and thereby skipped that
+tick's settlement and mark stages; per-market accrual was logged but not
+persisted, so no venue join was possible. All three are fixed, with a
+failing-before regression test.
 
 ### 1.1 What was actually observed
 
@@ -127,6 +159,30 @@ The tail is not zero in history: one prior stale-ask entry went `PAR_REFUND` to
 $0.0005 for **−$350.64** (`docs/audit-cycle1.md` S1).
 
 ### 2.3 What binds it: capital-days, not edge
+
+**Diagnosed root cause of the 97 % idle.** The pillar could only see a market
+once UMA emitted a `ProposePrice`, and that proposal arrives **p50 30.6 h after
+the market's `endDate`** (p95 39.3 h; 98.2 % after), while the book is gone
+**p50 2.23 h / p95 7.30 h after `endDate`**. So every closing-soon market was
+invisible for the ~23 h in which it was still tradeable and unpriceable
+afterwards. Of 10,028 open markets closing within 24 h, **9,069 (90.4 %)** are
+already below 0.99 — the pillar was seeing **2** of them.
+
+Fixed by staging the closing-soon cohort: the radar now asks Gamma for its own
+`end_date_min`/`end_date_max` window using the *measured* p95 close span
+(7.30 h) and the measured tape liveness, ingests those rows, and binds
+question→condition-id every cycle (64 ms over 3,529 questions). It derives **no**
+price for an unresolved market — `verdict_for` still refuses without a proposal.
+
+| | before | after |
+|---|---|---|
+| pillar census | **2** conditions | **3,531** staged (0.02 % → 35.2 % of the 24 h population) |
+| priced with both sides | 2 | 3,142 below par of 3,529 |
+
+At the measured 4.91 % gross and a 2.23 h median hold, $1,000 turns ~10.8×/day;
+funding 10 conditions/day is ≈ $361/day net = **0.36 $/$/day, 3.9× the hurdle**.
+Capital is not the binding constraint once coverage is fixed — ladder depth and
+the tradable share are.
 
 | Cadence | Return per capital-day | vs 0.0924 hurdle |
 |---|---|---|

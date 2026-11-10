@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from polymarketbot.chain import (
+from polymarketbot.strategy.onchain.core import (
     ALREADY_KNOWN,
     EXECUTION_REVERTED,
     NONCE_TOO_LOW,
@@ -27,14 +27,14 @@ from polymarketbot.chain import (
     rpc_url,
 )
 from polymarketbot.risk.fast_signer import keccak256
-from polymarketbot.trading.ctf import (
+from polymarketbot.strategy.onchain.ctf import (
     MergeExecutionResult,
     PolygonCtfClient,
     SettlementOutcome,
 )
-from polymarketbot.trading.engine import RealMoneyTradingEngine
-from polymarketbot.trading.settlement import ROUTER
-from polymarketbot.trading.pending_settlements import (
+from polymarketbot.live.engine import RealMoneyTradingEngine
+from polymarketbot.strategy.onchain.settlement import ROUTER
+from polymarketbot.strategy.onchain.pending import (
     PENDING,
     REVERTED,
     SUCCESS,
@@ -143,7 +143,7 @@ def _ctf(chain: FakeChain, store: PendingSettlementStore | None = None) -> Polyg
 @pytest.fixture(autouse=True)
 def _no_pol_price_network(monkeypatch):
     monkeypatch.setattr(
-        "polymarketbot.trading.ctf.get_dynamic_pol_usd_price", lambda: 0.1
+        "polymarketbot.strategy.onchain.ctf.get_dynamic_pol_usd_price", lambda: 0.1
     )
 
 
@@ -154,7 +154,7 @@ def _no_pol_price_network(monkeypatch):
 
 @pytest.fixture
 def _isolated_env(monkeypatch):
-    monkeypatch.setattr("polymarketbot.chain._env_file", lambda: {})
+    monkeypatch.setattr("polymarketbot.strategy.onchain.core._env_file", lambda: {})
     for name in ("POLYGON_RPC_URL", "POLYGON_RPC_URLS", "ETH_RPC_URL"):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch

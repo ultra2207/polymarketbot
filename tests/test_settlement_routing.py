@@ -16,9 +16,9 @@ from decimal import Decimal
 
 import pytest
 
-from polymarketbot.chain import ChainClient
+from polymarketbot.strategy.onchain.core import ChainClient
 from polymarketbot.gamma import GammaClient
-from polymarketbot.trading.settlement import (
+from polymarketbot.strategy.onchain.settlement import (
     CTF,
     NEGRISK_ADAPTER,
     NEGRISK_CONVERT_SELECTOR,

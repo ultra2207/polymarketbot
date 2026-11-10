@@ -2,7 +2,7 @@
 
 import pytest
 from unittest.mock import MagicMock, patch
-from polymarketbot.rewards.scanner import find_optimal_lp_markets, get_real_l2_score
+from polymarketbot.strategy.reward.scanner import find_optimal_lp_markets, get_real_l2_score
 
 
 def _venue_get(markets_payload: dict, tick: float = 0.01):
@@ -104,7 +104,7 @@ def test_find_optimal_lp_markets_filters():
 
     with patch("requests.Session.get", _venue_get(mock_markets_payload)):
         # Mock orderbook L2 response
-        with patch("polymarketbot.rewards.scanner.lp_screen.get_real_l2_score") as mock_l2:
+        with patch("polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score") as mock_l2:
             mock_l2.return_value = (500.0, 1000.0, 0.60)
 
             ranked = find_optimal_lp_markets(bankroll_usd=150.0, min_days_to_expiry=7.0)
@@ -118,7 +118,7 @@ def test_find_optimal_lp_markets_filters():
 
 def test_scanner_5s_ttl_caching_and_telemetry():
     """Verify that multiple scans within 5s return cached results and track cache hits."""
-    from polymarketbot.rewards.scanner import (
+    from polymarketbot.strategy.reward.scanner import (
         get_scanner_telemetry,
         reset_scanner_telemetry,
         find_optimal_lp_markets,
@@ -143,7 +143,7 @@ def test_scanner_5s_ttl_caching_and_telemetry():
     }
 
     with patch("requests.Session.get", side_effect=_venue_get(mock_payload)) as mock_get:
-        with patch("polymarketbot.rewards.scanner.lp_screen.get_real_l2_score") as mock_l2:
+        with patch("polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score") as mock_l2:
             mock_l2.return_value = (300.0, 500.0, 0.55)
 
             # First scan -> Cache Miss (fetches via network)
@@ -167,7 +167,7 @@ def test_scanner_5s_ttl_caching_and_telemetry():
 
 def test_get_real_l2_score_caching_and_429():
     """Verify that get_real_l2_score caches inside 5s and tracks HTTP 429 status."""
-    from polymarketbot.rewards.scanner import (
+    from polymarketbot.strategy.reward.scanner import (
         get_real_l2_score,
         get_scanner_telemetry,
         reset_scanner_telemetry,
@@ -221,7 +221,7 @@ def test_get_real_l2_score_caching_and_429():
 # refuses the market.
 # ---------------------------------------------------------------------------
 
-from polymarketbot.rewards.tape_regime import MarketRegime, NS_PER_HOUR
+from polymarketbot.strategy.reward.regime import MarketRegime, NS_PER_HOUR
 
 
 def _regime(mean_size: float = 40.0) -> MarketRegime:
@@ -263,8 +263,8 @@ def _yield_kwargs(**overrides):
 
 def test_category_regimes_are_gone_and_the_tape_regime_drives_the_estimate():
     """No category table: the market's own measured print size sets the terms."""
-    import polymarketbot.rewards.scoring as scoring
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    import polymarketbot.strategy.reward.scoring as scoring
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     assert not hasattr(scoring, "CATEGORY_REGIMES")
 
@@ -283,7 +283,7 @@ def test_category_regimes_are_gone_and_the_tape_regime_drives_the_estimate():
 
 def test_missing_tape_regime_refuses_the_market():
     """An unmeasured regime is missing data: no estimate, reason logged."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     refused = calculate_expected_yield(**_yield_kwargs(regime=None))
     assert refused["daily_reward_payout"] is None
@@ -292,8 +292,8 @@ def test_missing_tape_regime_refuses_the_market():
 
 def test_fill_probability_is_the_measured_horizon_cell_not_a_fill_share():
     """P(fill) comes from the measured (tick, flow, horizon) cell, uncapped."""
-    from polymarketbot.rewards.fill_measurement import load_quote_fill_horizon
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.measurement import load_quote_fill_horizon
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     table = load_quote_fill_horizon()
     expected_p = table.p_fill(300.0, 0.01, 20.0)
@@ -312,7 +312,7 @@ def test_fill_probability_is_the_measured_horizon_cell_not_a_fill_share():
 
 def test_fill_probability_is_read_per_tick_from_the_measured_table():
     """A finer tick has its own measured probability; it is not a ratio guess."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     coarse = calculate_expected_yield(**_yield_kwargs(tick_size=0.01))
     fine = calculate_expected_yield(**_yield_kwargs(tick_size=0.001))
@@ -323,7 +323,7 @@ def test_fill_probability_is_read_per_tick_from_the_measured_table():
 
 def test_unmeasured_fill_cell_refuses_instead_of_capping():
     """A (tick, flow, horizon) the table does not cover has no probability."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     # Below the shortest measured lifetime (5 s) there is no cell to lean on.
     refused = calculate_expected_yield(**_yield_kwargs(quote_horizon_s=1.0))
@@ -338,7 +338,7 @@ def test_unmeasured_fill_cell_refuses_instead_of_capping():
 
 def test_capital_is_the_callers_and_has_no_default():
     """``bankroll_usd``/``concentration_pct`` are gone; capital is required."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     # Passing the old pair is a TypeError, not a silently accepted allocation.
     with pytest.raises(TypeError):
@@ -366,7 +366,7 @@ def test_capital_is_the_callers_and_has_no_default():
 
 def test_quote_horizon_is_required_and_has_no_default():
     """A fill probability without the lifetime it was measured over is not one."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     with pytest.raises(TypeError):
         calculate_expected_yield(
@@ -376,7 +376,7 @@ def test_quote_horizon_is_required_and_has_no_default():
 
 def test_unavailable_measurement_tables_refuse_rather_than_extrapolate(monkeypatch):
     """A missing fill/markout artifact is an explicit refusal, not a guess."""
-    import polymarketbot.rewards.scanner.pricing as scanner_mod
+    import polymarketbot.strategy.reward.scanner.pricing as scanner_mod
 
     scanner_mod.reset_measured_tables()
     monkeypatch.setattr(scanner_mod, "_FILL_HORIZON", None)
@@ -395,7 +395,7 @@ def test_unavailable_measurement_tables_refuse_rather_than_extrapolate(monkeypat
 
 def test_lp_scan_requires_the_callers_bankroll():
     """``find_optimal_lp_markets`` has no default bankroll any more."""
-    from polymarketbot.rewards.scanner import find_optimal_lp_markets
+    from polymarketbot.strategy.reward.scanner import find_optimal_lp_markets
 
     with pytest.raises(TypeError):
         find_optimal_lp_markets()
@@ -406,7 +406,7 @@ def test_lp_scan_requires_the_callers_bankroll():
 
 def test_scan_refuses_markets_without_a_measured_regime():
     """The scanner measures regimes from the tape and refuses the rest."""
-    from polymarketbot.rewards.scanner import OpportunityScanner
+    from polymarketbot.strategy.reward.scanner import OpportunityScanner
 
     payload = {
         "data": [
@@ -424,8 +424,8 @@ def test_scan_refuses_markets_without_a_measured_regime():
         ]
     }
     scanner = OpportunityScanner()
-    with patch("polymarketbot.rewards.scanner.screen.measure_regimes_cached") as mock_measure:
-        from polymarketbot.rewards.tape_regime import RegimeMeasurement
+    with patch("polymarketbot.strategy.reward.scanner.screen.measure_regimes_cached") as mock_measure:
+        from polymarketbot.strategy.reward.regime import RegimeMeasurement
 
         mock_measure.return_value = RegimeMeasurement(
             window_start_ns=0,

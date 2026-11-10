@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import venue
-from polymarketbot.paper.books import ladder
-from polymarketbot.paper.pillars import settlement
+import polymarketbot.strategy.venue.reads as venue
+from polymarketbot.strategy.books import ladder
+import polymarketbot.strategy.settlement.decision as settlement
 
 log = get_logger(__name__)
 

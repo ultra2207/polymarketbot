@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from polymarketbot.trading.domain2.settlement_fair_value import (
+from polymarketbot.strategy.settlement.fair_value import (
     BIND_AGED_OUT,
     BIND_AMBIGUOUS,
     BIND_BOUND,

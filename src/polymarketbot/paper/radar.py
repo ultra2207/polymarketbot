@@ -13,9 +13,9 @@ import time
 from typing import Any, Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import venue
+import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.paper.pillars.settlement_runner import MARKET_CLOSED, NO_MARKET
-from polymarketbot.trading.domain2.settlement_fair_value import normalize_question
+from polymarketbot.strategy.settlement.fair_value import normalize_question
 
 log = get_logger(__name__)
 
@@ -343,7 +343,7 @@ def make_uma_poller(engine) -> Any:
     makes every proposal's age (and therefore its liveness) wrong.
     """
     try:
-        from polymarketbot.chain import ChainClient
+        from polymarketbot.strategy.onchain.core import ChainClient
         from polymarketbot.paper import uma_poll
     except Exception:  # noqa: BLE001 - optional chain dependency
         return None
@@ -353,7 +353,7 @@ def make_uma_poller(engine) -> Any:
     # disagree about the protocol's block time.
     interval_s: Optional[float] = None
     try:
-        from polymarketbot.trading.ctf import load_measured_block_interval_s
+        from polymarketbot.strategy.onchain.ctf import load_measured_block_interval_s
 
         interval_s = load_measured_block_interval_s()
     except Exception as exc:  # noqa: BLE001 - no tape is a valid paper mode

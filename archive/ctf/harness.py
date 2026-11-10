@@ -5,9 +5,9 @@ loop.  Three of its inputs used to come from ``polymarketbot.paper``:
 
 * the quote record ``Resting`` and the ``pending_for`` guard
   (``polymarketbot.paper.actions``),
-* the market/print views it annotates with (``polymarketbot.paper.venue``),
+* the market/print views it annotates with (``polymarketbot.strategy.venue.reads``),
 * the measured fill rule that books fills of a resting maker quote
-  (``polymarketbot.paper.pillars.reward.measured_fill_shares`` through
+  (``polymarketbot.strategy.reward.decision.measured_fill_shares`` through
   ``reward_runner.apply_resting_fills``).
 
 Archive code may not import ``polymarketbot.paper``, so those definitions are
@@ -34,7 +34,7 @@ log = get_logger("archive.ctf")
 
 @dataclass(frozen=True)
 class Market:
-    """Static market facts, copied from ``polymarketbot.paper.venue.Market``."""
+    """Static market facts, copied from ``polymarketbot.strategy.venue.reads.Market``."""
 
     condition_id: str
     question: str
@@ -107,7 +107,7 @@ def measured_fill_shares(
 ) -> float:
     """Expected shares filled on a resting bid at ``quote_price``.
 
-    Copied rule (``polymarketbot.paper.pillars.reward.measured_fill_shares``): a
+    Copied rule (``polymarketbot.strategy.reward.decision.measured_fill_shares``): a
     print fills this bid only when it printed at the bid's own price
     (``|print.price - quote_price| <= tick / 2``), with our share of that
     level's flow being ``our_size / (level_shares + our_size)``.  A SELL print

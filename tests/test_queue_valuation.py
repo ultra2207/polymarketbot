@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.rewards.queue_valuation import (
+from polymarketbot.strategy.reward.queue import (
     CapitalMigrationEngine,
     CTFGasProfile,
     LiquidationRoute,

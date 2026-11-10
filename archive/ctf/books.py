@@ -1,4 +1,4 @@
-"""Order-book math copied from ``polymarketbot.paper.books``.
+"""Order-book math copied from ``polymarketbot.strategy.books``.
 
 The archived CTF pillar is self-contained: it may not import ``polymarketbot.paper``
 (that package is live and moves on its own schedule).  These four helpers are a

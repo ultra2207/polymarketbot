@@ -19,17 +19,19 @@ import time
 from typing import Any, Callable, Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import actions as venue_actions, radar, venue
+from polymarketbot.paper import actions as venue_actions, radar
+import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.paper.actions import Resting
-from polymarketbot.paper.books import best_bid
-from polymarketbot.paper.latency import ActionBook, RttProbe
-from polymarketbot.paper.ledger import Ledger
+from polymarketbot.strategy.books import best_bid
+from polymarketbot.strategy.latency import ActionBook, RttProbe
+from polymarketbot.strategy.ledger import Ledger
 # ``settlement`` is re-exported: callers patch the shared module object
 # (``engine_mod.settlement.verdict_for``) and every runner must see the patch,
 # so all of them import the same module object.
-from polymarketbot.paper.pillars import reward_runner, settlement, settlement_runner, tail_budget  # noqa: F401
-from polymarketbot.trading.domain2.settlement_allocator import MarginalSettlementAllocator
-from polymarketbot.trading.domain2.settlement_fair_value import normalize_question
+from polymarketbot.paper.pillars import reward_runner, settlement_runner, tail_budget  # noqa: F401
+import polymarketbot.strategy.settlement.decision as settlement
+from polymarketbot.strategy.settlement.allocator import MarginalSettlementAllocator
+from polymarketbot.strategy.settlement.fair_value import normalize_question
 
 log = get_logger(__name__)
 

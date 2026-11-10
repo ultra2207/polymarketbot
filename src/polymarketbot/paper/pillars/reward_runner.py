@@ -23,11 +23,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import venue
+import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.paper.actions import Resting
-from polymarketbot.paper.books import shares_at
-from polymarketbot.paper.pillars import reward
-from polymarketbot.rewards.rebates import RebateAccountant, RebateCredit
+from polymarketbot.strategy.books import shares_at
+import polymarketbot.strategy.reward.decision as reward
+from polymarketbot.strategy.reward.rebates import RebateAccountant, RebateCredit
 
 log = get_logger(__name__)
 

@@ -30,7 +30,7 @@ from archive.ctf.complement_quoter import (
     LegQuote,
     round_tick,
 )
-from polymarketbot.trading.ctf import PolygonCtfClient
+from polymarketbot.strategy.onchain.ctf import PolygonCtfClient
 
 
 @pytest.fixture

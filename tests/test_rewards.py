@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.rewards.scoring import (
+from polymarketbot.strategy.reward.scoring import (
     OrderQuote,
     calculate_epoch_payout,
     compute_book_side_scores,
@@ -128,7 +128,7 @@ def test_epoch_payout_and_floor() -> None:
 
 
 def test_competitor_depth_ladder_and_jensens_inequality() -> None:
-    from polymarketbot.rewards.scoring import (
+    from polymarketbot.strategy.reward.scoring import (
         DEFAULT_COMPETITOR_LADDER,
         compute_competitor_ladder_score,
     )
@@ -165,7 +165,7 @@ def test_competitor_depth_ladder_and_jensens_inequality() -> None:
 # Allocator: measured inputs, USD activation lots, KKT water-filling
 # ---------------------------------------------------------------------------
 
-from polymarketbot.rewards.allocator import (  # noqa: E402
+from polymarketbot.strategy.reward.allocator import (  # noqa: E402
     PROTOCOL_MIN_DAILY_PAYOUT_USD,
     LiquidityRewardsAllocator,
 )
@@ -256,7 +256,7 @@ def test_water_filling_equalises_marginal_yield_across_markets() -> None:
 
 def test_reserve_ceiling_is_total_exposure_not_a_bankroll_fraction() -> None:
     """The reserve cap is the notional that could fill at once, never 35 %."""
-    from polymarketbot.rewards.allocator import calculate_endogenous_reserve
+    from polymarketbot.strategy.reward.allocator import calculate_endogenous_reserve
 
     # Three $100 exposures at 0.5 pay-out each: h_i = 50, so no more than $150
     # of inventory can fill simultaneously. A 35 % ceiling on this bankroll
@@ -295,7 +295,7 @@ def test_reserve_ceiling_is_total_exposure_not_a_bankroll_fraction() -> None:
 
 def _measured_regime(condition_id: str = "0xtest"):
     """A tape regime shaped like a measured one (window, prints, statistics)."""
-    from polymarketbot.rewards.tape_regime import MarketRegime, NS_PER_HOUR
+    from polymarketbot.strategy.reward.regime import MarketRegime, NS_PER_HOUR
 
     window_end_ns = 1_794_306_326_926_867_001
     return MarketRegime(
@@ -329,7 +329,7 @@ MEASURED_INPUTS = dict(
 
 def test_expected_yield_uses_measured_distance_and_mid() -> None:
     """No 0.5c / 0.50 defaults: an unmeasured quote earns no estimate."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     base = dict(
         daily_rate=500.0,
@@ -353,7 +353,7 @@ def test_expected_yield_uses_measured_distance_and_mid() -> None:
 
 def test_one_sided_quote_is_scored_at_a_third() -> None:
     """The venue's one-sided penalty applies to the scanner, not just paper."""
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     common = dict(
         daily_rate=500.0,
@@ -381,8 +381,8 @@ def test_one_sided_quote_is_scored_at_a_third() -> None:
 
 def test_unmeasured_gas_refuses_the_yield_estimate(monkeypatch) -> None:
     """A rate-limited RPC must not price merges at a fabricated $0.015."""
-    import polymarketbot.trading.ctf as ctf_mod
-    from polymarketbot.rewards.scanner import calculate_expected_yield
+    import polymarketbot.strategy.onchain.ctf as ctf_mod
+    from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     def boom():
         raise RuntimeError("eth_blockNumber rate limited")
@@ -485,7 +485,7 @@ def test_water_filling_funds_nothing_whose_accrual_cannot_beat_its_own_fill_yiel
 
 def test_fill_probability_is_read_from_the_measured_table_or_refused() -> None:
     """A quote horizon outside the measured grid has no probability: refuse."""
-    from polymarketbot.paper.pillars.reward import expected_fill_yield
+    from polymarketbot.strategy.reward.decision import expected_fill_yield
 
     priced = expected_fill_yield(
         tick=0.01, min_flow_shares=50.0, horizon_s=5.0,

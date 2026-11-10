@@ -36,7 +36,7 @@ from polymarketbot.paper.uma_poll import (
     UMA_POLL_MAX_WINDOW_BLOCKS,
     UmaProposalPoller,
 )
-from polymarketbot.trading.domain2.settlement_fair_value import (
+from polymarketbot.strategy.settlement.fair_value import (
     UMA_LIVE_VERDICTS_PATH,
     SettlementFairValueModel,
     TapeProposal,

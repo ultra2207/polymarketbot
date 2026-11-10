@@ -1,7 +1,7 @@
 """Unit tests for production-grade MINLP/MILP Capital Allocator."""
 
 import pytest
-from polymarketbot.rewards.allocator import LiquidityRewardsAllocator, MarketAllocation, PortfolioAllocationResult
+from polymarketbot.strategy.reward.allocator import LiquidityRewardsAllocator, MarketAllocation, PortfolioAllocationResult
 
 
 @pytest.fixture
@@ -146,7 +146,7 @@ def test_endogenous_reserve_scaling(allocator):
 
 
 def test_continuous_optimization_governor(allocator, sample_candidates):
-    from polymarketbot.rewards.allocator import ContinuousOptimizationGovernor
+    from polymarketbot.strategy.reward.allocator import ContinuousOptimizationGovernor
 
     gov = ContinuousOptimizationGovernor(allocator=allocator, hurdle_pct=0.15, min_dwell_time_seconds=300.0)
     actions = gov.evaluate_governor_cycle(

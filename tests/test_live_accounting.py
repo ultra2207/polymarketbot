@@ -9,11 +9,11 @@ import time
 
 import pytest
 
-from polymarketbot.rewards.deskew import DeSkewDecision, DeSkewPathway
-from polymarketbot.trading.client import ClobAPIError, OrderPlacementResult
-from polymarketbot.trading.ctf import MergeExecutionResult
-from polymarketbot.trading.engine import RealMoneyTradingEngine
-from polymarketbot.trading.settlement import (
+from polymarketbot.strategy.reward.deskew import DeSkewDecision, DeSkewPathway
+from polymarketbot.strategy.venue.clob import ClobAPIError, OrderPlacementResult
+from polymarketbot.strategy.onchain.ctf import MergeExecutionResult
+from polymarketbot.live.engine import RealMoneyTradingEngine
+from polymarketbot.strategy.onchain.settlement import (
     NEGRISK_ADAPTER,
     NEGRISK_MERGE_SELECTOR,
     ROUTER,
@@ -845,7 +845,7 @@ def _ready_live_merge(engine, ctf, monkeypatch, route, meta):
     engine.shares_yes = engine.shares_no = 5.0
     engine._last_merge_ts = 0.0
     monkeypatch.setattr(
-        "polymarketbot.trading.engine.verify_route",
+        "polymarketbot.live.engine.verify_route",
         lambda *args, **kwargs: (True, "ok"),
     )
 

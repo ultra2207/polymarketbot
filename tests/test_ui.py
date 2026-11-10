@@ -29,7 +29,7 @@ def test_ui_imports_without_streamlit_runtime():
 
 
 def test_ui_reads_the_live_paper_journal(tmp_path: Path):
-    from polymarketbot.paper.ledger import SCHEMA
+    from polymarketbot.strategy.ledger import SCHEMA
     from polymarketbot.ui.app import (
         format_ts,
         lot_value,

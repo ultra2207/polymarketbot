@@ -11,10 +11,10 @@ from __future__ import annotations
 import time
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import venue
+import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.paper.actions import pending_for
-from polymarketbot.paper.books import best_ask
-from polymarketbot.paper.pillars import settlement
+from polymarketbot.strategy.books import best_ask
+import polymarketbot.strategy.settlement.decision as settlement
 from polymarketbot.paper.pillars.tail_budget import tail_budget
 
 log = get_logger(__name__)

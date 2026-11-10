@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from polymarketbot.paper import venue
-from polymarketbot.paper.venue import condition_tape
+import polymarketbot.strategy.venue.reads as venue
+from polymarketbot.strategy.venue.reads import condition_tape
 
 
 @pytest.fixture(autouse=True)

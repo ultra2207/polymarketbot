@@ -19,8 +19,9 @@ Layout:
   auto-merger (formerly ``polymarketbot.trading.complement_quoter``).
 * :mod:`.books` / :mod:`.harness` / :mod:`.measurements` / :mod:`.merger` /
   :mod:`.strategy_types` - small pure helpers copied out of the live packages so
-  the archive has no dependency on ``polymarketbot.paper`` or
-  ``polymarketbot.trading`` (see README "Copied helpers").
+  the archive has no dependency on ``polymarketbot.paper`` or the retired
+  ``polymarketbot.trading`` package (the live half is now
+  ``polymarketbot.live``; see README "Copied helpers").
 * :mod:`.tests` - the moved tests; run them by explicit path from the
   repository root:
   ``uv run python -m pytest -q archive/ctf/tests``.

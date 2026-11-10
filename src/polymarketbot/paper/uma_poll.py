@@ -32,10 +32,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from polymarketbot.chain import RATE_LIMIT, classify_rpc_error, provider_name
+from polymarketbot.strategy.onchain.core import RATE_LIMIT, classify_rpc_error, provider_name
 from polymarketbot.data.uma import UMA_ADDRESSES, decode_log
 from polymarketbot.logs import get_logger
-from polymarketbot.trading.domain2.settlement_fair_value import (
+from polymarketbot.strategy.settlement.fair_value import (
     TapeProposal,
     UmaVerdictTape,
 )

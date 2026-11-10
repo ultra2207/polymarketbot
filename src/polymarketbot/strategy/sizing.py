@@ -17,7 +17,7 @@ import math
 from typing import Any, Dict, Optional, Tuple
 
 from polymarketbot.logs import get_logger
-from polymarketbot.rewards.allocator import calculate_endogenous_reserve
+from polymarketbot.strategy.reward.allocator import calculate_endogenous_reserve
 
 logger = get_logger("strategy.sizing")
 

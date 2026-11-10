@@ -16,8 +16,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from polymarketbot.rewards import scanner
-from polymarketbot.rewards.scanner import (
+import polymarketbot.strategy.reward.scanner as scanner
+from polymarketbot.strategy.reward.scanner import (
     find_optimal_lp_markets,
     get_real_l2_score,
     reset_scanner_telemetry,
@@ -75,7 +75,7 @@ def _venue_get(markets: list[dict], tick: float = 0.01):
 def _run_scan(markets: list[dict], **kwargs: object) -> list[dict]:
     reset_scanner_telemetry()
     with patch("requests.Session.get", side_effect=_venue_get(markets)), patch(
-        "polymarketbot.rewards.scanner.lp_screen.get_real_l2_score",
+        "polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score",
         return_value=(500.0, 1000.0, 0.60),
     ):
         return find_optimal_lp_markets(bankroll_usd=150.0, limit_output=5, **kwargs)
@@ -183,7 +183,7 @@ def test_reported_depth_is_the_audited_sum(
 ) -> None:
     reset_scanner_telemetry()
     with patch("requests.Session.get", side_effect=_venue_get([_market()])), patch(
-        "polymarketbot.rewards.scanner.lp_screen.get_real_l2_score",
+        "polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score",
         return_value=mocked_l2,
     ):
         ranked = find_optimal_lp_markets(bankroll_usd=150.0, limit_output=5)

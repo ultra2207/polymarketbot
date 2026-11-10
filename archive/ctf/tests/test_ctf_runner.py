@@ -19,8 +19,8 @@ from archive.ctf.harness import Market
 from archive.ctf.landing import land_ctf
 from archive.ctf.runner import run_ctf
 from polymarketbot.fees import FeeSchedule
-from polymarketbot.paper.latency import ActionBook
-from polymarketbot.paper.ledger import Ledger
+from polymarketbot.strategy.latency import ActionBook
+from polymarketbot.strategy.ledger import Ledger
 
 
 def _book(bid: float | None, ask: float | None, size: float = 1000.0) -> dict:

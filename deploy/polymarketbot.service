@@ -29,7 +29,7 @@ ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capi
 
 # Alternate modes (override via systemctl edit polymarketbot):
 #   Real Money Quoting (Blocked until Dec 1st - Requires --live, --yes, and populated credentials):
-#     ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.trading.runner --live --yes --budget-pct 0.20
+#     ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.live.runner --live --yes --budget-pct 0.20
 
 # Reliability & Crash Recovery
 Restart=always

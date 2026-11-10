@@ -1,7 +1,7 @@
 """Tests for Robust Capital Velocity & Dynamic Hazard Modeling."""
 
 import pytest
-from polymarketbot.trading.domain2.robust_hazard import (
+from polymarketbot.strategy.settlement.hazard import (
     calculate_cycle_velocity,
     calculate_physical_cycle_time,
     BayesianCategoryState,

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.paper.books import (
+from polymarketbot.strategy.books import (
     best_ask,
     best_bid,
     ladder,
@@ -16,8 +16,8 @@ from polymarketbot.paper.books import (
     shares_at,
     walk_cost,
 )
-from polymarketbot.paper.latency import ActionBook
-from polymarketbot.paper.ledger import Ledger
+from polymarketbot.strategy.latency import ActionBook
+from polymarketbot.strategy.ledger import Ledger
 
 
 def _book(bids: list[tuple[float, float]], asks: list[tuple[float, float]]) -> dict:
@@ -158,7 +158,7 @@ def test_rtt_probe_keeps_its_sample_out_of_the_latency_report(tmp_path):
     it is why no measured RPC RTT ever existed."""
     import json
 
-    from polymarketbot.paper.latency import RttProbe
+    from polymarketbot.strategy.latency import RttProbe
 
     report = tmp_path / "local_latency.json"
     report.write_text(
@@ -187,7 +187,7 @@ def test_rtt_probe_keeps_its_sample_out_of_the_latency_report(tmp_path):
 def test_rtt_probe_seeds_from_a_legacy_sample_when_its_own_file_is_absent(tmp_path):
     import json
 
-    from polymarketbot.paper.latency import RttProbe
+    from polymarketbot.strategy.latency import RttProbe
 
     legacy = tmp_path / "legacy.json"
     legacy.write_text(json.dumps({"p50_ms": 300.0}), encoding="utf-8")

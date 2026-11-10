@@ -18,9 +18,9 @@ from __future__ import annotations
 import pytest
 
 from polymarketbot.fees import FeeSchedule, maker_fee_rebate
-from polymarketbot.paper.pillars import reward
-from polymarketbot.paper.venue import Market
-from polymarketbot.rewards.rebates import RebateAccountant
+import polymarketbot.strategy.reward.decision as reward
+from polymarketbot.strategy.venue.reads import Market
+from polymarketbot.strategy.reward.rebates import RebateAccountant
 
 DAY = "2026-11-10"
 SCHEDULE = FeeSchedule(rate=0.05, exponent=1.0, taker_only=True, rebate_rate=0.15)
@@ -239,7 +239,7 @@ def test_no_client_means_modelled_with_a_reason():
 def test_run_reward_persists_per_market_accrual(monkeypatch, tmp_path):
     """Each tick must journal (condition, UTC day, USD) for a later venue join."""
     from polymarketbot.paper.actions import Resting
-    from polymarketbot.paper.ledger import Ledger
+    from polymarketbot.strategy.ledger import Ledger
     from polymarketbot.paper.pillars import reward_runner
 
     now = 1_000_000.0

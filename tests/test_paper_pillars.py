@@ -20,15 +20,16 @@ import yaml
 from polymarketbot.fees import FeeSchedule, taker_fee
 from polymarketbot.paper import engine as engine_mod
 from polymarketbot.paper import radar
-from polymarketbot.paper.books import shares_at
-from polymarketbot.paper.latency import ActionBook
-from polymarketbot.paper.pillars import reward, settlement
-from polymarketbot.paper.venue import Market, Print
-from polymarketbot.trading.domain2.robust_hazard import (
+from polymarketbot.strategy.books import shares_at
+from polymarketbot.strategy.latency import ActionBook
+import polymarketbot.strategy.reward.decision as reward
+import polymarketbot.strategy.settlement.decision as settlement
+from polymarketbot.strategy.venue.reads import Market, Print
+from polymarketbot.strategy.settlement.hazard import (
     BayesianDisputeTracker,
     MeasuredDisputeCounts,
 )
-from polymarketbot.trading.domain2.settlement_fair_value import (
+from polymarketbot.strategy.settlement.fair_value import (
     OracleVerdict,
     SettlementFairValueModel,
     UmaVerdictTape,
@@ -918,7 +919,7 @@ def _policy(confidence: float):
 
 
 def _evidence():
-    from polymarketbot.trading.domain2.tail_evidence import evidence_from_counts
+    from polymarketbot.strategy.settlement.tail_evidence import evidence_from_counts
 
     return evidence_from_counts(
         70, 0, disputed=0, source="test", challenge_trials=134664, challenges=158

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pyarrow.parquet as pq
 
-from polymarketbot.trading.session_recorder import LiveSessionRecorder
+from polymarketbot.live.recorder import LiveSessionRecorder
 
 
 class FakeClob:
@@ -134,7 +134,7 @@ def test_recorder_writes_engine_venue_and_hook_rows(tmp_path) -> None:
 
 
 def test_user_event_parser_maps_orders_trades_and_unknowns() -> None:
-    from polymarketbot.trading.session_recorder import _parse_user_event
+    from polymarketbot.live.recorder import _parse_user_event
 
     table, row = _parse_user_event(
         {"type": "order", "market": "0xcid", "asset_id": "yes", "id": "o-1", "status": "LIVE"}

@@ -11,17 +11,17 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from polymarketbot.logs import get_logger
-from polymarketbot.paper import venue
-from polymarketbot.paper.books import ladder
+import polymarketbot.strategy.venue.reads as venue
+from polymarketbot.strategy.books import ladder
 from polymarketbot.paper.settlement_risk import (
     SettlementTailPolicy,
     load_settlement_tail_policy,
 )
-from polymarketbot.trading.domain2.settlement_allocator import (
+from polymarketbot.strategy.settlement.allocator import (
     HeldExposure,
     SettlementCandidate,
 )
-from polymarketbot.trading.domain2.tail_evidence import TailEvidence, load_tail_evidence
+from polymarketbot.strategy.settlement.tail_evidence import TailEvidence, load_tail_evidence
 
 log = get_logger(__name__)
 

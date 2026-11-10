@@ -1,5 +1,8 @@
-"""Paper-trading pillars: pure decision functions, one module per strategy.
+"""Paper-trading pillars: the runners that wire the strategy core to the ledger.
 
-Submodules are imported explicitly (``from polymarketbot.paper.pillars import
-reward``) so a pillar can be tested without importing the other two.
+The decision functions moved to the shared core: reward decisions live in
+``polymarketbot.strategy.reward.decision`` and settlement decisions in
+``polymarketbot.strategy.settlement.decision``.  These submodules keep the
+paper-only bookkeeping (fills, rebates, tail budget) and are imported
+explicitly so one runner can be tested without importing the others.
 """

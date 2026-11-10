@@ -8,7 +8,7 @@ The tail-budget allocator needs three things before it will size a book:
 * ``tail_confidence`` - the band the loss is stated at.  Also stated, not
   derived.
 * the measured verdict-reversal tail - evidence, read from
-  :mod:`polymarketbot.trading.domain2.tail_evidence`.
+  :mod:`polymarketbot.strategy.settlement.tail_evidence`.
 
 This module is the single place the first two are read.  The engine loads the
 policy once, logs it with its source, and refuses to allocate when it is absent:

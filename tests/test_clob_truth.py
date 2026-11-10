@@ -13,7 +13,7 @@ import pytest
 import requests
 
 from polymarketbot.dataapi import DataAPIClient
-from polymarketbot.trading.client import (
+from polymarketbot.strategy.venue.clob import (
     NEG_RISK_CTF_EXCHANGE_V2,
     USDC_ASSET_ADDRESSES,
     ClobAPIError,
@@ -778,7 +778,7 @@ def test_dry_run_place_order_records_mock_and_keeps_balance():
 # Public surface
 # --------------------------------------------------------------------------
 def test_public_names_still_import():
-    import polymarketbot.trading.client as module
+    import polymarketbot.strategy.venue.clob as module
 
     assert module.FastOrderSigner is not None
     assert module.DEFAULT_CLOB_HOST == "https://clob.polymarket.com"

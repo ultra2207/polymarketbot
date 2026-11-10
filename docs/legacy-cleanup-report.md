@@ -4,6 +4,51 @@ Evidence date: 2026-11-10. Reachability was computed with an AST import BFS from
 the two real entry points, not from filenames. Line counts are **code lines**
 (non-blank, non-comment).
 
+## 0.0 Execution log (waves 1-5 landed, 2026-11-10)
+
+| Metric | Before waves | After wave 6 | Change |
+|---|---|---|---|
+| `src/` modules | 198 | **94** | −104 |
+| `src/` code lines | 70,592 | **36,086** | **−49 %** |
+| Files > 300 code lines | 77 | **38** | −39 |
+| Reachable from neither entry | 98 modules / 32,124 lines | 7 modules / 2,456 lines | −92 % |
+| Test suite | 1,726 passed | **812 passed** | −914 (deleted subjects + 63 archived) |
+| Net working-tree change | — | **−61,580 lines** across 247 files | — |
+
+(Code lines = non-blank, non-comment, docstrings included, measured with the
+same counter before and after.)
+
+Landed:
+
+- **Wave 1** — `trading/__init__.py` and `trading/domain2/__init__.py` reduced to
+  docstrings. `paper.main` went from loading **12** live-stack modules it never
+  called to **0** (measured by `sys.modules` diff; 102 → 65 modules loaded).
+- **Wave 2** — CTF **archived, not deleted**: `archive/ctf/` holds the pillar
+  package, runner, allocator, split-arb, complement quoter and 63 tests, all
+  importable, with a README stating the measured refutation and the re-run
+  commands. `trading/ctf.py` (on-chain ERC-1155 primitives) stayed because
+  settlement redemption needs it. The paper engine now runs two pillars.
+- **Wave 3** — 21 dead engines deleted (11,093 lines) after AST reachability
+  verification. `fees.py` is now the **only** fee implementation in the tree;
+  seven divergent copies died with their files.
+- **Wave 4** — simulator retired (10 files / 7,373 lines; `feed.py` →
+  `trading/feed.py`, `optimizer.py` → `strategy/sizing.py`) and the
+  data-collection platform retired (43 files / 16,913 lines), with `parse_log`
+  and `ancillary_title` moved into `data/uma.py` first so the UMA poller
+  survived.
+- **Wave 5** — `ops/`, `reports/`, the old `strategy/`, `PaperSessionRecorder`
+  and the one-off census scripts deleted. `ui/` and the three artifact builders
+  kept because they have live consumers.
+
+Two deletions were **refused** with reasons, which is the correct outcome:
+`tools/ctf_quote_fill_horizon.py` builds the fill/markout tables that live reward
+pricing loads at runtime, and `tools/fill_calibration.py` produces
+`fill_model.json`, read by `rewards.queue_valuation`. Deleting either would have
+frozen live pricing with no regeneration path.
+
+**Wave 6 (in progress)** is the structural move to `live/` + `paper/` + shared
+`strategy/`, and **wave 7** is splitting the surviving large files.
+
 ## 0. Target architecture
 
 Two entry points, one strategy core. Anything not reachable from these two is

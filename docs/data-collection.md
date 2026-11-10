@@ -102,7 +102,7 @@ Two corrections to the master plan are baked into this implementation:
   every A record, probes each with a TLS handshake, pins a working edge, and on
   a reset excludes that edge for 300 s, rebuilds the session against the next
   candidate and retries with full-jitter exponential backoff.
-* **Polygon** uses `polymarketbot.chain.rpc_url()`, which rewrites the Alchemy
+* **Polygon** uses `polymarketbot.strategy.onchain.core.rpc_url()`, which rewrites the Alchemy
   app key in `ETH_RPC_URL` to `polygon-mainnet`. Alchemy's free tier caps
   `eth_getLogs` at 10 blocks, so the primary path is WSS `eth_subscribe`; the
   HTTP path walks 10-block windows and never skips a block. Providers are
@@ -207,14 +207,14 @@ endpoint on this host.
 | Self-hosted Erigon/Bor | no external quota | yes | full archive | none | multi-TB NVMe + long sync; the only option that removes the quota |
 
 **Chosen order:** Alchemy → dRPC → PublicNode → (Ankr when configured). It is
-the order of `polymarketbot.chain.rpc_urls()`, and the socket path uses the same
+the order of `polymarketbot.strategy.onchain.core.rpc_urls()`, and the socket path uses the same
 list, not just HTTP. Rationale: only Alchemy and dRPC served archive logs for
 free, dRPC is keyless so it survives a dead key, and PublicNode is a third
 opinion with a different host. Ankr adds a fourth independent operator; enable
 it with `POLYGON_RPC_URLS=https://rpc.ankr.com/polygon` rather than hard-coding
 it, because its public `eth_getLogs` range cap is unverified here.
 
-Rotation rules (`polymarketbot.chain.ProviderPool`):
+Rotation rules (`polymarketbot.strategy.onchain.core.ProviderPool`):
 
 * A **429 rests that provider**, it does not fail the call: the next provider is
   tried in the same pass. Cooldown starts at 60 s and doubles per consecutive

@@ -184,13 +184,13 @@ def main() -> int:
         )
 
     # Polygon RPC: the clock the on-chain leg (merge/split/redeem) actually
-    # pays. ``polymarketbot.trading.ctf.load_persisted_rpc_rtt_s`` looks for
+    # pays. ``polymarketbot.strategy.onchain.ctf.load_persisted_rpc_rtt_s`` looks for
     # this exact name; without it the on-chain leg silently falls back to the
     # CLOB HTTP round trip, which is a different network path.
     try:
         from urllib.parse import urlsplit
 
-        from polymarketbot.chain import rpc_url
+        from polymarketbot.strategy.onchain.core import rpc_url
 
         _rpc_endpoint, _ = rpc_url()
         endpoints.append(

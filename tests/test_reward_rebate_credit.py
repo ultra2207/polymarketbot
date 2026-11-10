@@ -2,7 +2,7 @@
 
 Regression test for a live defect: ``apply_resting_fills`` called
 ``reward.maker_rebate(price, shares, schedule)``, but that function never
-existed in ``polymarketbot.paper.pillars.reward``. ``paper.engine._tick`` wraps
+existed in ``polymarketbot.strategy.reward.decision``. ``paper.engine._tick`` wraps
 the whole tick in ``except Exception``, so the failure surfaced as:
 
   * the fill already booked by ``ledger.buy`` (so inventory was right),
@@ -22,7 +22,8 @@ import pytest
 
 from polymarketbot.fees import FeeSchedule, maker_fee_rebate
 from polymarketbot.paper.actions import Resting
-from polymarketbot.paper.pillars import reward, reward_runner
+from polymarketbot.paper.pillars import reward_runner
+import polymarketbot.strategy.reward.decision as reward
 
 PRICE = 0.81
 SHARES = 20.0

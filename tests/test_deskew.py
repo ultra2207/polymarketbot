@@ -1,7 +1,7 @@
 """Unit tests for the Dynamic Inventory De-Skewing Optimizer."""
 
 import pytest
-from polymarketbot.rewards.deskew import DeSkewPathway, DynamicDeSkewOptimizer
+from polymarketbot.strategy.reward.deskew import DeSkewPathway, DynamicDeSkewOptimizer
 
 
 def test_neutrality_zone_returns_hold():
@@ -186,7 +186,7 @@ class TestDynamicThresholdCalculator:
     """Tests for DynamicThresholdCalculator across capital tiers and market regimes."""
 
     def test_starter_portfolio_thresholds(self):
-        from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+        from polymarketbot.strategy.reward.deskew import DynamicThresholdCalculator
 
         # $70 starter, quote 20 shares, $17.50 reserve
         calib = DynamicThresholdCalculator.calibrate_all(
@@ -202,7 +202,7 @@ class TestDynamicThresholdCalculator:
         assert calib.auto_merge_threshold >= 10.0
 
     def test_whale_portfolio_thresholds(self):
-        from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+        from polymarketbot.strategy.reward.deskew import DynamicThresholdCalculator
 
         # $10,000 whale, quote 400 shares, $2,500 reserve
         calib = DynamicThresholdCalculator.calibrate_all(
@@ -217,7 +217,7 @@ class TestDynamicThresholdCalculator:
         assert calib.auto_merge_threshold >= 100.0
 
     def test_holding_time_expiry_adaptation(self):
-        from polymarketbot.rewards.deskew import DynamicThresholdCalculator
+        from polymarketbot.strategy.reward.deskew import DynamicThresholdCalculator
 
         # 5-minute market (300s remaining): holding time must be tightly bounded
         t_5m = DynamicThresholdCalculator.compute_holding_time(time_to_expiry_seconds=300.0)

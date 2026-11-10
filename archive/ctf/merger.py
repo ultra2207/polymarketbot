@@ -1,6 +1,6 @@
 """Complete-set merge logic for Polymarket Conditional Tokens (CTF).
 
-Copied verbatim from ``polymarketbot.rewards.merger`` when that module was
+Copied verbatim from ``polymarketbot.strategy.reward.merger`` when that module was
 deleted (its last live consumer was the archived complement quoter).  In binary
 prediction markets 1 YES token + 1 NO token merge into exactly 1.00 USDC
 collateral, so a two-sided maker recycles matched collateral instead of leaving

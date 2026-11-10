@@ -236,7 +236,7 @@ ExecStart=
 ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 
 # --- Option 2: Live Real Money Quoter (BLOCKED until Dec 1st - requires real capital) ---
-# ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.trading.runner --live --yes --budget-pct 0.20
+# ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.live.runner --live --yes --budget-pct 0.20
 ```
 
 Reload and restart:

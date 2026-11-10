@@ -1,4 +1,4 @@
-"""Operator-runner gating and honesty tests for polymarketbot.trading.runner.
+"""Operator-runner gating and honesty tests for polymarketbot.live.runner.
 
 No network: every client, feed and engine is a local fake.
 """
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from polymarketbot.trading import runner
+import polymarketbot.live.runner as runner
 
 END_DATE = "2030-01-01T00:00:00Z"
 

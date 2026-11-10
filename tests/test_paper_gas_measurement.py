@@ -76,7 +76,7 @@ def test_missing_price_is_a_refusal_not_zero() -> None:
 
 
 def test_missing_gas_price_is_a_refusal_not_zero(monkeypatch) -> None:
-    import polymarketbot.chain as chain
+    import polymarketbot.strategy.onchain.core as chain
 
     class _NoRpc:
         def __init__(self, *args, **kwargs) -> None:

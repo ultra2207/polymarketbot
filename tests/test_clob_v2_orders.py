@@ -31,7 +31,7 @@ from polymarketbot.risk.fast_signer import (
     _point_add,
     _point_mul,
 )
-from polymarketbot.trading.client import (
+from polymarketbot.strategy.venue.clob import (
     DEFAULT_CTF_EXCHANGE,
     ClobAPIError,
     ClobAuthCredentials,

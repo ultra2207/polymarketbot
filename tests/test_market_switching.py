@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.rewards.scanner import MarketOpportunity
-from polymarketbot.rewards.switching import (
+from polymarketbot.strategy.reward.scanner import MarketOpportunity
+from polymarketbot.strategy.reward.switching import (
     OpportunisticSwitchingEngine,
     SwitchingConfig,
 )

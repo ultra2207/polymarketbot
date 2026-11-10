@@ -84,16 +84,16 @@ and, for the engine tests, a smaller engine stub.
 
 ## What deliberately stayed live
 
-* `src/polymarketbot/trading/ctf.py` — the on-chain ERC-1155 primitives
+* `src/polymarketbot/strategy/onchain/ctf.py` — the on-chain ERC-1155 primitives
   (split/merge/redeem calldata, EIP-1559 signing, gas, RLP). **Live settlement
   redemption needs it**; `tests/test_chain_settlement.py`,
   `test_settlement_routing.py`, `test_tx_lifecycle.py` exercise it.
-* `src/polymarketbot/paper/ledger.py` — including the `CtfMinter` bucket and
+* `src/polymarketbot/strategy/ledger.py` — including the `CtfMinter` bucket and
   `merge()`, so an old journal still resumes and reports its equity.
 * `data/derived/ctf_*.json` and `data/derived/ctf_census/` — the measured
   artifacts. They were **not copied**: both the archive and the live loaders
   read them in place.
-* `src/polymarketbot/rewards/fill_measurement.py` — the live loader for
+* `src/polymarketbot/strategy/reward/measurement.py` — the live loader for
   `ctf_quote_fill_horizon.json` and `ctf_maker_markout.json`. The reward
   pillar and the opportunity scanner price with these tables, so the loaders
   stayed in the live tree; the archive has its own copy in `pillars/`.
@@ -103,20 +103,20 @@ and, for the engine tests, a smaller engine stub.
 ## Copied helpers (why this package is self-contained)
 
 Archive code may import `polymarketbot.fees`, `polymarketbot.fill_model`,
-`polymarketbot.logs`, `polymarketbot.market` (plus `chain` for the measured
+`polymarketbot.logs`, `polymarketbot.market` (plus `strategy.onchain.core` for the measured
 on-chain clocks). It must not import `polymarketbot.paper` or
-`polymarketbot.trading`, so these small, pure definitions were copied:
+`polymarketbot.live`, so these small, pure definitions were copied:
 
 | File | Copied from | Why |
 |---|---|---|
-| `books.py` | `polymarketbot.paper.books` | `best_bid`/`best_ask`/`shares_at`/`ladder` — pure dict math |
-| `harness.py` | `paper.venue` (`Market`, `Print`), `paper.actions` (`Resting`, `pending_for`), `pillars.reward.measured_fill_shares` + `reward_runner.apply_resting_fills` | the quote record, the market/print views and the fill-accrual rule the runner needs. The paper pillar's rolling log tally was dropped (no reader here); the rebate now calls `fees.maker_fee_rebate`, which is the function the paper path intended. |
-| `measurements.py` | `trading.ctf` (`load_persisted_rpc_rtt_s`, `load_measured_block_interval_s`, `get_dynamic_gas_price_gwei`, `get_dynamic_pol_usd_price`) | measured on-chain inputs; `trading/ctf.py` stays live, but the archive may not import it |
+| `books.py` | `polymarketbot.strategy.books` | `best_bid`/`best_ask`/`shares_at`/`ladder` — pure dict math |
+| `harness.py` | `strategy.venue.reads` (`Market`, `Print`), `paper.actions` (`Resting`, `pending_for`), `strategy.reward.decision.measured_fill_shares` + `paper.pillars.reward_runner.apply_resting_fills` | the quote record, the market/print views and the fill-accrual rule the runner needs. The paper pillar's rolling log tally was dropped (no reader here); the rebate now calls `fees.maker_fee_rebate`, which is the function the paper path intended. |
+| `measurements.py` | `strategy.onchain.ctf` (`load_persisted_rpc_rtt_s`, `load_measured_block_interval_s`, `get_dynamic_gas_price_gwei`, `get_dynamic_pol_usd_price`) | measured on-chain inputs; `strategy/onchain/ctf.py` stays live, but the archive may not import it |
 | `strategy_types.py` | `polymarketbot.strategy.base` | the five context dataclasses + `StrategyModule` protocol the quoter implements; the strategy harness was deleted in the same wave |
 | `merger.py` | `polymarketbot.rewards.merger` | `CompleteSetPosition`/`MergeEvent` bookkeeping and the `mergePositions` calldata builder the quoter auto-merges with; the live module was deleted once this quoter was its last consumer |
 
 One archived **test** (`tests/test_complement_quoter.py::test_polygon_ctf_client_dry_run_integration`)
-imports `polymarketbot.trading.ctf.PolygonCtfClient`, which is live on purpose:
+imports `polymarketbot.strategy.onchain.ctf.PolygonCtfClient`, which is live on purpose:
 it checks the quoter against the real dry-run client contract. It is a test
 cross-check, not a package dependency.
 

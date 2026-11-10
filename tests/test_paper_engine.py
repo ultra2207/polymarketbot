@@ -14,7 +14,7 @@ import pytest
 
 from polymarketbot.fees import FeeSchedule
 from polymarketbot.paper import engine as engine_mod
-from polymarketbot.paper.venue import Market
+from polymarketbot.strategy.venue.reads import Market
 
 
 class _Http:
@@ -132,7 +132,7 @@ def test_settlement_buys_winner_at_landing_and_marks_par(tmp_path, fake_venue,
     monkeypatch.setattr(
         engine_mod.settlement, "verdict_for",
         lambda model, m, now=None: __import__(
-            "polymarketbot.trading.domain2.settlement_fair_value",
+            "polymarketbot.strategy.settlement.fair_value",
             fromlist=["OracleVerdict"],
         ).OracleVerdict(0, 1.0, "gamma_payout", time.time()),
     )
@@ -279,7 +279,7 @@ def test_block_interval_is_seconds_per_block_from_the_tape(tmp_path, fake_venue,
     engine = _engine(tmp_path, books, gas=None)
 
     monkeypatch.setattr(
-        "polymarketbot.trading.ctf.load_measured_block_interval_s",
+        "polymarketbot.strategy.onchain.ctf.load_measured_block_interval_s",
         lambda *a, **kw: 1.501,
     )
     poller = engine._make_uma_poller()
@@ -289,7 +289,7 @@ def test_block_interval_is_seconds_per_block_from_the_tape(tmp_path, fake_venue,
     # Without a tape, two live heads over five seconds must give 5/4 = 1.25 s
     # per block, not 4/5 = 0.8 blocks per second.
     monkeypatch.setattr(
-        "polymarketbot.trading.ctf.load_measured_block_interval_s",
+        "polymarketbot.strategy.onchain.ctf.load_measured_block_interval_s",
         lambda *a, **kw: None,
     )
     engine.interval = 10.0  # the live probe sleeps interval/2 = 5 s
@@ -303,7 +303,7 @@ def test_block_interval_is_seconds_per_block_from_the_tape(tmp_path, fake_venue,
     def _sleep(seconds):
         clock["now"] += seconds
 
-    monkeypatch.setattr("polymarketbot.chain.ChainClient", _Chain)
+    monkeypatch.setattr("polymarketbot.strategy.onchain.core.ChainClient", _Chain)
     monkeypatch.setattr(engine_mod.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(engine_mod.time, "sleep", _sleep)
 

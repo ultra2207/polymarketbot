@@ -44,12 +44,12 @@ def generate_order_salt() -> int:
 
 
 def round_price_to_tick(price: float, tick_size: float) -> Decimal:
-    from polymarketbot.trading.client import round_price_to_tick as _rpt
+    from polymarketbot.strategy.venue.clob import round_price_to_tick as _rpt
     return _rpt(price, tick_size)
 
 
 def compute_order_amounts(side: str, size: float, price: float, tick_size: float) -> tuple[int, int]:
-    from polymarketbot.trading.client import compute_order_amounts as _coa
+    from polymarketbot.strategy.venue.clob import compute_order_amounts as _coa
     return _coa(side, size, price, tick_size)
 
 logger = get_logger("presigned_cache")

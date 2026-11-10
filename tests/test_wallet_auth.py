@@ -25,7 +25,7 @@ from polymarketbot.risk.fast_signer import (
     keccak256,
     private_key_to_address,
 )
-from polymarketbot.trading.client import (
+from polymarketbot.strategy.venue.clob import (
     DEFAULT_CTF_EXCHANGE_V2,
     ClobAuthCredentials,
     LiveClobClient,

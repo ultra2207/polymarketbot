@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from polymarketbot.trading.base import BaseMarketMakingEngine, PositionView
+from polymarketbot.live.base import BaseMarketMakingEngine, PositionView
 
 
 class _HarnessEngine(BaseMarketMakingEngine):

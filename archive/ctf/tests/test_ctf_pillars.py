@@ -4,7 +4,7 @@ These are the ``ctf`` sections of ``tests/test_paper_pillars.py`` (the taker
 parity, maker parity, measured fill/markout table, quote audit and on-chain leg
 clock tests).  The test bodies and every assertion are unchanged; only the
 import points at ``archive.ctf.pillars`` and the market view is the archived
-copy of ``polymarketbot.paper.venue.Market``.
+copy of ``polymarketbot.strategy.venue.reads.Market``.
 
 Run by explicit path from the repository root::
 
