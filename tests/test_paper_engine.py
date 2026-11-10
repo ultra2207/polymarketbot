@@ -311,3 +311,41 @@ def test_block_interval_is_seconds_per_block_from_the_tape(tmp_path, fake_venue,
     assert live is not None
     assert live.block_interval_s == pytest.approx(1.25)
     engine.ledger.close()
+
+
+def test_mark_stage_flags_a_vanished_book_once_then_clears(tmp_path):
+    """No book: flag the lot, keep the last measurement, log one transition."""
+    from loguru import logger
+
+    engine = _engine(tmp_path, {}, gas=None)
+    assert engine.ledger.buy(
+        "RewardHarvester", condition_id="c9", token_id="tok9",
+        shares=100.0, price=0.40,
+    )
+    lot = engine.ledger.positions("RewardHarvester")[0]
+
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(str(message)),
+                         level="WARNING")
+    try:
+        engine._mark({"tok9": _book(0.55, 0.56)})
+        assert lot.mark_live is True
+        assert engine.ledger.equity()["RewardHarvester"] == pytest.approx(
+            100.0 - 40.0 + 100.0 * 0.55
+        )
+
+        engine._mark({})
+        assert lot.mark_live is False
+        assert [item.token_id for item in
+                engine.ledger.unmarked("RewardHarvester")] == ["tok9"]
+        # Repeated no-book ticks must not re-log the same transition.
+        engine._mark({})
+        assert sum("mark unmeasured" in message for message in messages) == 1
+
+        engine._mark({"tok9": _book(0.60, 0.61)})
+        assert lot.mark_live is True
+        assert lot.last_mark == pytest.approx(0.60)
+        assert engine.ledger.unmarked("RewardHarvester") == []
+    finally:
+        logger.remove(sink_id)
+    engine.ledger.close()

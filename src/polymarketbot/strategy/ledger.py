@@ -8,6 +8,7 @@ No lot is ever valued at its own purchase price when a market mark exists.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 import time
@@ -49,7 +50,8 @@ CREATE TABLE IF NOT EXISTS lots (
     cost_usd REAL NOT NULL,
     par_value REAL,
     last_mark REAL NOT NULL DEFAULT 0,
-    tag TEXT NOT NULL DEFAULT ''
+    tag TEXT NOT NULL DEFAULT '',
+    mark_live INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS reward_accrual (
     ts REAL NOT NULL,
@@ -74,6 +76,11 @@ class Lot:
     par_value: Optional[float] = None
     last_mark: float = 0.0
     tag: str = ""
+    # True while ``last_mark`` is a live book measurement. ``False`` means the
+    # lot has never been measured (``last_mark`` is its purchase price) *or*
+    # its book disappeared after the last measurement; the flag is surfaced so
+    # equity can never silently pretend a frozen price is current.
+    mark_live: bool = False
 
     def mark(self) -> float:
         if self.par_value is not None:
@@ -106,9 +113,31 @@ class Ledger:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+        #: Baseline for the interval reconciliation: the last committed
+        #: snapshot's per-strategy components plus the trades rowid at that
+        #: instant. In memory only, so a resumed run starts checking from its
+        #: second snapshot instead of guessing which journal rows the previous
+        #: run had already counted.
+        self._prev_snapshot: Optional[dict[str, Any]] = None
         if resume:
             self._resume()
+
+    def _migrate(self) -> None:
+        """Add columns that older soak databases do not have.
+
+        A resumed lot from before ``mark_live`` existed cannot say whether its
+        persisted mark was measured or just its purchase price, so the column
+        defaults to 0 (unmeasured) and the next tick re-measures it. That is the
+        honest reading: an unlabelled price is not evidence of a live book.
+        """
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(lots)")}
+        if "mark_live" not in columns:
+            self._conn.execute(
+                "ALTER TABLE lots ADD COLUMN mark_live INTEGER NOT NULL DEFAULT 0"
+            )
+            log.info("ledger: added lots.mark_live; resumed marks start unmeasured")
 
     def _resume(self) -> None:
         """Restore the last durable cash and inventory per strategy."""
@@ -120,10 +149,10 @@ class Ledger:
         for strategy, cash_value in rows:
             if strategy in self._books:
                 self._books[strategy].cash = float(cash_value)
-        for strategy, condition_id, token_id, shares, cost_usd, par_value, mark, tag in \
+        for strategy, condition_id, token_id, shares, cost_usd, par_value, mark, tag, live in \
                 self._conn.execute(
                     "SELECT strategy, condition_id, token_id, shares, cost_usd, par_value,"
-                    " last_mark, tag FROM lots"
+                    " last_mark, tag, mark_live FROM lots"
                 ):
             book = self._books.get(strategy)
             if book is None or shares <= 1e-9:
@@ -131,7 +160,7 @@ class Ledger:
             book.lots.append(Lot(strategy, condition_id, token_id, float(shares),
                                  float(cost_usd),
                                  None if par_value is None else float(par_value),
-                                 float(mark), tag))
+                                 float(mark), tag, bool(live)))
         if rows:
             log.info(f"resumed ledger: {[(name, round(b.cash, 2)) for name, b in self._books.items()]}")
 
@@ -221,19 +250,29 @@ class Ledger:
         """
         with self._lock:
             book = self._books[strategy]
-            legs = [lot for lot in book.lots if lot.condition_id == condition_id]
-            if not legs:
+            other = next(
+                (lot for lot in book.lots
+                 if lot.condition_id == condition_id
+                 and lot.token_id != token_id
+                 and lot.shares > 1e-9),
+                None,
+            )
+            own_shares = sum(
+                lot.shares for lot in book.lots
+                if lot.token_id == token_id and lot.shares > 1e-9
+            )
+            # Neither leg may be touched unless the merge can complete: the
+            # previous order removed the first leg and then discovered the
+            # sibling was missing, burning inventory with no journal row.
+            if (
+                other is None
+                or own_shares + 1e-9 < pair_shares
+                or other.shares + 1e-9 < pair_shares
+            ):
                 return 0.0
             cost = self._remove_shares(book, token_id, pair_shares)
-            if cost is None:
-                return 0.0
-            other = next(
-                (lot for lot in legs if lot.token_id != token_id and lot.shares > 0.0), None
-            )
-            if other is None:
-                return 0.0
             removed = self._remove_shares(book, other.token_id, pair_shares)
-            if removed is None:
+            if cost is None or removed is None:
                 return 0.0
             cost += removed
             proceeds = pair_shares * 1.0 - float(gas)
@@ -359,14 +398,54 @@ class Ledger:
             self._row(strategy, "credit", condition_id, token_id, 0.0, 0.0, 0.0,
                       float(amount), detail)
 
-    def mark(self, token_id: str, price: float) -> None:
+    def mark(self, token_id: str, price: float,
+             strategy: Optional[str] = None) -> bool:
+        """Record a live book measurement on every lot of ``token_id``.
+
+        Returns True when at least one lot transitioned from unmeasured to
+        measured, so a caller can log the transition once instead of on every
+        tick. The price is never invented: a bid outside ``(0, 1)`` is refused
+        and the lot keeps its honest unmeasured state.
+        """
         if not (0.0 < price < 1.0):
-            return
+            return False
         with self._lock:
-            for book in self._books.values():
+            books = (self._books[strategy],) if strategy is not None else self._books.values()
+            transitioned = False
+            for book in books:
                 for lot in book.lots:
                     if lot.token_id == token_id:
                         lot.last_mark = float(price)
+                        transitioned = transitioned or not lot.mark_live
+                        lot.mark_live = True
+            return transitioned
+
+    def mark_unmeasured(self, token_id: str,
+                        strategy: Optional[str] = None) -> bool:
+        """Flag lots of ``token_id`` as unmeasured because their book is gone.
+
+        ``last_mark`` is kept as the last real measurement (not a fabricated
+        price) but ``mark_live`` is cleared so readers can see that the number
+        is stale rather than current. Returns True on a measured -> unmeasured
+        transition, which is the once-per-transition log trigger.
+        """
+        with self._lock:
+            books = (self._books[strategy],) if strategy is not None else self._books.values()
+            transitioned = False
+            for book in books:
+                for lot in book.lots:
+                    if lot.token_id == token_id and lot.mark_live:
+                        lot.mark_live = False
+                        transitioned = True
+            return transitioned
+
+    def unmarked(self, strategy: str) -> list[Lot]:
+        """Open lots whose value is not backed by a live market measurement."""
+        with self._lock:
+            return [
+                lot for lot in self._books[strategy].lots
+                if lot.shares > 1e-9 and lot.par_value is None and not lot.mark_live
+            ]
 
     def set_par(self, condition_id: str, winning_token_id: str,
                 par: float = 1.0) -> None:
@@ -399,26 +478,152 @@ class Ledger:
                 for name, book in self._books.items()
             }
 
-    def snapshot(self) -> dict[str, float]:
-        equity = self.equity()
+    def reconcile(self) -> dict[str, dict[str, float]]:
+        """Check every book against its lots and the journal since the snapshot.
+
+        Returns the decomposition per strategy. This is the diagnostic that
+        ``snapshot`` runs immediately before committing; it is public so a
+        caller (or a test) can check the books without writing a snapshot and
+        without changing the numbers it is checking.
+        """
         now = time.time()
         with self._lock:
+            return self._reconcile_locked(now)
+
+    def snapshot(self) -> dict[str, float]:
+        """Persist cash, inventory and equity, and reconcile them first.
+
+        This is the accounting commit, run once per engine interval (and once
+        at stop), not per tick: ``equity()`` is read every tick and stays a
+        straight sum, while the checks below are O(lots) plus two journal
+        aggregates. A defect is logged with every component rather than
+        clamped, so the journal and the reported equity can never disagree
+        silently.
+        """
+        now = time.time()
+        with self._lock:
+            trades_rowid = int(
+                self._conn.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM trades"
+                ).fetchone()[0]
+            )
+            report = self._reconcile_locked(now)
+            equity = {name: parts["equity"] for name, parts in report.items()}
             self._conn.execute("DELETE FROM lots")
-            for name, book in self._books.items():
+            for name, parts in report.items():
                 self._conn.execute(
                     "INSERT INTO snapshots (ts, strategy, cash, positions_value, equity)"
                     " VALUES (?,?,?,?,?)",
-                    (now, name, book.cash, book.positions_value(), equity[name]),
+                    (now, name, parts["cash"], parts["positions"], parts["equity"]),
                 )
                 self._conn.executemany(
                     "INSERT INTO lots (strategy, condition_id, token_id, shares, cost_usd,"
-                    " par_value, last_mark, tag) VALUES (?,?,?,?,?,?,?,?)",
+                    " par_value, last_mark, tag, mark_live)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
                     [(name, lot.condition_id, lot.token_id, lot.shares, lot.cost_usd,
-                      lot.par_value, lot.last_mark, lot.tag)
-                     for lot in book.lots if lot.shares > 1e-9],
+                      lot.par_value, lot.last_mark, lot.tag, int(lot.mark_live))
+                     for lot in self._books[name].lots if lot.shares > 1e-9],
                 )
             self._conn.commit()
+            # The journal window is keyed by SQLite rowid, not timestamps: a
+            # trade committed in the same clock tick as this snapshot must land
+            # on exactly one side of the boundary.
+            self._prev_snapshot = {
+                "ts": now,
+                "trades_rowid": trades_rowid,
+                "books": {
+                    name: (parts["cash"], parts["positions"], parts["equity"])
+                    for name, parts in report.items()
+                },
+            }
         return equity
+
+    def _reconcile_locked(self, now: float) -> dict[str, dict[str, float]]:
+        previous = self._prev_snapshot
+        report: dict[str, dict[str, float]] = {}
+        for name, book in self._books.items():
+            cash = float(book.cash)
+            positions = float(book.positions_value())
+            # Recompute the position sum from the lots themselves instead of
+            # trusting the method under test: the two must agree.
+            expected = sum(
+                lot.shares * lot.mark() for lot in book.lots if lot.shares > 1e-9
+            )
+            value = cash + positions
+            report[name] = {
+                "cash": cash,
+                "positions": positions,
+                "expected_positions": expected,
+                "equity": value,
+            }
+            self._check_book(name, cash, positions, expected, value)
+            prior = previous["books"].get(name) if previous is not None else None
+            if prior is not None:
+                self._check_window(
+                    name, cash, positions, value, prior,
+                    previous["trades_rowid"], previous["ts"], now,
+                )
+        return report
+
+    @staticmethod
+    def _tolerance(*values: float) -> float:
+        return 1e-6 + 1e-9 * max((abs(value) for value in values), default=0.0)
+
+    def _check_book(self, name: str, cash: float, positions: float,
+                    expected: float, equity: float) -> None:
+        """Check ``equity == cash + sum(shares * mark)`` for one book."""
+        components = (equity, cash, expected)
+        if not all(math.isfinite(value) for value in components + (positions,)):
+            log.error(
+                f"accounting defect [{name}]: non-finite component "
+                f"equity={equity!r} cash={cash!r} positions={positions!r} "
+                f"lots={expected!r}"
+            )
+            return
+        tol = self._tolerance(*components)
+        if abs(equity - (cash + expected)) > tol:
+            log.error(
+                f"accounting defect [{name}]: equity=${equity:,.6f} != "
+                f"cash=${cash:,.6f} + positions=${expected:,.6f} "
+                f"(book reports positions=${positions:,.6f}, "
+                f"residual=${equity - (cash + expected):+,.6f}, tol=${tol:.2e})"
+            )
+
+    def _check_window(self, name: str, cash: float, positions: float,
+                      equity: float, prior: tuple[float, float, float],
+                      trades_rowid: int, prev_ts: float, now: float) -> None:
+        """Check one snapshot window: ``d_equity == d_cash + d_positions``.
+
+        ``accrual_credited`` is reported separately but is *part of* ``d_cash``
+        (every ``credit`` writes a trade row), so it is not added again; the
+        independent check that makes this non-trivial is that ``d_cash`` must
+        equal the journal's own ``SUM(cash_delta)`` for the window.
+        """
+        prev_cash, prev_positions, prev_equity = prior
+        journaled, accrual = self._conn.execute(
+            "SELECT COALESCE(SUM(cash_delta), 0.0),"
+            " COALESCE(SUM(CASE WHEN kind = 'credit' AND detail = 'reward_accrual'"
+            " THEN cash_delta ELSE 0.0 END), 0.0)"
+            " FROM trades WHERE strategy = ? AND rowid > ?",
+            (name, trades_rowid),
+        ).fetchone()
+        journaled = float(journaled)
+        accrual = float(accrual)
+        d_cash = cash - prev_cash
+        d_positions = positions - prev_positions
+        d_equity = equity - prev_equity
+        tol = self._tolerance(d_equity, d_cash, d_positions, journaled, accrual)
+        residual = d_equity - (d_cash + d_positions)
+        cash_residual = d_cash - journaled
+        if abs(residual) > tol or abs(cash_residual) > tol:
+            log.error(
+                f"accounting defect [{name}] window {now - prev_ts:.0f}s: "
+                f"d_equity=${d_equity:+,.6f} != d_cash=${d_cash:+,.6f} + "
+                f"d_positions=${d_positions:+,.6f} (residual=${residual:+,.6f}); "
+                f"cash moved ${d_cash:+,.6f} but journal says ${journaled:+,.6f} "
+                f"(residual=${cash_residual:+,.6f}); accrual credited in window="
+                f"${accrual:+,.6f} (already inside d_cash); tol=${tol:.2e}"
+            )
 
     # -- internals -------------------------------------------------------
     @staticmethod
@@ -437,7 +642,11 @@ class Ledger:
             if lot.token_id == token_id and lot.par_value == par_value and lot.tag == tag:
                 lot.shares += shares
                 lot.cost_usd += cost_usd
-                lot.last_mark = mark
+                # A live token-level mark already applies to the new shares; do
+                # not reset it to this fill's price. An unmeasured lot keeps the
+                # new fill as its cost basis fallback.
+                if not lot.mark_live:
+                    lot.last_mark = mark
                 return
         book.lots.append(
             Lot(strategy, condition_id, token_id, shares, cost_usd, par_value, mark, tag)
@@ -445,7 +654,15 @@ class Ledger:
 
     @staticmethod
     def _remove_shares(book: StrategyBook, token_id: str, shares: float) -> Optional[float]:
+        # Pre-check before touching anything: this used to remove whatever it
+        # could and *then* return None when the request was unsatisfiable,
+        # which burned inventory with no journal row and no cash movement.
         remaining = float(shares)
+        available = sum(
+            lot.shares for lot in book.lots if lot.token_id == token_id and lot.shares > 1e-12
+        )
+        if available + 1e-9 < remaining:
+            return None
         removed_cost = 0.0
         for lot in book.lots:
             if remaining <= 1e-12:

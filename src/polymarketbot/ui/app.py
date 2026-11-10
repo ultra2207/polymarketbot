@@ -44,6 +44,7 @@ LOT_COLUMNS = (
     "cost_usd",
     "par_value",
     "last_mark",
+    "mark_live",
     "tag",
 )
 
@@ -81,7 +82,21 @@ def read_trades(db_path: Path | str = DB_PATH, limit: int = 500) -> list[dict[st
 
 
 def read_lots(db_path: Path | str = DB_PATH) -> list[dict[str, Any]]:
-    return read_table(db_path, "lots", LOT_COLUMNS, order_by="strategy, condition_id")
+    rows = read_table(db_path, "lots", LOT_COLUMNS, order_by="strategy, condition_id")
+    if rows:
+        return rows
+    # A journal written before mark_live existed has no such column, so the
+    # first query fails inside read_table and returns []. Re-read the legacy
+    # columns and mark every lot unmeasured, the same honest default the
+    # ledger applies when it migrates the table.
+    legacy = read_table(
+        db_path, "lots",
+        tuple(column for column in LOT_COLUMNS if column != "mark_live"),
+        order_by="strategy, condition_id",
+    )
+    for row in legacy:
+        row["mark_live"] = 0
+    return legacy
 
 
 def _first_and_last(snapshots: list[dict[str, Any]]) -> tuple[dict[str, dict], dict[str, dict]]:
@@ -269,10 +284,16 @@ def main() -> None:
             frame["value"] = [lot_value(lot) for lot in lots]
             frame["cost_usd"] = frame["cost_usd"].astype(float)
             frame["unrealised"] = frame["value"] - frame["cost_usd"]
+            # A frozen or never-measured mark must not read as a current one.
+            frame["mark_state"] = [
+                "par" if lot["par_value"] is not None
+                else ("live" if lot["mark_live"] else "UNMARKED")
+                for lot in lots
+            ]
             st.dataframe(
                 frame[[
                     "strategy", "condition_id", "token_id", "shares", "cost_usd",
-                    "par_value", "last_mark", "value", "unrealised", "tag",
+                    "par_value", "last_mark", "mark_state", "value", "unrealised", "tag",
                 ]].rename(columns={
                     "strategy": "Strategy",
                     "condition_id": "Condition",
@@ -281,6 +302,7 @@ def main() -> None:
                     "cost_usd": "Cost",
                     "par_value": "Par",
                     "last_mark": "Mark",
+                    "mark_state": "Mark state",
                     "value": "Value",
                     "unrealised": "Unrealised",
                     "tag": "Tag",
@@ -288,7 +310,13 @@ def main() -> None:
                 hide_index=True,
                 use_container_width=True,
             )
-            st.caption(f"Total lot value: ${sum(lot_value(lot) for lot in lots):.2f}")
+            unmarked = [lot for lot in lots
+                        if lot["par_value"] is None and not lot["mark_live"]]
+            st.caption(
+                f"Total lot value: ${sum(lot_value(lot) for lot in lots):.2f}"
+                + (f" | {len(unmarked)} lot(s) UNMARKED: valued at the last "
+                   f"measurement, not a live book." if unmarked else "")
+            )
         else:
             st.info("No inventory held: every quote is resting or has been settled.")
 

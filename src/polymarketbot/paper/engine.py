@@ -290,9 +290,26 @@ class PaperEngine:
     def _mark(self, books: dict[str, dict]) -> None:
         for strategy in STRATEGIES:
             for lot in self.ledger.positions(strategy):
+                # An oracle verdict is a protocol value, not a market guess: par
+                # already prices the lot and needs no book.
+                if lot.par_value is not None:
+                    continue
                 bid = best_bid(books.get(lot.token_id) or {})
-                if bid is not None:
-                    self.ledger.mark(lot.token_id, bid)
+                if bid is None:
+                    # Never invent a price to fill the gap. Keep the last real
+                    # measurement as the value, clear `mark_live`, and say so
+                    # once per measured -> unmeasured transition.
+                    if self.ledger.mark_unmeasured(lot.token_id, strategy):
+                        log.warning(
+                            f"mark unmeasured: {strategy} {lot.token_id[:10]} "
+                            f"{lot.shares:.2f} shares held at ${lot.mark():.4f} "
+                            f"(last live ${lot.last_mark:.4f}); no bid this tick"
+                        )
+                elif self.ledger.mark(lot.token_id, bid, strategy):
+                    log.info(
+                        f"mark live: {strategy} {lot.token_id[:10]} "
+                        f"{lot.shares:.2f} shares at bid ${bid:.4f}"
+                    )
 
     def _rtt(self) -> float:
         return self.rtt.p50() or 0.0
@@ -304,10 +321,15 @@ class PaperEngine:
         for name in STRATEGIES:
             positions = self.ledger.positions(name)
             value = sum(lot.shares * lot.mark() for lot in positions)
+            unmarked = self.ledger.unmarked(name)
+            unmarked_value = sum(lot.shares * lot.mark() for lot in unmarked)
             parts.append(
                 f"{name}: cash=${self.ledger.cash(name):,.2f} "
                 f"pos=${value:,.2f} eq=${equity[name]:,.2f} "
-                f"lots={len(positions)} fills={self._fills[name]}"
+                f"lots={len(positions)} fills={self._fills[name]} "
+                # Inventory the equity number contains without a live book behind
+                # it: a counter, so `pos=$...` is never mistaken for a measurement.
+                f"unmarked={len(unmarked)}/${unmarked_value:,.2f}"
             )
         log.info(" | ".join(parts) +
                  f" | rtt={f'{rtt*1000:.0f}ms' if rtt else 'unmeasured'} "
