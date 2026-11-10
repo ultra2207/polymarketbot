@@ -116,7 +116,7 @@ seams, preserving public import paths:
 |---|---|---|---|
 | `live/engine.py` | 2,894 | `live/engine/` — 16 modules | 264 |
 | `strategy/venue/clob.py` | 2,373 | `venue/clob/` — 14 modules | 277 |
-| `live/runner.py` | 1,976 | CLI / market / UI / loop | 1,149 |
+| `live/runner.py` | 1,976 | CLI / market / UI / `supervisor/` — 11 modules | 296 |
 | `live/base.py` | 1,451 | economics / store / quoting / yield | 488 |
 | `strategy/onchain/ctf.py` | 1,472 | `onchain/ctf/` — 13 modules | 220 |
 | `strategy/venue/feed.py` | 974 | `venue/feed/` — 9 modules | 195 |
@@ -129,9 +129,15 @@ signed-transaction grids, 150 water-fill candidate sets, 500 marginal-maths
 cases, 400 accruals, 400 fill audits, 200 verdict models, plus a seven-event
 websocket sequence.
 
-`live/runner.py` at 1,149 is the one honest exception: it is a single 920-line
-supervision function, and splitting it requires restructuring control flow, not
-moving code. It is flagged rather than cut.
+`live/runner.py` was wave 7's one deferred file: a single 920-line supervision
+function whose split needs named seams, not just a file move. Wave 9 landed it:
+the coroutine became `live/supervisor/` (`context` holds the run record and the
+collaborators the façade binds so `runner.<Name>` overrides still redirect every
+phase; `startup`, `sizing`, `feed`, `switch`, `lifecycle`, `loop` own the
+labelled phases; `desk`, `markets`, `helpers` hold the helpers they use), and
+`live/runner.py` is now a façade that keeps `parse_args`, `main`, the live gate
+binding and the original module surface. The phases are the same statements in
+the same order with the same arguments, log text and exception handling.
 
 ## 0. Target architecture
 

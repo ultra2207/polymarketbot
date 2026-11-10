@@ -62,6 +62,7 @@ def _read_ledger(db_path: str | Path, day: str) -> dict[str, Any]:
             "error": f"ledger journal {path} does not exist",
             "accrual_by_condition": {},
             "rebates_by_condition": {},
+            "rebate_note": "",
         }
     conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     try:
@@ -74,14 +75,26 @@ def _read_ledger(db_path: str | Path, day: str) -> dict[str, Any]:
         accrual: dict[str, float] = {}
         accrual_note = ""
         if "reward_accrual" in tables:
-            accrual = {
-                str(condition_id): float(total or 0.0)
-                for condition_id, total in conn.execute(
-                    "SELECT condition_id, SUM(accrued_usd) FROM reward_accrual"
-                    " WHERE day = ? GROUP BY condition_id",
-                    (day,),
+            # A journal that never recorded an accrual cannot say "we earned
+            # nothing": an empty table is an absent measurement, and printing
+            # $0.00 for it would read as a refutation of the model.
+            recorded = int(
+                conn.execute("SELECT COUNT(*) FROM reward_accrual").fetchone()[0] or 0
+            )
+            if recorded == 0:
+                accrual_note = (
+                    "this journal has no reward_accrual rows at all, so it was not "
+                    "recording accrual; the ledger side is unknown, not zero"
                 )
-            }
+            else:
+                accrual = {
+                    str(condition_id): float(total or 0.0)
+                    for condition_id, total in conn.execute(
+                        "SELECT condition_id, SUM(accrued_usd) FROM reward_accrual"
+                        " WHERE day = ? GROUP BY condition_id",
+                        (day,),
+                    )
+                }
         else:
             accrual_note = (
                 "this journal predates the reward_accrual table, so the ledger "
@@ -89,19 +102,29 @@ def _read_ledger(db_path: str | Path, day: str) -> dict[str, Any]:
             )
         rebates: dict[str, float] = {}
         rebate_by_detail: dict[str, float] = {}
+        rebate_note = ""
         if "trades" in tables:
-            for condition_id, detail, total in conn.execute(
-                "SELECT condition_id, detail, SUM(cash_delta) FROM trades"
-                " WHERE kind = 'credit' AND detail LIKE 'maker_rebate%'"
-                " AND date(ts, 'unixepoch') = ? GROUP BY condition_id, detail",
-                (day,),
-            ):
-                rebates[str(condition_id)] = rebates.get(str(condition_id), 0.0) + float(
-                    total or 0.0
+            trades_recorded = int(
+                conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] or 0
+            )
+            if trades_recorded == 0:
+                rebate_note = (
+                    "this journal recorded no trades at all, so it was not "
+                    "live; the rebate side is unknown, not zero"
                 )
-                rebate_by_detail[str(detail)] = rebate_by_detail.get(
-                    str(detail), 0.0
-                ) + float(total or 0.0)
+            else:
+                for condition_id, detail, total in conn.execute(
+                    "SELECT condition_id, detail, SUM(cash_delta) FROM trades"
+                    " WHERE kind = 'credit' AND detail LIKE 'maker_rebate%'"
+                    " AND date(ts, 'unixepoch') = ? GROUP BY condition_id, detail",
+                    (day,),
+                ):
+                    rebates[str(condition_id)] = rebates.get(
+                        str(condition_id), 0.0
+                    ) + float(total or 0.0)
+                    rebate_by_detail[str(detail)] = rebate_by_detail.get(
+                        str(detail), 0.0
+                    ) + float(total or 0.0)
         return {
             "source": "measured",
             "error": "",
@@ -109,6 +132,7 @@ def _read_ledger(db_path: str | Path, day: str) -> dict[str, Any]:
             "accrual_by_condition": accrual,
             "rebates_by_condition": rebates,
             "rebate_by_detail": rebate_by_detail,
+            "rebate_note": rebate_note,
         }
     finally:
         conn.close()
@@ -190,6 +214,7 @@ def reconcile_day(
             "rebates_by_condition": ledger["rebates_by_condition"],
             "rebate_by_detail": ledger.get("rebate_by_detail", {}),
             "rebate_total": ledger_rebate_total,
+            "rebate_note": ledger.get("rebate_note", ""),
         },
         "ratios": {
             "earnings": _ratio(venue_earnings_total, ledger_accrual_total),
@@ -283,6 +308,8 @@ def format_report(data: dict[str, Any]) -> str:
         lines.append(f"  venue total: {_money(venue_r['total'])}")
     if ledger["source"] != "measured":
         lines.append(f"  ledger: {UNMEASURED} ({ledger['error']})")
+    elif ledger.get("rebate_note"):
+        lines.append(f"  ledger: {UNMEASURED} ({ledger['rebate_note']})")
     else:
         detail = ledger["rebate_by_detail"]
         split = ", ".join(f"{name}={_money(usd)}" for name, usd in sorted(detail.items()))
