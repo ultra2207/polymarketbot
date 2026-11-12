@@ -79,6 +79,10 @@ class _HarnessEngine(BaseMarketMakingEngine):
             cash_reserve_usd=0.0,  # the harness models no locked/reserved cash
             **kwargs,
         )
+        # This harness bypasses the live market configuration step, which is
+        # where the real engine reads the venue's minimum order notional. The
+        # value is telemetry-only on the reward-epoch path under test.
+        self.min_order_usd = 0.0
 
     def _set_quote(self, token_side, quote_side, price, size, ts) -> None:
         qid = f"{quote_side}_{token_side}".upper()
