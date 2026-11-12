@@ -1,16 +1,21 @@
-"""Tests for Storage Sentinel & SOTA Resource Optimization."""
+"""Storage helpers: disk guards, SQLite pragmas, journal opening, pruning."""
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 from polymarketbot.storage import (
     clean_ephemeral_caches,
     get_disk_status,
+    open_journal_connection,
     prune_directory,
     prune_sqlite_table,
+    run_with_busy_retry,
     tune_sqlite_connection,
 )
 
@@ -63,12 +68,16 @@ def test_directory_pruning(tmp_path: Path):
     root = tmp_path / "sessions"
     root.mkdir()
 
-    # Create 8 dummy session folders with marker
+    # Create 8 dummy session folders with marker. The mtime is set explicitly:
+    # `time.sleep(0.01)` between creates still ties on a coarse-mtime volume and
+    # made this test order-dependent on directory enumeration.
+    base = time.time() - 3600.0
     for i in range(8):
         s_dir = root / f"sess_{i}"
         s_dir.mkdir()
         (s_dir / "session.json").write_text("{}", encoding="utf-8")
-        time.sleep(0.01)
+        os.utime(s_dir / "session.json", (base + i, base + i))
+        os.utime(s_dir, (base + i, base + i))
 
     assert len(list(root.iterdir())) == 8
 
@@ -96,3 +105,64 @@ def test_clean_ephemeral_caches(tmp_path: Path):
     assert cleaned >= 2
     assert not spill.exists()
     assert not pytest_cache.exists()
+
+
+def test_open_journal_connection_is_wal_and_readable_while_writing(tmp_path: Path):
+    db = tmp_path / "journal.db"
+    conn = open_journal_connection(db)
+    assert conn.execute("PRAGMA journal_mode;").fetchone()[0].lower() == "wal"
+    assert conn.execute("PRAGMA busy_timeout;").fetchone()[0] > 0
+    conn.execute("CREATE TABLE trades (ts REAL)")
+    conn.execute("INSERT INTO trades VALUES (1.0)")
+    conn.commit()
+
+    # The dashboard's read-only connection must not block the writer.
+    reader = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    assert reader.execute("SELECT count(*) FROM trades").fetchone()[0] == 1
+    conn.execute("INSERT INTO trades VALUES (2.0)")
+    conn.commit()
+    assert reader.execute("SELECT count(*) FROM trades").fetchone()[0] == 2
+    reader.close()
+    conn.close()
+
+
+def test_open_journal_connection_gives_up_on_a_held_lock(tmp_path: Path):
+    db = tmp_path / "locked.db"
+    holder = sqlite3.connect(db)
+    holder.execute("CREATE TABLE t (a INTEGER)")
+    holder.commit()
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            # Bounded: two attempts with a 50 ms busy timeout, not a hang.
+            open_journal_connection(db, busy_timeout_ms=50, attempts=2)
+    finally:
+        holder.rollback()
+        holder.close()
+    # With the lock released the same call succeeds.
+    open_journal_connection(db, busy_timeout_ms=50, attempts=2).close()
+
+
+def test_run_with_busy_retry_only_retries_locked_errors():
+    calls: list[int] = []
+
+    def flaky() -> str:
+        calls.append(1)
+        if len(calls) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    assert run_with_busy_retry(flaky, attempts=4, base_delay_s=0.0) == "ok"
+    assert len(calls) == 3
+
+    def broken() -> None:
+        raise sqlite3.OperationalError("no such table: trades")
+
+    with pytest.raises(sqlite3.OperationalError):
+        run_with_busy_retry(broken, attempts=4, base_delay_s=0.0)
+
+    def always_locked() -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        run_with_busy_retry(always_locked, attempts=3, base_delay_s=0.0)

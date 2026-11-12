@@ -29,7 +29,7 @@ Package layout (every body was moved verbatim from the former ``feed.py``):
 
 from __future__ import annotations
 
-from . import (  # noqa: F401
+from . import (
     book,
     client,
     connection,

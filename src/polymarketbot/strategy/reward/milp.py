@@ -10,7 +10,7 @@ water-fill instead.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from ortools.linear_solver import pywraplp
 
@@ -24,8 +24,8 @@ def solve_milp(
     parsed_candidates: list[dict[str, Any]],
     usable_capital: float,
     num_segments: int,
-    max_active_markets: Optional[int],
-) -> Optional[list[tuple[dict[str, Any], float]]]:
+    max_active_markets: int | None,
+) -> list[tuple[dict[str, Any], float]] | None:
     """Solve the allocation MILP; ``None`` means "fall back to water-filling"."""
     solver = pywraplp.Solver.CreateSolver("SCIP")
     if not solver:

@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.14"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
@@ -1218,8 +1218,10 @@ dependencies = [
     { name = "duckdb" },
     { name = "eth-keys" },
     { name = "loguru" },
+    { name = "numpy" },
     { name = "orjson" },
     { name = "ortools" },
+    { name = "pandas" },
     { name = "pyarrow" },
     { name = "pycryptodome" },
     { name = "pytz" },
@@ -1246,8 +1248,10 @@ requires-dist = [
     { name = "duckdb", specifier = ">=2.0.0" },
     { name = "eth-keys", specifier = ">=0.8.0" },
     { name = "loguru", specifier = ">=0.7.3" },
+    { name = "numpy", specifier = ">=2.1" },
     { name = "orjson", specifier = ">=3.13.0" },
     { name = "ortools", specifier = ">=9.15.6755" },
+    { name = "pandas", specifier = ">=2.2" },
     { name = "pyarrow", specifier = ">=26.0.0" },
     { name = "pycryptodome", specifier = ">=3.24.1,<4" },
     { name = "pytz", specifier = ">=2026.6" },

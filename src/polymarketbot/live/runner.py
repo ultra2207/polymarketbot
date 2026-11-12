@@ -47,21 +47,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from typing import Any, List, Optional
+from typing import Any
 
-from polymarketbot.logs import get_logger
-from polymarketbot.strategy.reward.scanner import find_optimal_lp_markets, get_real_l2_score
-from polymarketbot.strategy.reward.switching import (
-    OpportunisticSwitchingEngine,
-    SwitchDecision,
-    SwitchEvent,
-)
-from polymarketbot.strategy.sizing import derive_quote_size, optimize_spread_offset
-from polymarketbot.strategy.venue.clob import ClobAuthCredentials, LiveClobClient
-from polymarketbot.strategy.onchain.ctf import PolygonCtfClient
 from polymarketbot.live.engine import RealMoneyTradingEngine
-from polymarketbot.strategy.venue.feed import LivePolymarketFeed
-
 from polymarketbot.live.runner_cli import parse_args, require_live_confirmation
 from polymarketbot.live.runner_market import (
     MARKET_STATUS_INTERVAL,
@@ -70,16 +58,25 @@ from polymarketbot.live.runner_market import (
     _settlement_available,
     build_switching_engine,
     rebind_engine_to_market,
+)
+from polymarketbot.live.runner_market import (
     resolve_market_details as _resolve_market_details,
 )
-from polymarketbot.live.runner_ui import render_dashboard, write_banner, write_final_summary
+from polymarketbot.live.runner_ui import (
+    render_dashboard,
+    write_banner,
+    write_final_summary,
+)
 from polymarketbot.live.supervisor import feed as _feed_phases
 from polymarketbot.live.supervisor import loop as _loop
 from polymarketbot.live.supervisor import sizing as _sizing
 from polymarketbot.live.supervisor import startup as _startup
 from polymarketbot.live.supervisor import switch as _switch
 from polymarketbot.live.supervisor.context import Deps, RunContext
-from polymarketbot.live.supervisor.helpers import _close_engine_quietly, _thread_optional
+from polymarketbot.live.supervisor.helpers import (
+    _close_engine_quietly,
+    _thread_optional,
+)
 from polymarketbot.live.supervisor.lifecycle import REDEEM_RETRY_INTERVAL
 from polymarketbot.live.supervisor.loop import (
     BALANCE_SYNC_INTERVAL,
@@ -91,6 +88,20 @@ from polymarketbot.live.supervisor.markets import (
     _compute_competing_score,
     _format_open_order_ids,
 )
+from polymarketbot.logs import get_logger
+from polymarketbot.strategy.onchain.ctf import PolygonCtfClient
+from polymarketbot.strategy.reward.scanner import (
+    find_optimal_lp_markets,
+    get_real_l2_score,
+)
+from polymarketbot.strategy.reward.switching import (
+    OpportunisticSwitchingEngine,
+    SwitchDecision,
+    SwitchEvent,
+)
+from polymarketbot.strategy.sizing import derive_quote_size, optimize_spread_offset
+from polymarketbot.strategy.venue.clob import ClobAuthCredentials, LiveClobClient
+from polymarketbot.strategy.venue.feed import LivePolymarketFeed
 
 log = get_logger("real_money_trader")
 
@@ -101,18 +112,18 @@ __all__ = [
     "BALANCE_SYNC_INTERVAL",
     "CANCEL_RETRY_ATTEMPTS",
     "CANCEL_RETRY_BACKOFF_SECONDS",
-    "ClobAuthCredentials",
     "EXIT_ORDERS_UNCONFIRMED",
-    "LiveClobClient",
-    "LivePolymarketFeed",
     "LOOP_SLEEP_SECONDS",
     "MARKET_STATUS_INTERVAL",
     "MIN_APR_SAMPLES",
-    "MarketSwitchBlocked",
     "ORDERS_SYNC_INTERVAL",
+    "REDEEM_RETRY_INTERVAL",
+    "ClobAuthCredentials",
+    "LiveClobClient",
+    "LivePolymarketFeed",
+    "MarketSwitchBlocked",
     "OpportunisticSwitchingEngine",
     "PolygonCtfClient",
-    "REDEEM_RETRY_INTERVAL",
     "RealMoneyTradingEngine",
     "SwitchDecision",
     "SwitchEvent",
@@ -154,13 +165,13 @@ MIN_APR_SAMPLES = 60
 def resolve_market_details(
     feed: LivePolymarketFeed,
     clob: Any,
-    requested_cid: Optional[str] = None,
-    requested_yes: Optional[str] = None,
-    requested_no: Optional[str] = None,
+    requested_cid: str | None = None,
+    requested_yes: str | None = None,
+    requested_no: str | None = None,
     bankroll: float = 150.0,
-    min_size: Optional[float] = None,
-    max_spread: Optional[float] = None,
-    daily_reward: Optional[float] = None,
+    min_size: float | None = None,
+    max_spread: float | None = None,
+    daily_reward: float | None = None,
 ) -> dict[str, Any]:
     """Resolve the market, real token ids and execution metadata.
 
@@ -249,7 +260,7 @@ async def run_live_runner_async(args: argparse.Namespace) -> int:
     return await _loop.run_loop(ctx)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.yes and not args.live:
         log.warning("--yes has no effect without --live; running dry-run.")

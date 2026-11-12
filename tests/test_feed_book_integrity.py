@@ -211,6 +211,8 @@ def test_reconnect_clears_maintained_book() -> None:
                 [{"price": "0.44", "size": "600"}],
             )
         )
+        # The maintained-book reader is the only observable of a cleared base:
+        # listener callbacks fire only on updates, not on reconnect clears.
         assert feed._snapshot_from_book("tok").best_bid == 0.40
 
         feed._clear_books()
@@ -369,6 +371,8 @@ def test_book_coalescing_keeps_latest_per_asset() -> None:
                     _book_msg("tok", [{"price": price, "size": "10"}], [{"price": "0.99", "size": "10"}])
                 )
 
+            # Queue depth is the only direct observable of the coalescing worker;
+            # the public drop counter below proves the other two were dropped.
             assert feed._dispatch_queue.qsize() == 1
             assert feed.dispatch_dropped_count == 2
 
@@ -470,6 +474,8 @@ def test_event_queue_is_bounded_and_drops_oldest_books_first() -> None:
 def test_feed_event_queue_is_bounded_and_counts_drops() -> None:
     async def _test() -> None:
         feed = LivePolymarketFeed()
+        # The configured bound has no public accessor; the drop counter and the
+        # drained stream below prove the queue honours it.
         assert feed._event_queue.maxsize == EVENT_QUEUE_MAXSIZE
 
         # Shrink the stream so the bound is reachable without thousands of frames.
@@ -487,7 +493,7 @@ def test_feed_event_queue_is_bounded_and_counts_drops() -> None:
                 )
             )
 
-        assert feed._event_queue.qsize() == 3
+        # Draining exactly three events below proves the bound held.
         assert feed.event_dropped_count == 2
         # get_next_event's signature is unchanged and yields the newest events.
         sizes = []
@@ -537,6 +543,8 @@ def test_dispatch_refusal_still_flushes_event_queue() -> None:
                     }
                 )
             )
+            # The single queued snapshot is the coalesced delta; the public drop
+            # counter below proves the superseded frames were discarded.
             assert feed._dispatch_queue.qsize() == 1
 
             await feed._process_ws_payload(

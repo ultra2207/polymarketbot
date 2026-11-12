@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.reward.scoring import (
@@ -50,6 +49,16 @@ class QuoteMixin:
         token_pos = self.shares_yes if tok == "YES" else self.shares_no
         token_avg = self.avg_cost_yes if tok == "YES" else self.avg_cost_no
         token_mid = self._fresh_mid(tok)
+        if token_mid is None:
+            # A limit price is not a mid. Without a fresh book the risk check,
+            # the reward score and every mid-relative distance are unmeasured,
+            # so the quote is refused rather than priced against itself.
+            logger.warning(
+                f"Quote {qid} refused: no fresh {tok} mid (book missing or stale); "
+                "the limit price is not a mid"
+            )
+            self._cancel_quote(qid)
+            return
         allowed, reason, approved_size, approved_price = self.risk_manager.validate_quote(
             asset_id=token_id,
             condition_id=self.condition_id,
@@ -60,7 +69,7 @@ class QuoteMixin:
             current_pos_cost=abs(token_pos * token_avg),
             current_portfolio_inventory_usd=self._inventory_value(),
             current_cash_usd=self.get_cash(),
-            mid_price=token_mid if token_mid is not None else price,
+            mid_price=token_mid,
             tick_size=self.tick_size,
             timestamp=ts,
             event_id=self.event_id,
@@ -96,6 +105,21 @@ class QuoteMixin:
             return
 
         existing = self.active_quotes.get(qid)
+        if existing and str(existing.get("status", "")).upper() == "CANCELLING":
+            # The previous cancel was never confirmed: the venue may still hold
+            # this order, so neither re-placing nor pretending it rests is safe.
+            # Retry the cancel and re-place only once the venue confirms it.
+            old_oid = str(existing.get("order_id", "") or "")
+            if old_oid and not self.clob_client.cancel_order(old_oid):
+                logger.warning(
+                    f"Quote {qid} order {old_oid} is still un-cancelled; retrying the "
+                    "cancel and sending no replacement this tick"
+                )
+                return
+            self._release_reserved_cash(existing)
+            self.active_quotes.pop(qid, None)
+            self.micro_risk.on_cancel(token_id, old_oid)
+            existing = None
         if existing and (
             abs(float(existing.get("price", 0.0)) - price) < 1e-9
             and abs(float(existing.get("size", 0.0)) - requested_size) < 1e-6
@@ -103,7 +127,7 @@ class QuoteMixin:
             # Price and size unchanged: retain active CLOB order without queue penalty
             return
 
-        pre_available: Optional[float] = None
+        pre_available: float | None = None
         if (
             not self.dry_run
             and side == "BUY"
@@ -118,7 +142,6 @@ class QuoteMixin:
         # replacement while the old order's cancel is unconfirmed.
         if existing and existing.get("order_id"):
             old_oid = str(existing["order_id"])
-            self._canceled_order_ids.add(old_oid)
             if not self.clob_client.cancel_order(old_oid):
                 existing["status"] = "CANCELLING"
                 logger.warning(
@@ -127,6 +150,7 @@ class QuoteMixin:
                 return
             self._release_reserved_cash(existing)
             self.active_quotes.pop(qid, None)
+            self.micro_risk.on_cancel(token_id, old_oid)
 
         place_started = time.perf_counter()
         res = self.clob_client.place_order(
@@ -137,6 +161,7 @@ class QuoteMixin:
             tick_size=self.tick_size,
             neg_risk=self.neg_risk,
             fee_rate_bps=self.fee_rate_bps,
+            min_order_usd=self.min_order_usd,
             post_only=True,
         )
         place_rtt_ms = (time.perf_counter() - place_started) * 1000.0
@@ -155,9 +180,27 @@ class QuoteMixin:
                 logger.warning(f"Locked-cash calibration read failed after placement: {e}")
             else:
                 expected_reserve = requested_size * price
-                decreased = (pre_available - post_available) > max(1e-6, expected_reserve * 0.5)
-                self._locked_already_in_balance = not decreased
-                if self._locked_already_in_balance:
+                # Which accounting mode the endpoint reports is decided by
+                # comparing the observed decrease to the reserve this order
+                # placed, not by a hand-set 50 % threshold: the reserve either
+                # left the free balance or it did not. A decrease in between
+                # (another fill or cancel moved the balance in the same window)
+                # measures nothing, so the mode stays uncalibrated.
+                if expected_reserve <= 0.0:
+                    observed_ratio = 0.0
+                else:
+                    observed_ratio = (pre_available - post_available) / expected_reserve
+                if observed_ratio >= 0.99:
+                    self._locked_already_in_balance = False
+                elif observed_ratio <= 0.01:
+                    self._locked_already_in_balance = True
+                else:
+                    logger.warning(
+                        f"Locked-cash calibration inconclusive: free balance moved "
+                        f"{observed_ratio * 100:.1f}% of the ${expected_reserve:.4f} reserve "
+                        "placed; leaving the accounting mode uncalibrated"
+                    )
+                if self._locked_already_in_balance is True:
                     # The endpoint includes the reserve, so undo the local
                     # reservation made while the mode was still unknown.
                     self.cash += expected_reserve
@@ -166,6 +209,29 @@ class QuoteMixin:
                     f"after BUY {requested_size:.2f}@{price:.4f}; balance "
                     f"{'INCLUDES' if self._locked_already_in_balance else 'EXCLUDES'} locked collateral"
                 )
+
+        # Track the L3 queue position this order lands in, from the last book.
+        # ``on_entry`` snapshots the measured size resting ahead of us at this
+        # price; that is this quote's real queue-ahead, so it is persisted
+        # instead of reporting an unmeasured 0.0. A disabled gate returns None
+        # (no calibration = nothing measured) and stays at 0.0.
+        measured_queue_ahead = 0.0
+        depth_bids, depth_asks = self._book_depth.get(tok, ([], []))
+        try:
+            entry = self.micro_risk.on_entry(
+                str(res.order_id),
+                token_id,
+                side,
+                price,
+                requested_size,
+                ts,
+                bids=depth_bids,
+                asks=depth_asks,
+            )
+            if entry is not None:
+                measured_queue_ahead = float(entry.ahead_at_entry)
+        except Exception as e:  # noqa: BLE001 - risk telemetry must never block a live order
+            logger.warning(f"Unified risk engine entry record failed for {qid}: {e}")
 
         # Score quote for rewards. With no book there is no mid to score against;
         # the quote is still recorded, with a zero (unmeasured) score.
@@ -186,13 +252,14 @@ class QuoteMixin:
                 min_size=self.rewards_min_size,
             )
 
-            vq_res = self.migration_engine.queue_model.evaluate_queue_value(
-                quote_size=requested_size,
-                queue_ahead=0.0,
-                half_spread_cents=max(0.1, spread_cents),
-                token_mid_price=mid_tok,
-            )
-            v_queue_value = vq_res.net_queue_value_usd
+            if self.migration_engine is not None:
+                vq_res = self.migration_engine.queue_model.evaluate_queue_value(
+                    quote_size=requested_size,
+                    queue_ahead=measured_queue_ahead,
+                    half_spread_cents=max(0.1, spread_cents),
+                    token_mid_price=mid_tok,
+                )
+                v_queue_value = vq_res.net_queue_value_usd
 
         self.active_quotes[qid] = {
             "quote_id": qid,
@@ -203,7 +270,7 @@ class QuoteMixin:
             "price": price,
             "size": requested_size,
             "size_matched": 0.0,
-            "queue_ahead": 0.0,
+            "queue_ahead": round(measured_queue_ahead, 6),
             "score": round(score, 4),
             "v_queue": round(v_queue_value, 4),
             "timestamp": ts,
@@ -211,6 +278,7 @@ class QuoteMixin:
             "is_dry_run": res.is_dry_run,
             "is_taker": False,
         }
+
         self.locked_cash = self._compute_locked_cash()
         self._emit_event(
             "quote_placed",
@@ -221,6 +289,7 @@ class QuoteMixin:
                 "side": side,
                 "price": price,
                 "size": requested_size,
+                "queue_ahead": round(measured_queue_ahead, 6),
                 "dry_run": bool(res.is_dry_run),
                 "place_rtt_ms": round(place_rtt_ms, 3),
             },
@@ -242,7 +311,7 @@ class QuoteMixin:
                 side,
                 price,
                 requested_size,
-                0.0,
+                round(measured_queue_ahead, 6),
                 score,
                 "LIVE",
             ),
@@ -258,13 +327,19 @@ class QuoteMixin:
         if not order_id:
             self.active_quotes.pop(qid, None)
             return
-        self._canceled_order_ids.add(order_id)
         cancel_started = time.perf_counter()
         cancelled = self.clob_client.cancel_order(order_id)
         cancel_rtt_ms = (time.perf_counter() - cancel_started) * 1000.0
         if cancelled:
             self._release_reserved_cash(quote_data)
+            self.mark_quote_row(qid, "CANCELLED")
             self.active_quotes.pop(qid, None)
+            token_side = str(quote_data.get("token_side", "")).upper()
+            if token_side in ("YES", "NO"):
+                self.micro_risk.on_cancel(
+                    self.asset_id_yes if token_side == "YES" else self.asset_id_no,
+                    order_id,
+                )
             self.locked_cash = self._compute_locked_cash()
             self._emit_event(
                 "quote_cancelled",

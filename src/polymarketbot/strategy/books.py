@@ -7,7 +7,8 @@ shares. Nothing here invents a price or a size: a missing side returns
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from collections.abc import Iterable
+from typing import Any
 
 Level = tuple[float, float]  # (price, shares)
 
@@ -25,17 +26,17 @@ def _levels(raw: Any) -> Iterable[Level]:
             yield price, size
 
 
-def best_bid(book: dict[str, Any]) -> Optional[float]:
+def best_bid(book: dict[str, Any]) -> float | None:
     prices = [price for price, _ in _levels(book.get("bids"))]
     return max(prices) if prices else None
 
 
-def best_ask(book: dict[str, Any]) -> Optional[float]:
+def best_ask(book: dict[str, Any]) -> float | None:
     prices = [price for price, _ in _levels(book.get("asks"))]
     return min(prices) if prices else None
 
 
-def mid(book: dict[str, Any]) -> Optional[float]:
+def mid(book: dict[str, Any]) -> float | None:
     bid, ask = best_bid(book), best_ask(book)
     if bid is None or ask is None or bid >= ask:
         return None
@@ -52,7 +53,7 @@ def ladder(book: dict[str, Any], *, asks: bool) -> list[Level]:
     return sorted(levels, key=lambda item: item[0], reverse=not asks)
 
 
-def walk_cost(levels: list[Level], shares: float) -> Optional[tuple[float, float]]:
+def walk_cost(levels: list[Level], shares: float) -> tuple[float, float] | None:
     """(cost, filled_shares) for buying/selling ``shares`` down/up the ladder."""
     remaining = float(shares)
     cost = 0.0

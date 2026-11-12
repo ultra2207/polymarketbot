@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
+from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.clob.common import (
     COLLATERAL_DECIMALS,
     DEFAULT_TICK_SIZE,
     ClobAPIError,
+    ClobMarketParamsUnreadable,
 )
+
+logger = get_logger("clob_client")
 
 
 def _parse_collateral_amount(value: Any) -> float:
@@ -20,7 +24,7 @@ def _parse_collateral_amount(value: Any) -> float:
     raw base units. The ``> 100_000`` guess from the old implementation is gone.
     """
     if isinstance(value, bool):
-        raise ValueError(f"not an amount: {value!r}")
+        raise ValueError(f"not an amount: {value!r}")  # noqa: TRY004 - callers contract on ValueError for invalid input
     if isinstance(value, (int, float)):
         return float(value)
     text = str(value).strip()
@@ -54,9 +58,9 @@ class ReadMixin:
 
     def get_open_orders(
         self,
-        market: Optional[str] = None,
+        market: str | None = None,
         *,
-        order_id: Optional[str] = None,
+        order_id: str | None = None,
         max_pages: int = 20,
     ) -> list[dict[str, Any]]:
         """Query user orders from ``GET /data/orders`` (audit C3/M1).
@@ -86,7 +90,61 @@ class ReadMixin:
             pages = max_pages
         return self._paginate("/data/orders", params, max_pages=pages)
 
-    def get_order(self, order_id: str) -> Optional[dict[str, Any]]:
+    def get_taker_delay_s(self, condition_id: str) -> tuple[bool, float | None]:
+        """The venue's published taker delay for one market.
+
+        Returns ``(applies, delay_seconds)``:
+
+        * ``applies`` is True when the market is flagged for the hold
+          (``itode`` on ``GET /clob-markets/{condition_id}``, docs
+          ``site/concepts/order-lifecycle.md``).
+        * ``delay_seconds`` is the published ``trading.takerDelayMs`` (the field
+          the unified SDK exposes; ``secondsDelay``/``seconds_delay`` are the
+          deprecated spellings). ``None`` means the market applies a hold but
+          does not publish its duration, so a caller must refuse to model it
+          away rather than treat it as zero.
+
+        A failed read is reported as ``(False, None)`` and logged: quoting a
+        maker does not depend on it, and pretending a cross had a hold would be
+        an invented constant.
+        """
+        if self.dry_run or not condition_id:
+            return False, None
+        path = f"/clob-markets/{condition_id}"
+        try:
+            payload = self._request("GET", path, auth=False)
+        except ClobAPIError as exc:
+            logger.debug(f"GET {path} failed ({exc}); taker delay unknown")
+            return False, None
+        if not isinstance(payload, dict):
+            return False, None
+        applies = bool(payload.get("itode"))
+        trading = payload.get("trading")
+        if not isinstance(trading, dict):
+            trading = payload
+        delay_s: float | None = None
+        for key in ("takerDelayMs", "taker_delay_ms"):
+            value = trading.get(key)
+            if value not in (None, ""):
+                try:
+                    delay_s = float(value) / 1000.0
+                except (TypeError, ValueError):
+                    delay_s = None
+                break
+        if delay_s is None:
+            for key in ("secondsDelay", "seconds_delay"):
+                value = trading.get(key)
+                if value not in (None, ""):
+                    try:
+                        delay_s = float(value)
+                    except (TypeError, ValueError):
+                        delay_s = None
+                    break
+        if delay_s is not None and delay_s <= 0.0:
+            delay_s = None
+        return applies or delay_s is not None, delay_s
+
+    def get_order(self, order_id: str) -> dict[str, Any] | None:
         """Fetch one order by id (first element of ``/data/orders?id=...``), or None.
 
         Raises:
@@ -102,7 +160,7 @@ class ReadMixin:
 
     def get_trades(
         self,
-        market: Optional[str] = None,
+        market: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Query the authenticated user's trades from ``GET /data/trades``.
@@ -225,8 +283,15 @@ class ReadMixin:
         Returns ``{"neg_risk", "tick_size", "fee_rate_bps", "closed",
         "accepting_orders", "end_date_iso", "raw"}``.
 
+        ``tick_size`` and ``fee_rate_bps`` are the values the venue published.
+        A body that omits or mangles either one raises instead of substituting
+        a default: a 0.01 tick mis-rounds every price on a finer market and a
+        0 bps fee prices the taker side free.
+
         Raises:
             ClobAPIError: on any failed call or non-object body.
+            ClobMarketParamsUnreadable: when the payload omits an unparseable
+                tick size or fee rate.
             ValueError: for an empty condition id.
         """
         if not condition_id:
@@ -245,25 +310,51 @@ class ReadMixin:
         if tick_raw in (None, ""):
             tick_raw = payload.get("tick_size")
         try:
-            tick_size = float(tick_raw) if tick_raw not in (None, "") else DEFAULT_TICK_SIZE
+            tick_size = float(tick_raw) if tick_raw not in (None, "") else None
         except (TypeError, ValueError):
-            tick_size = DEFAULT_TICK_SIZE
-        if tick_size <= 0.0:
-            tick_size = DEFAULT_TICK_SIZE
+            tick_size = None
+        if tick_size is None or tick_size <= 0.0:
+            raise ClobMarketParamsUnreadable(
+                f"GET {path} published no usable minimum_tick_size "
+                f"({tick_raw!r}); refusing to assume {DEFAULT_TICK_SIZE}"
+            )
 
         fee_raw = payload.get("fee_rate_bps")
         if fee_raw is None:
             fee_raw = payload.get("taker_base_fee")
         try:
-            fee_rate_bps = int(float(fee_raw)) if fee_raw not in (None, "") else 0
+            fee_rate_bps: int | None = (
+                int(float(fee_raw)) if fee_raw not in (None, "") else None
+            )
         except (TypeError, ValueError):
-            fee_rate_bps = 0
+            fee_rate_bps = None
+        if fee_rate_bps is None:
+            raise ClobMarketParamsUnreadable(
+                f"GET {path} published no usable fee_rate_bps ({fee_raw!r}); "
+                "refusing to sign a zero-fee order"
+            )
+
+        # The market's own minimum order notional (USDC). ``None`` when the
+        # payload does not publish it: callers keep the refusal rather than
+        # sizing against an assumed minimum.
+        min_order_raw = payload.get("minimum_order_size")
+        if min_order_raw in (None, ""):
+            min_order_raw = payload.get("order_min_size")
+        try:
+            min_order_size = (
+                float(min_order_raw) if min_order_raw not in (None, "") else None
+            )
+        except (TypeError, ValueError):
+            min_order_size = None
+        if min_order_size is not None and min_order_size <= 0.0:
+            min_order_size = None
 
         end_date_iso = payload.get("end_date_iso")
         return {
             "neg_risk": bool(payload.get("neg_risk", False)),
             "tick_size": tick_size,
             "fee_rate_bps": fee_rate_bps,
+            "order_min_size": min_order_size,
             "closed": bool(payload.get("closed", False)),
             "accepting_orders": bool(payload.get("accepting_orders", False)),
             "end_date_iso": str(end_date_iso) if end_date_iso else None,

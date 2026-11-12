@@ -90,6 +90,7 @@ from polymarketbot.strategy.venue.clob.common import (
     ZERO_ADDRESS,
     ZERO_BYTES32_HEX,
     ClobAPIError,
+    ClobMarketParamsUnreadable,
     OrderPlacementResult,
 )
 from polymarketbot.strategy.venue.clob.signing import generate_order_salt
@@ -121,6 +122,7 @@ __all__ = [
     "ZERO_BYTES32_HEX",
     "ClobAPIError",
     "ClobAuthCredentials",
+    "ClobMarketParamsUnreadable",
     "FastEIP712Signer",
     "FastEIP712SignerV2",
     "FastOrder",

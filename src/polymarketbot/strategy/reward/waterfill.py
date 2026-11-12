@@ -68,6 +68,24 @@ def solve_water_filling(
     remaining = usable_capital
     funded: list[tuple[dict[str, Any], float]] = []
 
+    def lot_yield_density(market: dict[str, Any]) -> float:
+        """Total yield of this market's activation lot, per dollar of lot.
+
+        The lot is an indivisible cash commitment, so the unit of choice is the
+        whole lot and the value it buys is ``R(c_min)`` - not the marginal
+        ``dR/dc``, which describes a divisible allocation it cannot have.
+        """
+        lot_yield = evaluate_market_total_yield(
+            market["c_min"],
+            market["P"],
+            market["D"],
+            market["alpha"],
+            *_fill_side_of(market),
+        )
+        if lot_yield is None or market["c_min"] <= 0.0:
+            return 0.0
+        return float(lot_yield) / float(market["c_min"])
+
     while free and remaining > 1e-9:
         caps = water_level_caps(free, remaining)
         starved = [m for m, cap in zip(free, caps) if cap < m["c_min"]]
@@ -76,11 +94,28 @@ def solve_water_filling(
                 funded.append((m, cap))
             remaining = 0.0
             break
-        for m in starved:
+        # A market whose water level is below its activation lot cannot take
+        # the divisible allocation the KKT solution describes; a market at or
+        # above it can. Fund the divisible optimum first, then spend only the
+        # cash that optimum left idle on indivisible lots, best yield density
+        # first.
+        #
+        # The previous version funded *every* starved lot unconditionally, so a
+        # budget that could not carry all of them was over-allocated by the
+        # excess (two $60 lots on a $100 budget spent $120) and the caller's
+        # cash invariant broke after the decision to take it.
+        divisible = [(m, cap) for m, cap in zip(free, caps) if cap >= m["c_min"]]
+        for m, cap in divisible:
+            funded.append((m, cap))
+            remaining -= cap
+        divisible_ids = {id(m) for m, _cap in divisible}
+        free = [m for m in free if id(m) not in divisible_ids]
+        for m in sorted(free, key=lot_yield_density, reverse=True):
+            if m["c_min"] > remaining + 1e-9:
+                continue
             funded.append((m, m["c_min"]))
             remaining -= m["c_min"]
-        starved_ids = {id(m) for m in starved}
-        free = [m for m in free if id(m) not in starved_ids]
+        free = []
 
     if not funded:
         return PortfolioAllocationResult(

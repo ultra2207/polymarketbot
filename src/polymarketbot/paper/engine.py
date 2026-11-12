@@ -16,16 +16,17 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
+import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import actions as venue_actions
-import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.paper.actions import Resting
+from polymarketbot.paper.pillars import reward_runner
+from polymarketbot.risk.queue_position import QueuePositionTracker
 from polymarketbot.strategy.books import best_bid
 from polymarketbot.strategy.latency import ActionBook, RttProbe
 from polymarketbot.strategy.ledger import Ledger
-from polymarketbot.paper.pillars import reward_runner
 
 log = get_logger(__name__)
 
@@ -43,7 +44,7 @@ class PaperEngine:
         rtt: RttProbe,
         db_path: str,
         interval: float = 10.0,
-        duration: Optional[float] = None,
+        duration: float | None = None,
         resume: bool = False,
         rtt_refresh_s: float = 60.0,
     ) -> None:
@@ -73,11 +74,15 @@ class PaperEngine:
         #: notional and the equity it started from. The implied rate and the
         #: equity delta are both derived from this one window so they cannot
         #: describe different intervals.
-        self._reward_window: Optional[dict[str, float]] = None
+        self._reward_window: dict[str, float] | None = None
         #: KKT price of capital from the last reward allocation, USD/USD/day.
         #: None until solved; the CTF gate refuses rather than assumes 0.
-        self._shadow_yield: Optional[float] = None
+        self._shadow_yield: float | None = None
         self.reward_quotes: dict[str, Resting] = {}
+        #: FIFO position of every resting reward quote, reconstructed from the
+        #: L2 book and the public prints (``risk/queue_position.py``). Fills are
+        #: booked from this position, not from a pro-rata share of the level.
+        self.queues = QueuePositionTracker()
         self.walker = venue.UniverseWalker(gamma, pages_per_tick=20)
         self._universe_log_ts = 0.0
         self._book_cursor = 0
@@ -113,7 +118,7 @@ class PaperEngine:
             tick_started = time.monotonic()
             try:
                 self._tick()
-            except Exception:  # noqa: BLE001 - one bad tick must not stop the soak
+            except Exception:
                 log.exception("paper tick failed")
             if time.time() - last_snapshot >= self.interval:
                 last_snapshot = time.time()

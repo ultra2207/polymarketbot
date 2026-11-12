@@ -40,10 +40,11 @@ read-only ``eth_call`` probes so a settlement is never sent blind.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.risk.fast_signer import keccak256
@@ -137,7 +138,7 @@ class SettlementRoute(str, Enum):
 # ---------------------------------------------------------------------------
 def _clean_hex(value: Any, field: str) -> str:
     if not isinstance(value, str):
-        raise ValueError(f"{field} must be a hex string, got {type(value).__name__}")
+        raise ValueError(f"{field} must be a hex string, got {type(value).__name__}")  # noqa: TRY004 - callers contract on ValueError for invalid input
     clean = value.strip()
     if clean[:2].lower() == "0x":
         clean = clean[2:]
@@ -150,7 +151,7 @@ def _clean_hex(value: Any, field: str) -> str:
 
 def _word_uint(value: Any, field: str) -> bytes:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} must be an integer, got {type(value).__name__}")
+        raise ValueError(f"{field} must be an integer, got {type(value).__name__}")  # noqa: TRY004 - callers contract on ValueError for invalid input
     if value < 0 or value > _UINT256_MAX:
         raise ValueError(f"{field} out of uint256 range: {value}")
     return value.to_bytes(32, "big")
@@ -227,7 +228,7 @@ def negrisk_index_set(question_indices: Iterable[int]) -> int:
     bits = 0
     for index in question_indices:
         if isinstance(index, bool) or not isinstance(index, int):
-            raise ValueError(f"question index must be an integer, got {index!r}")
+            raise ValueError(f"question index must be an integer, got {index!r}")  # noqa: TRY004 - callers contract on ValueError for invalid input
         if index < 0:
             raise ValueError(f"question index cannot be negative: {index}")
         if index >= 256:
@@ -500,20 +501,20 @@ def derive_ctf_position_id(
 def _token_id(value: Any) -> int:
     """Parse a Gamma token id (decimal string) or a hex/uint token id."""
     if isinstance(value, bool):
-        raise ValueError("token id cannot be a bool")
+        raise ValueError("token id cannot be a bool")  # noqa: TRY004 - callers contract on ValueError for invalid input
     if isinstance(value, int):
         token = value
     elif isinstance(value, str):
         text = value.strip()
         token = int(text, 16) if text[:2].lower() == "0x" else int(text)
     else:
-        raise ValueError(f"unsupported token id: {value!r}")
+        raise ValueError(f"unsupported token id: {value!r}")  # noqa: TRY004 - callers contract on ValueError for invalid input
     if token < 0 or token > _UINT256_MAX:
         raise ValueError(f"token id out of uint256 range: {value!r}")
     return token
 
 
-def _eth_call_uint(chain_client: "ChainClient", to: str, data: str) -> int:
+def _eth_call_uint(chain_client: ChainClient, to: str, data: str) -> int:
     result = chain_client.eth_call(to=to, data=data)
     if not result or result == "0x":
         raise RuntimeError(f"eth_call to {to} returned no data")
@@ -521,7 +522,7 @@ def _eth_call_uint(chain_client: "ChainClient", to: str, data: str) -> int:
 
 
 def _is_approved_for_all(
-    chain_client: "ChainClient", token_contract: str, holder: str, operator: str
+    chain_client: ChainClient, token_contract: str, holder: str, operator: str
 ) -> bool:
     data = (
         "0x"
@@ -532,7 +533,7 @@ def _is_approved_for_all(
     return _eth_call_uint(chain_client, token_contract, data) != 0
 
 
-def _ctf_balance(chain_client: "ChainClient", holder: str, token_id: int) -> int:
+def _ctf_balance(chain_client: ChainClient, holder: str, token_id: int) -> int:
     data = (
         "0x"
         + CTF_BALANCE_SELECTOR
@@ -587,7 +588,7 @@ def _ctf_token_ids(condition_id: str, meta: dict | None) -> list[int]:
     ]
 
 
-def _ctf_payout_denominator(chain_client: "ChainClient", condition_id: str) -> int:
+def _ctf_payout_denominator(chain_client: ChainClient, condition_id: str) -> int:
     data = (
         "0x"
         + CTF_PAYOUT_DENOMINATOR_SELECTOR
@@ -597,7 +598,7 @@ def _ctf_payout_denominator(chain_client: "ChainClient", condition_id: str) -> i
 
 
 def _ctf_payout_numerator(
-    chain_client: "ChainClient", condition_id: str, outcome_index: int
+    chain_client: ChainClient, condition_id: str, outcome_index: int
 ) -> int:
     data = (
         "0x"
@@ -611,7 +612,7 @@ def _ctf_payout_numerator(
 def verify_ctf_outcome(
     condition_id: str,
     token_id: str | int,
-    chain_client: "ChainClient",
+    chain_client: ChainClient,
     *,
     meta: dict | None = None,
 ) -> CtfOutcomeEvidence:
@@ -760,7 +761,7 @@ def verify_route(
     route: SettlementRoute | str,
     condition_id: str,
     holder: str,
-    chain_client: "ChainClient",
+    chain_client: ChainClient,
     *,
     meta: dict | None = None,
 ) -> tuple[bool, str]:

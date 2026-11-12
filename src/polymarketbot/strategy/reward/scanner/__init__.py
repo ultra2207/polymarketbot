@@ -84,10 +84,10 @@ from .venue import fetch_tick_size, get_real_l2_score
 
 __all__ = [
     "CLOB_REST_URL",
+    "SCANNER_CACHE_TTL_SECONDS",
     "MarketOpportunity",
     "MarketRegime",
     "OpportunityScanner",
-    "SCANNER_CACHE_TTL_SECONDS",
     "ScannerTelemetry",
     "calculate_expected_yield",
     "fetch_tick_size",

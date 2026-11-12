@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any
 
 from polymarketbot.gamma import GammaClient
@@ -32,8 +32,13 @@ from polymarketbot.logs import IST, get_logger
 
 log = get_logger("data.universe_metadata")
 
-META_PATH = Path("data/derived/universe_metadata.parquet")
-MANIFEST_DEFAULT = Path("data/tape/manifest_current.json")
+# Anchored to the checkout, not the caller's working directory: `load_rows()`
+# is called from the live runner and the session recorder, and a relative path
+# silently returned {} (no fees, no event grouping) whenever the process was
+# started from anywhere else.
+_ROOT = Path(__file__).resolve().parents[3]
+META_PATH = _ROOT / "data" / "derived" / "universe_metadata.parquet"
+MANIFEST_DEFAULT = _ROOT / "data" / "tape" / "manifest_current.json"
 
 # Manifest fields the enrichment owns. Existing non-null values are preserved
 # only for fields the walk already owns (question/slug/pool); these are filled.
@@ -191,6 +196,8 @@ def refresh(
 ) -> dict[str, int]:
     """Fetch the manifest's condition ids, write the table, backfill the manifest."""
     path = Path(manifest_path)
+    if not path.exists():
+        raise FileNotFoundError(f"manifest {path} does not exist")
     payload = json.loads(path.read_text(encoding="utf-8"))
     ids = [
         str(m["condition_id"])
@@ -199,11 +206,24 @@ def refresh(
     ]
     # Keep rows for conditions that left the manifest: the scorecard still
     # needs their fees for trades executed while they were listed.
-    ids = list(dict.fromkeys(ids + list(load_rows(out_path))))
+    existing = load_rows(out_path)
+    # The manifest carries the venue's original spelling while the parquet is
+    # keyed lowercased, so a plain dedupe fetched every such condition twice.
+    seen: dict[str, str] = {}
+    for condition_id in ids + [row.get("condition_id") for row in existing.values()]:
+        if condition_id:
+            seen.setdefault(str(condition_id).lower(), str(condition_id))
+    ids = list(seen.values())
     if limit:
         ids = ids[:limit]
     rows = fetch_rows(ids, client=client)
-    written = write_rows(rows, out_path)
+    # ...and for conditions Gamma no longer returns at all (delisted, migrated
+    # or renamed): `write_rows` replaces the file, so without this merge the
+    # comment above was false and the history was silently dropped.
+    by_id = {str(row["condition_id"]).lower(): row for row in rows if row.get("condition_id")}
+    for condition_id, row in existing.items():
+        by_id.setdefault(condition_id, row)
+    written = write_rows(list(by_id.values()), out_path)
     applied = apply_to_manifest(rows, manifest_path)
     log.info(
         f"metadata: {len(ids)} ids -> {len(rows)} rows, {written} written, "

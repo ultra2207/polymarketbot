@@ -19,14 +19,17 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
-from polymarketbot.logs import get_logger
-import polymarketbot.strategy.venue.reads as venue
-from polymarketbot.paper.actions import Resting
-from polymarketbot.strategy.books import shares_at
 import polymarketbot.strategy.reward.decision as reward
+import polymarketbot.strategy.venue.reads as venue
+from polymarketbot.logs import get_logger
+from polymarketbot.paper.actions import Resting, new_order_id, queue_tracker
+from polymarketbot.strategy.books import ladder
+from polymarketbot.strategy.reward.accrual import (
+    REWARD_ELIGIBILITY_SECONDS,
+    RewardDayAccrual,
+)
 from polymarketbot.strategy.reward.rebates import RebateAccountant, RebateCredit
 
 log = get_logger(__name__)
@@ -34,7 +37,19 @@ log = get_logger(__name__)
 
 def utc_day(ts: float) -> str:
     """The UTC epoch day (``YYYY-MM-DD``) a timestamp falls in."""
-    return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(float(ts), UTC).strftime("%Y-%m-%d")
+
+
+def day_accruals(engine) -> dict[str, RewardDayAccrual]:
+    """The engine's per-condition UTC-day accumulators, created on first use.
+
+    The venue pays a market per UTC day, so accrual is banked at that grain and
+    only a settled day (total ``>= $1.00``) becomes cash.
+    """
+    accruals = getattr(engine, "_reward_accruals", None)
+    if accruals is None:
+        accruals = engine._reward_accruals = {}
+    return accruals
 
 
 def competitor_window(engine) -> reward.CompetingScoreWindow:
@@ -95,6 +110,7 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         # measured earns nothing and is counted, so a window can never book a
         # share of a pool it never measured.
         accrued = 0.0
+        settled = 0.0
         priced = refused = unqualified = 0
         pools = 0.0
         notional = 0.0
@@ -103,10 +119,15 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         sample_sds: list[float] = []
         low_confidence = 0
         top: list[tuple[float, str, float, float]] = []
-        # Per-condition accrual for the journal: the venue reports payouts per
-        # condition, so the ledger side must be kept at that grain or it can
-        # never be joined to ``GET /rewards/user``.
-        per_market: dict[str, float] = {}
+        # Day accrual is banked per (condition, UTC day) and becomes cash only
+        # when the day settles at rollover against the venue's $1.00 minimum -
+        # never by flooring the instantaneous rate.
+        accruals = day_accruals(engine)
+        # One aggregate rate/anchor per condition this tick: a condition that
+        # holds more than one quote must not have its interval counted twice.
+        rates: dict[str, float] = {}
+        anchors: dict[str, float] = {}
+        resting_conditions: set[str] = set()
         window_scores = competitor_window(engine)
         # One quote per market: the pillar quotes the cheaper leg only, so
         # this set must have the same size as ``priced``. Logged so a market
@@ -115,6 +136,7 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         for quote in engine.reward_quotes.values():
             if quote.cancel_at is not None or quote.shares <= 0.0:
                 continue
+            resting_conditions.add(quote.condition_id)
             market = engine.by_condition.get(quote.condition_id)
             if market is None or not market.binary:
                 refused += 1
@@ -126,7 +148,7 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
             # Observe the pair-wide snapshot into the window first: the venue's
             # denominator is the epoch mean, and this reading is the only
             # evidence the estimator has.
-            estimate: Optional[reward.CompetingEstimate] = None
+            estimate: reward.CompetingEstimate | None = None
             detail = reward.market_competing_detail(market, books)
             if detail is not None:
                 estimate = window_scores.observe(
@@ -141,13 +163,18 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                 leg_book=books.get(quote.token_id),
                 other_book=books.get(others[0]),
                 competing=estimate,
+                # The paper pillar quotes into a simulated book: the venue L2
+                # snapshot it reads never contains the order, so the measured
+                # competitor total is clean and our score is added once. A
+                # caller reading the venue's own book with its order resting
+                # there states True, or it divides our claim by itself twice.
+                books_include_our_order=False,
             )
             if share is None:
                 refused += 1
                 continue
             priced += 1
             priced_markets.add(quote.condition_id)
-            per_market[quote.condition_id] = per_market.get(quote.condition_id, 0.0)
             pools += share.pool_usd_per_day
             notional += quote.shares * quote.price
             competing.append(share.competing_score)
@@ -159,25 +186,75 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
             if not share.qualifies:
                 unqualified += 1
                 continue
-            usd = share.usd_per_day * dt / 86_400.0
-            accrued += usd
-            per_market[quote.condition_id] = per_market.get(quote.condition_id, 0.0) + usd
+            # The venue only counts an order that has rested at least 3.5 s,
+            # and `placed` is this quote's first rest: the accrual anchor is
+            # that boundary, so the pre-eligibility interval is never charged
+            # to the rate this order earns.
+            eligible_from = float(quote.placed) + REWARD_ELIGIBILITY_SECONDS
+            if now > eligible_from:
+                rates[quote.condition_id] = (
+                    rates.get(quote.condition_id, 0.0) + share.usd_per_day
+                )
+                anchors[quote.condition_id] = min(
+                    anchors.get(quote.condition_id, eligible_from), eligible_from
+                )
             top.append((share.usd_per_day, quote.condition_id,
                         share.competing_score, share.share))
-        # Journal every priced market each tick, including a measured zero:
-        # a market that was priced and earned nothing is evidence, and a
-        # missing row would be indistinguishable from a market never priced.
-        for condition_id, usd in per_market.items():
+        # Record every resting condition, including the measured zeros: an
+        # interval with no eligible rate must still advance the accumulator's
+        # clock or the next rate would be charged for it. ``journal`` keeps the
+        # tick's increment per (UTC day, condition), because an interval that
+        # crosses midnight belongs to two venue payout periods.
+        today = datetime.fromtimestamp(now, UTC).date()
+        journal: dict[tuple[str, str], float] = {}
+        for condition_id in resting_conditions:
+            account = accruals.get(condition_id)
+            if account is None:
+                account = accruals[condition_id] = RewardDayAccrual(condition_id)
+            before = {d: account.pending_utc_day(d) for d in account.pending_days()}
+            rate = rates.get(condition_id, 0.0)
+            if rate > 0.0:
+                account.record(anchors[condition_id], 0.0)
+                account.record(now, rate)
+            else:
+                account.record(now, 0.0)
+            for accrual_day in set(before) | set(account.pending_days()):
+                delta = account.pending_utc_day(accrual_day) - before.get(accrual_day, 0.0)
+                if delta == 0.0:
+                    continue
+                key = (accrual_day.isoformat(), condition_id)
+                journal[key] = journal.get(key, 0.0) + delta
+                accrued += delta
+            if condition_id in priced_markets:
+                # Journal every priced market each tick, including a measured
+                # zero: a market that was priced and earned nothing is
+                # evidence, and a missing row would be indistinguishable from a
+                # market never priced.
+                journal.setdefault((day, condition_id), 0.0)
+        # Settle every completed UTC day. The $1.00 minimum is applied to the
+        # day's total here, at rollover, and nowhere else.
+        for condition_id, account in accruals.items():
+            for accrual_day in account.pending_days():
+                if accrual_day >= today:
+                    continue
+                usd = account.settle_utc_day(accrual_day)
+                if usd <= 0.0:
+                    continue
+                settled += usd
+                engine.ledger.credit(
+                    "RewardHarvester",
+                    amount=usd,
+                    condition_id=condition_id,
+                    detail="reward_accrual",
+                )
+        for (journal_day, condition_id), usd in journal.items():
             engine.ledger.record_reward_accrual(
-                day=day,
+                day=journal_day,
                 condition_id=condition_id,
                 accrued_usd=usd,
                 priced_markets=len(priced_markets),
                 ts=now,
             )
-        if accrued > 0.0:
-            engine.ledger.credit("RewardHarvester", amount=accrued,
-                                 detail="reward_accrual")
         # Window bookkeeping: the implied rate and the equity it produced
         # must be integrated over the *same* interval, or the two numbers
         # cannot be compared at all. Measured 2026-11-10 window 9: an
@@ -188,15 +265,18 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         window = engine._reward_window
         if window is None:
             window = engine._reward_window = {
-                "since": now, "accrued": 0.0, "notional_seconds": 0.0,
+                "since": now, "accrued": 0.0, "settled": 0.0,
+                "notional_seconds": 0.0,
                 "equity0": engine.ledger.equity().get("RewardHarvester", 0.0),
             }
         window["accrued"] += accrued
+        window["settled"] = window.get("settled", 0.0) + settled
         window["notional_seconds"] += notional * dt
         if now - engine._reward_log_ts >= 60.0:
             engine._reward_log_ts = now
             elapsed = max(1e-9, now - float(window["since"]))
             window_accrued = float(window["accrued"])
+            window_settled = float(window.get("settled", 0.0))
             window_implied = window_accrued * 86_400.0 / elapsed
             window_notional = float(window["notional_seconds"]) / elapsed
             equity_now = engine.ledger.equity().get("RewardHarvester", 0.0)
@@ -228,13 +308,15 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                 f"reward accrual: {priced} quotes over {len(priced_markets)} "
                 f"markets priced, {unqualified} "
                 f"not qualifying, {refused} refused (unmeasured books or "
-                f"denominator) | credited ${window_accrued:,.4f} over "
+                f"denominator) | pending ${window_accrued:,.4f} over "
                 f"{elapsed:.0f}s = ${window_implied:,.2f}/day on a time-average "
                 f"${window_notional:,.2f} resting "
                 f"({window_implied / window_notional * 100.0 if window_notional > 0 else 0.0:.2f}%/day); "
+                f"settled ${window_settled:,.4f} at UTC rollover ($1.00 daily "
+                f"floor applied per market); "
                 f"equity moved ${equity_delta:+,.4f} = ${equity_rate:,.2f}/day "
                 f"({100.0 * equity_rate / window_implied - 100.0 if window_implied > 0 else 0.0:+.1f}% "
-                f"vs credited, same window) | ${window_implied / venue_pool * 100.0 if venue_pool > 0 else 0.0:.3f}% of the "
+                f"vs pending, same window) | ${window_implied / venue_pool * 100.0 if venue_pool > 0 else 0.0:.3f}% of the "
                 f"${venue_pool:,.0f}/day venue pool measured over {rewarded_count} "
                 f"rewarded markets and "
                 f"{window_implied / pools * 100.0 if pools > 0 else 0.0:.1f}% of the "
@@ -294,10 +376,26 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
     engine._shadow_yield = shadow_state.get("shadow_yield")
     for token_id, quote in wanted.items():
         current = engine.reward_quotes.get(token_id)
-        if current and abs(current.price - quote.price) < 1e-9:
+        # An order is gone once it has fully filled (``shares == 0``) or has
+        # been cancelled. The fill path leaves a fully-filled quote in place
+        # with ``cancel_at is None``, so treating merely "present at the same
+        # price" as still resting silenced that market for the rest of the
+        # run: the planner wanted a quote and the engine answered with the
+        # zero share remainder. Re-place whenever the order is gone, on the
+        # same cash/inventory gate the planner already applied.
+        gone = (
+            current is None
+            or current.shares <= 0.0
+            or current.cancel_at is not None
+        )
+        if (
+            current is not None
+            and not gone
+            and abs(current.price - quote.price) < 1e-9
+        ):
             current.daily_payout = quote.daily_payout
             continue
-        if current is not None and current.cancel_at is None:
+        if current is not None and not gone and current.cancel_at is None:
             current.cancel_at = now
             engine.actions.submit("reward_cancel", "RewardHarvester",
                                   {"token_id": token_id})
@@ -322,10 +420,62 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                                   {"token_id": token_id})
         if current.cancel_at is not None and now >= current.cancel_at + engine._rtt():
             engine.reward_quotes.pop(token_id, None)
+            if current.order_id:
+                queue_tracker(engine).drop(token_id, current.order_id)
             # The market is no longer quoted here, so its estimator window has
             # no reader: drop it rather than letting the dict grow with every
             # market the pillar ever touched.
             competitor_window(engine).forget(current.condition_id)
+
+
+def _with_own_order(
+    levels: list[tuple[float, float]], price: float, size: float
+) -> list[tuple[float, float]]:
+    """The ladder the venue would publish while our order rests.
+
+    The tracker's ``on_book`` contract is the venue's aggregated depth, which
+    includes our own order: ``ahead = min(prev, observed - size)``. The paper
+    engine's simulated book does not contain the virtual order, so the fill
+    pass adds it at our price before every snapshot. Without this the first
+    snapshot would read the size *ahead* of us as the whole level and clear it
+    (``observed - size``), putting the order at the front of a queue it is
+    still behind.
+    """
+    if size <= 0.0:
+        return levels
+    merged: list[tuple[float, float]] = []
+    placed = False
+    for level_price, level_size in levels:
+        if abs(level_price - price) <= 1e-12:
+            merged.append((level_price, level_size + size))
+            placed = True
+        else:
+            merged.append((level_price, level_size))
+    if not placed:
+        merged.append((price, size))
+    return merged
+
+
+def _fifo_fill(quote: Resting, progress) -> float:
+    """Shares this pass consumed from the resting order, from the tracker.
+
+    FIFO consumption is cumulative: prints at our price first clear the size
+    that was ahead of us when we landed, and only the overflow fills us. A
+    print strictly through our price fills the whole remaining order. Both
+    facts are carried by :class:`~polymarketbot.risk.contracts.QueueProgress`,
+    so the fill is ``consumed - already booked`` and never a pro-rata share of
+    the level.
+    """
+    if progress is None or not progress.filled:
+        return 0.0
+    size = quote.initial_shares or quote.shares
+    if progress.traded_at_level <= progress.initial_ahead:
+        # No printed volume at our level, yet the order is marked filled: a
+        # print went through our price. The rest of the order is gone.
+        consumed = size
+    else:
+        consumed = min(size, progress.traded_at_level - progress.initial_ahead)
+    return max(0.0, consumed - quote.booked_fill)
 
 
 def apply_resting_fills(
@@ -336,6 +486,8 @@ def apply_resting_fills(
     prints: list[venue.Print],
     now: float,
 ) -> None:
+    tracker = queue_tracker(engine)
+    ordered_prints = sorted(prints, key=lambda p: (p.ts, getattr(p, "seq", 0)))
     for token_id, quote in list(resting.items()):
         if now < quote.placed:
             continue
@@ -343,22 +495,58 @@ def apply_resting_fills(
             # The EV that justified this quote was measured over exactly
             # this window; past it the quote rests on an unmeasured
             # probability.
+            if quote.order_id:
+                tracker.drop(token_id, quote.order_id)
             resting.pop(token_id, None)
             continue
         if quote.cancel_at is not None and now >= quote.cancel_at + engine._rtt():
+            if quote.order_id:
+                tracker.drop(token_id, quote.order_id)
             resting.pop(token_id, None)
             continue
-        market_prints = [p for p in prints
-                         if p.token_id == token_id and p.ts > quote.seen_ts]
-        if market_prints:
-            quote.seen_ts = max(p.ts for p in market_prints)
         book = books.get(token_id) or {}
-        level_shares = shares_at(book, bid=True, price=quote.price)
-        fill = reward.measured_fill_shares(quote.price, quote.shares, level_shares,
-                                           market_prints, quote.tick)
-        # Measured prints are 1-5 shares; discarding sub-lot flow guarantees
-        # no fill against a 20-200 share minimum. Carry it instead.
-        quote.accumulated += max(0.0, fill)
+        bids = ladder(book, asks=False)
+        asks = ladder(book, asks=True)
+        if not quote.order_id:
+            # A quote that reached this pass without landing (a resumed ledger
+            # or a caller that injected it) is registered at the first book it
+            # is observed against. That is the only snapshot available, and it
+            # is stated as the entry book rather than silently assumed empty.
+            quote.order_id = new_order_id(strategy, token_id)
+            quote.initial_shares = quote.initial_shares or quote.shares
+        if tracker.progress(quote.order_id) is None:
+            tracker.on_entry(
+                quote.order_id, token_id, "BUY", quote.price, quote.shares,
+                max(quote.placed, quote.seen_ts), bids, asks,
+            )
+        # One snapshot per tick: size that appears at our price after entry is
+        # behind us, which the tracker enforces by clamping ``ahead``. Our own
+        # resting size is added because the venue's published level includes
+        # it and the simulated book does not.
+        tracker.on_book(
+            token_id,
+            _with_own_order(bids, quote.price, quote.shares),
+            asks,
+            now,
+        )
+        market_prints = [
+            p for p in ordered_prints
+            if p.token_id == token_id and p.ts > quote.seen_ts
+        ]
+        for printed in market_prints:
+            tracker.on_trade(
+                token_id, printed.price, printed.size, printed.side, printed.ts
+            )
+        if market_prints:
+            quote.seen_ts = market_prints[-1].ts
+        raw = _fifo_fill(quote, tracker.progress(quote.order_id))
+        # The tracker's consumption is cumulative, so it is booked here even
+        # when the lot is below the venue minimum; dropping it would double
+        # count the same shares on the next pass. Measured prints are 1-5
+        # shares, so the sub-lot carry is what lets a 20-200 share minimum
+        # ever clear.
+        quote.booked_fill += raw
+        quote.accumulated += raw
         fill = min(quote.accumulated, quote.shares)
         if fill < quote.min_order:
             continue

@@ -30,6 +30,30 @@ class LedgerMixin:
         except (TypeError, ValueError):
             return 0
 
+    def mark_quote_row(self, quote_id: str, status: str) -> None:
+        """Close the persisted quote row for ``quote_id``.
+
+        ``active_quotes`` rows are inserted ``LIVE`` at placement; without this
+        the table asserts that every order ever placed is still resting. The
+        newest row for the quote id is the one this placement/close belongs to.
+        """
+        if self._conn is None or not quote_id:
+            return
+        try:
+            self._conn.execute(
+                """
+                UPDATE active_quotes SET status = ?
+                WHERE rowid = (
+                    SELECT rowid FROM active_quotes
+                    WHERE quote_id = ? ORDER BY rowid DESC LIMIT 1
+                )
+                """,
+                (str(status), str(quote_id)),
+            )
+            self._conn.commit()
+        except Exception as exc:  # noqa: BLE001 - telemetry must never block an order
+            logger.warning(f"Could not mark quote row {quote_id} as {status}: {exc}")
+
     def flush_ledger(self) -> None:
         """Write atomic state snapshot to SQLite and JSON ledger."""
         cash_val, locked_val, inventory_val = self._accounting_snapshot()
@@ -50,7 +74,7 @@ class LedgerMixin:
                 cash_val,
                 inventory_val,
                 equity_val,
-                inventory_val,
+                self._unrealized_pnl(),
                 pos.realized_pnl,
                 total_pnl_val,
                 self.total_rewards_credited,
@@ -96,7 +120,7 @@ class LedgerMixin:
                 "trading_bankroll": getattr(self, "trading_bankroll", self.initial_cash),
                 "pol_balance": self.pol_balance,
                 "equity": equity_val,
-                "unrealized_pnl": inventory_val,
+                "unrealized_pnl": self._unrealized_pnl(),
                 "realized_pnl": pos.realized_pnl,
                 "total_pnl": total_pnl_val,
                 "total_rewards_credited": self.total_rewards_credited,
@@ -126,7 +150,7 @@ class LedgerMixin:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(ledger_data, f, indent=2)
             os.replace(tmp_path, self.ledger_path)
-        except Exception as e:
+        except (OSError, TypeError, ValueError) as e:
             logger.warning(f"Failed to write JSON ledger atomically: {e}")
             if tmp_path.exists():
                 try:
@@ -173,10 +197,10 @@ class LedgerMixin:
             "total_wallet_balance": round(total_wb, 2),
             "budget_pct": round(b_pct, 1),
             "trading_bankroll": round(t_bankroll, 2),
-            "pol_balance": round(self.pol_balance, 4),
+            "pol_balance": None if self.pol_balance is None else round(self.pol_balance, 4),
             "market_value": round(inventory_val, 2),
             "realized_pnl": round(pos.realized_pnl, 4),
-            "unrealized_pnl": round(inventory_val, 4),
+            "unrealized_pnl": round(self._unrealized_pnl(), 4),
             "total_pnl": round(equity_val - self.initial_equity, 4),
             "shares_yes": round(pos.shares_yes, 2),
             "shares_no": round(pos.shares_no, 2),

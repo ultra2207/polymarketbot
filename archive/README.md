@@ -20,6 +20,7 @@ revived.
 | `paper/radar.py`, `paper/uma_poll.py` | Settlement radar and UMA verdict feed | Settlement-only I/O | — |
 | `live/settlement/`, `live/supervisor/desk.py` | Live settlement desk | Settlement strategy removed from the live trader | — |
 | `tests/*settlement*`, `test_robust_hazard.py`, `test_uma_verdict_poll.py` | Tests for the above | Test the archived code | — |
+| `data/uma.py`, `tests/test_uma.py` | UMA Optimistic Oracle / CTF-adapter log decoder and its ABI vectors | No `src/` importer after the collector was deleted; the replay that consumed it is gone too, so `data/derived/uma_events.parquet` is frozen. The decoder is kept because the topic0 table is verified against mainnet | #20, #33 |
 
 ## What deliberately did NOT move
 

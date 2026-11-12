@@ -7,10 +7,10 @@ a test instead of silently decoding nothing.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
-
 from polymarketbot.data.uma import (
     CONTRACT_ADAPTER_V1,
     CONTRACT_ADAPTER_V2,

@@ -1,8 +1,36 @@
 """Tests for find_optimal_lp_markets and dynamic ROI optimization."""
 
-import pytest
 from unittest.mock import MagicMock, patch
-from polymarketbot.strategy.reward.scanner import find_optimal_lp_markets, get_real_l2_score
+
+import pytest
+
+from polymarketbot.strategy.reward.scanner import (
+    find_optimal_lp_markets,
+    get_real_l2_score,
+    reset_scanner_telemetry,
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_scanner_caches():
+    """Start and end every test with empty caches and fresh telemetry.
+
+    ``_SCANNER_CACHE`` is a process global keyed only by the scan's numeric
+    arguments, so a scan cached by one test is served to the next test that
+    happens to pass the same bankroll and bounds - the file's order was the
+    only thing hiding it. ``reset_scanner_telemetry`` predates ``_SPREAD_CACHE``
+    and does not clear it, so the fixture does that too.
+    """
+    from polymarketbot.strategy.reward.scanner import state as scanner_state
+
+    def _clear() -> None:
+        reset_scanner_telemetry()
+        with scanner_state._CACHE_LOCK:
+            scanner_state._SPREAD_CACHE.clear()
+
+    _clear()
+    yield
+    _clear()
 
 
 def _venue_get(markets_payload: dict, tick: float = 0.01):
@@ -102,26 +130,28 @@ def test_find_optimal_lp_markets_filters():
         ]
     }
 
-    with patch("requests.Session.get", _venue_get(mock_markets_payload)):
+    with (
+        patch("requests.Session.get", _venue_get(mock_markets_payload)),
         # Mock orderbook L2 response
-        with patch("polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score") as mock_l2:
-            mock_l2.return_value = (500.0, 1000.0, 0.60)
+        patch("polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score") as mock_l2,
+    ):
+        mock_l2.return_value = (500.0, 1000.0, 0.60)
 
-            ranked = find_optimal_lp_markets(bankroll_usd=150.0, min_days_to_expiry=7.0)
+        ranked = find_optimal_lp_markets(bankroll_usd=150.0, min_days_to_expiry=7.0)
 
-            assert len(ranked) == 1
-            assert ranked[0]["condition_id"] == "0x_sweet_spot"
-            assert ranked[0]["clears_floor"] is True
-            assert ranked[0]["real_daily_payout"] > 1.00
-            assert ranked[0]["daily_roi_pct"] > 0.0
+        assert len(ranked) == 1
+        assert ranked[0]["condition_id"] == "0x_sweet_spot"
+        assert ranked[0]["clears_floor"] is True
+        assert ranked[0]["real_daily_payout"] > 1.00
+        assert ranked[0]["daily_roi_pct"] > 0.0
 
 
 def test_scanner_5s_ttl_caching_and_telemetry():
     """Verify that multiple scans within 5s return cached results and track cache hits."""
     from polymarketbot.strategy.reward.scanner import (
+        find_optimal_lp_markets,
         get_scanner_telemetry,
         reset_scanner_telemetry,
-        find_optimal_lp_markets,
     )
 
     reset_scanner_telemetry()
@@ -142,27 +172,29 @@ def test_scanner_5s_ttl_caching_and_telemetry():
         ]
     }
 
-    with patch("requests.Session.get", side_effect=_venue_get(mock_payload)) as mock_get:
-        with patch("polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score") as mock_l2:
-            mock_l2.return_value = (300.0, 500.0, 0.55)
+    with (
+        patch("requests.Session.get", side_effect=_venue_get(mock_payload)) as mock_get,
+        patch("polymarketbot.strategy.reward.scanner.lp_screen.get_real_l2_score") as mock_l2,
+    ):
+        mock_l2.return_value = (300.0, 500.0, 0.55)
 
-            # First scan -> Cache Miss (fetches via network)
-            res1 = find_optimal_lp_markets(bankroll_usd=150.0)
-            telemetry = get_scanner_telemetry()
-            assert telemetry.total_scans == 1
-            assert telemetry.cache_misses == 1
-            assert telemetry.cache_hits == 0
-            assert len(res1) == 1
-            assert res1[0]["condition_id"] == "0x_cache_test"
+        # First scan -> Cache Miss (fetches via network)
+        res1 = find_optimal_lp_markets(bankroll_usd=150.0)
+        telemetry = get_scanner_telemetry()
+        assert telemetry.total_scans == 1
+        assert telemetry.cache_misses == 1
+        assert telemetry.cache_hits == 0
+        assert len(res1) == 1
+        assert res1[0]["condition_id"] == "0x_cache_test"
 
-            # Second scan immediately -> 5s TTL Cache Hit (zero HTTP calls!)
-            mock_get.reset_mock()
-            res2 = find_optimal_lp_markets(bankroll_usd=150.0)
-            mock_get.assert_not_called()  # Proves zero network calls
-            assert telemetry.total_scans == 2
-            assert telemetry.cache_hits == 1
-            assert len(res2) == 1
-            assert res2[0]["condition_id"] == "0x_cache_test"
+        # Second scan immediately -> 5s TTL Cache Hit (zero HTTP calls!)
+        mock_get.reset_mock()
+        res2 = find_optimal_lp_markets(bankroll_usd=150.0)
+        mock_get.assert_not_called()  # Proves zero network calls
+        assert telemetry.total_scans == 2
+        assert telemetry.cache_hits == 1
+        assert len(res2) == 1
+        assert res2[0]["condition_id"] == "0x_cache_test"
 
 
 def test_get_real_l2_score_caching_and_429():
@@ -185,14 +217,14 @@ def test_get_real_l2_score_caching_and_429():
     }
     mock_session.get.return_value = mock_resp
 
-    score1, sz1, mid1 = get_real_l2_score(mock_session, "token_l2_cache", 3.0)
+    score1, _sz1, mid1 = get_real_l2_score(mock_session, "token_l2_cache", 3.0)
     assert mid1 == 0.51
     telemetry = get_scanner_telemetry()
     assert telemetry.total_book_queries == 1
 
     # Immediate second call for same token -> served from _BOOK_CACHE
     mock_session.get.reset_mock()
-    score2, sz2, mid2 = get_real_l2_score(mock_session, "token_l2_cache", 3.0)
+    score2, _sz2, mid2 = get_real_l2_score(mock_session, "token_l2_cache", 3.0)
     mock_session.get.assert_not_called()
     assert score2 == score1
     assert mid2 == mid1
@@ -204,7 +236,7 @@ def test_get_real_l2_score_caching_and_429():
     mock_429.status_code = 429
     mock_session.get.return_value = mock_429
 
-    score_429, sz_429, mid_429 = get_real_l2_score(mock_session, "token_429", 3.0)
+    _score_429, _sz_429, _mid_429 = get_real_l2_score(mock_session, "token_429", 3.0)
     assert telemetry.http_429_errors == 1
     assert "HTTP 429" in telemetry.last_error_message
 
@@ -221,7 +253,9 @@ def test_get_real_l2_score_caching_and_429():
 # refuses the market.
 # ---------------------------------------------------------------------------
 
-from polymarketbot.strategy.reward.regime import MarketRegime, NS_PER_HOUR
+from datetime import UTC
+
+from polymarketbot.strategy.reward.regime import NS_PER_HOUR, MarketRegime
 
 
 def _regime(mean_size: float = 40.0) -> MarketRegime:
@@ -243,27 +277,27 @@ def _regime(mean_size: float = 40.0) -> MarketRegime:
 
 
 def _yield_kwargs(**overrides):
-    base = dict(
-        daily_rate=500.0,
-        max_spread_cents=3.0,
-        min_size=20.0,
-        allocated_capital_usd=1000.0,
-        tick_size=0.01,
-        quote_horizon_s=300.0,
-        spread_cents=1.0,
-        mid_price=0.40,
-        competing_score=1000.0,
-        regime=_regime(),
-        gas_fee_per_merge=0.01,
-        merge_threshold=30.0,
-    )
+    base = {
+        "daily_rate": 500.0,
+        "max_spread_cents": 3.0,
+        "min_size": 20.0,
+        "allocated_capital_usd": 1000.0,
+        "tick_size": 0.01,
+        "quote_horizon_s": 300.0,
+        "spread_cents": 1.0,
+        "mid_price": 0.40,
+        "competing_score": 1000.0,
+        "regime": _regime(),
+        "gas_fee_per_merge": 0.01,
+        "merge_threshold": 30.0,
+    }
     base.update(overrides)
     return base
 
 
 def test_category_regimes_are_gone_and_the_tape_regime_drives_the_estimate():
     """No category table: the market's own measured print size sets the terms."""
-    import polymarketbot.strategy.reward.scoring as scoring
+    from polymarketbot.strategy.reward import scoring
     from polymarketbot.strategy.reward.scanner import calculate_expected_yield
 
     assert not hasattr(scoring, "CATEGORY_REGIMES")
@@ -439,3 +473,68 @@ def test_scan_refuses_markets_without_a_measured_regime():
             raw_markets=payload["data"],
         )
     assert ranked == []
+
+
+def _rewards_payload_market(end_field: str, end_value: str) -> dict:
+    return {
+        "condition_id": "0xpayload_expiry",
+        "question": "Payload Expiry Market",
+        "rewards_config": [{"rate_per_day": "500.0"}],
+        "rewards_max_spread": 4.5,
+        "rewards_min_size": 20.0,
+        end_field: end_value,
+        "tokens": [
+            {
+                "token_id": "100000000000000000000000000000000000000000000000000000000000021",
+                "outcome": "YES",
+                "price": "0.50",
+            },
+            {
+                "token_id": "100000000000000000000000000000000000000000000000000000000000022",
+                "outcome": "NO",
+                "price": "0.50",
+            },
+        ],
+    }
+
+
+def test_ended_reward_market_is_rejected_when_only_end_date_is_published():
+    """The CLOB rewards payload publishes ``end_date``, never ``end_date_iso``.
+
+    Reading only ``end_date_iso`` marked every reward market "distant expiry" and
+    let already-ended markets through to the live validator, which then aborted
+    startup.
+    """
+    from datetime import datetime
+
+    from polymarketbot.strategy.reward.scanner.candidates import _screen_lp_candidate
+
+    candidate, reason = _screen_lp_candidate(
+        _rewards_payload_market("end_date", "2026-11-04 00:00:00+00"),
+        now_utc=datetime(2026, 11, 11, tzinfo=UTC),
+        min_days_to_expiry=7.0,
+        min_mid_price=0.05,
+        max_mid_price=0.95,
+        bankroll_usd=40.0,
+    )
+
+    assert candidate is None
+    assert reason.startswith("expired:")
+
+
+def test_near_expiry_reward_market_is_rejected_via_end_date():
+    from datetime import datetime
+
+    from polymarketbot.strategy.reward.scanner.candidates import _screen_lp_candidate
+
+    candidate, reason = _screen_lp_candidate(
+        _rewards_payload_market("end_date", "2026-11-13 00:00:00+00"),
+        now_utc=datetime(2026, 11, 11, tzinfo=UTC),
+        min_days_to_expiry=7.0,
+        min_mid_price=0.05,
+        max_mid_price=0.95,
+        bankroll_usd=40.0,
+    )
+
+    assert candidate is None
+    assert reason.startswith("near_expiry:")

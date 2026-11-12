@@ -10,9 +10,10 @@ import json
 import statistics
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import requests
 
@@ -57,7 +58,7 @@ class RttProbe:
                 self._rtts = [float(p50) / 1000.0]
                 return
 
-    def measure(self) -> Optional[float]:
+    def measure(self) -> float | None:
         try:
             started = time.perf_counter()
             response = self._session.get(self._url, timeout=5.0)
@@ -73,7 +74,7 @@ class RttProbe:
         self._persist()
         return self.p50()
 
-    def p50(self) -> Optional[float]:
+    def p50(self) -> float | None:
         with self._lock:
             if not self._rtts:
                 return None
@@ -112,7 +113,7 @@ class ActionBook:
 
     def __init__(
         self,
-        rtt_source: Callable[[], Optional[float]],
+        rtt_source: Callable[[], float | None],
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._rtt_source = rtt_source
@@ -126,8 +127,8 @@ class ActionBook:
         kind: str,
         strategy: str,
         payload: dict[str, Any],
-        rtt: Optional[float] = None,
-    ) -> Optional[Action]:
+        rtt: float | None = None,
+    ) -> Action | None:
         """Queue an action that lands once its own flight has elapsed.
 
         ``rtt`` overrides the CLOB round trip for actions that do not travel
@@ -145,7 +146,7 @@ class ActionBook:
             self._pending.append(action)
         return action
 
-    def due(self, now: Optional[float] = None) -> list[Action]:
+    def due(self, now: float | None = None) -> list[Action]:
         current = self._clock() if now is None else float(now)
         with self._lock:
             ready = [action for action in self._pending if action.lands <= current]

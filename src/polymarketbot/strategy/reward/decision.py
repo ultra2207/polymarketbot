@@ -28,7 +28,7 @@ USDC.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.strategy.reward.accrual import AccrualShare, measured_accrual
 from polymarketbot.strategy.reward.allocator import (
@@ -71,28 +71,28 @@ from polymarketbot.strategy.reward.scoring import (
 )
 
 __all__ = [
+    "MIN_CONFIDENT_SAMPLES",
+    "PROTOCOL_EPOCH_SAMPLES",
+    "PROTOCOL_MIN_DAILY_PAYOUT_USD",
+    "PROTOCOL_SAMPLE_INTERVAL_S",
+    "SINGLE_SIDED_PENALTY",
     "AccrualShare",
     "CompetingDetail",
     "CompetingEstimate",
     "CompetingScoreWindow",
     "FillDecision",
     "FillTape",
-    "MIN_CONFIDENT_SAMPLES",
     "MarketFillYield",
-    "PROTOCOL_EPOCH_SAMPLES",
-    "PROTOCOL_MIN_DAILY_PAYOUT_USD",
-    "PROTOCOL_SAMPLE_INTERVAL_S",
     "PortfolioAllocationResult",
     "RewardQuote",
-    "SINGLE_SIDED_PENALTY",
     "allocate",
     "commit_quotes",
     "expected_fill_yield",
     "fill_audit",
     "fill_tape",
-    "markout_cost_usd",
     "market_competing_detail",
     "market_competing_score",
+    "markout_cost_usd",
     "measured_accrual",
     "measured_fill_shares",
     "plan_quotes",
@@ -121,8 +121,8 @@ def allocate(
 def plan_quotes(
     candidates: list[dict[str, Any]],
     cash_usd: float,
-    resting: Optional[dict[str, tuple[float, float]]] = None,
-    state: Optional[dict[str, Any]] = None,
+    resting: dict[str, tuple[float, float]] | None = None,
+    state: dict[str, Any] | None = None,
 ) -> list[RewardQuote]:
     """The pillar's tick decision: optimise, then commit within cash.
 

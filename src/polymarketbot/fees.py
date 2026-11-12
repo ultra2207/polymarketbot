@@ -38,15 +38,23 @@ fetched, and it encodes the published history:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_EVEN, ROUND_HALF_UP
+from datetime import UTC, datetime
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
 
-CONFIG = Path("configs/fees.yaml")
+CONFIG = Path(__file__).resolve().parents[2] / "configs" / "fees.yaml"
+"""The published fee table, resolved from the package rather than the CWD.
+
+A relative ``configs/fees.yaml`` resolved only when a process ran from the
+repository root: a tool, a test runner or a service unit launched anywhere else
+raised ``FileNotFoundError`` from the first fee lookup.
+"""
 
 
 @dataclass(frozen=True)
@@ -60,7 +68,7 @@ class FeeSchedule:
     source: str = "config"
 
     @classmethod
-    def from_gamma(cls, d: dict) -> "FeeSchedule":
+    def from_gamma(cls, d: dict) -> FeeSchedule:
         return cls(
             rate=float(d.get("rate", 0.0)),
             exponent=float(d.get("exponent", 1.0)),
@@ -70,7 +78,7 @@ class FeeSchedule:
         )
 
     @classmethod
-    def zero(cls) -> "FeeSchedule":
+    def zero(cls) -> FeeSchedule:
         return cls(rate=0.0, exponent=1.0, taker_only=True, rebate_rate=0.0,
                    source="zero")
 
@@ -94,7 +102,7 @@ def _config(path: str | Path = CONFIG) -> dict:
 def _eras(path: str | Path = CONFIG) -> tuple[_Era, ...]:
     out = []
     for e in _config(path)["eras"]:
-        when = datetime.fromisoformat(str(e["effective_from"])).replace(tzinfo=timezone.utc)
+        when = datetime.fromisoformat(str(e["effective_from"])).replace(tzinfo=UTC)
         out.append(_Era(
             e["name"], when, dict(e.get("rates") or {}),
             dict(e.get("rebates") or {}), dict(e.get("exponents") or {}),
@@ -103,7 +111,7 @@ def _eras(path: str | Path = CONFIG) -> tuple[_Era, ...]:
     return tuple(sorted(out, key=lambda x: x.effective_from))
 
 
-def _dec(value: float | int) -> Decimal:
+def _dec(value: float) -> Decimal:
     """Exact decimal for a published parameter (0.0695, 0.30, 1000)."""
     return Decimal(str(value))
 
@@ -224,9 +232,9 @@ def era_schedule(category: str, when: datetime | str,
     mapped through `category_map`.
     """
     if isinstance(when, str):
-        when = datetime.fromisoformat(when.replace("Z", "+00:00"))
+        when = datetime.fromisoformat(when)
     if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
+        when = when.replace(tzinfo=UTC)
 
     cat = fee_category(category, path)
     rate = 0.0
@@ -274,7 +282,7 @@ def schedule_for_fee_type(fee_type: str, when: datetime | str,
     if spec is None:
         return None
     when = _as_utc(when)
-    start = datetime.fromisoformat(str(spec["effective_from"])).replace(tzinfo=timezone.utc)
+    start = datetime.fromisoformat(str(spec["effective_from"])).replace(tzinfo=UTC)
     if when < start:
         return FeeSchedule.zero()
     return FeeSchedule(
@@ -299,14 +307,14 @@ def schedule_for_fee_type(fee_type: str, when: datetime | str,
 # 1H/4H/daily/weekly markets only on 2026-03-06. That over-charges at most ten
 # weeks of one family and never under-charges — the safe direction, because
 # under-stating fees inflates every measured edge.
-PILOT_START = datetime(2026, 1, 5, tzinfo=timezone.utc)
-FEE_STRUCTURE_V2 = datetime(2026, 3, 30, tzinfo=timezone.utc)
+PILOT_START = datetime(2026, 1, 5, tzinfo=UTC)
+FEE_STRUCTURE_V2 = datetime(2026, 3, 30, tzinfo=UTC)
 
 
 def _as_utc(when: datetime | str) -> datetime:
     if isinstance(when, str):
-        when = datetime.fromisoformat(when.replace("Z", "+00:00"))
-    return when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
+        when = datetime.fromisoformat(when)
+    return when if when.tzinfo is not None else when.replace(tzinfo=UTC)
 
 
 def schedule_at(row: dict, when: datetime | str) -> FeeSchedule:
@@ -366,107 +374,60 @@ def schedule_from_market(row: dict) -> FeeSchedule:
 
     when = row.get("created_at") or row.get("end_date")
     if when is None:
-        when = datetime.now(timezone.utc)
+        when = datetime.now(UTC)
     return era_schedule(row.get("category") or "other", when)
 
 
-# ---------------------------------------------------------------------------
-# Taker Rebate Program (docs.polymarket.com/programs/taker-rebates)
-#
-# Live 2026-05-28. Tiers are set by 30-day Weighted Volume, and a rebate only
-# applies to trades made *from the moment a tier is reached*, so the rate is a
-# function of the account's own history - not a property of the market. That is
-# why it lives here as a separate model rather than inside FeeSchedule.
-#
-# The pipeline doc warns that every "dead after fees" verdict used the gross
-# taker fee. This module makes the correction measurable; what it cannot do is
-# make it large, because the entry tier is 3 %.
-# ---------------------------------------------------------------------------
-
-REBATE_LIVE_FROM = "2026-05-28"
-
-# (minimum 30-day weighted volume, tier name, rebate rate). Tier 0 below $2,000.
-REBATE_TIERS: tuple[tuple[float, str, float], ...] = (
-    (2_000.0, "Bronze", 0.03),
-    (20_000.0, "Silver", 0.08),
-    (200_000.0, "Gold", 0.18),
-    (1_000_000.0, "Platinum", 0.32),
-    (4_000_000.0, "Diamond", 0.44),
-    (10_000_000.0, "Obsidian", 0.50),
-)
-
-# Category weights from the published table. Only fee-paying trades earn volume,
-# so a fee-free market (geopolitics) earns nothing regardless of its weight.
-W_VOLUME_WEIGHT: dict[str, float] = {
-    "sports": 1.0,
-    "politics": 1.3,
-    "finance": 1.3,
-    "mentions": 1.3,
-    "tech": 1.3,
-    "economics": 1.7,
-    "culture": 1.7,
-    "weather": 1.7,
-    "other": 1.7,
-    "crypto": 2.3,
-    "geopolitics": 0.0,
-}
-
-DEFAULT_W_VOLUME_WEIGHT: float = W_VOLUME_WEIGHT["other"]
+_FEE_PAYLOAD_KEYS = ("feeSchedule", "fees")
 
 
-def weighted_volume(notional: float, entry_price: float, category: str) -> float:
-    """Weighted Volume earned by one taker trade.
+class FeeScheduleUnreadable(RuntimeError):
+    """A Gamma market carries a fee schedule that cannot be parsed.
 
-        wV = Trade Size x (1 - Entry Price) x Category Weight x Bonuses
-
-    `notional` is dollars paid (shares x price). Bonuses are promotional and are
-    not modelled.
+    Refusing is the only safe response. A missing schedule is not a free
+    market: substituting :meth:`FeeSchedule.zero` would understate the cost of
+    every taker fill and inflate the measured edge on exactly the markets where
+    the venue charges (``docs/fees.md``).
     """
-    if notional <= 0:
-        return 0.0
-    if not 0.0 <= entry_price <= 1.0:
-        raise ValueError(f"price out of range: {entry_price}")
-    weight = W_VOLUME_WEIGHT.get(category.lower(), DEFAULT_W_VOLUME_WEIGHT)
-    return notional * (1.0 - entry_price) * weight
 
 
-def taker_tier(weighted_volume_30d: float) -> tuple[str, float]:
-    """Tier name and rebate rate for a 30-day weighted volume."""
-    name, rate = "None", 0.0
-    for threshold, tier_name, tier_rate in REBATE_TIERS:
-        if weighted_volume_30d >= threshold:
-            name, rate = tier_name, tier_rate
-    return name, rate
+def schedule_for_market(market: Mapping[str, Any]) -> FeeSchedule:
+    """The authoritative schedule from one raw Gamma market payload.
 
+    ``FeeSchedule.zero()`` is returned only for a *measured* zero: the venue
+    flags ``feesEnabled`` false, or the payload carries no fee field at all
+    (markets created before fees existed). A payload that is present but
+    unparseable raises :class:`FeeScheduleUnreadable` with the raw value.
 
-def taker_rebate(taker_fees: float, weighted_volume_30d: float,
-                 when: datetime | str,
-                 price: float = 0.5, category: str = "other") -> float:
-    """Rebate on a batch of taker fees, or 0 before the program opened.
-
-    Deliberately conservative in two ways: the tier is evaluated on the *current*
-    volume with no forward progression, and promotional bonuses are ignored.
+    Unlike :func:`schedule_from_market`, which answers "what did this market
+    charge then" from persisted ``markets_pit`` rows, this reads the live
+    per-market ``feeSchedule`` Gamma publishes and does not fall back to the
+    era table.
     """
-    if _as_utc(when) < _as_utc(REBATE_LIVE_FROM):
-        return 0.0
-    # A fee-free market earns no weighted volume, so it can never reach a tier
-    # on its own; the guard keeps the semantics honest rather than profitable.
-    if W_VOLUME_WEIGHT.get(category.lower(), DEFAULT_W_VOLUME_WEIGHT) == 0.0:
-        return 0.0
-    _, rate = taker_tier(weighted_volume_30d)
-    return _round_fee(taker_fees * rate)
-
-
-def turnover_needed_for_tier(threshold: float, capital: float,
-                             price: float, category: str) -> float:
-    """How many times 30-day capital must turn over to reach a tier.
-
-    The number that decides whether a rebate is ever relevant at our size.
-    """
-    per_unit = capital * (1.0 - price) * W_VOLUME_WEIGHT.get(category.lower(), DEFAULT_W_VOLUME_WEIGHT)
-    if per_unit <= 0:
-        return float("inf")
-    return threshold / per_unit
+    cid = market.get("conditionId") or market.get("condition_id") or "?"
+    raw: Any = None
+    for key in _FEE_PAYLOAD_KEYS:
+        if market.get(key) is not None:
+            raw = market[key]
+            break
+    if market.get("feesEnabled") is False:
+        return FeeSchedule.zero()
+    if raw is None:
+        if market.get("feesEnabled") is None and market.get("feeType") is None:
+            return FeeSchedule.zero()
+        raise FeeScheduleUnreadable(
+            f"market {cid} declares fees but carries no feeSchedule: {dict(market)!r}"
+        )
+    if not isinstance(raw, Mapping) or not raw:
+        raise FeeScheduleUnreadable(
+            f"market {cid} has an empty or non-object fee schedule: {raw!r}"
+        )
+    try:
+        return FeeSchedule.from_gamma(raw)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise FeeScheduleUnreadable(
+            f"market {cid} has an unreadable fee schedule: {raw!r}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +521,7 @@ def weighted_taker_volume(
     if cat not in weights:
         return None
     weight = float(weights[cat])
-    if weight <= 0.0 or era_schedule(category, datetime.now(timezone.utc), path).rate <= 0.0:
+    if weight <= 0.0 or era_schedule(category, datetime.now(UTC), path).rate <= 0.0:
         return 0.0
     if trade_size_usd <= 0.0:
         return 0.0
@@ -634,13 +595,13 @@ def us_combo_taker_fee(
     combo = config["combo"]
     cutover = datetime.fromisoformat(str(combo["change_effective_from"]))
     if when is None:
-        moment = datetime.now(timezone.utc)
+        moment = datetime.now(UTC)
     elif isinstance(when, str):
-        moment = datetime.fromisoformat(when.replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(when)
     else:
         moment = when
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
+        moment = moment.replace(tzinfo=UTC)
     fixed = (float(combo["fixed_power4_after"]) if moment >= cutover
              else float(combo["fixed_power4_before"]))
     one_minus = 1 - _dec(price)

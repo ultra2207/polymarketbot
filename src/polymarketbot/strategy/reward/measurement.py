@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
 
 from polymarketbot.logs import get_logger
 
@@ -55,12 +54,12 @@ class QuoteFillHorizon:
     measured tick/flow grid, returns ``None`` (missing data).
     """
 
-    cells: Tuple[Tuple[float, float, float, float], ...]
+    cells: tuple[tuple[float, float, float, float], ...]
     placements: int = 0
 
     P_FILL_INTERPOLATION_ERROR = 0.2571
 
-    def _cell_at(self, horizon: float, tick_value: float, flow: float) -> Optional[float]:
+    def _cell_at(self, horizon: float, tick_value: float, flow: float) -> float | None:
         rows = [
             c for c in self.cells
             if c[0] == horizon and abs(c[1] - tick_value) < 1e-12 and c[2] >= flow
@@ -74,7 +73,7 @@ class QuoteFillHorizon:
         horizon_s: float,
         tick: float,
         min_flow_shares: float,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Measured P(fill) for this horizon, tick and required fill size."""
         horizon = float(horizon_s)
         tick_value = float(tick)
@@ -107,14 +106,14 @@ class QuoteFillHorizon:
             if abs(c[1] - float(tick)) < 1e-12 and c[2] >= flow
         })
 
-    def horizon_bound(self, tick: float, min_flow_shares: float) -> Optional[float]:
+    def horizon_bound(self, tick: float, min_flow_shares: float) -> float | None:
         """Longest measurable requote lifetime, or ``None`` without support."""
         measured = self.supported_horizons(tick, min_flow_shares)
         return measured[-1] if measured else None
 
     def clamped_p_fill(
         self, horizon_s: float, tick: float, min_flow_shares: float
-    ) -> Optional[Tuple[float, float]]:
+    ) -> tuple[float, float] | None:
         """``(p_fill, priced_horizon_s)``, pinning an over-long life to support.
 
         A requote lifetime longer than the longest measured horizon is priced at
@@ -144,9 +143,9 @@ class MakerMarkout:
     a leg that fills alone.
     """
 
-    cells: Tuple[Tuple[float, float, float, int], ...] = ()
+    cells: tuple[tuple[float, float, float, int], ...] = ()
 
-    def markout(self, horizon_s: float, tick: float) -> Optional[float]:
+    def markout(self, horizon_s: float, tick: float) -> float | None:
         """Measured adverse drift per share, or ``None`` when unmeasured.
 
         A horizon between two measured cells is charged the **larger** of the
@@ -183,7 +182,7 @@ class MakerMarkout:
         )
 
 
-def load_quote_fill_horizon(path: Optional[Path] = None) -> QuoteFillHorizon:
+def load_quote_fill_horizon(path: Path | None = None) -> QuoteFillHorizon:
     """Load and validate the measured horizon fill table; raise if unusable."""
     model_path = Path(path) if path is not None else DEFAULT_QUOTE_FILL_HORIZON_PATH
     with open(model_path, "r", encoding="utf-8") as fh:
@@ -213,7 +212,7 @@ def load_quote_fill_horizon(path: Optional[Path] = None) -> QuoteFillHorizon:
     return QuoteFillHorizon(cells=tuple(cells), placements=placements)
 
 
-def load_maker_markout(path: Optional[Path] = None) -> MakerMarkout:
+def load_maker_markout(path: Path | None = None) -> MakerMarkout:
     """Load the measured single-leg markout; raise when it carries no cells."""
     model_path = Path(path) if path is not None else DEFAULT_MAKER_MARKOUT_PATH
     with open(model_path, "r", encoding="utf-8") as fh:

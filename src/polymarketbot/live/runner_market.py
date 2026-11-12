@@ -12,9 +12,12 @@ from __future__ import annotations
 import math
 import re
 import time
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
+from polymarketbot.fees import FeeScheduleUnreadable, schedule_for_market
+from polymarketbot.gamma import GammaClient
 from polymarketbot.logs import get_logger
 from polymarketbot.market import TokenConfig
 from polymarketbot.strategy.reward.scanner import (
@@ -27,6 +30,7 @@ from polymarketbot.strategy.reward.switching import (
     OpportunisticSwitchingEngine,
     SwitchingConfig,
 )
+from polymarketbot.strategy.venue.clob import ClobAPIError
 from polymarketbot.strategy.venue.feed import LivePolymarketFeed
 
 if TYPE_CHECKING:  # the engine only appears in the rebind annotation
@@ -42,7 +46,7 @@ MARKET_STATUS_INTERVAL = 60.0
 # ---------------------------------------------------------------------------
 # Small coercion helpers (never invent a value)
 # ---------------------------------------------------------------------------
-def _coerce_float(value: Any) -> Optional[float]:
+def _coerce_float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -52,7 +56,7 @@ def _coerce_float(value: Any) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
-def _numeric_token_id(value: Any) -> Optional[str]:
+def _numeric_token_id(value: Any) -> str | None:
     """Return a CLOB token id (plain decimal digits) or None."""
     if isinstance(value, bool):
         return None
@@ -65,26 +69,26 @@ def _numeric_token_id(value: Any) -> Optional[str]:
     return None
 
 
-def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+def _parse_iso_datetime(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.strip())
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
-def _first_string(*values: Any) -> Optional[str]:
+def _first_string(*values: Any) -> str | None:
     for value in values:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
 
 
-def _first_bool(*values: Any) -> Optional[bool]:
+def _first_bool(*values: Any) -> bool | None:
     for value in values:
         if value is None:
             continue
@@ -99,6 +103,18 @@ def _first_bool(*values: Any) -> Optional[bool]:
             if lowered in ("false", "0", "no"):
                 return False
     return None
+
+
+def _payload_is_neg_risk(payload: dict[str, Any] | None) -> bool:
+    """Whether a payload states neg-risk; an absent flag is not a yes.
+
+    Auto-selection skips a market only on a stated ``true``. A payload that
+    omits the field is left in place and the startup/switch gate decides with
+    the authoritative CLOB value.
+    """
+    if not payload:
+        return False
+    return _first_bool(payload.get("neg_risk"), payload.get("negRisk")) is True
 
 
 def _reward_rate(raw_market: dict[str, Any]) -> float:
@@ -168,19 +184,23 @@ def build_switching_engine(
     *,
     bankroll_usd: float,
     live_yield: float,
-) -> Optional[OpportunisticSwitchingEngine]:
+) -> OpportunisticSwitchingEngine | None:
     """Build the rewards re-scan engine for an auto-selected market.
 
     A pinned ``--condition-id`` is an operator decision and never migrates.
-    ``switch_hurdle_pct`` is zero: the module's measured switching cost (gas +
-    merge gas + crossing friction, amortized over the holding horizon) is the
-    entire hurdle, so the runner contributes no economic constant of its own.
+    The hurdle and its amortisation horizon are not configured here: the engine
+    solves both from measured quantities (round-trip cost per dollar moved and
+    the payback period). This function supplies the one measurement the engine
+    cannot take itself - the persisted CLOB round trip that prices the unquoted
+    interval.
     """
     if not market.get("auto_selected"):
         return None
+    from polymarketbot.live.engine.deskew import persisted_clob_rtt_s
+
     config = SwitchingConfig(
         scan_interval_seconds=MARKET_STATUS_INTERVAL,
-        switch_hurdle_pct=0.0,
+        round_trip_latency_seconds=persisted_clob_rtt_s(),
     )
     switcher = OpportunisticSwitchingEngine(
         scanner=OpportunityScanner(),
@@ -207,15 +227,32 @@ def rebind_engine_to_market(
     Returns the USDC unlocked by the merge (0.0 when there was nothing to merge).
 
     Raises:
-        MarketSwitchBlocked: when outcome-token inventory remains after the
-            merge attempt. ``RealMoneyTradingEngine`` tracks one market's
-            inventory at a time, so migrating with old shares would mark them
-            against the new market.
+        MarketSwitchBlocked: when the target market's fee schedule cannot be
+            read, or when outcome-token inventory remains after the merge
+            attempt. ``RealMoneyTradingEngine`` tracks one market's inventory
+            at a time, so migrating with old shares would mark them against the
+            new market.
     """
+    # The switch is refused before anything on the engine is mutated: a market
+    # with an unreadable fee curve cannot be priced, and the runner keeps the
+    # old market rather than quoting the new one with stale fees.
+    raw_market = details.get("raw_market")
+    try:
+        if not isinstance(raw_market, dict):
+            raise FeeScheduleUnreadable(
+                f"market {details.get('condition_id')!r} carries no raw market payload"
+            )
+        fee_schedule = schedule_for_market(raw_market)
+    except FeeScheduleUnreadable as exc:
+        log.error(f"[MARKET SWITCH] Refusing switch: {exc}")
+        raise MarketSwitchBlocked(
+            f"fee schedule for the target market is unreadable: {exc}"
+        ) from exc
+
     unlocked_cash = 0.0
     try:
         merged = engine.trigger_ctf_merge()
-    except Exception as exc:  # a failed merge must not leave quoting halted forever
+    except Exception as exc:  # noqa: BLE001 - a failed merge must not leave quoting halted
         merged = None
         log.error(f"[MARKET SWITCH] Merge of the old market failed: {exc}")
     if merged is not None:
@@ -250,6 +287,12 @@ def rebind_engine_to_market(
     engine.neg_risk = bool(details["neg_risk"])
     engine.event_id = details.get("event_id")
     engine.fee_rate_bps = int(details["fee_rate_bps"])
+    engine.min_order_usd = float(details["order_min_usd"])
+    # The target market's measured fee curve replaces the old market's; the
+    # cached de-skew optimizer embeds that curve and its thresholds, so it must
+    # be rebuilt against the new market on next use.
+    engine.fee_schedule = fee_schedule
+    engine._deskew_optimizer = None
     engine.days_to_resolution = float(details["days_to_resolution"])
     engine.competing_score_override = details.get("competing_score_override")
     engine.market_closed = False
@@ -266,8 +309,8 @@ def rebind_engine_to_market(
     engine._deskew_order = None
     engine._last_deskew_attempt_ts = 0.0
     engine.verified_scoring_orders.clear()
-    engine.microstructure_yes.reset()
-    engine.microstructure_no.reset()
+    engine.micro_risk.reset()
+    engine.micro_risk.tick_size = engine.tick_size
     engine.latest_switching_cost = None
     engine.latest_hurdle_decision = None
     engine.governor.market_entry_times.pop(old_cid, None)
@@ -288,7 +331,7 @@ def rebind_engine_to_market(
 # ---------------------------------------------------------------------------
 # Market resolution
 # ---------------------------------------------------------------------------
-def _resolve_token(requested: Optional[str], discovered: Optional[str], label: str, cid: str) -> str:
+def _resolve_token(requested: str | None, discovered: str | None, label: str, cid: str) -> str:
     """Resolve one token id, refusing a flag that disagrees with the CLOB.
 
     The CLOB market detail is authoritative: a stale ``--token-*`` (for example
@@ -320,15 +363,15 @@ def _resolve_token(requested: Optional[str], discovered: Optional[str], label: s
 def resolve_market_details(
     feed: LivePolymarketFeed,
     clob: Any,
-    requested_cid: Optional[str] = None,
-    requested_yes: Optional[str] = None,
-    requested_no: Optional[str] = None,
+    requested_cid: str | None = None,
+    requested_yes: str | None = None,
+    requested_no: str | None = None,
     bankroll: float = 150.0,
-    min_size: Optional[float] = None,
-    max_spread: Optional[float] = None,
-    daily_reward: Optional[float] = None,
+    min_size: float | None = None,
+    max_spread: float | None = None,
+    daily_reward: float | None = None,
     *,
-    find_markets: Optional[Callable[..., Any]] = None,
+    find_markets: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve the market, real token ids and execution metadata.
 
@@ -344,9 +387,12 @@ def resolve_market_details(
     log.info("Resolving market details from Polymarket CLOB API...")
 
     markets = feed.get_rewards_markets_sync() or []
-    target_market: Optional[dict[str, Any]] = None
-    competing_score_override: Optional[float] = None
-    daily_reward_override: Optional[float] = None
+    # ``clob.dry_run`` is False only in a real-money run. The neg-risk skip is
+    # live-only: a dry-run has no settlement path to refuse.
+    live = not bool(getattr(clob, "dry_run", True))
+    target_market: dict[str, Any] | None = None
+    competing_score_override: float | None = None
+    daily_reward_override: float | None = None
 
     if requested_cid:
         requested_lower = requested_cid.strip().lower()
@@ -366,28 +412,51 @@ def resolve_market_details(
         )
         try:
             optimal_markets = scan_markets(bankroll_usd=bankroll, limit_output=5)
-        except Exception as exc:  # network failure is not fatal: fall back to rate sort
+        except Exception as exc:  # noqa: BLE001 - caller-supplied scan; fall back to rate sort
             log.warning(f"Optimal market scan failed ({exc}); falling back to the rewards rate sort.")
             optimal_markets = []
         if optimal_markets:
-            best = optimal_markets[0]
-            target_market = best.get("raw_market")
-            competing_score_override = _coerce_float(best.get("competing_score"))
-            daily_reward_override = _coerce_float(best.get("daily_pool"))
-            log.info(
-                f"[OPTIMAL SWEET SPOT DETECTED] Auto-selected: '{best.get('question', 'n/a')}' "
-                f"(Pool: ${daily_reward_override or 0.0:,.2f}/day, "
-                f"Competing depth: {best.get('qualifying_shares', 0.0):,.0f} sh, "
-                f"Expected payout: ${best.get('real_daily_payout', 0.0):.2f}/day)"
+            # Live trading cannot settle a neg-risk market (no NegRiskAdapter),
+            # so choosing one only guarantees a startup refusal. Skip a stated
+            # neg-risk candidate and let the next one through.
+            best = next(
+                (
+                    candidate
+                    for candidate in optimal_markets
+                    if not (
+                        live
+                        and _payload_is_neg_risk(candidate.get("raw_market"))
+                    )
+                ),
+                None,
             )
+            if best is not None:
+                target_market = best.get("raw_market")
+                competing_score_override = _coerce_float(best.get("competing_score"))
+                daily_reward_override = _coerce_float(best.get("daily_pool"))
+                log.info(
+                    f"[OPTIMAL SWEET SPOT DETECTED] Auto-selected: '{best.get('question', 'n/a')}' "
+                    f"(Pool: ${daily_reward_override or 0.0:,.2f}/day, "
+                    f"Competing depth: {best.get('qualifying_shares', 0.0):,.0f} sh, "
+                    f"Expected payout: ${best.get('real_daily_payout', 0.0):.2f}/day)"
+                )
         if target_market is None and markets:
+            skipped_neg_risk = 0
             for market in sorted(markets, key=_reward_rate, reverse=True):
                 if market.get("closed") is True or market.get("archived") is True:
+                    continue
+                if live and _payload_is_neg_risk(market):
+                    skipped_neg_risk += 1
                     continue
                 tokens = market.get("tokens") or []
                 if len(tokens) >= 2:
                     target_market = market
                     break
+            if skipped_neg_risk:
+                log.warning(
+                    f"[MARKET SELECT] Skipped {skipped_neg_risk} neg-risk market(s): "
+                    "the live engine cannot settle them (no NegRiskAdapter path)."
+                )
         if target_market is None:
             raise SystemExit(
                 "No open rewards market could be resolved from the CLOB rewards list. "
@@ -402,7 +471,7 @@ def resolve_market_details(
             raise SystemExit("Resolved market payload has no condition_id.")
         try:
             detail = clob.get_market(cid) or {}
-        except Exception as exc:
+        except (ClobAPIError, ValueError) as exc:
             log.warning(
                 f"GET /markets/{cid} failed ({exc}); using the rewards payload metadata. "
                 "tick size / neg risk may be resolved per-token instead."
@@ -464,9 +533,9 @@ def resolve_market_details(
         ]
 
     # Token ids: the market payload is authoritative; an explicit flag must match.
-    discovered_yes: Optional[str] = None
-    discovered_no: Optional[str] = None
-    payload_mid: Optional[float] = None
+    discovered_yes: str | None = None
+    discovered_no: str | None = None
+    payload_mid: float | None = None
     for token in raw_market.get("tokens") or []:
         if not isinstance(token, dict):
             continue
@@ -486,7 +555,7 @@ def resolve_market_details(
     if mid_price is None:
         try:
             book = feed.get_book_sync(token_yes)
-        except Exception as exc:
+        except (OSError, ValueError, KeyError, TypeError) as exc:
             book = None
             log.warning(f"Could not fetch an order book for {token_yes}: {exc}")
         if book is not None and book.bids and book.asks:
@@ -511,6 +580,20 @@ def resolve_market_details(
     if tick_size is None or tick_size <= 0.0:
         raise SystemExit(f"Cannot resolve a positive tick size for token {token_yes}.")
 
+    # The venue's own order minimum (Gamma ``orderMinSize``, in USDC). Required:
+    # a sub-minimum order is rejected by the CLOB after a full signing and
+    # submit round trip, and a guessed minimum would size the quote instead.
+    min_order_usd = GammaClient.min_order_size(raw_market)
+    if min_order_usd is None:
+        min_order_usd = GammaClient.min_order_size(detail.get("raw") or {})
+    if min_order_usd is None:
+        min_order_usd = _coerce_float(detail.get("order_min_size"))
+    if min_order_usd is None or min_order_usd <= 0.0:
+        raise SystemExit(
+            f"Market {cid} publishes no usable orderMinSize; refusing to size an "
+            "order against an unknown venue minimum."
+        )
+
     neg_risk = _first_bool(raw_market.get("neg_risk"), detail.get("neg_risk"))
     if neg_risk is None:
         try:
@@ -526,17 +609,41 @@ def resolve_market_details(
     fee_value = _coerce_float(fee_rate_bps_raw)
     if fee_value is not None and fee_value < 0.0:
         raise SystemExit(f"Market {cid} reports a negative fee rate: {fee_rate_bps_raw!r}")
-    fee_rate_bps = int(round(fee_value)) if fee_value is not None else 0
+    fee_rate_bps = round(fee_value) if fee_value is not None else 0
 
-    end_date_iso = _first_string(raw_market.get("end_date_iso"), detail.get("end_date_iso"))
+    # The CLOB rewards payload publishes ``end_date``; gamma/CLOB detail may
+    # publish either. Reading only ``end_date_iso`` rejected every rewarded
+    # market the rewards list supplied.
+    end_date_iso = _first_string(
+        raw_market.get("end_date_iso"),
+        raw_market.get("end_date"),
+        detail.get("end_date_iso"),
+        detail.get("end_date"),
+    )
 
-    # Validate the payload we will actually trade, with resolved token ids.
+    # Effective reward config: a documented ``--min-size`` / ``--max-spread``
+    # override wins over the payload, and the payload is validated with those
+    # effective values so an override can rescue a market whose raw payload
+    # would be rejected by the gates wrong-side-out.
+    #
+    # Validate the payload we will actually trade, with resolved token ids and
+    # the effective overrides.
     validated_payload: dict[str, Any] = dict(raw_market)
     validated_payload["tokens"] = [
         {"outcome": "YES", "token_id": token_yes, "price": mid_price},
         {"outcome": "NO", "token_id": token_no},
     ]
     validated_payload["end_date_iso"] = end_date_iso
+    resolved_min_size = _coerce_float(min_size)
+    if resolved_min_size is None:
+        resolved_min_size = _coerce_float(validated_payload.get("rewards_min_size"))
+    if resolved_min_size is not None:
+        validated_payload["rewards_min_size"] = resolved_min_size
+    resolved_max_spread = _coerce_float(max_spread)
+    if resolved_max_spread is None:
+        resolved_max_spread = _coerce_float(validated_payload.get("rewards_max_spread"))
+    if resolved_max_spread is not None:
+        validated_payload["rewards_max_spread"] = resolved_max_spread
     ok, reason = validate_market_for_live(validated_payload)
     if not ok:
         raise SystemExit(f"Market {cid} is not safe to quote live: {reason}")
@@ -544,19 +651,13 @@ def resolve_market_details(
     end_dt = _parse_iso_datetime(end_date_iso)
     if end_dt is None:
         raise SystemExit(f"Market {cid} end_date_iso is unparseable: {end_date_iso!r}")
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     days_to_resolution = max((end_dt - now_utc).total_seconds() / 86400.0, 1.0 / 24.0)
 
-    resolved_min_size = _coerce_float(min_size)
-    if resolved_min_size is None:
-        resolved_min_size = _coerce_float(validated_payload.get("rewards_min_size"))
     if resolved_min_size is None:
         raise SystemExit(f"Market {cid} has no rewards_min_size; supply --min-size.")
     if resolved_min_size <= 0.0:
         raise SystemExit(f"Market {cid} resolved a non-positive min size: {resolved_min_size}.")
-    resolved_max_spread = _coerce_float(max_spread)
-    if resolved_max_spread is None:
-        resolved_max_spread = _coerce_float(validated_payload.get("rewards_max_spread"))
     if resolved_max_spread is None:
         raise SystemExit(f"Market {cid} has no rewards_max_spread; supply --max-spread.")
     if resolved_max_spread <= 0.0:
@@ -599,6 +700,7 @@ def resolve_market_details(
         "neg_risk": bool(neg_risk),
         "event_id": raw_market.get("event_id"),
         "fee_rate_bps": fee_rate_bps,
+        "order_min_usd": min_order_usd,
         "end_date_iso": end_date_iso,
         "end_timestamp": end_dt.timestamp(),
         "days_to_resolution": days_to_resolution,

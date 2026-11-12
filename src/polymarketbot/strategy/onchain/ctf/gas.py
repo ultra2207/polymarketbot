@@ -26,9 +26,10 @@ import os
 import statistics
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.onchain.core import ChainClient
@@ -41,7 +42,7 @@ GAS_ORACLE_URL = "https://gasstation.polygon.technology/v2"
 # from the operating host on 2026-11-09. Order is by measured response time.
 # Override with POLYGON_RPC_URLS (comma-separated): a dedicated endpoint is
 # preferred in production and is not a price, so it is configuration.
-PUBLIC_RPC_URLS: Tuple[str, ...] = (
+PUBLIC_RPC_URLS: tuple[str, ...] = (
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.drpc.org",
     "https://1rpc.io/matic",
@@ -51,7 +52,7 @@ PUBLIC_RPC_URLS: Tuple[str, ...] = (
 # (binance 0.086860, coinbase 0.086840, okx 0.086860, kraken 0.086880).
 # MATICUSDT is deliberately absent: MATIC and POL are separate markets and a
 # stale MATIC quote is a wrong measurement, not a fallback.
-POL_PRICE_SOURCES: Tuple[Tuple[str, str], ...] = (
+POL_PRICE_SOURCES: tuple[tuple[str, str], ...] = (
     ("binance_polusdt", "https://api.binance.com/api/v3/ticker/price?symbol=POLUSDT"),
     ("coinbase_pol_usd", "https://api.coinbase.com/v2/prices/POL-USD/spot"),
     ("okx_pol_usdt", "https://www.okx.com/api/v5/market/ticker?instId=POL-USDT"),
@@ -83,7 +84,7 @@ class GasUnmeasured(RuntimeError):
 class GasReading:
     gwei: float
     source: str
-    samples: Dict[str, float]
+    samples: dict[str, float]
     spread_pct: float
     measured_at: float
     stale_seconds: float = 0.0
@@ -97,7 +98,7 @@ class GasReading:
 class PolReading:
     usd: float
     source: str
-    samples: Dict[str, float]
+    samples: dict[str, float]
     spread_pct: float
     measured_at: float
     stale_seconds: float = 0.0
@@ -112,7 +113,7 @@ class PolReading:
 # --------------------------------------------------------------------------
 
 
-def _hex_to_int(value: Any) -> Optional[int]:
+def _hex_to_int(value: Any) -> int | None:
     if value is None:
         return None
     try:
@@ -123,7 +124,7 @@ def _hex_to_int(value: Any) -> Optional[int]:
         return None
 
 
-def _hex_to_gwei(value: Any) -> Optional[float]:
+def _hex_to_gwei(value: Any) -> float | None:
     """Wei as Gwei, or None when the value is absent / zero / undecodable."""
     raw = _hex_to_int(value)
     if raw is None or raw <= 0:
@@ -131,7 +132,7 @@ def _hex_to_gwei(value: Any) -> Optional[float]:
     return raw / 1e9
 
 
-def _spread_pct(samples: Dict[str, float]) -> float:
+def _spread_pct(samples: dict[str, float]) -> float:
     values = [v for v in samples.values() if v and v > 0]
     if len(values) < 2:
         return 0.0
@@ -141,7 +142,7 @@ def _spread_pct(samples: Dict[str, float]) -> float:
     return (max(values) - min(values)) / centre * 100.0
 
 
-def _aggregate(samples: Dict[str, float]) -> Tuple[Optional[float], str]:
+def _aggregate(samples: dict[str, float]) -> tuple[float | None, str]:
     """Median over independent sources; the spread is reported by the caller."""
     values = {k: v for k, v in samples.items() if v and v > 0}
     if not values:
@@ -149,7 +150,7 @@ def _aggregate(samples: Dict[str, float]) -> Tuple[Optional[float], str]:
     return statistics.median(values.values()), f"median_of_{len(values)}"
 
 
-def _max_stale_seconds(explicit: Optional[float], env_key: str) -> float:
+def _max_stale_seconds(explicit: float | None, env_key: str) -> float:
     if explicit is not None:
         return float(explicit)
     raw = os.environ.get(env_key)
@@ -201,7 +202,7 @@ def _client_rpc(client: Any, method: str, params: list) -> Any:
         return None
 
 
-def _fee_history_tip(call: Callable[[str, list], Any]) -> Optional[float]:
+def _fee_history_tip(call: Callable[[str, list], Any]) -> float | None:
     """Median p50 priority fee actually paid over the last blocks."""
     history = call("eth_feeHistory", ["0x5", "latest", [50]])
     if not isinstance(history, dict):
@@ -221,9 +222,9 @@ def _fee_history_tip(call: Callable[[str, list], Any]) -> Optional[float]:
 def _samples_from_transport(
     call: Callable[[str, list], Any],
     label: str,
-) -> Dict[str, float]:
+) -> dict[str, float]:
     """All-in gas price samples from one RPC, each with its own provenance."""
-    samples: Dict[str, float] = {}
+    samples: dict[str, float] = {}
 
     block = call("eth_getBlockByNumber", ["latest", False])
     base = _hex_to_gwei(block.get("baseFeePerGas")) if isinstance(block, dict) else None
@@ -247,11 +248,11 @@ def _samples_from_transport(
     return samples
 
 
-def _oracle_samples() -> Dict[str, float]:
+def _oracle_samples() -> dict[str, float]:
     """Fast-tier total fee, and the priority fee it publishes separately."""
     import requests
 
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     try:
         resp = requests.get(GAS_ORACLE_URL, timeout=2.0)
         if resp.status_code != 200:
@@ -270,7 +271,7 @@ def _oracle_samples() -> Dict[str, float]:
     return out
 
 
-def _rpc_urls(explicit: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
+def _rpc_urls(explicit: tuple[str, ...] | None) -> tuple[str, ...]:
     if explicit:
         return tuple(explicit)
     raw = os.environ.get("POLYGON_RPC_URLS")
@@ -286,7 +287,7 @@ def _rpc_urls(explicit: Optional[Tuple[str, ...]]) -> Tuple[str, ...]:
 # --------------------------------------------------------------------------
 
 
-def _load_state(path: Path) -> Optional[Dict[str, Any]]:
+def _load_state(path: Path) -> dict[str, Any] | None:
     try:
         if not path.exists():
             return None
@@ -297,7 +298,7 @@ def _load_state(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _save_state(path: Path, payload: Dict[str, Any]) -> None:
+def _save_state(path: Path, payload: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -311,11 +312,11 @@ def _save_state(path: Path, payload: Dict[str, Any]) -> None:
 # gas
 # --------------------------------------------------------------------------
 
-_GAS_CACHE: Dict[str, Any] = {"reading": None, "ts": 0.0}
+_GAS_CACHE: dict[str, Any] = {"reading": None, "ts": 0.0}
 _GAS_LOCK = threading.Lock()
 
 
-def _cache_ttl(explicit: Optional[float], env_key: str) -> float:
+def _cache_ttl(explicit: float | None, env_key: str) -> float:
     if explicit is not None:
         return float(explicit)
     raw = os.environ.get(env_key)
@@ -331,13 +332,13 @@ def _cache_ttl(explicit: Optional[float], env_key: str) -> float:
 
 
 def measure_gas(
-    chain_client: Optional[ChainClient] = None,
-    rpc_url: Optional[str] = None,
-    rpc_urls: Optional[Tuple[str, ...]] = None,
-    max_stale_seconds: Optional[float] = None,
+    chain_client: ChainClient | None = None,
+    rpc_url: str | None = None,
+    rpc_urls: tuple[str, ...] | None = None,
+    max_stale_seconds: float | None = None,
     persist: bool = True,
-    cache_ttl_seconds: Optional[float] = None,
-) -> Optional[GasReading]:
+    cache_ttl_seconds: float | None = None,
+) -> GasReading | None:
     """Measure the all-in Polygon gas price, or return None. Never a default."""
     # A caller that supplies its own transport is asking for *that* view; it is
     # never served another transport's cached reading. The cache exists for the
@@ -347,12 +348,12 @@ def measure_gas(
     now = time.time()
     if ttl > 0:
         with _GAS_LOCK:
-            cached: Optional[GasReading] = _GAS_CACHE.get("reading")
+            cached: GasReading | None = _GAS_CACHE.get("reading")
             cached_ts = float(_GAS_CACHE.get("ts") or 0.0)
         if cached is not None and (now - cached_ts) < ttl:
             return cached
 
-    transports: list[Tuple[str, Callable[[str, list], Any]]] = []
+    transports: list[tuple[str, Callable[[str, list], Any]]] = []
 
     client = chain_client
     if client is None and rpc_url is not None:
@@ -368,7 +369,7 @@ def measure_gas(
             host = url.split("//", 1)[-1].split("/", 1)[0]
             transports.append((host, lambda m, p, u=url: _http_rpc(u, m, p)))
 
-    samples: Dict[str, float] = {}
+    samples: dict[str, float] = {}
     for label, call in transports:
         samples.update(_samples_from_transport(call, label))
 
@@ -466,12 +467,12 @@ def measure_gas(
 
 
 def get_dynamic_gas_price_gwei(
-    chain_client: Optional[ChainClient] = None,
-    rpc_url: Optional[str] = None,
-    rpc_urls: Optional[Tuple[str, ...]] = None,
-    max_stale_seconds: Optional[float] = None,
-    cache_ttl_seconds: Optional[float] = None,
-) -> Optional[float]:
+    chain_client: ChainClient | None = None,
+    rpc_url: str | None = None,
+    rpc_urls: tuple[str, ...] | None = None,
+    max_stale_seconds: float | None = None,
+    cache_ttl_seconds: float | None = None,
+) -> float | None:
     """Measured all-in gas price in Gwei, or None when it cannot be measured."""
     reading = measure_gas(
         chain_client=chain_client,
@@ -487,11 +488,11 @@ def get_dynamic_gas_price_gwei(
 # POL/USD
 # --------------------------------------------------------------------------
 
-_POL_CACHE: Dict[str, Any] = {"reading": None, "ts": 0.0}
+_POL_CACHE: dict[str, Any] = {"reading": None, "ts": 0.0}
 _POL_LOCK = threading.Lock()
 
 
-def _pol_from_source(name: str, url: str) -> Optional[float]:
+def _pol_from_source(name: str, url: str) -> float | None:
     import requests
 
     try:
@@ -499,7 +500,7 @@ def _pol_from_source(name: str, url: str) -> Optional[float]:
         if resp.status_code != 200:
             return None
         data = resp.json()
-        price: Optional[float] = None
+        price: float | None = None
         if isinstance(data, dict):
             if "price" in data:
                 price = float(data["price"])
@@ -522,18 +523,18 @@ def _pol_from_source(name: str, url: str) -> Optional[float]:
 
 def measure_pol_usd(
     cache_ttl_seconds: float = 300.0,
-    max_stale_seconds: Optional[float] = None,
+    max_stale_seconds: float | None = None,
     persist: bool = True,
-) -> Optional[PolReading]:
+) -> PolReading | None:
     """Median POL/USD across listed venues, or None. Never a default."""
     now = time.time()
     with _POL_LOCK:
-        cached: Optional[PolReading] = _POL_CACHE.get("reading")
+        cached: PolReading | None = _POL_CACHE.get("reading")
         cached_ts = float(_POL_CACHE.get("ts") or 0.0)
     if cached is not None and (now - cached_ts) < cache_ttl_seconds:
         return cached
 
-    samples: Dict[str, float] = {}
+    samples: dict[str, float] = {}
     for name, url in POL_PRICE_SOURCES:
         price = _pol_from_source(name, url)
         if price is not None:
@@ -602,8 +603,8 @@ def measure_pol_usd(
 
 def get_dynamic_pol_usd_price(
     cache_ttl_seconds: float = 300.0,
-    max_stale_seconds: Optional[float] = None,
-) -> Optional[float]:
+    max_stale_seconds: float | None = None,
+) -> float | None:
     """Measured POL/USD, or None when it cannot be measured."""
     reading = measure_pol_usd(
         cache_ttl_seconds=cache_ttl_seconds,
@@ -618,11 +619,11 @@ def get_dynamic_pol_usd_price(
 
 
 def estimate_merge_cost_usd(
-    pol_usd_price: Optional[float] = None,
+    pol_usd_price: float | None = None,
     gas_units: int = 78_000,
-    gas_price_gwei: Optional[float] = None,
-    chain_client: Optional[ChainClient] = None,
-) -> Optional[float]:
+    gas_price_gwei: float | None = None,
+    chain_client: ChainClient | None = None,
+) -> float | None:
     """Dollar cost of one mergePositions: gas units x gas price x POL/USD.
 
     ``None`` means unmeasurable, never zero. ``gas_units`` is the documented
@@ -643,12 +644,12 @@ def estimate_merge_cost_usd(
 
 
 def calculate_optimal_merge_threshold(
-    gas_cost_usd: Optional[float] = None,
+    gas_cost_usd: float | None = None,
     fee_basis_points: float = 0.0,
     max_gas_friction_ratio: float = 0.0015,
     min_threshold_shares: float = 1.0,
-    pol_usd_price: Optional[float] = None,
-    chain_client: Optional[ChainClient] = None,
+    pol_usd_price: float | None = None,
+    chain_client: ChainClient | None = None,
 ) -> float:
     """Minimum complete sets whose gas drag stays under ``max_gas_friction_ratio``.
 

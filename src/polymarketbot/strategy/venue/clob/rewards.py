@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from polymarketbot.dataapi import DataAPIClient
 from polymarketbot.logs import get_logger
-from polymarketbot.strategy.venue.clob.common import USDC_ASSET_ADDRESSES
+from polymarketbot.strategy.venue.clob.common import USDC_ASSET_ADDRESSES, ClobAPIError
 
 logger = get_logger("clob_client")
 
 
-def _as_float(value: Any) -> Optional[float]:
+def _as_float(value: Any) -> float | None:
     """Parse a JSON number/string; None when absent or malformed."""
     if value is None or value == "":
         return None
@@ -22,7 +22,7 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
-def _earnings_usd(row: dict[str, Any]) -> Optional[float]:
+def _earnings_usd(row: dict[str, Any]) -> float | None:
     """USD value of one reward row: ``earnings * asset_rate``.
 
     A missing rate is 1.0 only for a known USDC asset; otherwise the row cannot
@@ -75,7 +75,7 @@ class RewardMixin:
     """Per-day reward totals and their Data API fallback."""
 
 
-    def get_rewards_for_date(self, date: Optional[str] = None) -> dict[str, Any]:
+    def get_rewards_for_date(self, date: str | None = None) -> dict[str, Any]:
         """Read ``GET /rewards/user/total`` for one UTC day, per asset.
 
         Returns the row array (``{date, asset_address, maker_address, earnings,
@@ -85,7 +85,7 @@ class RewardMixin:
         sum and reported in ``unknown_earnings``. Raises nothing: on failure the
         result is ``source="unavailable"`` with an ``error`` and no number.
         """
-        target_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target_date = date or datetime.now(UTC).strftime("%Y-%m-%d")
         if self.dry_run or not self.maker_address:
             return {
                 "date": target_date,
@@ -108,7 +108,7 @@ class RewardMixin:
                     "maker_address": self.maker_address,
                 },
             )
-        except Exception as e:
+        except ClobAPIError as e:
             logger.debug(f"CLOB {path} query: {e}")
             return {
                 "date": target_date,
@@ -170,7 +170,7 @@ class RewardMixin:
         (``source="polymarket_data_api"``); if that also fails it returns zeros
         with ``source="unavailable"`` and an ``error`` string.
         """
-        target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target_date = datetime.now(UTC).strftime("%Y-%m-%d")
 
         if self.dry_run or not self.maker_address:
             return {
@@ -194,8 +194,17 @@ class RewardMixin:
                 # separate endpoints. Rebates used to be reported here as a
                 # hardcoded 0.0, which said "you earned no rebate" for every
                 # wallet that did; they are read from /rebates/current and the
-                # source of that number travels with it.
-                rebates = self.get_current_rebates(target_date)
+                # source of that number travels with it. A rebate read failure
+                # degrades the rebate line, never the reward total.
+                try:
+                    rebates = self.get_current_rebates(target_date)
+                except Exception as e:  # noqa: BLE001 - a rebate read must never break the reward total
+                    logger.warning(f"CLOB rebates read failed while reading rewards: {e}")
+                    rebates = {
+                        "total_usd": 0.0,
+                        "source": "unavailable",
+                        "error": str(e),
+                    }
                 return {
                     "total_rewards_usd": earnings["total_usd"],
                     "reward_income_usd": earnings["total_usd"],
@@ -238,7 +247,7 @@ class RewardMixin:
                     max_pages=1,
                 )
                 payouts = act[:20] if act else []
-            except Exception as e:
+            except (RuntimeError, ValueError, TypeError) as e:
                 errors.append(f"activity: {e}")
 
             return {
@@ -250,7 +259,7 @@ class RewardMixin:
                 "source": "polymarket_data_api",
                 "recent_payouts": payouts,
             }
-        except Exception as e:
+        except (RuntimeError, ValueError, KeyError, TypeError) as e:
             errors.append(str(e))
             logger.warning(f"Failed to fetch authentic reward balance from Data API: {e}")
 

@@ -18,7 +18,8 @@ Features:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import math
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.reward.allocator_candidates import (
@@ -45,17 +46,25 @@ from polymarketbot.strategy.reward.models import (
     MarketAllocation,
     PortfolioAllocationResult,
 )
-from polymarketbot.strategy.reward.reserve import calculate_endogenous_reserve
+from polymarketbot.strategy.reward.reserve import (
+    ReserveCalibration,
+    calculate_endogenous_reserve,
+)
 from polymarketbot.strategy.reward.waterfill import solve_water_filling
 
 log = get_logger("rewards_allocator")
 
+# Operator policy: the minimum liquid cushion is 5% of the bankroll. Above it
+# the optimizer decides how much to deploy; a liquidity-rewards objective
+# deploys the other 95% unless a market's marginal yield is below the hurdle.
+MIN_RESERVE_PCT = 0.05
+
 __all__ = [
+    "PROTOCOL_MIN_DAILY_PAYOUT_USD",
     "ContinuousOptimizationGovernor",
     "GovernorAction",
     "LiquidityRewardsAllocator",
     "MarketAllocation",
-    "PROTOCOL_MIN_DAILY_PAYOUT_USD",
     "PortfolioAllocationResult",
     "calculate_endogenous_reserve",
 ]
@@ -66,7 +75,7 @@ class LiquidityRewardsAllocator:
 
     def __init__(
         self,
-        reserve_pct: Optional[float] = None,
+        reserve_pct: float | None = None,
         num_linear_segments: int = 10,
     ) -> None:
         # ``reserve_pct`` is only consulted when a caller explicitly disables
@@ -97,10 +106,10 @@ class LiquidityRewardsAllocator:
     def evaluate_market_payout(
         self,
         capital: float,
-        daily_pool: Optional[float],
-        competing_score: Optional[float],
+        daily_pool: float | None,
+        competing_score: float | None,
         alpha: float,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Delegate to the module-level marginal maths."""
         return evaluate_market_payout(capital, daily_pool, competing_score, alpha)
 
@@ -112,12 +121,12 @@ class LiquidityRewardsAllocator:
     def evaluate_market_total_yield(
         self,
         capital: float,
-        daily_pool: Optional[float],
-        competing_score: Optional[float],
+        daily_pool: float | None,
+        competing_score: float | None,
         alpha: float,
         stay_fraction: float,
         fill_yield_usd_per_usd_per_day: float,
-    ) -> Optional[float]:
+    ) -> float | None:
         """Delegate to the module-level marginal maths."""
         return evaluate_market_total_yield(
             capital,
@@ -148,39 +157,45 @@ class LiquidityRewardsAllocator:
         )
 
     @staticmethod
-    def _fill_side(cand: dict[str, Any]) -> Optional[tuple[float, float]]:
+    def _fill_side(cand: dict[str, Any]) -> tuple[float, float] | None:
         """Delegate to the module-level marginal maths."""
         return fill_side(cand)
 
     def optimize_allocation_milp(
         self,
         candidates: list[dict[str, Any]],
-        bankroll_usd: float = 150.0,
-        max_active_markets: Optional[int] = None,
+        bankroll_usd: float | None = None,
+        max_active_markets: int | None = None,
         floor_target: float = PROTOCOL_MIN_DAILY_PAYOUT_USD,
         use_endogenous_reserve: bool = True,
-        exact_reserve_override: Optional[float] = None,
+        exact_reserve_override: float | None = None,
         _is_pass2: bool = False,
     ) -> PortfolioAllocationResult:
-        """Solve capital allocation using Google OR-Tools SCIP MILP solver with concave piecewise linear secants."""
+        """Solve capital allocation using Google OR-Tools SCIP MILP solver with concave piecewise linear secants.
+
+        ``bankroll_usd`` is required. There is no default: a bankroll is a
+        measured account value, and every allocation this returns is a fraction
+        of it, so a forgotten argument must refuse rather than size positions
+        against an assumed $150.
+        """
+        if bankroll_usd is None:
+            raise ValueError(
+                "bankroll_usd is required: the allocator has no bankroll default "
+                "and will not size positions against an assumed one"
+            )
+        bankroll_usd = float(bankroll_usd)
+        if not math.isfinite(bankroll_usd):
+            raise ValueError(f"bankroll_usd must be finite, got {bankroll_usd!r}")
         if exact_reserve_override is not None:
             cash_reserve = round(exact_reserve_override, 2)
             usable_capital = max(0.0, round(bankroll_usd - cash_reserve, 2))
         elif use_endogenous_reserve:
-            # Reserve = one measured venue-minimum activation lot: the smallest
-            # rewards_min_size (shares) x mid (USD/share) in the supplied universe,
-            # i.e. the cash needed to open one more qualifying position. No
-            # hand-set reserve fraction or sqrt multiple.
-            activation_lots: list[float] = []
-            for cand in candidates:
-                try:
-                    lot_shares = float(cand.get("min_size", 0.0))
-                    lot_mid = float(cand.get("real_mid", cand.get("mid_yes", 0.0)))
-                except (TypeError, ValueError):
-                    continue
-                if lot_shares > 0.0 and 0.0 < lot_mid < 1.0:
-                    activation_lots.append(lot_shares * lot_mid)
-            init_reserve = round(min(bankroll_usd, min(activation_lots, default=0.0)), 2)
+            # Operator policy: hold at least 5% liquid. Above that floor the
+            # optimizer decides; a liquidity-rewards objective leaves almost
+            # none of the remaining 95% idle. The old one-activation-lot
+            # reserve held 37-57% of a $40-$100 bankroll, which the measured
+            # $0.1-2/share/day queue value does not justify.
+            init_reserve = round(MIN_RESERVE_PCT * bankroll_usd, 2)
             usable_capital = max(0.0, bankroll_usd - init_reserve)
             cash_reserve = init_reserve
         else:
@@ -264,28 +279,6 @@ class LiquidityRewardsAllocator:
         # fix.
         allocations.sort(key=lambda a: a.expected_total_yield_usd_per_day, reverse=True)
 
-        if use_endogenous_reserve and allocations and not _is_pass2:
-            exact_reserve = calculate_endogenous_reserve(
-                allocations=[a.__dict__ for a in allocations],
-                bankroll_usd=bankroll_usd,
-            )
-            # 2-Pass Refinement: Re-solve with the exact portfolio-derived risk reserve
-            if abs(exact_reserve - cash_reserve) >= 1.0:
-                return self.optimize_allocation_milp(
-                    candidates=candidates,
-                    bankroll_usd=bankroll_usd,
-                    max_active_markets=max_active_markets,
-                    floor_target=floor_target,
-                    use_endogenous_reserve=True,
-                    exact_reserve_override=exact_reserve,
-                    _is_pass2=True,
-                )
-            cash_reserve = round(exact_reserve, 2)
-            usable_capital = round(bankroll_usd - cash_reserve, 2)
-        elif _is_pass2 and exact_reserve_override is not None:
-            cash_reserve = round(exact_reserve_override, 2)
-            usable_capital = round(bankroll_usd - cash_reserve, 2)
-
         daily_roi = (total_payout / total_allocated) * 100.0 if total_allocated > 0 else 0.0
         monthly_roi = daily_roi * 30.0
 
@@ -320,8 +313,10 @@ class LiquidityRewardsAllocator:
         self,
         allocations: list[dict[str, Any]],
         bankroll_usd: float,
-        base_gas_buffer_usd: Optional[float] = None,
-        ctf_client: Optional[Any] = None,
+        base_gas_buffer_usd: float | None = None,
+        ctf_client: Any | None = None,
+        *,
+        calibration: ReserveCalibration | None = None,
     ) -> float:
         """Delegate to module-level calculate_endogenous_reserve."""
         return calculate_endogenous_reserve(
@@ -329,4 +324,5 @@ class LiquidityRewardsAllocator:
             bankroll_usd=bankroll_usd,
             base_gas_buffer_usd=base_gas_buffer_usd,
             ctf_client=ctf_client,
+            calibration=calibration,
         )

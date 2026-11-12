@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
@@ -33,7 +33,7 @@ class MarketAllocation:
     """``daily_reward_payout * stay_fraction + expected_fill_yield``: the number
     the optimiser actually maximised. ``daily_reward_payout`` stays the accrual
     alone because that is what the engine credits as cash."""
-    p_fill: Optional[float] = None
+    p_fill: float | None = None
     """Measured per-horizon fill probability behind the fill term; ``None``
     when the candidate's fill side was not priced."""
 
@@ -83,4 +83,4 @@ class PortfolioAllocationResult:
     #: dollar (a CTF parity lock, a settlement buy) must beat it or the capital
     #: is better left on the reward book. ``None`` when no allocation was
     #: solved, so a caller cannot mistake "unmeasured" for "zero hurdle".
-    shadow_yield_floor_usd_per_usd_per_day: Optional[float] = None
+    shadow_yield_floor_usd_per_usd_per_day: float | None = None

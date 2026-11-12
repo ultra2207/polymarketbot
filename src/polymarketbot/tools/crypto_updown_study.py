@@ -14,15 +14,20 @@ per unit of work and skipping units already written:
 from __future__ import annotations
 
 import argparse
+import http.client
+import itertools
 import json
+import math
+import os
 import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import duckdb
@@ -33,7 +38,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "src"))
 
-from polymarketbot.logs import get_logger  # noqa: E402
+from polymarketbot.logs import get_logger
 
 TAPE = ROOT / "data" / "tape"
 OUT = ROOT / "data" / "derived" / "crypto_updown_study"
@@ -54,11 +59,40 @@ HOURLY = re.compile(
     r"(?P<hour>\d{1,2})(?P<ampm>am|pm)-et$")
 BUCKET = re.compile(r"^(?P<asset>btc|[a-z]+)-updown-(?P<mins>\d+)m-(?P<unix>\d+)$")
 RANGE = re.compile(r"(?P<h1>\d{1,2})(?::(?P<m1>\d{2}))?\s*(?P<a1>am|pm)\s*[-–]\s*"
-                   r"(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?\s*(?P<a2>am|pm)", re.I)
-SINGLE = re.compile(r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<a>am|pm)", re.I)
+                   r"(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?\s*(?P<a2>am|pm)", re.IGNORECASE)
+SINGLE = re.compile(r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<a>am|pm)", re.IGNORECASE)
 
 ET = ZoneInfo("America/New_York")
 log = get_logger("crypto_updown_study")
+
+
+# --------------------------------------------------------------------------
+# durable writes
+#
+# Every command in this pipeline resumes by "does the destination exist?". That
+# makes a half-written file worse than a missing one: the resume check accepts
+# it forever. Each write therefore lands in a hidden temporary beside the target
+# and is renamed into place, so existence implies completeness.
+# --------------------------------------------------------------------------
+
+def _write_parquet(rows_or_frame: Any, path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    if isinstance(rows_or_frame, pd.DataFrame):
+        rows_or_frame.to_parquet(tmp, index=False)
+    else:
+        pq.write_table(pa.Table.from_pylist(rows_or_frame), tmp)
+    os.replace(tmp, path)
+
+
+def _write_json_text(text: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------
@@ -89,12 +123,12 @@ def hourly_window(question: str) -> tuple[int, int] | None:
     if not m:
         return None
     month_name, day, rest = m.group(1), int(m.group(2)), m.group(3)
-    months = "january february march april may june july august september october november december".split()
+    months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
     if month_name.lower() not in months:
         return None
     month = months.index(month_name.lower()) + 1
     year = int(re.search(r"(20\d\d)", q).group(1)) if re.search(r"(20\d\d)", q) else \
-        datetime.now(timezone.utc).year
+        datetime.now(UTC).year
     def hr(h: str, a: str) -> int:
         h = int(h) % 12
         return h + (12 if a.lower() == "pm" else 0)
@@ -139,6 +173,9 @@ def cmd_scan(args) -> None:
         dest = SEEN / f"date={date}" / f"hour={hour}.parquet"
         dest.parent.mkdir(parents=True, exist_ok=True)
         cols = ", ".join(f"json_extract_string(raw_json,'$.{f}') AS {f}" for f in FIELDS)
+        # COPY writes the destination itself; a kill would leave a truncated
+        # part that the existence check above then skips forever.
+        tmp = dest.with_name(f".{dest.name}.tmp")
         sql = f"""
         copy (
           select distinct condition_id, {cols},
@@ -149,15 +186,16 @@ def cmd_scan(args) -> None:
             and (json_extract_string(raw_json,'$.slug') like '%up-or-down%'
                  or json_extract_string(raw_json,'$.slug') like '%updown%')
             and coalesce(json_extract_string(raw_json,'$.slug'),'') <> ''
-        ) to '{dest.as_posix()}' (format parquet)
+        ) to '{tmp.as_posix()}' (format parquet)
         """
         con.execute(sql)
+        os.replace(tmp, dest)
         n = con.execute(f"select count(*) from '{dest.as_posix()}'").fetchone()[0]
         log.info(f"scan {date}/{hour}: {n} updown markets in {time.time() - t:.1f}s "
                  f"[{i}/{len(todo)}]")
 
 
-def load_seen() -> "duckdb.DuckDBPyRelation":
+def load_seen() -> duckdb.DuckDBPyRelation:
     con = duckdb.connect()
     return con.sql(f"select * from '{SEEN.as_posix()}/date=*/hour=*.parquet'")
 
@@ -172,7 +210,7 @@ def fetch_clob_meta(cid: str, tries: int = 4) -> dict | None:
         try:
             d = json.loads(path.read_text())
             return None if d.get("__missing") else d
-        except Exception:
+        except (OSError, ValueError, AttributeError):
             path.unlink(missing_ok=True)
     url = f"https://clob.polymarket.com/markets/{cid}"
     for attempt in range(tries):
@@ -188,7 +226,7 @@ def fetch_clob_meta(cid: str, tries: int = 4) -> dict | None:
                 path.write_text(json.dumps({"__missing": True}))
                 return None
             time.sleep(1.2 * (attempt + 1))
-        except Exception:
+        except (OSError, ValueError, http.client.HTTPException):
             time.sleep(1.2 * (attempt + 1))
     log.warning(f"clob metadata failed cid={cid}")
     return None
@@ -200,7 +238,7 @@ def _fs(raw) -> dict:
         return {}
     try:
         d = json.loads(raw)
-    except Exception:
+    except (TypeError, ValueError):
         return {}
     out = {}
     for k in ("rate", "exponent", "rebate_rate"):
@@ -270,7 +308,7 @@ def cmd_markets(args) -> None:
                             up = tid
                         else:
                             down = tid
-            except Exception:
+            except (TypeError, ValueError):
                 pass
         if up is None:
             log.warning(f"no UP token for {r.slug} (outcomes={outs})")
@@ -360,9 +398,7 @@ def cmd_markets(args) -> None:
         })
     have = {r["condition_id"] for r in recs}
     recs = [r for r in recs if r["up_token"]]
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    pq.write_table(pa.Table.from_pylist(recs), OUT / "markets.parquet")
+    _write_parquet(recs, OUT / "markets.parquet")
     import collections
     c = collections.Counter((x["asset"], x["interval_minutes"]) for x in recs)
     log.info(f"markets.parquet rows={len(recs)} with_winner={sum(1 for x in recs if x['winner_up'] is not None)}")
@@ -378,7 +414,7 @@ def cmd_markets(args) -> None:
 # --------------------------------------------------------------------------
 
 def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[list]:
-    day = datetime.fromtimestamp(start_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
+    day = datetime.fromtimestamp(start_ms / 1000, UTC).strftime("%Y-%m-%d")
     path = KLINES / f"{symbol}_{interval}_{day}.json"
     if path.exists():
         return json.loads(path.read_text())
@@ -427,9 +463,7 @@ def cmd_outcomes(args) -> None:
             "rel_move_bp": None if not ok else (c - o) / o * 1e4,
             "clob_winner_up": None if r.winner_up is None else bool(r.winner_up),
         })
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    pq.write_table(pa.Table.from_pylist(out), OUT / "outcomes.parquet")
+    _write_parquet(out, OUT / "outcomes.parquet")
     df = con.sql(f"select * from '{OUT.as_posix()}/outcomes.parquet'").df()
     both = df.dropna(subset=["binance_up", "clob_winner_up"])
     if len(both):
@@ -452,7 +486,7 @@ def _num(v):
         f = float(v)
     except (TypeError, ValueError):
         return None
-    return None if f != f else f
+    return None if math.isnan(f) else f
 
 
 def _num_list(v):
@@ -465,7 +499,7 @@ def _num_list(v):
 
 
 def _hour_of(ms: int) -> tuple[str, str]:
-    t = datetime.fromtimestamp(ms / 1000, timezone.utc)
+    t = datetime.fromtimestamp(ms / 1000, UTC)
     return t.strftime("%Y-%m-%d"), t.strftime("%H")
 
 
@@ -491,7 +525,7 @@ def cmd_books(args) -> None:
             continue
         # every horizon must fall inside this partition
         part_start = int(datetime.strptime(f"{date} {hour}", "%Y-%m-%d %H").replace(
-            tzinfo=timezone.utc).timestamp() * 1000)
+            tzinfo=UTC).timestamp() * 1000)
         part_end = part_start + 3_600_000
         sub = sub[(sub.window_end_ms - 300_000 >= part_start) & (sub.window_end_ms - 9_000 < part_end)]
         if sub.empty:
@@ -561,13 +595,12 @@ def cmd_books(args) -> None:
             tick = tick_map.get(r["condition_id"], 0.001)
             d = dkey.get((r["condition_id"], r["side"], int(r["offset_ms"])))
             asks = _num_list(d.get("asks") if d else None)
-            bids = _num_list(d.get("bids") if d else None)
             levels = sorted({float(a["price"]) for a in asks})[:5]
             size_at: dict[float, float] = {}
             for a in asks:
                 size_at[float(a["price"])] = size_at.get(float(a["price"]), 0.0) + float(a["size"])
             ask_best = levels[0] if levels else None
-            def depth(k):
+            def depth(k, ask_best=ask_best, tick=tick, asks=asks):
                 if ask_best is None:
                     return None
                 cap = ask_best + tick * k + 1e-9
@@ -591,9 +624,7 @@ def cmd_books(args) -> None:
                 "ask_ladder": [(p, size_at[p]) for p in levels],
                 "tick_size": tick,
             })
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        pq.write_table(pa.Table.from_pylist(recs), dest)
+        _write_parquet(recs, dest)
         done += 1
         log.info(f"books {date}/{hour}: markets={len(sub)} token-horizons={len(recs)} "
                  f"in {time.time() - t:.1f}s ({done} written)")
@@ -612,7 +643,7 @@ def fetch_history(token: str, tries: int = 4) -> list[dict] | None:
     if path.exists():
         try:
             return json.loads(path.read_text())
-        except Exception:
+        except (OSError, ValueError, http.client.HTTPException):
             path.unlink(missing_ok=True)
     url = f"https://clob.polymarket.com/prices-history?market={token}&interval=max&fidelity=1"
     for attempt in range(tries):
@@ -623,7 +654,7 @@ def fetch_history(token: str, tries: int = 4) -> list[dict] | None:
                 d = json.loads(r.read()).get("history") or []
             path.write_text(json.dumps(d))
             return d
-        except Exception:
+        except (OSError, ValueError, AttributeError):
             time.sleep(1.2 * (attempt + 1))
     log.warning(f"price history failed token={token}")
     return None
@@ -646,7 +677,7 @@ def _hist_rows(con, mk) -> list[dict]:
             wstart = int(r.window_start_ms)
             before = [(t, p) for t, p in zip(ts, px) if t <= wend]
             inside = [(t, p) for t, p in before if t >= wstart]
-            gaps = [b - a for a, b in zip(ts, ts[1:])]
+            gaps = [b - a for a, b in itertools.pairwise(ts)]
             last_before = before[-1] if before else (None, None)
             out.append({
                 "condition_id": r.condition_id, "side": side, "n_obs": len(h),
@@ -676,9 +707,7 @@ def cmd_prices(args) -> None:
         list(ex.map(lambda x: fetch_history(str(x)), list(mk.up_token) + list(mk.down_token)))
     log.info(f"price history fetched in {time.time() - t:.0f}s")
     rows = _hist_rows(con, mk)
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    pq.write_table(pa.Table.from_pylist(rows), OUT / "price_history_features.parquet")
+    _write_parquet(rows, OUT / "price_history_features.parquet")
     df = con.sql(f"select * from '{OUT.as_posix()}/price_history_features.parquet'").df()
     log.info(f"price features rows={len(df)} obs>0={(df.n_obs > 0).sum()} "
              f"median_obs={df.n_obs.median()} obs_inside_window={(df.n_obs_inside_window > 0).sum()}")
@@ -695,11 +724,11 @@ def cmd_minutes(args) -> None:
         log.info("minutes: no bitcoin markets")
         return
     lo, hi = int(mk.window_start_ms.min()), int(mk.window_end_ms.max())
-    days = sorted({datetime.fromtimestamp(x / 1000, timezone.utc).strftime("%Y-%m-%d")
+    days = sorted({datetime.fromtimestamp(x / 1000, UTC).strftime("%Y-%m-%d")
                    for x in range(int(lo) - 86_400_000, int(hi) + 86_400_000, 86_400_000)})
     mins: dict[int, list] = {}
     for d in days:
-        start = int(datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+        start = int(datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
         for k in fetch_klines("BTCUSDT", "1m", start, start + 86_400_000 - 60_000):
             mins[int(k[0])] = k
     log.info(f"minutes: {len(mins)} 1-minute bars over {len(days)} days; markets={len(mk)}")
@@ -733,9 +762,7 @@ def cmd_minutes(args) -> None:
                 "winner_up": None if r.winner_up is None else bool(r.winner_up),
                 "settles_on": r.settles_on,
             })
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    pq.write_table(pa.Table.from_pylist(rows), OUT / "minute_paths.parquet")
+    _write_parquet(rows, OUT / "minute_paths.parquet")
     log.info(f"minute_paths rows={len(rows)} markets={len(mk)}")
 
 
@@ -748,7 +775,7 @@ def fetch_window_px(token: str, start_s: int, end_s: int, tries: int = 4) -> lis
     if path.exists():
         try:
             return json.loads(path.read_text())
-        except Exception:
+        except (OSError, ValueError, http.client.HTTPException):
             path.unlink(missing_ok=True)
     url = (f"https://clob.polymarket.com/prices-history?market={token}"
            f"&startTs={start_s}&endTs={end_s}&fidelity=1")
@@ -760,7 +787,7 @@ def fetch_window_px(token: str, start_s: int, end_s: int, tries: int = 4) -> lis
                 d = json.loads(r.read()).get("history") or []
             path.write_text(json.dumps(d))
             return d
-        except Exception:
+        except (OSError, ValueError, AttributeError):
             time.sleep(1.0 * (attempt + 1))
     log.warning(f"window px failed token={token}")
     return None
@@ -809,9 +836,7 @@ def cmd_windows(args) -> None:
                     "staleness_s": None if t is None else (cut - t) / 1000,
                     "n_obs_in_window": sum(1 for t2, _ in pts if int(r.window_start_ms) <= t2 <= wend),
                 })
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        pq.write_table(pa.Table.from_pylist(rows), dest)
+        _write_parquet(rows, dest)
         log.info(f"windows batch {b0}: {len(sub)} markets, {len(rows)} horizon rows -> {dest.name}")
     log.info("windows: done")
 
@@ -848,8 +873,6 @@ def _boot_ci(vals, blocks, reps: int = 2000, seed: int = 7):
 
 
 def cmd_report(args) -> None:
-    import collections
-    import statistics
     con = duckdb.connect()
     con.execute("set threads=4")
     mk = con.sql(f"select * from '{OUT.as_posix()}/markets.parquet'").df()
@@ -857,7 +880,7 @@ def cmd_report(args) -> None:
     cov = con.sql(f"select * from '{OUT.as_posix()}/partition_coverage.parquet'").df()
     summary: dict = {}
     summary["inventory"] = {
-        "markets": int(len(mk)),
+        "markets": len(mk),
         "by_asset_interval": {f"{a}/{i}m": int(n) for (a, i), n in
                               mk.groupby(["asset", "interval_minutes"]).size().items()},
         "settlement_source": {k: int(v) for k, v in mk.settles_on.value_counts().items()},
@@ -865,14 +888,14 @@ def cmd_report(args) -> None:
                          for (r, e, rb, to), n in mk.groupby(
                              ["fee_rate", "fee_exponent", "fee_rebate", "fee_taker_only"]).size().items()},
         "tick_size": {str(k): int(v) for k, v in mk.tick_size.value_counts().items()},
-        "window_start_utc": datetime.fromtimestamp(mk.window_start_ms.min() / 1000, timezone.utc).isoformat(),
-        "window_end_utc": datetime.fromtimestamp(mk.window_end_ms.max() / 1000, timezone.utc).isoformat(),
+        "window_start_utc": datetime.fromtimestamp(mk.window_start_ms.min() / 1000, UTC).isoformat(),
+        "window_end_utc": datetime.fromtimestamp(mk.window_end_ms.max() / 1000, UTC).isoformat(),
         "window_dates": {str(k): int(v) for k, v in
-                         mk.assign(d=lambda x: [datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d")
+                         mk.assign(d=lambda x: [datetime.fromtimestamp(t / 1000, UTC).strftime("%Y-%m-%d")
                                                 for t in x.window_end_ms]).d.value_counts().sort_index().items()},
         "up_share": float(mk.winner_up.mean()),
         "tape_partitions_with_updown_rows": int((cov.ncids > 0).sum()),
-        "tape_partitions": int(len(cov)),
+        "tape_partitions": len(cov),
     }
 
     # ---- the decisive data check: is there any tick-level book for the windows? ----
@@ -920,17 +943,17 @@ def cmd_report(args) -> None:
     meta = mk.set_index("condition_id")
     wide["winner_up"] = wide.condition_id.map(meta.winner_up).astype(bool)
     wide["interval_minutes"] = wide.condition_id.map(meta.interval_minutes)
-    wide["day"] = [datetime.fromtimestamp(meta.window_end_ms[c] / 1000, timezone.utc).strftime("%Y-%m-%d")
+    wide["day"] = [datetime.fromtimestamp(meta.window_end_ms[c] / 1000, UTC).strftime("%Y-%m-%d")
                    for c in wide.condition_id]
     wide["expiry_hour"] = (wide.condition_id.map(meta.window_end_ms) // 3_600_000).astype("int64")
-    wide["hour"] = [datetime.fromtimestamp(int(x) * 3600, timezone.utc).strftime("%H")
+    wide["hour"] = [datetime.fromtimestamp(int(x) * 3600, UTC).strftime("%H")
                     for x in wide.expiry_hour]
     wide["mid_sum"] = wide["up"] + wide.get("down")
     wide["fav_side"] = ["up" if u >= d else "down" for u, d in
                         zip(wide["up"], wide.get("down", 1.0 - wide["up"]))]
     wide["fav_px"] = [max(u, d) for u, d in zip(wide["up"], wide.get("down", 1.0 - wide["up"]))]
     wide["won"] = [(fs == "up") == w for fs, w in zip(wide.fav_side, wide.winner_up)]
-    wide.to_parquet(OUT / "path_features.parquet")
+    _write_parquet(wide, OUT / "path_features.parquet")
 
     calib = []
     for off, g in wide.groupby("offset_s"):
@@ -938,12 +961,12 @@ def cmd_report(args) -> None:
             s = g[(g["up"] >= lo) & (g["up"] < hi)]
             if len(s):
                 calib.append({"offset_s": int(off), "basis": "up_price", "lo": lo, "hi": hi,
-                              "n": int(len(s)), "resolve_rate": float(s.winner_up.mean()),
+                              "n": len(s), "resolve_rate": float(s.winner_up.mean()),
                               "mean_px": float(s["up"].mean())})
             f = g[(g.fav_px >= lo) & (g.fav_px < hi)]
             if len(f):
                 calib.append({"offset_s": int(off), "basis": "favourite_price", "lo": lo, "hi": hi,
-                              "n": int(len(f)), "resolve_rate": float(f.won.mean()),
+                              "n": len(f), "resolve_rate": float(f.won.mean()),
                               "mean_px": float(f.fav_px.mean())})
     summary["calibration"] = calib
 
@@ -957,7 +980,7 @@ def cmd_report(args) -> None:
             net = 1.0 * s.won.astype(float) - s.fav_px - fee
             lo, hi = _boot_ci(list(net), list(s.expiry_hour))
             sweep.append({
-                "offset_s": int(off), "threshold": th, "n": int(len(s)),
+                "offset_s": int(off), "threshold": th, "n": len(s),
                 "hit_rate": float(s.won.mean()), "mean_px": float(s.fav_px.mean()),
                 "fee_per_share": float(fee.mean()),
                 "mean_net_per_share": float(net.mean()),
@@ -981,7 +1004,7 @@ def cmd_report(args) -> None:
             s["net"] = s.won.astype(float) - s.fav_px - s.fee
             for (day, hour), gg in s.groupby(["day", "hour"]):
                 detail.append({"offset_s": off, "threshold": th, "day": day, "hour": hour,
-                               "n": int(len(gg)), "hit_rate": float(gg.won.mean()),
+                               "n": len(gg), "hit_rate": float(gg.won.mean()),
                                "mean_net": float(gg.net.mean())})
     summary["by_day_hour"] = detail
 
@@ -993,7 +1016,7 @@ def cmd_report(args) -> None:
     g = wide.pivot_table(index="condition_id", columns="offset_s", values="up")
     if 60 in g and 10 in g:
         d = (g[10] - g[60]).abs().dropna()
-        lat["abs_mid_change_last_60s"] = {"n": int(len(d)), "median": float(d.median()),
+        lat["abs_mid_change_last_60s"] = {"n": len(d), "median": float(d.median()),
                                          "p90": float(d.quantile(0.9))}
         # diffusion scaling: a 1 s drift is ~sqrt(1/60) of a 60 s drift
         lat["implied_abs_change_last_1s_median"] = float(d.median() / (60 ** 0.5))
@@ -1002,15 +1025,15 @@ def cmd_report(args) -> None:
     summary["latency"] = lat
 
     summary["sample"] = {
-        "markets": int(len(mk)),
+        "markets": len(mk),
         "markets_with_path_data": int(wide.condition_id.nunique()),
-        "market_horizon_obs": int(len(wide)),
+        "market_horizon_obs": len(wide),
         "window_days": sorted(set(detail and [x["day"] for x in detail])),
         "independence": ("trades are grouped by expiry hour; an hour's markets share one "
                          "BTC/ETH/SOL volatility regime, so the cluster bootstrap over "
                          "expiry-hour blocks is the reported CI"),
     }
-    (OUT / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    _write_json_text(json.dumps(summary, indent=1, default=str), OUT / "summary.json")
     log.info(f"report written: market_horizons={len(wide)} "
              f"calib_rows={len(calib)} sweep_rows={len(sweep)}")
     for r in sweep:
@@ -1048,9 +1071,9 @@ def cmd_report2(args) -> None:
     wide["fee_rate"] = wide.condition_id.map(meta.fee_rate).fillna(0.07).astype(float)
     wend = wide.condition_id.map(meta.window_end_ms)
     wide["expiry_hour"] = (wend // 3_600_000).astype("int64")
-    wide["day"] = [datetime.fromtimestamp(int(x), timezone.utc).strftime("%Y-%m-%d")
+    wide["day"] = [datetime.fromtimestamp(int(x), UTC).strftime("%Y-%m-%d")
                    for x in wide.expiry_hour * 3600]
-    wide["hour"] = [datetime.fromtimestamp(int(x), timezone.utc).strftime("%H")
+    wide["hour"] = [datetime.fromtimestamp(int(x), UTC).strftime("%H")
                     for x in wide.expiry_hour * 3600]
     wide["mid_up"] = (wide["best_bid|up"] + wide["best_ask|up"]) / 2
     wide["mid_down"] = (wide["best_bid|down"] + wide["best_ask|down"]) / 2
@@ -1064,7 +1087,7 @@ def cmd_report2(args) -> None:
     wide["fee"] = [_fee(a, r) for a, r in zip(wide.fav_ask, wide.fee_rate)]
     wide["net"] = wide.won.astype(float) - wide.fav_ask - wide.fee
     wide["mid_sum"] = wide.mid_up + wide.mid_down
-    wide.to_parquet(OUT / "book_features.parquet")
+    _write_parquet(wide, OUT / "book_features.parquet")
 
     sweep = []
     for off, g in wide.groupby("offset_ms"):
@@ -1074,7 +1097,7 @@ def cmd_report2(args) -> None:
                 continue
             lo, hi = _boot_ci(list(s.net), list(s.expiry_hour))
             sweep.append({
-                "offset_s": int(off) / 1000, "threshold": th, "n": int(len(s)),
+                "offset_s": int(off) / 1000, "threshold": th, "n": len(s),
                 "hit_rate": float(s.won.mean()), "mean_ask": float(s.fav_ask.mean()),
                 "mean_fee": float(s.fee.mean()), "mean_net_per_share": float(s.net.mean()),
                 "sum_net_per_share": float(s.net.sum()),
@@ -1090,7 +1113,7 @@ def cmd_report2(args) -> None:
             s = g[(g.fav_ask >= lo_) & (g.fav_ask < hi_)]
             if len(s):
                 calib.append({"offset_s": int(off) / 1000, "lo": lo_, "hi": hi_,
-                              "n": int(len(s)), "hit_rate": float(s.won.mean()),
+                              "n": len(s), "hit_rate": float(s.won.mean()),
                               "mean_ask": float(s.fav_ask.mean()),
                               "mean_net": float(s.net.mean())})
     detail = []
@@ -1099,7 +1122,7 @@ def cmd_report2(args) -> None:
             s = wide[(wide.offset_ms == off) & (wide.fav_ask >= th)]
             for (day, hour), gg in s.groupby(["day", "hour"]):
                 detail.append({"offset_s": off / 1000, "threshold": th, "day": day,
-                               "hour": hour, "n": int(len(gg)),
+                               "hour": hour, "n": len(gg),
                                "hit_rate": float(gg.won.mean()),
                                "mean_net": float(gg.net.mean())})
     lat = {}
@@ -1111,16 +1134,16 @@ def cmd_report2(args) -> None:
             continue
         s = gl.loc[common]
         s = s[s.fav_ask >= 0.98]
-        lat[label] = {"n": int(len(s)), "hit_rate": float(s.won.mean()),
+        lat[label] = {"n": len(s), "hit_rate": float(s.won.mean()),
                       "mean_ask": float(s.fav_ask.mean()),
                       "mean_net": float(s.net.mean()),
                       "share_ask_rose": float((gl.loc[common].fav_ask >
                                                g10.loc[common].fav_ask).mean())}
     summary = {
         "sample": {
-            "markets_in_universe": int(len(mk)),
+            "markets_in_universe": len(mk),
             "markets_with_two_sided_book_at_a_horizon": int(wide.condition_id.nunique()),
-            "market_horizon_obs": int(len(wide)),
+            "market_horizon_obs": len(wide),
             "horizons_s": sorted({int(x) / 1000 for x in wide.offset_ms.unique()}),
             "days": sorted(wide.day.unique()),
             "intervals": {str(k): int(v) for k, v in
@@ -1144,7 +1167,7 @@ def cmd_report2(args) -> None:
                        "with configs/fees.yaml fee_types.crypto_fees_v2"),
         },
     }
-    (OUT / "summary_book.json").write_text(_json.dumps(summary, indent=1, default=str))
+    _write_json_text(_json.dumps(summary, indent=1, default=str), OUT / "summary_book.json")
     log.info(f"report2: markets={summary['sample']['markets_with_two_sided_book_at_a_horizon']} "
              f"obs={len(wide)} days={summary['sample']['days']}")
     for r in sweep:
@@ -1223,7 +1246,7 @@ def cmd_bets(args) -> None:
 
     ordered = bets.gross.sort_values().to_numpy()
     def es(alpha: float) -> float:
-        k = max(1, int(round((1 - alpha) * len(ordered))))
+        k = max(1, round((1 - alpha) * len(ordered)))
         return float(ordered[:k].mean())
 
     out = {
@@ -1250,14 +1273,14 @@ def cmd_bets(args) -> None:
         "fills_per_losing_bet": float(bets[bets.won == 0].fills.mean()) if n_loss else None,
         "by_interval": {
             str(int(k)): {
-                "bets": int(len(g)), "losing": int((g.won == 0).sum()),
+                "bets": len(g), "losing": int((g.won == 0).sum()),
                 "loss_rate": float(1 - g.won.mean()),
                 "ev_per_share_bet_weighted": float(g.gross.mean()),
             }
             for k, g in bets.groupby("interval_minutes")
         },
     }
-    (OUT / "bets.json").write_text(_json.dumps(out, indent=1, default=str))
+    _write_json_text(_json.dumps(out, indent=1, default=str), OUT / "bets.json")
     log.info(
         f"bets ask>={thr} last {args.window_s}s: {n_bets} bets / {out['fills']} fills, "
         f"loss {n_loss} ({loss_rate:.2%}, 95% CI [{loss_ci[0]:.2%}, {loss_ci[1]:.2%}]), "
@@ -1367,7 +1390,7 @@ def cmd_maker(args) -> None:
     def block(sub, model):
         f = sub[sub[model]]
         n_q = len(sub)
-        out = {"model": model, "quoted": n_q, "filled": int(len(f)),
+        out = {"model": model, "quoted": n_q, "filled": len(f),
                "fill_rate": float(len(f) / n_q) if n_q else 0.0}
         if f.empty:
             return out
@@ -1381,7 +1404,7 @@ def cmd_maker(args) -> None:
         loss = float(1 - f.won.mean())
         b_odds = (1.0 - px) / px
         ordered = sorted(g)
-        k = max(1, int(round(0.05 * n)))
+        k = max(1, round(0.05 * n))
         out.update({
             "mean_bid": px,
             "hit_rate": float(f.won.mean()),
@@ -1425,11 +1448,11 @@ def cmd_maker(args) -> None:
         "dates_with_bid_data": used_dates,
         "rebate_rate": rebate,
         "unit": "one bet = (market, quote offset); unfilled quotes score zero",
-        "quotes": int(len(df)),
+        "quotes": len(df),
         "markets": int(df.condition_id.nunique()),
         "models": {m: [r for r in rows if r["model"] == m] for m in ("strict", "touch")},
     }
-    (OUT / "maker.json").write_text(_json.dumps(out, indent=1, default=str))
+    _write_json_text(_json.dumps(out, indent=1, default=str), OUT / "maker.json")
     log.info(f"maker: bid data present only on {used_dates} "
              f"({out['quotes']} quotes over {out['markets']} markets)")
     for r in rows:

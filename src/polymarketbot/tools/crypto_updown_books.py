@@ -31,10 +31,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import http.client
 import json
 import time
 from collections import deque
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,8 @@ import pandas as pd
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.feed import LivePolymarketFeed
+from polymarketbot.tools.expiry import parse_expiry_ms
+from polymarketbot.tools.tape_buffer import flush_frame, minute_part
 
 # `-m` makes __name__ == "__main__", which would give every entry the same
 # unhelpful source name; name the source explicitly so it gets its own log.
@@ -99,18 +101,19 @@ def _window_end_ms(market: dict[str, Any], window_start_s: int, seconds: int) ->
     start + interval is exact. The payload is only trusted when it carries a
     time component.
     """
-    for key in ("endDate", "endDateIso"):
-        raw = market.get(key)
-        if not raw or "T" not in str(raw):
-            continue
-        try:
-            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            continue
+    payload_ms = parse_expiry_ms(
+        market.get("endDateIso"), market.get("endDate"), require_time=True
+    )
+    if payload_ms is not None:
+        return payload_ms
     return (window_start_s + seconds) * 1000
+
+
+def _usable(market: Any) -> bool:
+    """True when a Gamma row carries the ids the recorder needs to subscribe."""
+    if not isinstance(market, dict):
+        return False
+    return bool(market.get("conditionId")) and len(_parse_ids(market.get("clobTokenIds"))) == 2
 
 
 class Discovery:
@@ -125,17 +128,22 @@ class Discovery:
         if path.exists():
             try:
                 payload = json.loads(path.read_text())
-            except Exception:
+            except (OSError, ValueError, http.client.HTTPException):
                 payload = None
-            if payload is not None:
-                return payload or None
+            # Only a payload that actually identifies the two outcome tokens is
+            # worth caching. A pre-creation row (no conditionId/clobTokenIds) was
+            # cached for the window's whole life, so the recorder never
+            # subscribed to the market once the venue filled it in.
+            if _usable(payload):
+                return payload
         try:
             rows = _get_json(f"https://gamma-api.polymarket.com/markets?slug={slug}")
-        except Exception as exc:  # transient DNS/HTTP; retried next cycle
+        except (OSError, ValueError, http.client.HTTPException) as exc:  # transient DNS/HTTP; retried next cycle
             log.debug(f"slug lookup failed {slug}: {exc}")
             return None
         market = rows[0] if rows else None
-        path.write_text(json.dumps(market))
+        if _usable(market):
+            path.write_text(json.dumps(market))
         return market
 
     def discover(self, now: float) -> list[dict[str, Any]]:
@@ -227,11 +235,6 @@ class BookBuffer:
         if not self.rows:
             return 0
         now = now or time.time()
-        date = datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%d")
-        hour = datetime.fromtimestamp(now, UTC).strftime("%H")
-        minute = datetime.fromtimestamp(now, UTC).strftime("%M")
-        dest = self.out / f"date={date}" / f"hour={hour}"
-        dest.mkdir(parents=True, exist_ok=True)
         rows = list(self.rows)
         self.rows.clear()
         df = pd.DataFrame(rows, columns=[
@@ -240,15 +243,14 @@ class BookBuffer:
             "bid_size", "ask_size", "depth_bid", "depth_ask", "bids_json", "asks_json",
             "source",
         ])
-        path = dest / f"minute={minute}.parquet"
-        # a rerun inside the same wall-clock minute appends rather than overwrites
-        if path.exists():
-            try:
-                prev = pd.read_parquet(path)
-                df = pd.concat([prev, df], ignore_index=True)
-            except Exception:
-                pass
-        df.to_parquet(path, index=False)
+        path = minute_part(self.out, now)
+        try:
+            # a rerun inside the same wall-clock minute appends rather than
+            # overwrites; the replace is atomic and a corrupt part is quarantined
+            flush_frame(df, path)
+        except BaseException:
+            self.rows.extendleft(reversed(rows))
+            raise
         self.written += len(rows)
         self.files += 1
         return len(rows)
@@ -298,23 +300,17 @@ class TradeBuffer:
         if not self.rows:
             return 0
         now = now or time.time()
-        dest = (self.out / f"date={datetime.fromtimestamp(now, UTC).strftime('%Y-%m-%d')}"
-                / f"hour={datetime.fromtimestamp(now, UTC).strftime('%H')}")
-        dest.mkdir(parents=True, exist_ok=True)
-        minute = datetime.fromtimestamp(now, UTC).strftime("%M")
         rows = list(self.rows)
         self.rows.clear()
         df = pd.DataFrame(rows, columns=[
             "recv_ns", "venue_ts_ms", "asset_id", "condition_id", "slug", "side",
             "price", "size", "trade_side", "trade_id", "source",
         ])
-        path = dest / f"minute={minute}.parquet"
-        if path.exists():
-            try:
-                df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
-            except Exception:
-                pass
-        df.to_parquet(path, index=False)
+        try:
+            flush_frame(df, minute_part(self.out, now))
+        except BaseException:
+            self.rows.extendleft(reversed(rows))
+            raise
         self.written += len(rows)
         return len(rows)
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from typing import List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
 
@@ -19,9 +18,9 @@ class CtfMergeMixin:
         self,
         condition_id: str,
         amount_shares: float,
-        index_sets: Optional[List[int]] = None,
-        pol_usd_price: Optional[float] = None,
-        token_ids: Optional[Tuple[str, ...]] = None,
+        index_sets: list[int] | None = None,
+        pol_usd_price: float | None = None,
+        token_ids: tuple[str, ...] | None = None,
     ) -> MergeExecutionResult:
         """Execute or simulate on-chain CTF complete-set merge.
 
@@ -42,7 +41,25 @@ class CtfMergeMixin:
             )
 
         indices = list(index_sets or [1, 2])
-        calldata = self.encode_merge_positions(condition_id, amount_shares, index_sets)
+        try:
+            calldata = self.encode_merge_positions(condition_id, amount_shares, index_sets)
+        except ValueError as exc:
+            # A hand-built ABI word is an instruction to the contract: refuse
+            # instead of broadcasting a malformed payload.
+            logger.error(
+                f"CTF mergePositions refused for condition {condition_id[:14]}: {exc}"
+            )
+            return MergeExecutionResult(
+                success=False,
+                tx_hash="",
+                condition_id=condition_id,
+                complete_sets_merged=0.0,
+                usdc_unlocked=0.0,
+                gas_fee_usd=0.0,
+                gas_units_used=0,
+                error=f"invalid merge calldata: {exc}",
+                is_dry_run=bool(self.dry_run),
+            )
 
         live_key_error = self._live_without_key_reason()
         if live_key_error is not None:
@@ -175,7 +192,7 @@ class CtfMergeMixin:
         to_address: str,
         condition_id: str,
         amount_shares: float,
-        pol_usd_price: Optional[float] = None,
+        pol_usd_price: float | None = None,
         kind: str = "merge",
     ) -> MergeExecutionResult:
         """Broadcast a merge/convert call to a non-CTF target.

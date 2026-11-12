@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.onchain.core import (
@@ -28,11 +27,11 @@ class CtfSubmissionMixin:
         self,
         calldata: str,
         *,
-        to_address: Optional[str] = None,
+        to_address: str | None = None,
         condition_id: str = "",
         kind: str = "merge",
         amount: float = 0.0,
-        pol_usd_price: Optional[float] = None,
+        pol_usd_price: float | None = None,
     ) -> SettlementOutcome:
         """Sign, persist, broadcast and confirm one CTF transaction.
 

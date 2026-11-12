@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional, Union
+from typing import Any
+
 
 def _parse_float(val: Any, default: float = 0.0) -> float:
     """Safely parse float from arbitrary JSON input."""
@@ -17,7 +19,7 @@ def _parse_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
-def _parse_opt_float(val: Any) -> Optional[float]:
+def _parse_opt_float(val: Any) -> float | None:
     """Parse an optional float, preserving the difference between missing and 0."""
     if val is None or val == "":
         return None
@@ -63,12 +65,16 @@ class OrderBookSnapshot:
     asks: list[OrderBookLevel] = field(default_factory=list)
     best_bid: float = 0.0
     best_ask: float = 1.0
-    mid: float = 0.50
-    spread: float = 0.0
-    spread_cents: float = 0.0
+    # ``mid``/``spread`` are only defined for a two-sided book. ``None`` means
+    # this snapshot cannot be priced: an empty book used to report a 0.50 mid
+    # and a zero spread, which the reward scorer reads as a real, maximally
+    # scoring quote at the middle of a market that has no quotes at all.
+    mid: float | None = None
+    spread: float | None = None
+    spread_cents: float | None = None
     tick_size: float = 0.01
     timestamp: float = field(default_factory=time.time)
-    hash: Optional[str] = None
+    hash: str | None = None
     source: str = "ws"  # "ws" or "rest"
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,9 +84,11 @@ class OrderBookSnapshot:
             "asks": [a.to_dict() for a in self.asks],
             "best_bid": round(self.best_bid, 4),
             "best_ask": round(self.best_ask, 4),
-            "mid": round(self.mid, 4),
-            "spread": round(self.spread, 4),
-            "spread_cents": round(self.spread_cents, 2),
+            "mid": None if self.mid is None else round(self.mid, 4),
+            "spread": None if self.spread is None else round(self.spread, 4),
+            "spread_cents": (
+                None if self.spread_cents is None else round(self.spread_cents, 2)
+            ),
             "tick_size": self.tick_size,
             "timestamp": self.timestamp,
             "hash": self.hash,
@@ -143,8 +151,8 @@ def build_book_snapshot(
     raw_bids: Any,
     raw_asks: Any,
     tick_size: float = 0.01,
-    book_hash: Optional[str] = None,
-    timestamp: Optional[float] = None,
+    book_hash: str | None = None,
+    timestamp: float | None = None,
     source: str = "ws",
 ) -> OrderBookSnapshot:
     """Construct a validated, sorted OrderBookSnapshot from raw bid/ask data."""
@@ -154,20 +162,16 @@ def build_book_snapshot(
     best_bid = bids[0].price if bids else 0.0
     best_ask = asks[0].price if asks else 1.0
 
+    # A mid needs both sides. One-sided and empty books report ``None`` so a
+    # caller prices a real quote or refuses; there is no stand-in mid.
     if best_bid > 0.0 and best_ask < 1.0 and best_ask >= best_bid:
-        mid = round((best_bid + best_ask) / 2.0, 4)
-        spread = round(best_ask - best_bid, 4)
-    elif best_bid > 0.0:
-        mid = round(best_bid, 4)
-        spread = 0.0
-    elif best_ask < 1.0:
-        mid = round(best_ask, 4)
-        spread = 0.0
+        mid: float | None = round((best_bid + best_ask) / 2.0, 4)
+        spread: float | None = round(best_ask - best_bid, 4)
     else:
-        mid = 0.50
-        spread = 0.0
+        mid = None
+        spread = None
 
-    spread_cents = round(spread * 100.0, 2)
+    spread_cents: float | None = None if spread is None else round(spread * 100.0, 2)
     ts = timestamp if timestamp is not None else time.time()
 
     return OrderBookSnapshot(
@@ -186,5 +190,5 @@ def build_book_snapshot(
     )
 
 
-BookCallback = Callable[[OrderBookSnapshot], Union[None, Awaitable[None]]]
-TradeCallback = Callable[[MarketTrade], Union[None, Awaitable[None]]]
+BookCallback = Callable[[OrderBookSnapshot], None | Awaitable[None]]
+TradeCallback = Callable[[MarketTrade], None | Awaitable[None]]

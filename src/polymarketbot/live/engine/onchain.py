@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 from polymarketbot.gamma import GammaClient
 from polymarketbot.live.engine.merge import _CtfMergeOutcome, _CtfMergePreflight
@@ -29,7 +29,7 @@ logger = get_logger("real_money_engine")
 class OnchainMixin:
     """On-chain settlement bookkeeping for the live engine."""
 
-    def _pending_settlement_rows(self) -> Optional[List[dict]]:
+    def _pending_settlement_rows(self) -> list[dict] | None:
         """Unresolved settlement rows for this condition; None when unreadable."""
         if self._conn is None:
             return None
@@ -68,10 +68,23 @@ class OnchainMixin:
             if not isinstance(receipt, dict) or not receipt:
                 continue
             status = receipt.get("status")
+            if status is None:
+                logger.warning(
+                    f"Settlement receipt for {tx_hash} carries no status; leaving it "
+                    "PENDING rather than resolving it as reverted"
+                )
+                continue
             try:
-                mined = status is not None and int(str(status), 16) == 1
+                mined = int(str(status), 16) == 1
             except (TypeError, ValueError):
-                mined = False
+                # An unparseable status is not evidence of a revert: resolving it
+                # would clear the single-flight row and let the same complete
+                # sets be merged a second time.
+                logger.warning(
+                    f"Settlement receipt for {tx_hash} has an unreadable status "
+                    f"{status!r}; leaving it PENDING"
+                )
+                continue
             store.resolve(tx_hash, SETTLEMENT_SUCCESS if mined else SETTLEMENT_REVERTED, receipt)
             resolved += 1
             logger.info(
@@ -86,7 +99,7 @@ class OnchainMixin:
             )
         return {"checked": len(rows), "resolved": resolved, "pending": len(rows) - resolved}
 
-    def update_dynamic_gas_and_threshold(self) -> Tuple[float, float]:
+    def update_dynamic_gas_and_threshold(self) -> tuple[float, float]:
         """Update dynamic gas fee and optimal merge threshold from live conditions.
 
         An unmeasurable gas price does not move the threshold: the last measured
@@ -108,7 +121,7 @@ class OnchainMixin:
         self.auto_merge_threshold = threshold
         return gas_cost, threshold
 
-    def _resolve_settlement_route(self) -> tuple[SettlementRoute, Optional[dict]]:
+    def _resolve_settlement_route(self) -> tuple[SettlementRoute, dict | None]:
         """Classify the market's settlement ledger once, from Gamma metadata.
 
         A lookup failure is *not* cached: a transient Gamma outage must not
@@ -173,6 +186,19 @@ class OnchainMixin:
                 sets_to_merge = preflight.sets_to_merge
                 now = preflight.now
                 self._last_merge_ts = now
+                # The sets leave inventory at their average cost basis, so the
+                # gain is the collateral unlocked minus that basis and the gas.
+                # A merge is not a zero-PnL event: buying a set for 0.96 and
+                # merging it for 1.00 realises 0.04 per set.
+                if self._cost_basis_unknown:
+                    realized_gain = 0.0
+                    logger.warning(
+                        "Merge gain left unbooked: this position's cost basis is unknown"
+                    )
+                else:
+                    basis = sets_to_merge * (float(self.avg_cost_yes) + float(self.avg_cost_no))
+                    realized_gain = float(res.usdc_unlocked) - float(gas_usd) - basis
+                    self.realized_pnl += realized_gain
                 self.shares_yes = max(0.0, self.shares_yes - sets_to_merge)
                 self.shares_no = max(0.0, self.shares_no - sets_to_merge)
                 self.cash += float(res.usdc_unlocked) - float(gas_usd)
@@ -206,7 +232,7 @@ class OnchainMixin:
                         res.usdc_unlocked,
                         gas_usd,
                         res.usdc_unlocked - gas_usd,
-                        0.0,
+                        realized_gain,
                         self.cash,
                     ),
                 )
@@ -240,7 +266,7 @@ class OnchainMixin:
                             ),
                             note=note,
                         )
-                except Exception as e:  # measurement only; never raises into settlement
+                except Exception as e:  # noqa: BLE001 - measurement must never raise into settlement
                     logger.warning(f"Merge cost measurement failed: {e}")
 
                 return res

@@ -7,10 +7,11 @@ unchanged by living in a separate module.
 
 from __future__ import annotations
 
+import math
 import time
-from typing import List, Optional, Tuple
 
 from polymarketbot.logs import get_logger
+from polymarketbot.risk.contracts import RiskAction, RiskDecision
 from polymarketbot.strategy.reward.deskew import (
     DeSkewDecision,
     DeSkewPathway,
@@ -49,7 +50,7 @@ class QuotingMixin:
 
     def should_reprice(
         self,
-        existing: Optional[dict],
+        existing: dict | None,
         price: float,
         size: float,
         ts: float,
@@ -74,11 +75,9 @@ class QuotingMixin:
         existing_size = float(existing.get("size", 0.0) or 0.0)
         price_moved = abs(float(price) - existing_price)
         size_moved = abs(float(size) - existing_size)
-        if price_moved <= self.min_reprice_ticks * tick and size_moved < 1e-6:
-            return False
-        return True
+        return not (price_moved <= self.min_reprice_ticks * tick and size_moved < 1e-06)
 
-    def compute_quote_scores(self) -> Tuple[float, float, float]:
+    def compute_quote_scores(self) -> tuple[float, float, float]:
         """Return ``(q_min, q_one, q_two)`` for the currently resting quotes.
 
         Uses the official complementary-book scoring with the live YES/NO mids and
@@ -96,8 +95,8 @@ class QuotingMixin:
         mid_yes = (b_yes + a_yes) / 2.0
         mid_no = (b_no + a_no) / 2.0
 
-        yes_quotes: List[OrderQuote] = []
-        no_quotes: List[OrderQuote] = []
+        yes_quotes: list[OrderQuote] = []
+        no_quotes: list[OrderQuote] = []
         for q in self.active_quotes.values():
             price = float(q.get("price", 0.0) or 0.0)
             size = float(q.get("size", 0.0) or 0.0)
@@ -134,7 +133,7 @@ class QuotingMixin:
         q_min = compute_minimum_score(q_one=q_one, q_two=q_two, midpoint=mid_yes)
         return q_min, q_one, q_two
 
-    def evaluate_quotes(self, timestamp: Optional[float] = None) -> None:
+    def evaluate_quotes(self, timestamp: float | None = None) -> None:
         """Run 2-Tier Dynamic De-Skewing Optimizer and generate maker quotes."""
         ts = timestamp or time.time()
         pos = self.get_position(self.condition_id)
@@ -151,7 +150,7 @@ class QuotingMixin:
         self.risk_manager.update_portfolio_pnl(
             current_equity=equity_val,
             realized_pnl=pos.realized_pnl,
-            unrealized_pnl=equity_val - cash_val,
+            unrealized_pnl=self._unrealized_pnl(),
             current_cash=cash_val,
             timestamp=ts,
         )
@@ -175,18 +174,32 @@ class QuotingMixin:
             return
 
         # Microstructure signals
-        state_yes = self.microstructure_yes.latest_state
+        state_yes = self.micro_risk.flow(self.asset_id_yes)
         rolling_ofi = state_yes.ofi_10_events if state_yes else 0.0
         drift_cents = state_yes.drift_cents if state_yes else 0.0
 
-        # Evaluate skew
-        decision = self.deskew_optimizer.evaluate_skew(
+        # Evaluate skew. Without a fitted calibration (or any other measured
+        # input the optimizer needs) de-skewing is disabled: quote neutrally
+        # rather than calling into ``None`` or pricing a provisional threshold.
+        optimizer = self.deskew_optimizer
+        if optimizer is None:
+            if not self._deskew_skip_logged:
+                logger.warning(
+                    f"DEGRADED: de-skew step skipped for {self.condition_id} "
+                    "(no optimizer); quoting neutral two-sided"
+                )
+                self._deskew_skip_logged = True
+            self._execute_neutral_maker_quoting(mid_yes, b_yes, a_yes, ts)
+            return
+
+        decision = optimizer.evaluate_skew(
             shares_yes=pos.shares_yes,
             shares_no=pos.shares_no,
             best_bid_yes=b_yes,
             best_ask_yes=a_yes,
             best_bid_no=b_no,
             best_ask_no=a_no,
+            holding_time_seconds=self.inventory_age_seconds(ts),
             rolling_ofi=rolling_ofi,
             micro_price_drift_cents=drift_cents,
             time_to_resolution_days=max(1.0 / 24.0, float(self.days_to_resolution)),
@@ -201,7 +214,7 @@ class QuotingMixin:
         # Tier 1: Passive Avellaneda-Stoikov Quote Fading
         if decision.pathway == DeSkewPathway.PASSIVE_FADE:
             net_q = pos.shares_yes - pos.shares_no
-            if abs(net_q) >= self.deskew_optimizer.q_soft:
+            if abs(net_q) >= optimizer.q_soft:
                 self._execute_tier1_passive_fade(decision, mid_yes, b_yes, a_yes, ts)
                 return
             else:
@@ -214,7 +227,7 @@ class QuotingMixin:
         # Neutral Two-Sided Maker Quoting around Mid
         self._execute_neutral_maker_quoting(mid_yes, b_yes, a_yes, ts)
 
-    def _measure_reward_score(self) -> Optional[float]:
+    def _measure_reward_score(self) -> float | None:
         """Current official Q_min score, or None when it cannot be computed.
 
         ``None`` is the refusal the paper pillar reports for an unmeasured
@@ -231,11 +244,11 @@ class QuotingMixin:
             return None
         try:
             q_min, _q_one, _q_two = self.compute_quote_scores()
-        except Exception as e:  # measurement must never break quoting
+        except Exception as e:  # noqa: BLE001 - measurement must never break quoting
             logger.debug(f"Reward score measurement failed: {e}")
             return None
         value = float(q_min)
-        if value != value or value in (float("inf"), float("-inf")):
+        if math.isnan(value) or value in (float("inf"), float("-inf")):
             return None
         return value
 
@@ -380,44 +393,16 @@ class QuotingMixin:
         best_ask_yes: float,
         ts: float,
     ) -> None:
-        """Standard two-sided maker quotes with asymmetric toxicity quote fading."""
+        """Standard two-sided maker quotes with per-leg microstructure risk decisions."""
         if self._check_volatility_breaker(mid_yes, ts):
             return
 
         offset = self.spread_offset_cents / 100.0
 
-        # Query microstructure actions
-        action_buy = self.microstructure_yes.evaluate_quote_action("BUY")
-        action_sell = self.microstructure_yes.evaluate_quote_action("SELL")
-
         bid_offset = offset
         ask_offset = offset
         suppress_bid = False
         suppress_ask = False
-
-        if action_sell.should_pull:
-            suppress_ask = True
-            logger.warning(
-                f"[ASYMMETRIC TOXICITY DEFENSE] Suppressing ask quote (toxic buying flow): {action_sell.reason}"
-            )
-        elif action_sell.should_widen:
-            widen_val = action_sell.spread_offset_cents / 100.0
-            ask_offset += widen_val
-            logger.warning(
-                f"[ASYMMETRIC TOXICITY DEFENSE] Widening ask offset by +{action_sell.spread_offset_cents:.2f}c: {action_sell.reason}"
-            )
-
-        if action_buy.should_pull:
-            suppress_bid = True
-            logger.warning(
-                f"[ASYMMETRIC TOXICITY DEFENSE] Suppressing bid quote (toxic selling flow): {action_buy.reason}"
-            )
-        elif action_buy.should_widen:
-            widen_val = action_buy.spread_offset_cents / 100.0
-            bid_offset += widen_val
-            logger.warning(
-                f"[ASYMMETRIC TOXICITY DEFENSE] Widening bid offset by +{action_buy.spread_offset_cents:.2f}c: {action_buy.reason}"
-            )
 
         # Replacing a resting order releases its locked collateral, so sizing must use
         # total trading cash (free + locked), never free cash alone.
@@ -432,9 +417,9 @@ class QuotingMixin:
                 mid_yes, net_q, self.gamma, self.days_to_resolution
             )
 
-            _, best_ask_no = self.get_best_bid_ask("NO")
+            best_bid_no, best_ask_no = self.get_best_bid_ask("NO")
             max_bid_yes = self.round_quote_price(best_ask_yes - tick, "YES")
-            if best_ask_no is None:
+            if best_ask_no is None or best_bid_no is None:
                 logger.debug(
                     f"No NO book for {self.condition_id}; skipping neutral quoting"
                 )
@@ -442,7 +427,12 @@ class QuotingMixin:
             max_bid_no = self.round_quote_price(best_ask_no - tick, "NO")
             min_ask_yes = self.round_quote_price(best_bid_yes + tick, "YES")
 
-            skew_adj = net_q * 0.0005
+            # Inventory skew is price impact, not a policy constant: one share
+            # of unavoidable net inventory moves the price by the reciprocal of
+            # the measured size resting at the touch. No depth at the touch means
+            # no measured impact, so no skew is applied (and the quote keeps its
+            # plain reservation price) instead of using a hand-set 0.0005.
+            skew_adj = net_q * self._inventory_impact_per_share("YES")
             target_bid_yes = min(
                 self.round_quote_price(r_yes - bid_offset - max(0.0, skew_adj), "YES"),
                 max_bid_yes,
@@ -456,6 +446,33 @@ class QuotingMixin:
                 self.round_quote_price(1.00 - target_ask_yes, "NO"),
                 max_bid_no,
             )
+
+            # One engine decides each leg on its own queue position and flow.
+            mid_no = (best_bid_no + best_ask_no) / 2.0
+            bid_pull, bid_widen_cents, bid_size_mult = self._micro_leg_decision(
+                self.asset_id_yes, "BUY", target_bid_yes, mid_yes, ts, "BID YES"
+            )
+            no_pull, no_widen_cents, no_size_mult = self._micro_leg_decision(
+                self.asset_id_no, "BUY", target_bid_no, mid_no, ts, "BID NO"
+            )
+            suppress_bid = suppress_bid or bid_pull
+            suppress_ask = suppress_ask or no_pull
+            if bid_widen_cents:
+                bid_offset += bid_widen_cents / 100.0
+                target_bid_yes = min(
+                    self.round_quote_price(r_yes - bid_offset - max(0.0, skew_adj), "YES"),
+                    max_bid_yes,
+                )
+            if no_widen_cents:
+                ask_offset += no_widen_cents / 100.0
+                target_ask_yes = max(
+                    self.round_quote_price(r_yes + ask_offset - min(0.0, skew_adj), "YES"),
+                    min_ask_yes,
+                )
+                target_bid_no = min(
+                    self.round_quote_price(1.00 - target_ask_yes, "NO"),
+                    max_bid_no,
+                )
 
             # Enforce the rewards minimum size: a sub-minimum order earns nothing and
             # only adds fill risk, so suppress quoting entirely instead of emitting it.
@@ -481,21 +498,38 @@ class QuotingMixin:
                 self._cancel_quote("SELL_NO")
                 return
 
+            # Apply each leg's streak size reduction; a size that no longer
+            # qualifies for rewards is not worth resting, so suppress the leg.
+            bid_size = eff_size * bid_size_mult
+            no_size = eff_size * no_size_mult
+            if not suppress_bid and bid_size + 1e-9 < self.rewards_min_size:
+                logger.warning(
+                    f"[MICRO RISK] BID YES size {bid_size:.2f} < min_size="
+                    f"{self.rewards_min_size:.1f} after the streak reduction; suppressing the leg."
+                )
+                suppress_bid = True
+            if not suppress_ask and no_size + 1e-9 < self.rewards_min_size:
+                logger.warning(
+                    f"[MICRO RISK] BID NO size {no_size:.2f} < min_size="
+                    f"{self.rewards_min_size:.1f} after the streak reduction; suppressing the leg."
+                )
+                suppress_ask = True
+
             # Place quotes or cancel if suppressed. Leave untouched quotes resting so
             # queue priority survives book ticks (reprice gate).
             if not suppress_bid:
                 if self.should_reprice(
-                    self.active_quotes.get("BUY_YES"), target_bid_yes, eff_size, ts
+                    self.active_quotes.get("BUY_YES"), target_bid_yes, bid_size, ts
                 ):
-                    self._set_quote("YES", "BUY", target_bid_yes, eff_size, ts)
+                    self._set_quote("YES", "BUY", target_bid_yes, bid_size, ts)
             else:
                 self._cancel_quote("BUY_YES")
 
             if not suppress_ask:
                 if self.should_reprice(
-                    self.active_quotes.get("BUY_NO"), target_bid_no, eff_size, ts
+                    self.active_quotes.get("BUY_NO"), target_bid_no, no_size, ts
                 ):
-                    self._set_quote("NO", "BUY", target_bid_no, eff_size, ts)
+                    self._set_quote("NO", "BUY", target_bid_no, no_size, ts)
             else:
                 self._cancel_quote("BUY_NO")
 
@@ -522,23 +556,97 @@ class QuotingMixin:
             self.round_quote_price(best_bid_yes + tick, "YES"),
         )
 
+        # Same mapping as the institutional legs: the engine answers per order.
+        bid_pull, bid_widen_cents, bid_size_mult = self._micro_leg_decision(
+            self.asset_id_yes, "BUY", target_bid, mid_yes, ts, "BID YES"
+        )
+        ask_pull, ask_widen_cents, ask_size_mult = self._micro_leg_decision(
+            self.asset_id_yes, "SELL", target_ask, mid_yes, ts, "ASK YES"
+        )
+        suppress_bid = suppress_bid or bid_pull
+        suppress_ask = suppress_ask or ask_pull
+        if bid_widen_cents:
+            bid_offset += bid_widen_cents / 100.0
+            target_bid = min(
+                self.round_quote_price(mid_yes - bid_offset, "YES"),
+                self.round_quote_price(best_ask_yes - tick, "YES"),
+            )
+        if ask_widen_cents:
+            ask_offset += ask_widen_cents / 100.0
+            target_ask = max(
+                self.round_quote_price(mid_yes + ask_offset, "YES"),
+                self.round_quote_price(best_bid_yes + tick, "YES"),
+            )
+
+        bid_size = self.quote_size * bid_size_mult
+        ask_size = self.quote_size * ask_size_mult
+        if not suppress_bid and bid_size + 1e-9 < self.rewards_min_size:
+            suppress_bid = True
+        if not suppress_ask and ask_size + 1e-9 < self.rewards_min_size:
+            suppress_ask = True
+
         if not suppress_bid:
             if self.should_reprice(
-                self.active_quotes.get("BUY_YES"), target_bid, self.quote_size, ts
+                self.active_quotes.get("BUY_YES"), target_bid, bid_size, ts
             ):
-                self._set_quote("YES", "BUY", target_bid, self.quote_size, ts)
+                self._set_quote("YES", "BUY", target_bid, bid_size, ts)
         else:
             self._cancel_quote("BUY_YES")
 
         if not suppress_ask:
             if self.should_reprice(
-                self.active_quotes.get("SELL_YES"), target_ask, self.quote_size, ts
+                self.active_quotes.get("SELL_YES"), target_ask, ask_size, ts
             ):
-                self._set_quote("YES", "SELL", target_ask, self.quote_size, ts)
+                self._set_quote("YES", "SELL", target_ask, ask_size, ts)
         else:
             self._cancel_quote("SELL_YES")
 
-    def update_quote_size(self, new_quote_size: float, timestamp: Optional[float] = None) -> bool:
+    def _micro_leg_decision(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        mid: float | None,
+        ts: float,
+        leg: str,
+    ) -> tuple[bool, float, float]:
+        """Map one unified risk decision onto one quote leg.
+
+        Returns ``(suppress, widen_cents, size_multiplier)``. ``PULL``/
+        ``SUPPRESS`` retract the leg immediately (bypassing the reprice gate);
+        ``WIDEN`` returns the measured drift so the caller can rerun the leg's
+        offset and let the normal reprice gate decide; ``MAINTAIN``/``BLOCK``
+        change nothing (capital and breaker gates live in
+        :class:`RiskManager`). ``size_multiplier`` is the adverse-fill streak's
+        size reduction, which the caller applies to the leg's size.
+
+        Every decision is recorded on the live tape, including ``MAINTAIN``:
+        the unmeasured and near-miss decisions are exactly what a post-run
+        audit needs to explain why a quote was not pulled.
+        """
+        decision: RiskDecision = self.micro_risk.evaluate(
+            token_id,
+            side,
+            float(price),
+            float(mid if mid is not None else price),
+            ts,
+        )
+        self._emit_event(
+            "micro_risk_decision",
+            {"token_id": token_id, "leg": leg, **decision.as_record()},
+        )
+        if decision.action in (RiskAction.PULL, RiskAction.SUPPRESS):
+            logger.warning(f"[MICRO RISK] Pulling {leg} quote: {decision.reason}")
+            return True, 0.0, 1.0
+        if decision.action is RiskAction.WIDEN:
+            logger.warning(
+                f"[MICRO RISK] Widening {leg} offset by +{decision.widen_cents:.2f}c: "
+                f"{decision.reason}"
+            )
+            return False, float(decision.widen_cents), float(decision.size_multiplier)
+        return False, 0.0, float(decision.size_multiplier)
+
+    def update_quote_size(self, new_quote_size: float, timestamp: float | None = None) -> bool:
         """Safely update quote size and re-evaluate active quotes if changed by >= 5.0 shares."""
         new_size = round(max(5.0, float(new_quote_size)), 1)
         size_diff = abs(new_size - self.quote_size)

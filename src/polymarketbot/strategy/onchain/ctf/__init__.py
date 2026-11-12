@@ -35,7 +35,7 @@ from __future__ import annotations
 
 # Submodules first, dependency order, so monkeypatch targets such as
 # ``polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price`` exist.
-from . import (  # noqa: F401
+from . import (
     balances,
     calldata,
     constants,
@@ -66,10 +66,10 @@ from .constants import (
     ZERO_BYTES32,
 )
 from .gas import (
-    calculate_optimal_merge_threshold,
     GasReading,
     GasUnmeasured,
     PolReading,
+    calculate_optimal_merge_threshold,
     estimate_merge_cost_usd,
     get_dynamic_gas_price_gwei,
     get_dynamic_pol_usd_price,
@@ -91,28 +91,28 @@ from .rlp import (
 
 __all__ = [
     "CTF_CONTRACT_POLYGON",
-    "DEFAULT_COLLATERAL_USDC",
-    "ZERO_BYTES32",
-    "MERGE_POSITIONS_SELECTOR",
-    "REDEEM_POSITIONS_SELECTOR",
-    "ERC20_BALANCE_OF_SELECTOR",
     "CTF_POSITION_BALANCE_SELECTOR",
+    "DEFAULT_COLLATERAL_USDC",
+    "ERC20_BALANCE_OF_SELECTOR",
+    "MERGE_POSITIONS_SELECTOR",
     "POLYGON_CHAIN_ID",
-    "SignedEip1559Transaction",
-    "rlp_encode",
-    "eip1559_signing_hash",
-    "sign_eip1559_transaction",
+    "REDEEM_POSITIONS_SELECTOR",
+    "ZERO_BYTES32",
+    "GasReading",
+    "GasUnmeasured",
     "MergeExecutionResult",
+    "PolReading",
+    "PolygonCtfClient",
     "RedeemExecutionResult",
     "SettlementOutcome",
-    "PolygonCtfClient",
-    "get_dynamic_pol_usd_price",
+    "SignedEip1559Transaction",
+    "calculate_optimal_merge_threshold",
+    "eip1559_signing_hash",
+    "estimate_merge_cost_usd",
     "get_dynamic_gas_price_gwei",
+    "get_dynamic_pol_usd_price",
     "measure_gas",
     "measure_pol_usd",
-    "GasReading",
-    "PolReading",
-    "GasUnmeasured",
-    "estimate_merge_cost_usd",
-    "calculate_optimal_merge_threshold",
+    "rlp_encode",
+    "sign_eip1559_transaction",
 ]

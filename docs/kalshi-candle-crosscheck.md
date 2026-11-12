@@ -5,6 +5,12 @@ still running and the Polymarket collector live. The artifact is
 `data/derived/kalshi_pm_candle_check.parquet`; the script is
 `scripts/report_kalshi_candle_check.py`.
 
+> **Tools (2026-11-11).** `scripts/report_kalshi_candle_check.py` and every
+> other `scripts/*.py` named in this document were deleted in the 2026-11-10
+> scripts cleanup (`docs/code-quality-cleanup-plan.md` Appendix A) and have no
+> `python -m` replacement. The commands below no longer run; the measurements
+> are kept as the record of that run.
+
 **Verdict: H7 FAILS as written.** Of 43 pairs with at least 20 aligned 1-minute
 changes, 39 have a defined change correlation and **0 of them reach |r| ≥ 0.9**
 (the rule needs ≥ 20 such pairs). The maximum is r = 0.839 on 1,259 changes

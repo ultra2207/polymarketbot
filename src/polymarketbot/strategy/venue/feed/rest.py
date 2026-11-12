@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
 from polymarketbot.logs import get_logger
 
-from .models import OrderBookSnapshot, _parse_float, build_book_snapshot
+from .models import (
+    OrderBookSnapshot,
+    _parse_float,
+    _parse_opt_float,
+    build_book_snapshot,
+)
 
 logger = get_logger("trading.feed")
 
@@ -30,7 +35,7 @@ class _RestMixin:
             })
         return self._sync_session
 
-    def get_book_sync(self, token_id: str, max_retries: int = 3) -> Optional[OrderBookSnapshot]:
+    def get_book_sync(self, token_id: str, max_retries: int = 3) -> OrderBookSnapshot | None:
         """Fetch L2 order book snapshot for token_id synchronously via public REST."""
         session = self._ensure_session()
         url = f"{self.rest_url}/book"
@@ -57,17 +62,17 @@ class _RestMixin:
                 else:
                     logger.warning(f"Error fetching book for {token_id[:12]}: HTTP {resp.status_code}")
                     return None
-            except Exception as exc:
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 if attempt == max_retries - 1:
                     logger.debug(f"REST get_book failed for {token_id[:12]}: {exc}")
                 time.sleep(0.5 * (attempt + 1))
         return None
 
-    async def fetch_book(self, token_id: str) -> Optional[OrderBookSnapshot]:
+    async def fetch_book(self, token_id: str) -> OrderBookSnapshot | None:
         """Fetch L2 order book snapshot for token_id asynchronously via public REST."""
         return await asyncio.to_thread(self.get_book_sync, token_id)
 
-    def get_midpoint_sync(self, token_id: str, max_retries: int = 3) -> Optional[float]:
+    def get_midpoint_sync(self, token_id: str, max_retries: int = 3) -> float | None:
         """Fetch midpoint price for token_id synchronously via public REST."""
         session = self._ensure_session()
         url = f"{self.rest_url}/midpoint"
@@ -76,23 +81,27 @@ class _RestMixin:
                 resp = session.get(url, params={"token_id": token_id}, timeout=self.request_timeout)
                 if resp.status_code == 200:
                     data = resp.json()
-                    val = data.get("mid") or data.get("midpoint")
-                    return _parse_float(val, default=0.0)
+                    val = data.get("mid") if isinstance(data, dict) else None
+                    if val is None and isinstance(data, dict):
+                        val = data.get("midpoint")
+                    # A body without a usable mid is "unknown": 0.0 is a valid
+                    # extreme price and would be indistinguishable from one.
+                    return _parse_opt_float(val)
                 elif resp.status_code == 429:
                     time.sleep(1.0 * (attempt + 1))
                 else:
                     return None
-            except Exception as exc:
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 if attempt == max_retries - 1:
                     logger.debug(f"REST get_midpoint failed: {exc}")
                 time.sleep(0.5 * (attempt + 1))
         return None
 
-    async def fetch_midpoint(self, token_id: str) -> Optional[float]:
+    async def fetch_midpoint(self, token_id: str) -> float | None:
         """Fetch midpoint price for token_id asynchronously via public REST."""
         return await asyncio.to_thread(self.get_midpoint_sync, token_id)
 
-    def get_spread_sync(self, token_id: str, max_retries: int = 3) -> Optional[float]:
+    def get_spread_sync(self, token_id: str, max_retries: int = 3) -> float | None:
         """Fetch spread for token_id synchronously via public REST."""
         session = self._ensure_session()
         url = f"{self.rest_url}/spread"
@@ -101,19 +110,20 @@ class _RestMixin:
                 resp = session.get(url, params={"token_id": token_id}, timeout=self.request_timeout)
                 if resp.status_code == 200:
                     data = resp.json()
-                    val = data.get("spread")
-                    return _parse_float(val, default=0.0)
+                    # Missing and 0.0 stay distinguishable: a zero spread would
+                    # read as a locked market.
+                    return _parse_opt_float(data.get("spread") if isinstance(data, dict) else None)
                 elif resp.status_code == 429:
                     time.sleep(1.0 * (attempt + 1))
                 else:
                     return None
-            except Exception as exc:
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 if attempt == max_retries - 1:
                     logger.debug(f"REST get_spread failed: {exc}")
                 time.sleep(0.5 * (attempt + 1))
         return None
 
-    async def fetch_spread(self, token_id: str) -> Optional[float]:
+    async def fetch_spread(self, token_id: str) -> float | None:
         """Fetch spread for token_id asynchronously via public REST."""
         return await asyncio.to_thread(self.get_spread_sync, token_id)
 
@@ -145,7 +155,7 @@ class _RestMixin:
                     time.sleep(1.0 * (attempt + 1))
                 else:
                     return []
-            except Exception as exc:
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
                 if attempt == max_retries - 1:
                     logger.warning(f"REST get_rewards_markets failed: {exc}")
                 time.sleep(0.5 * (attempt + 1))

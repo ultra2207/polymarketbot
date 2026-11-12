@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import heapq
+import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -14,7 +16,7 @@ logger = get_logger("real_money_engine")
 
 
 # Horizon (seconds) -> measured fills column.
-MARKOUT_HORIZONS: Tuple[Tuple[float, str], ...] = (
+MARKOUT_HORIZONS: tuple[tuple[float, str], ...] = (
     (30.0, "markout_30s"),
     (300.0, "markout_5m"),
     (1800.0, "markout_30m"),
@@ -57,9 +59,9 @@ class MarkoutTracker:
     def __init__(
         self,
         conn: Any,
-        mid_getter: Callable[[str], Optional[float]],
-        lock: Optional[threading.RLock] = None,
-        clock: Optional[Callable[[], float]] = None,
+        mid_getter: Callable[[str], float | None],
+        lock: threading.RLock | None = None,
+        clock: Callable[[], float] | None = None,
         autostart: bool = True,
     ) -> None:
         self._conn = conn
@@ -67,11 +69,11 @@ class MarkoutTracker:
         self._lock = lock or threading.RLock()
         self._clock = clock or time.time
         self._autostart = bool(autostart)
-        self._heap: List[tuple[float, int, str, str, float, str, str]] = []
+        self._heap: list[tuple[float, int, str, str, float, str, str]] = []
         self._seq = 0
         self._cv = threading.Condition()
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._written = 0
         self._unmeasured = 0
 
@@ -82,7 +84,7 @@ class MarkoutTracker:
         token_side: str,
         fill_price: float,
         side: str,
-        now: Optional[float] = None,
+        now: float | None = None,
     ) -> None:
         """Queue the three markout horizons for one booked fill."""
         if not fill_key:
@@ -124,10 +126,10 @@ class MarkoutTracker:
         with self._cv:
             return len(self._heap)
 
-    def process_due(self, now: Optional[float] = None) -> int:
+    def process_due(self, now: float | None = None) -> int:
         """Write every markout whose horizon has matured (returns rows attempted)."""
         current = self._clock() if now is None else float(now)
-        due: List[tuple[float, int, str, str, float, str, str]] = []
+        due: list[tuple[float, int, str, str, float, str, str]] = []
         with self._cv:
             while self._heap and self._heap[0][0] <= current:
                 due.append(heapq.heappop(self._heap))
@@ -170,7 +172,7 @@ class MarkoutTracker:
                 return
             try:
                 mid = self._mid_getter(token_side)
-            except Exception as e:  # measurement only, never propagate
+            except Exception as e:  # noqa: BLE001 - measurement only, never propagate
                 logger.debug(f"Markout mid read failed for {fill_key}: {e}")
                 mid = None
             if mid is None:
@@ -187,7 +189,7 @@ class MarkoutTracker:
                 if cur.rowcount and cur.rowcount > 0:
                     self._written += 1
                 self._conn.commit()
-            except Exception as e:
+            except sqlite3.Error as e:
                 logger.warning(f"Markout write failed for {fill_key} {column}: {e}")
 
     def _run(self) -> None:

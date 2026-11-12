@@ -5,23 +5,34 @@ from __future__ import annotations
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from functools import lru_cache
+from typing import Any
 
 import requests
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.reward.allocator import PROTOCOL_MIN_DAILY_PAYOUT_USD
+from polymarketbot.strategy.reward.fill_measurement import expected_fill_yield
 from polymarketbot.strategy.reward.scoring import (
     quadratic_order_score,
     single_sided_score_fraction,
 )
+from polymarketbot.strategy.sizing import load_fill_policy_table
 
 from . import state
 from .candidates import _screen_lp_candidate
 from .venue import fetch_tick_size, get_real_l2_score
 
 logger = get_logger("rewards_scanner")
+
+
+@lru_cache(maxsize=32)
+def _fill_policy(tick_size_cents: float, max_spread_cents: float):
+    """The measured fill/markout table for one (tick, band), cached per scan."""
+    return load_fill_policy_table(
+        tick_size_cents=tick_size_cents, max_spread_cents=max_spread_cents
+    )
 
 
 def find_optimal_lp_markets(
@@ -103,7 +114,7 @@ def find_optimal_lp_markets(
             logger.warning("[SCANNER STALE CACHE FALLBACK] Returning stale cached candidates due to network error.")
             return [dict(m) for m in stale]
         return []
-    except Exception as e:
+    except (ValueError, KeyError, TypeError) as e:
         logger.error(f"Failed to fetch reward pools from CLOB: {e}")
         stale = state._cache_get_stale(state._SCANNER_CACHE, cache_key)
         if stale is not None:
@@ -114,7 +125,7 @@ def find_optimal_lp_markets(
 
     candidates: list[dict[str, Any]] = []
     rejection_counts: Counter[str] = Counter()
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
 
     for raw_market in raw_markets:
         if not isinstance(raw_market, dict):
@@ -152,16 +163,39 @@ def find_optimal_lp_markets(
     # venue's published value per surviving market instead of assuming one; a
     # market whose tick cannot be read has no measurable quote distance and is
     # dropped, counted in the log.
-    def hydrate_tick(cand: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def hydrate_tick(cand: dict[str, Any]) -> dict[str, Any] | None:
         if cand.get("tick_size") is not None and cand.get("our_score") is not None:
             return cand
         tick = fetch_tick_size(state._get_scanner_session(), str(cand["yes_token"]))
         if tick is None:
             return None
         cand["tick_size"] = tick
+        # The allocator needs the distance the score was computed at; publish
+        # it alongside the score once the venue tick is known.
+        cand["spread_offset_cents"] = tick * 100.0 / 2.0
         cand["our_score"] = quadratic_order_score(
             float(cand["max_spread"]), tick * 100.0 / 2.0, float(cand["quote_size"])
         )
+        # The fill side, from the same measured table and horizon the execution
+        # policy prices spreads with. A bid that fills stops accruing; pricing
+        # the pool share without that cost is the accrual-only overstatement
+        # the allocator refuses to mix silently. A market whose (tick, band)
+        # has no measured rows stays unpriced and the allocator says so.
+        mid = float(cand.get("mid_yes") or 0.0)
+        policy = _fill_policy(tick * 100.0, float(cand["max_spread"]))
+        if policy is not None and 0.0 < mid < 1.0:
+            fy = expected_fill_yield(
+                tick=tick,
+                min_flow_shares=float(cand["min_size"]),
+                horizon_s=float(policy.horizon_s),
+                quote_price=mid - tick / 2.0,
+                leg_mid=mid,
+            )
+            if fy is not None:
+                cand["p_fill"] = fy.p_fill
+                cand["stay_fraction"] = fy.stay_fraction
+                cand["fill_yield_usd_per_usd_per_day"] = fy.fill_yield_usd_per_usd_per_day
+                cand["fill_horizon_s"] = fy.horizon_s
         return cand
 
     if candidates:
@@ -182,8 +216,8 @@ def find_optimal_lp_markets(
             token_id=cand["yes_token"],
             max_spread_cents=cand["max_spread"],
         )
-        score_no: Optional[float] = None
-        qual_no: Optional[float] = None
+        score_no: float | None = None
+        qual_no: float | None = None
         if cand.get("no_token"):
             score_no, qual_no, _ = get_real_l2_score(
                 session=s,

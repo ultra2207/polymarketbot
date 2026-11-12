@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -40,7 +41,7 @@ DEFAULT_DB = "data/paper_engine.db"
 UNMEASURED = "unmeasured"
 
 
-def _ratio(numerator: Optional[float], denominator: Optional[float]) -> str:
+def _ratio(numerator: float | None, denominator: float | None) -> str:
     """Ratio string, or ``unmeasured``/``n/a`` when a side is missing."""
     if numerator is None or denominator is None:
         return UNMEASURED
@@ -223,7 +224,7 @@ def reconcile_day(
     }
 
 
-def _money(value: Optional[float]) -> str:
+def _money(value: float | None) -> str:
     return UNMEASURED if value is None else f"${value:,.6f}"
 
 
@@ -346,15 +347,15 @@ def format_report(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    from datetime import datetime, timezone
+def main(argv: list[str] | None = None) -> int:
+    from datetime import datetime
 
     parser = argparse.ArgumentParser(
         description="Reconcile venue reward/rebate payouts against the paper ledger"
     )
     parser.add_argument(
         "--date",
-        default=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        default=datetime.now(UTC).strftime("%Y-%m-%d"),
         help="UTC epoch day to reconcile (YYYY-MM-DD); defaults to today",
     )
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite ledger journal")

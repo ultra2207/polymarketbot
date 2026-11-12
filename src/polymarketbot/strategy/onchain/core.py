@@ -656,7 +656,7 @@ class ChainClient:
                 self._last = time.monotonic()
                 try:
                     result = self._post(url, method, params)
-                except Exception as exc:  # noqa: BLE001 - network + provider errors
+                except Exception as exc:
                     kind = classify_rpc_error(exc)
                     last = exc
                     if not is_transient(kind):

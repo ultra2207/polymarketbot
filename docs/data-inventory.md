@@ -1,7 +1,15 @@
 # Data inventory
 
+> **Status (2026-11-11).** The rebuild commands in this file
+> (`polymarketbot.data.builders.*`, `polymarketbot.tools.check_universe`) belonged to the
+> deleted `data/builders` and `scripts/` trees and raise `ModuleNotFoundError`, so the
+> derived tables below are **not** reproducible from this checkout. The only writers still
+> running are the two recorders in `docs/data-collection.md`
+> (`data/tape/clob_trades` and `data/derived/crypto_updown_study/books_live`); `data/raw/` is
+> immutable.
+
 What we hold, what we derive, and how to rebuild it. Sizes and row counts are from
-2026-11-01; derived files are reproducible from the raw set.
+2026-11-01; derived files were reproducible from the raw set at that date.
 
 > **2026-11-05:** `data/tape/` is the current 14-day event-driven tape (not in
 > the 2026-11-01 tables below) and the authoritative source for current

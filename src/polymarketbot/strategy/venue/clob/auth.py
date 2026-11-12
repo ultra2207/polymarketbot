@@ -10,7 +10,6 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
 
 
 @dataclass
@@ -133,7 +132,7 @@ class ClobAuthCredentials:
             try:
                 padded = self.api_secret + "=" * (-len(self.api_secret) % 4)
                 base64.urlsafe_b64decode(padded)
-            except Exception:
+            except (ValueError, TypeError):
                 errors.append("POLY_API_SECRET is not valid base64 encoded data.")
 
         if self.private_key:
@@ -167,7 +166,7 @@ def build_clob_hmac_signature(
     timestamp: str,
     method: str,
     request_path: str,
-    body: Optional[Union[str, bytes]] = None,
+    body: str | bytes | None = None,
 ) -> str:
     """Generate Layer-2 HMAC-SHA256 signature for Polymarket CLOB.
 
@@ -181,7 +180,7 @@ def build_clob_hmac_signature(
         # Handle optional padding if needed
         padded_secret = secret + "=" * (-len(secret) % 4)
         base64_secret = base64.urlsafe_b64decode(padded_secret)
-    except Exception:
+    except (ValueError, TypeError):
         base64_secret = secret.encode("utf-8")
 
     message = f"{timestamp}{method.upper()}{request_path}"
@@ -205,7 +204,7 @@ class AuthHeadersMixin:
         self,
         method: str,
         path: str,
-        body: Optional[Union[str, bytes]] = None,
+        body: str | bytes | None = None,
     ) -> dict[str, str]:
         """Construct L2 authentication headers.
 

@@ -49,6 +49,11 @@ Usage
     python -m polymarketbot.tools.fill_calibration [--root data/derived/l3_queue]
                                                    [--out data/derived/fill_model.json]
                                                    [--min-obs 100]
+
+Input is **not** derivable from this checkout: the producer of
+``data/derived/l3_queue`` (``polymarketbot.data.l3_queue``) was deleted in commit
+999ec0a, so this tool can re-fit an existing tree but cannot build one from the tape.
+An empty ``--root`` is an error, not a zero-observation model.
 """
 
 from __future__ import annotations
@@ -638,9 +643,9 @@ def main(argv: list[str] | None = None) -> int:
 
     files = sorted(args.root.glob("**/*.parquet"))
     if not files:
-        log.error("no parquet files under {}", args.root)
+        log.error("no parquet files under {}", args.root)  # noqa: PLE1205 - loguru str.format
         return 1
-    log.info("loading {} asset-hour file(s) under {}", len(files), args.root)
+    log.info("loading {} asset-hour file(s) under {}", len(files), args.root)  # noqa: PLE1205 - loguru str.format
 
     con = duckdb.connect()
     try:
@@ -664,7 +669,7 @@ def main(argv: list[str] | None = None) -> int:
         con.close()
 
     observations, excluded = build_observations(raw)
-    log.info(
+    log.info(  # noqa: PLE1205 - loguru str.format
         "{} level rows, {} print events, {} usable observations",
         level_rows,
         len(raw),
@@ -751,10 +756,10 @@ def main(argv: list[str] | None = None) -> int:
     args.out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     summary = args.out.with_suffix(".txt")
     summary.write_text(text + "\n", encoding="utf-8")
-    log.info("wrote {} and {}", args.out, summary)
+    log.info("wrote {} and {}", args.out, summary)  # noqa: PLE1205 - loguru str.format
 
     if not result["model_ok"]:
-        log.warning("no usable model: {}", result["model_reason"])
+        log.warning("no usable model: {}", result["model_reason"])  # noqa: PLE1205 - loguru str.format
         return 2
     return 0
 

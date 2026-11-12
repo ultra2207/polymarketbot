@@ -8,7 +8,7 @@ re-exports both and remains the module entry point.
 from __future__ import annotations
 
 import argparse
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 from polymarketbot.logs import get_logger
 
@@ -21,7 +21,7 @@ LIVE_CONFIRMATION_PHRASE = "START LIVE"
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Polymarket real-money reward market-making runner. Dry-run unless "
@@ -147,6 +147,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         default=60.0,
         help="L2 competing-score and reward-epoch refresh interval in seconds (default: 60.0s).",
+    )
+    parser.add_argument(
+        "--refit-every",
+        type=float,
+        default=3600.0,
+        help=(
+            "Seconds between bounded tape refits in the background (default: 3600s). "
+            "The first block runs at startup; 0 disables refitting."
+        ),
+    )
+    parser.add_argument(
+        "--refit-max-partitions",
+        type=int,
+        default=1,
+        help="Partitions one background refit block may process (default: 1).",
+    )
+    parser.add_argument(
+        "--refit-partition-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds one fitter subprocess may run inside a block (default: 60s).",
     )
     parser.add_argument(
         "--max-feed-staleness",

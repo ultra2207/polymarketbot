@@ -13,8 +13,13 @@ dependencies = [
     "duckdb>=2.0.0",
     "eth-keys>=0.8.0",
     "loguru>=0.7.3",
+    # Imported directly by the tape buffers, the study tools and the dashboard.
+    # They used to arrive transitively through streamlit/scipy, so a resolved
+    # environment without either failed at `import polymarketbot.tools.tape_buffer`.
+    "numpy>=2.1",
     "orjson>=3.13.0",
     "ortools>=9.15.6755",
+    "pandas>=2.2",
     "pyarrow>=26.0.0",
     "pycryptodome>=3.24.1,<4",
     "pytz>=2026.6",
@@ -42,6 +47,9 @@ find-links = ["wheels"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "network: reaches a public network endpoint; deselect with -m 'not network'",
+]
 
 [dependency-groups]
 dev = [

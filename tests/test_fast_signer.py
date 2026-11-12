@@ -16,7 +16,6 @@ from polymarketbot.risk.fast_signer import (
     FastOrder,
     compute_domain_separator,
     encode_address,
-    keccak256,
     private_key_to_address,
 )
 

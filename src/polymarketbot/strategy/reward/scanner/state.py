@@ -14,7 +14,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -60,7 +60,7 @@ class ScannerTelemetry:
 GLOBAL_SCANNER_TELEMETRY = ScannerTelemetry()
 _SCANNER_CACHE: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
 _BOOK_CACHE: OrderedDict[
-    str, tuple[float, tuple[Optional[float], Optional[float], Optional[float]]]
+    str, tuple[float, tuple[float | None, float | None, float | None]]
 ] = OrderedDict()
 SCANNER_CACHE_TTL_SECONDS: float = 5.0
 # Rotation through parameter sets is slow, so the opportunity cache only needs
@@ -70,10 +70,10 @@ _SCANNER_CACHE_MAX_ENTRIES: int = 64
 _BOOK_CACHE_MAX_ENTRIES: int = 2048
 # One entry per token: the venue publishes the tick per token, and it never
 # changes for a live market.
-_TICK_CACHE: OrderedDict[str, tuple[float, Optional[float]]] = OrderedDict()
+_TICK_CACHE: OrderedDict[str, tuple[float, float | None]] = OrderedDict()
 # One entry per token: the live bid-ask spread in cents, on the same clock as
 # the L2 book so one scan reads one snapshot per token.
-_SPREAD_CACHE: OrderedDict[str, tuple[float, Optional[float]]] = OrderedDict()
+_SPREAD_CACHE: OrderedDict[str, tuple[float, float | None]] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 _TELEMETRY_LOCK = threading.Lock()
 _SCANNER_SESSION_LOCAL = threading.local()

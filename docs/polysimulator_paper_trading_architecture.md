@@ -1,5 +1,10 @@
 # PolySimulator Cloud Paper Trading & Rewards Architecture
 
+> **Tools (2026-11-11).** `scripts/run_polysim_paper_trader.py` and the other
+> `scripts/*.py` runbook commands below were deleted in the 2026-11-10 scripts
+> cleanup and have no `python -m` replacement. The paper engine that survives is
+> `uv run python -m polymarketbot.paper.main`.
+
 This document details the architecture, microstructure design, and execution runbook for running our Polymarket Liquidity Rewards bot on **PolySimulator** (`api.polysimulator.com`) over the next 1-month forward testing window, prior to deploying real capital on Polygon mainnet.
 
 ---

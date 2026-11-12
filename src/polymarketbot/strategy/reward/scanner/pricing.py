@@ -7,14 +7,15 @@ from them. A cell the measurement does not cover is refused, never estimated.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import threading
+from typing import Any
 
 from polymarketbot.logs import get_logger
+from polymarketbot.strategy.reward.regime import MarketRegime
 from polymarketbot.strategy.reward.scoring import (
     quadratic_order_score,
     single_sided_score_fraction,
 )
-from polymarketbot.strategy.reward.regime import MarketRegime
 
 logger = get_logger("rewards_scanner")
 
@@ -45,16 +46,24 @@ def _yield_refusal(reason: str) -> dict[str, Any]:
     }
 
 
-_FILL_HORIZON: Optional[Any] = None
+_FILL_HORIZON: Any | None = None
 _FILL_HORIZON_TRIED = False
-_MAKER_MARKOUT: Optional[Any] = None
+_MAKER_MARKOUT: Any | None = None
 _MAKER_MARKOUT_TRIED = False
+
+# The loaders run on the scanner's thread pool. Publishing the tried flag before
+# the table was assigned let a thread entering during the load window read
+# TRIED=True, skip the load and get None - a refusal priced as "no measurement"
+# for the whole process lifetime. The lock serialises the load and the flag
+# flips only after the table is assigned, so a reader either waits for the real
+# table or sees the post-failure None, never the half-built object.
+_TABLE_LOCK = threading.Lock()
 
 # One day, a unit definition: fills per day from a per-horizon probability.
 _SECONDS_PER_DAY = 86_400.0
 
 
-def _fill_horizon_table() -> Optional[Any]:
+def _fill_horizon_table() -> Any | None:
     """The measured horizon fill table, or ``None`` when it cannot be loaded.
 
     Same artifact and same loader the paper reward gate prices with
@@ -63,44 +72,53 @@ def _fill_horizon_table() -> Optional[Any]:
     quote is filled.
     """
     global _FILL_HORIZON, _FILL_HORIZON_TRIED
-    if not _FILL_HORIZON_TRIED:
-        _FILL_HORIZON_TRIED = True
-        try:
-            from polymarketbot.strategy.reward.measurement import load_quote_fill_horizon
+    if _FILL_HORIZON_TRIED:
+        return _FILL_HORIZON
+    with _TABLE_LOCK:
+        if not _FILL_HORIZON_TRIED:
+            try:
+                from polymarketbot.strategy.reward.measurement import (
+                    load_quote_fill_horizon,
+                )
 
-            _FILL_HORIZON = load_quote_fill_horizon()
-        except Exception as exc:  # noqa: BLE001 - a missing measurement is data
-            logger.warning(
-                f"fill probability unavailable, yield not estimable: {exc}"
-            )
-            _FILL_HORIZON = None
+                _FILL_HORIZON = load_quote_fill_horizon()
+            except Exception as exc:  # noqa: BLE001 - a missing measurement is data
+                logger.warning(
+                    f"fill probability unavailable, yield not estimable: {exc}"
+                )
+                _FILL_HORIZON = None
+            _FILL_HORIZON_TRIED = True
     return _FILL_HORIZON
 
 
-def _maker_markout_table() -> Optional[Any]:
+def _maker_markout_table() -> Any | None:
     """The measured single-leg markout, or ``None`` when it cannot be loaded."""
     global _MAKER_MARKOUT, _MAKER_MARKOUT_TRIED
-    if not _MAKER_MARKOUT_TRIED:
-        _MAKER_MARKOUT_TRIED = True
-        try:
-            from polymarketbot.strategy.reward.measurement import load_maker_markout
+    if _MAKER_MARKOUT_TRIED:
+        return _MAKER_MARKOUT
+    with _TABLE_LOCK:
+        if not _MAKER_MARKOUT_TRIED:
+            try:
+                from polymarketbot.strategy.reward.measurement import load_maker_markout
 
-            _MAKER_MARKOUT = load_maker_markout()
-        except Exception as exc:  # noqa: BLE001 - a missing measurement is data
-            logger.warning(
-                f"signed markout unavailable, yield not estimable: {exc}"
-            )
-            _MAKER_MARKOUT = None
+                _MAKER_MARKOUT = load_maker_markout()
+            except Exception as exc:  # noqa: BLE001 - a missing measurement is data
+                logger.warning(
+                    f"signed markout unavailable, yield not estimable: {exc}"
+                )
+                _MAKER_MARKOUT = None
+            _MAKER_MARKOUT_TRIED = True
     return _MAKER_MARKOUT
 
 
 def reset_measured_tables() -> None:
     """Drop the cached measurement tables (test isolation)."""
     global _FILL_HORIZON, _FILL_HORIZON_TRIED, _MAKER_MARKOUT, _MAKER_MARKOUT_TRIED
-    _FILL_HORIZON = None
-    _FILL_HORIZON_TRIED = False
-    _MAKER_MARKOUT = None
-    _MAKER_MARKOUT_TRIED = False
+    with _TABLE_LOCK:
+        _FILL_HORIZON = None
+        _FILL_HORIZON_TRIED = False
+        _MAKER_MARKOUT = None
+        _MAKER_MARKOUT_TRIED = False
 
 
 def calculate_expected_yield(
@@ -111,12 +129,12 @@ def calculate_expected_yield(
     allocated_capital_usd: float,
     tick_size: float,
     quote_horizon_s: float,
-    spread_cents: Optional[float] = None,
-    mid_price: Optional[float] = None,
-    competing_score: Optional[float] = None,
-    regime: Optional[MarketRegime] = None,
-    merge_threshold: Optional[float] = None,
-    gas_fee_per_merge: Optional[float] = None,
+    spread_cents: float | None = None,
+    mid_price: float | None = None,
+    competing_score: float | None = None,
+    regime: MarketRegime | None = None,
+    merge_threshold: float | None = None,
+    gas_fee_per_merge: float | None = None,
     quote_sides: int = 2,
 ) -> dict[str, Any]:
     """Net expected marginal yield on the capital **the caller** allocates.
@@ -379,7 +397,9 @@ def calculate_expected_yield(
         eff_merge_threshold = None
     elif merge_threshold is None:
         try:
-            from polymarketbot.strategy.onchain.ctf import calculate_optimal_merge_threshold
+            from polymarketbot.strategy.onchain.ctf import (
+                calculate_optimal_merge_threshold,
+            )
             eff_merge_threshold = float(calculate_optimal_merge_threshold(gas_cost_usd=eff_gas_fee))
         except Exception:  # noqa: BLE001 - no threshold without a measured gas cost
             eff_merge_threshold = None

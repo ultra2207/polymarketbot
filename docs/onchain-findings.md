@@ -289,7 +289,9 @@ hurdle on the \$1 per complete set that a merge frees). Fed the measured cost:
     threshold = 0.00155 / 0.0015 = 1.03  ->  1 complete set
 
 The replay runs `auto_merge_threshold = 100.0`, and the comment at
-`scripts/replay_all_markets.py:385` already admits why that is wrong: *"the
+`scripts/replay_all_markets.py:385` (the harness was deleted in the 2026-11-10
+scripts cleanup; this is quoted from its last revision) already admits why that
+is wrong: *"the
 default (100) is above the quote size on most markets, so the channel never
 fires and the gas model is untested."* With pool-scaled cash of \$10–25 per market
 (pool-scaled), 100 complete sets = \$100 of dead inventory that the account can

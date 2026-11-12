@@ -15,21 +15,21 @@ import time
 import pytest
 
 from polymarketbot.risk.fast_signer import (
-    ORDER_V2_TYPEHASH,
-    ORDER_V2_TYPE_STRING,
     _SECP256K1_G,
     _SECP256K1_N,
     _SECP256K1_P,
     DEFAULT_CTF_EXCHANGE_V2,
-    FastEIP712SignerV2,
-    OrderV2,
+    ORDER_V2_TYPE_STRING,
+    ORDER_V2_TYPEHASH,
     V2_CTF_EXCHANGE,
     V2_NEG_RISK_CTF_EXCHANGE,
+    FastEIP712SignerV2,
+    OrderV2,
+    _point_add,
+    _point_mul,
     compute_domain_separator,
     compute_domain_separator_v2,
     keccak256,
-    _point_add,
-    _point_mul,
 )
 from polymarketbot.strategy.venue.clob import (
     DEFAULT_CTF_EXCHANGE,
@@ -261,11 +261,11 @@ def test_v2_signature_recovers_to_signer_eoa():
 
 def test_v1_and_v2_digests_differ_for_same_order_inputs():
     client = make_dry_client()
-    v2_order, v2_payload = client.build_signed_order(
+    _v2_order, v2_payload = client.build_signed_order(
         "42", "BUY", 0.5, 10.0, salt=5, timestamp=1_700_000_000_123, order_version=2
     )
-    v1_order, v1_payload = client.build_signed_order(
-        "42", "BUY", 0.5, 10.0, salt=5, order_version=1
+    _v1_order, v1_payload = client.build_signed_order(
+        "42", "BUY", 0.5, 10.0, salt=5, fee_rate_bps=0, order_version=1
     )
     assert v2_payload["order"]["signature"] != v1_payload["signature"]
     assert "taker" in v1_payload["order"]
@@ -291,6 +291,8 @@ def test_place_order_routes_v1_when_server_reports_one():
     assert body["order"]["feeRateBps"] == "0"
     assert "signature" in body and isinstance(body["signature"], str)
     assert "timestamp" not in body["order"]
+    # The POST body carries no EIP-712 domain, so the signer cache key is the
+    # only observable of which exchange contract signed this v1 order.
     assert f"v1:{DEFAULT_CTF_EXCHANGE.lower()}" in client._signers
 
 
@@ -308,6 +310,8 @@ def test_place_order_routes_v2_when_server_reports_two():
     assert body["order"]["timestamp"].isdigit()
     assert body["order"]["metadata"] == "0x" + "00" * 32
     assert body["order"]["signature"].startswith("0x")
+    # The POST body carries no EIP-712 domain, so the signer cache key is the
+    # only observable of which exchange contract signed this v2 order.
     assert f"v2:{DEFAULT_CTF_EXCHANGE_V2.lower()}" in client._signers
 
 
@@ -318,7 +322,9 @@ def test_order_version_mismatch_refetches_and_retries_once():
         FakeResponse({"success": True, "orderID": "0xretry"}),
     )
     client = make_client(fake, order_version=1)
-    result = client.place_order("42", "BUY", 0.5, 10.0, tick_size=0.01, neg_risk=False)
+    result = client.place_order(
+        "42", "BUY", 0.5, 10.0, tick_size=0.01, neg_risk=False, fee_rate_bps=0
+    )
 
     assert result.success is True
     assert [c["method"] for c in fake.calls] == ["POST", "GET", "POST"]
@@ -335,7 +341,9 @@ def test_order_version_mismatch_retries_only_once():
         FakeResponse({"error": "order_version_mismatch"}, status_code=400),
     )
     client = make_client(fake, order_version=1)
-    result = client.place_order("42", "BUY", 0.5, 10.0, tick_size=0.01, neg_risk=False)
+    result = client.place_order(
+        "42", "BUY", 0.5, 10.0, tick_size=0.01, neg_risk=False, fee_rate_bps=0
+    )
 
     assert result.success is False
     assert result.status == "REJECTED"
@@ -350,7 +358,7 @@ def test_v3_version_raises_and_place_order_refuses_to_sign():
     )
     client = make_client(fake)
     with pytest.raises(ClobAPIError, match="unsupported CLOB order version 3"):
-        client.order_version
+        _ = client.order_version
 
     result = client.place_order("42", "BUY", 0.5, 10.0, tick_size=0.01, neg_risk=False)
     assert result.success is False
@@ -374,7 +382,7 @@ def test_dry_run_version_smoke_with_mocked_http():
 
     result = client.place_order("42", "BUY", 0.5, 10.0)
     assert result.success is True and result.is_dry_run is True
-    assert client._mock_orders[result.order_id]["order_version"] == 2
+    assert client.get_order(result.order_id)["order_version"] == 2
     # no second /version call and no POST while dry-run
     assert len(fake.calls) == 1
 
@@ -418,4 +426,6 @@ def test_place_order_fetches_tick_and_neg_risk_when_omitted():
     # BUY: makerAmount = size(10.00) * price(0.414) = 4.14
     assert int(body["order"]["makerAmount"]) == 4_140_000
     assert int(body["order"]["takerAmount"]) == 10_000_000
+    # The POST body carries no EIP-712 domain, so the signer cache key is the
+    # only observable of which exchange contract signed this neg-risk order.
     assert f"v2:{V2_NEG_RISK_CTF_EXCHANGE.lower()}" in client._signers

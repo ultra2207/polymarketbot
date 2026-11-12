@@ -28,12 +28,10 @@ POLYGON_CHAIN_ID = 137
 # CTF position amounts are denominated in the 6-decimal collateral.
 CTF_SHARE_DECIMALS = 1_000_000
 
-# Settlement transaction gas clamps (Wei). Fees come from the live oracle but a
-# stuck transaction is worse than an over-priced one, so the floors are firm.
-_MIN_PRIORITY_FEE_WEI = 25 * 10**9
-_MAX_PRIORITY_FEE_WEI = 50 * 10**9
-_MIN_MAX_FEE_WEI = 25 * 10**9
-_MAX_MAX_FEE_WEI = 1_000 * 10**9
+# Settlement fee fields are derived from the chain at signing time (measured
+# oracle + the block's own baseFeePerGas and EIP-1559 next-block projection in
+# ``fees._eip1559_fee_params_wei``). There are deliberately no Wei clamps here:
+# a fixed floor/ceiling overrode the measured price in both directions.
 
 RECEIPT_POLL_INTERVAL_S = 0.5
 RECEIPT_TIMEOUT_S = 60.0

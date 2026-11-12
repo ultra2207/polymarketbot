@@ -28,15 +28,15 @@ from __future__ import annotations
 
 import json
 import queue
-import shutil
 import sqlite3
 import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -70,17 +70,17 @@ def _now_ns() -> int:
 
 
 def _iso_ns(ns: int) -> str:
-    return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).isoformat()
+    return datetime.fromtimestamp(ns / 1e9, tz=UTC).isoformat()
 
 
-def _short_hash(value: Any) -> Optional[str]:
+def _short_hash(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value)
     return text[:8] or None
 
 
-def _hex_int(value: Any) -> Optional[int]:
+def _hex_int(value: Any) -> int | None:
     if value is None:
         return None
     try:
@@ -89,7 +89,7 @@ def _hex_int(value: Any) -> Optional[int]:
         return None
 
 
-def _parse_user_event(payload: Any) -> Optional[tuple[str, dict[str, Any]]]:
+def _parse_user_event(payload: Any) -> tuple[str, dict[str, Any]] | None:
     """Map one CLOB user-channel message to ``(table, row)``.
 
     The user channel emits order and trade JSON objects (sometimes wrapped in a
@@ -135,12 +135,12 @@ class LiveSessionRecorder:
         market: dict[str, Any],
         dry_run: bool,
         out_root: str | Path = "data/live_tape",
-        engine_params: Optional[dict[str, Any]] = None,
-        public_tape_run: Optional[str] = None,
-        session_id: Optional[str] = None,
-        wallet: Optional[str] = None,
+        engine_params: dict[str, Any] | None = None,
+        public_tape_run: str | None = None,
+        session_id: str | None = None,
+        wallet: str | None = None,
         ctf_client: Any = None,
-        feed_age_fn: Optional[Callable[[], Optional[float]]] = None,
+        feed_age_fn: Callable[[], float | None] | None = None,
         user_ws: bool = True,
         user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user",
         engine_interval: float = 1.0,
@@ -155,7 +155,7 @@ class LiveSessionRecorder:
         max_queue: int = 10_000,
         use_data_api: bool = True,
     ) -> None:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self.session_id = session_id or f"{stamp}-{uuid.uuid4().hex[:6]}"
         self.out_dir = Path(out_root) / self.session_id
         self.db_path = Path(db_path)
@@ -171,7 +171,7 @@ class LiveSessionRecorder:
         self._user_ws_url = user_ws_url
         self._user_ws_status = "idle" if self._user_ws_enabled else "disabled"
         self._user_ws_events = 0
-        self._user_ws_thread: Optional[threading.Thread] = None
+        self._user_ws_thread: threading.Thread | None = None
 
         self.engine_interval = max(0.05, float(engine_interval))
         self.venue_interval = max(0.1, float(venue_interval))
@@ -188,8 +188,8 @@ class LiveSessionRecorder:
             maxsize=max(100, int(max_queue))
         )
         self._stop = threading.Event()
-        self._poller: Optional[threading.Thread] = None
-        self._writer: Optional[threading.Thread] = None
+        self._poller: threading.Thread | None = None
+        self._writer: threading.Thread | None = None
         self._lock = threading.Lock()
         self._watermarks: dict[str, int] = {}
         self._seen_orders: set[tuple[Any, ...]] = set()
@@ -199,14 +199,14 @@ class LiveSessionRecorder:
         self._errors = 0
         self._last_poll: dict[str, float] = {}
         self._seq = 0
-        self._started_ns: Optional[int] = None
-        self._stopped_ns: Optional[int] = None
+        self._started_ns: int | None = None
+        self._stopped_ns: int | None = None
         self._connections_open = False
-        self._engine_conn: Optional[sqlite3.Connection] = None
+        self._engine_conn: sqlite3.Connection | None = None
         self._engine_tables: list[str] = []
         self._data_api: Any = None
         self._pending_tx: set[str] = set()
-        self._user_ws_last_message_ts: Optional[float] = None
+        self._user_ws_last_message_ts: float | None = None
         self._last_orders: list[dict[str, Any]] = []
 
         # Prune old live tape sessions to enforce disk storage boundaries
@@ -219,7 +219,7 @@ class LiveSessionRecorder:
         prune_directory(out_root, max_entries=max_sessions, max_age_days=max_age_days, marker_file="session.json")
 
     # ------------------------------------------------------------------ setup
-    def _latest_public_run(self) -> Optional[str]:
+    def _latest_public_run(self) -> str | None:
         runs = sorted((REPO_ROOT / "data" / "tape" / "runs").glob("*.json"))
         if not runs:
             return None
@@ -229,7 +229,7 @@ class LiveSessionRecorder:
         except Exception:  # noqa: BLE001
             return runs[-1].stem
 
-    def _git_commit(self) -> Optional[str]:
+    def _git_commit(self) -> str | None:
         try:
             return subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
@@ -371,7 +371,11 @@ class LiveSessionRecorder:
 
     def record_event(self, kind: str, payload: dict[str, Any]) -> None:
         """In-process hook: quote intent, risk blocks, cancels. Never blocks."""
-        table = "risk_events" if kind in {"risk_blocked", "circuit_breaker"} else "quotes"
+        table = (
+            "risk_events"
+            if kind in {"risk_blocked", "circuit_breaker", "micro_risk_decision"}
+            else "quotes"
+        )
         self._emit(table, {"kind": kind, **payload}, critical=False)
         for field, label in (("place_rtt_ms", "place"), ("cancel_rtt_ms", "cancel")):
             value = payload.get(field)
@@ -392,12 +396,12 @@ class LiveSessionRecorder:
                 thread.join(timeout=10.0)
         try:
             self._poll_engine()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - best-effort final poll must not block stop
+            log.debug(f"final engine poll failed: {e}")
         try:
             self._poll_venue()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - best-effort final poll must not block stop
+            log.debug(f"final venue poll failed: {e}")
         self._drain_and_write()
         self._stopped_ns = _now_ns()
         try:
@@ -418,8 +422,8 @@ class LiveSessionRecorder:
         try:
             if self._engine_conn is not None:
                 self._engine_conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except sqlite3.Error as e:
+            log.debug(f"engine connection close failed: {e}")
         self._engine_conn = None
         self._connections_open = False
         log.info(

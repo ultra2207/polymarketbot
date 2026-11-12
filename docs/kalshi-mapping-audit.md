@@ -1,5 +1,10 @@
 # Kalshi ↔ Polymarket mapping: precision audit and v2
 
+> **Status (2026-11-11).** Audit record of 2026-11-06. `polymarketbot.data.kalshi_mapping`
+> (crawl, `score_pair`, `load_mapping`, and the `--artifact` CLI) was deleted with the
+> collector, so the commands in §8 cannot be re-run and nothing in the live path loads this
+> mapping.
+
 Status: measured 2026-11-06 (IST) against the live 2,464-market Polymarket cut
 (`data/tape/manifest_current.json`) and Kalshi production public REST
 (`api.elections.kalshi.com/trade-api/v2`, no key). The legacy artifact is left

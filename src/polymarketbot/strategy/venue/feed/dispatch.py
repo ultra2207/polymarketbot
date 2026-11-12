@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -41,7 +42,7 @@ class _DispatchMixin:
                     await self._deliver_trade(payload)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - dispatch worker must survive listener failures
                 logger.error(f"Error dispatching {kind} event: {exc}")
             finally:
                 self._dispatch_queue.task_done()
@@ -53,7 +54,7 @@ class _DispatchMixin:
             result = await asyncio.to_thread(callback, event)
             if inspect.isawaitable(result):
                 await result
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - listener callbacks are arbitrary user code
             logger.error(f"Error in {kind} listener callback: {e}")
 
     async def _deliver_book(self, snapshot: OrderBookSnapshot) -> None:

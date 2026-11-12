@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Optional, Tuple
+from typing import Any
 
 from polymarketbot.live.base import PositionView
 from polymarketbot.logs import get_logger
@@ -59,7 +59,7 @@ class AccountingMixin:
         self.locked_cash = self._compute_locked_cash()
         return self.locked_cash
 
-    def get_position(self, condition_id: Optional[str] = None) -> PositionView:
+    def get_position(self, condition_id: str | None = None) -> PositionView:
         cid = condition_id or self.condition_id
         return PositionView(
             condition_id=cid,
@@ -70,16 +70,48 @@ class AccountingMixin:
             realized_pnl=self.realized_pnl,
         )
 
-    def has_fresh_book(self, token_side: str, max_age: Optional[float] = None) -> bool:
+    def book_max_age_s(self) -> float:
+        """Oldest book age a decision may price.
+
+        Explicit ``book_stale_seconds`` wins; otherwise the engine's own reprice
+        cadence is the bound, because a decision taken at that cadence cannot
+        price a book older than it. A fabricated 30 s used to be the default.
+        """
+        explicit = getattr(self, "book_stale_seconds", None)
+        if explicit is not None:
+            return float(explicit)
+        return float(getattr(self, "min_reprice_interval_s", 0.0) or 0.0)
+
+    def has_fresh_book(self, token_side: str, max_age: float | None = None) -> bool:
         """True when the engine has a recent L2 snapshot for this outcome token."""
         tok = str(token_side).upper()
         ts = float(self._book_ts.get(tok, 0.0) or 0.0)
         if ts <= 0.0:
             return False
-        age = self.book_stale_seconds if max_age is None else float(max_age)
+        age = self.book_max_age_s() if max_age is None else float(max_age)
         return (time.time() - ts) <= age
 
-    def _fresh_mid(self, token_side: str) -> Optional[float]:
+    def _inventory_impact_per_share(self, token_side: str) -> float:
+        """Measured price impact of one share of inventory, from the live depth.
+
+        ``1 / size resting at the touch`` on the side we would have to trade to
+        flatten. ``0.0`` when that depth is unknown: an unmeasured impact is no
+        skew, never an invented coefficient.
+        """
+        tok = str(token_side).upper()
+        bids, asks = self._book_depth.get(tok, ([], []))
+        side_depth = bids if (self.shares_yes - self.shares_no) > 0.0 else asks
+        if not side_depth:
+            return 0.0
+        try:
+            touch_size = float(side_depth[0][1] if isinstance(side_depth[0], tuple) else side_depth[0].size)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return 0.0
+        if touch_size <= 0.0:
+            return 0.0
+        return 1.0 / touch_size
+
+    def _fresh_mid(self, token_side: str) -> float | None:
         """Fresh book mid, or None when the book is missing/stale/invalid."""
         tok = str(token_side).upper()
         if not self.has_fresh_book(tok):
@@ -92,7 +124,7 @@ class AccountingMixin:
         mid = (bid + ask) / 2.0
         return mid if 0.0 < mid < 1.0 else None
 
-    def _mark_prices(self) -> Tuple[float, float]:
+    def _mark_prices(self) -> tuple[float, float]:
         """Mark YES/NO for equity using fresh mids, else average cost.
 
         Never falls back to a fabricated 0.50. Crossed or complementary books
@@ -118,7 +150,20 @@ class AccountingMixin:
         mark_yes, mark_no = self._mark_prices()
         return self.shares_yes * mark_yes + self.shares_no * mark_no
 
-    def get_equity(self, prices: Optional[dict[str, tuple[float, float]]] = None) -> float:
+    def _unrealized_pnl(self) -> float:
+        """Inventory marked at the live mid, minus what it cost.
+
+        ``_inventory_value`` is a *market value*, not a profit: reporting it as
+        ``unrealized_pnl`` booked 100 % of every position as gain. A position
+        whose cost basis was never observed has no measurable PnL, so it reports
+        ``0.0`` instead of the whole notional.
+        """
+        if getattr(self, "_cost_basis_unknown", False):
+            return 0.0
+        basis = self.shares_yes * self.avg_cost_yes + self.shares_no * self.avg_cost_no
+        return self._inventory_value() - basis
+
+    def get_equity(self, prices: dict[str, tuple[float, float]] | None = None) -> float:
         """Free cash + locked collateral + inventory at fresh mid (else avg cost)."""
         return self.get_cash() + self.get_locked_cash() + self._inventory_value()
 
@@ -130,7 +175,7 @@ class AccountingMixin:
         self.cash -= amt
         if hasattr(self, "risk_manager") and hasattr(self.risk_manager, "portfolio_state"):
             self.risk_manager.portfolio_state.current_cash_usd = self.cash
-        logger.info(
+        logger.info(  # noqa: PLE1205 - loguru str.format
             "RealMoneyTradingEngine loaned ${:.2f} to Domain 2; cash remaining: ${:.2f}",
             amt, self.cash,
         )
@@ -145,7 +190,7 @@ class AccountingMixin:
         self.realized_pnl += prof
         if hasattr(self, "risk_manager") and hasattr(self.risk_manager, "portfolio_state"):
             self.risk_manager.portfolio_state.current_cash_usd = self.cash
-        logger.info(
+        logger.info(  # noqa: PLE1205 - loguru str.format
             "RealMoneyTradingEngine repatriated ${:.2f} (${:.2f} principal + ${:.2f} profit); cash now: ${:.2f}",
             total, ret, prof, self.cash,
         )
@@ -159,7 +204,7 @@ class AccountingMixin:
 
     def get_best_bid_ask(
         self, token_side: str
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         tok = token_side.upper()
         if tok in self._best_bids and tok in self._best_asks:
             return self._best_bids[tok], self._best_asks[tok]
@@ -173,7 +218,7 @@ class AccountingMixin:
         # No fabricated price: quote callers must skip when either side is missing.
         return self._best_bids.get(tok), self._best_asks.get(tok)
 
-    def _accounting_snapshot(self) -> Tuple[float, float, float]:
+    def _accounting_snapshot(self) -> tuple[float, float, float]:
         """Free cash, locked collateral and inventory value from one locked pass.
 
         ``get_cash()`` already recomputes locked collateral, so reading equity

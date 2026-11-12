@@ -10,13 +10,12 @@ Covers:
 
 from __future__ import annotations
 
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-import polymarketbot.strategy.reward.scanner as scanner
+from polymarketbot.strategy.reward import scanner
 from polymarketbot.strategy.reward.scanner import (
     find_optimal_lp_markets,
     get_real_l2_score,
@@ -107,7 +106,12 @@ def test_find_optimal_rejects_unsafe_markets(overrides: dict) -> None:
     ranked = _run_scan([_market(**overrides)])
 
     assert ranked == []
-    assert scanner.state._SCANNER_CACHE  # the empty result is cached, not silently skipped
+    # The empty result is cached, not silently skipped: a repeat scan answers
+    # from the cache without touching the venue again.
+    with patch("requests.Session.get") as mock_get:
+        again = find_optimal_lp_markets(bankroll_usd=150.0, limit_output=5)
+    assert again == []
+    mock_get.assert_not_called()
 
 
 def test_find_optimal_accepts_valid_market() -> None:
@@ -120,16 +124,25 @@ def test_find_optimal_accepts_valid_market() -> None:
     assert candidate["no_token"] == NO_TOKEN
 
 
-def test_find_optimal_still_ranks_market_without_end_date() -> None:
-    """Scanner ranking keeps its historical distant-expiry behaviour; live validation is stricter."""
-    market = _market()
-    market.pop("end_date_iso")
+def test_market_without_any_expiry_is_rejected_not_ranked_distant() -> None:
+    """An unknown expiry is missing data, not the furthest date.
 
-    ranked = _run_scan([market])
+    Ranking it 999 days out admitted already-ended markets to the live validator,
+    which then aborted startup. A payload that publishes ``end_date`` (the field
+    the CLOB rewards endpoint actually sends) stays rankable.
+    """
+    no_expiry = _market()
+    no_expiry.pop("end_date_iso")
+
+    assert _run_scan([no_expiry]) == []
+
+    payload_expiry = _market()
+    payload_expiry.pop("end_date_iso")
+    payload_expiry["end_date"] = FUTURE_END
+    ranked = _run_scan([payload_expiry])
 
     assert len(ranked) == 1
-    assert ranked[0]["days_left"] == 999.0
-    assert ranked[0]["end_date_iso"] is None
+    assert ranked[0]["days_left"] > 0.0
 
 
 def test_find_optimal_carries_execution_metadata() -> None:
@@ -211,20 +224,35 @@ def test_crossed_book_is_not_scored() -> None:
     )
 
     assert get_real_l2_score(session, "999000001", 3.0) == (None, None, None)
-    assert "999000001" not in scanner.state._BOOK_CACHE
+    # A crossed book is not cached: the next read goes back to the venue and
+    # scores the now-valid book.
+    session.get.return_value = _book_response(
+        bids=[{"price": "0.49", "size": "100.0"}],
+        asks=[{"price": "0.51", "size": "100.0"}],
+    )
+    scored = get_real_l2_score(session, "999000001", 3.0)
+    assert scored[0] is not None and scored[0] > 0.0
+    assert session.get.call_count == 2
 
 
-def test_crossed_book_falls_back_to_cached_value() -> None:
+def test_crossed_book_falls_back_to_cached_value(monkeypatch) -> None:
     reset_scanner_telemetry()
     token_id = "999000002"
-    scanner.state._BOOK_CACHE[token_id] = (time.time() - 60.0, (123.0, 456.0, 0.5))
+    # Expire every fresh read so the crossed book must take the stale fallback.
+    monkeypatch.setattr(scanner.state, "SCANNER_CACHE_TTL_SECONDS", 0.0)
     session = MagicMock()
+    session.get.return_value = _book_response(
+        bids=[{"price": "0.49", "size": "100.0"}],
+        asks=[{"price": "0.51", "size": "100.0"}],
+    )
+    first = get_real_l2_score(session, token_id, 3.0)
+    assert first[0] is not None and first[0] > 0.0
+
     session.get.return_value = _book_response(
         bids=[{"price": "0.55", "size": "100.0"}],
         asks=[{"price": "0.52", "size": "100.0"}],
     )
-
-    assert get_real_l2_score(session, token_id, 3.0) == (123.0, 456.0, 0.5)
+    assert get_real_l2_score(session, token_id, 3.0) == first
 
 
 def test_non_positive_max_spread_is_not_scored() -> None:
@@ -274,12 +302,12 @@ def test_validate_market_for_live_uses_supplied_now() -> None:
     market = _market()
 
     ok, reason = validate_market_for_live(
-        market, now=datetime(2099, 12, 30, tzinfo=timezone.utc)
+        market, now=datetime(2099, 12, 30, tzinfo=UTC)
     )
     assert (ok, reason) == (True, "ok")
 
     ok, reason = validate_market_for_live(
-        market, now=datetime(2100, 1, 1, tzinfo=timezone.utc)
+        market, now=datetime(2100, 1, 1, tzinfo=UTC)
     )
     assert ok is False
     assert "already ended" in reason

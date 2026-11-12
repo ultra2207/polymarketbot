@@ -13,14 +13,21 @@ Two confirmed documentation-audit defects are pinned here:
 
 from __future__ import annotations
 
-
+from datetime import UTC, date, datetime
 
 import pytest
 
-from polymarketbot.fees import FeeSchedule, maker_fee_rebate
 import polymarketbot.strategy.reward.decision as reward
-from polymarketbot.strategy.venue.reads import Market
+from polymarketbot.fees import FeeSchedule, maker_fee_rebate
+from polymarketbot.paper.actions import Resting
+from polymarketbot.paper.pillars import reward_runner
+from polymarketbot.strategy.ledger import Ledger
+from polymarketbot.strategy.reward.accrual import (
+    REWARD_ELIGIBILITY_SECONDS,
+    RewardDayAccrual,
+)
 from polymarketbot.strategy.reward.rebates import RebateAccountant
+from polymarketbot.strategy.venue.reads import Market
 
 DAY = "2026-11-10"
 SCHEDULE = FeeSchedule(rate=0.05, exponent=1.0, taker_only=True, rebate_rate=0.15)
@@ -236,16 +243,39 @@ def test_no_client_means_modelled_with_a_reason():
 
 
 # ------------------------------------------------- per-market persistence
-def test_run_reward_persists_per_market_accrual(monkeypatch, tmp_path):
-    """Each tick must journal (condition, UTC day, USD) for a later venue join."""
-    from polymarketbot.paper.actions import Resting
-    from polymarketbot.strategy.ledger import Ledger
-    from polymarketbot.paper.pillars import reward_runner
+class _Actions:
+    def submit(self, *args, **kwargs):
+        pass
 
-    now = 1_000_000.0
-    day = reward_runner.utc_day(now)
-    ledger = Ledger({"RewardHarvester": 1_000.0}, tmp_path / "ledger.db")
+
+class _Engine:
+    """The minimal engine surface ``run_reward`` reads for this test."""
+
+    def __init__(self, ledger: Ledger, market: Market, quote: Resting, now: float) -> None:
+        self.ledger = ledger
+        self.markets = [market]
+        self.by_condition = {market.condition_id: market}
+        self.reward_quotes = {quote.token_id: quote}
+        self.actions = _Actions()
+        self.interval = 10.0
+        self._reward_accrual_ts = now - 10.0
+        self._reward_log_ts = now
+        self._reward_window = None
+        self._fills = {"RewardHarvester": 0}
+
+    def _rtt(self) -> float:
+        return 0.0
+
+    def _reserved(self, resting) -> float:
+        return 0.0
+
+
+def _run_reward_tick(
+    monkeypatch, tmp_path, *, now: float, eligible_s: float, usd_per_day: float
+):
+    """Run one tick whose quote has been reward-eligible for ``eligible_s`` seconds."""
     market = _market()
+    ledger = Ledger({"RewardHarvester": 1_000.0}, tmp_path / "ledger.db")
     quote = Resting(
         strategy="RewardHarvester",
         condition_id=market.condition_id,
@@ -253,57 +283,141 @@ def test_run_reward_persists_per_market_accrual(monkeypatch, tmp_path):
         price=0.49,
         shares=200.0,
         min_order=5.0,
-        placed=now + 100.0,  # not landed yet: the fill stage skips it
+        # The venue counts an order only after 3.5 s of rest, so the accrual
+        # window opens at placement + 3.5 s.
+        placed=now - REWARD_ELIGIBILITY_SECONDS - eligible_s,
         tick=0.01,
     )
-
-    class _Actions:
-        def submit(self, *args, **kwargs):
-            pass
-
-    class _Engine:
-        def __init__(self) -> None:
-            self.ledger = ledger
-            self.markets = [market]
-            self.by_condition = {market.condition_id: market}
-            self.reward_quotes = {"yes": quote}
-            self.actions = _Actions()
-            self.interval = 10.0
-            self._reward_accrual_ts = now - 10.0
-            self._reward_log_ts = now
-            self._reward_window = None
-            self._fills = {"RewardHarvester": 0}
-
-        def _rtt(self) -> float:
-            return 0.0
-
-        def _reserved(self, resting) -> float:
-            return 0.0
-
-    engine = _Engine()
+    engine = _Engine(ledger, market, quote, now)
     monkeypatch.setattr(reward_runner.time, "time", lambda: now)
     monkeypatch.setattr(
         reward,
         "measured_accrual",
         lambda **kwargs: reward.AccrualShare(
-            usd_per_day=864.0,
+            usd_per_day=usd_per_day,
             share=0.1,
             our_score=1.0,
             competing_score=9.0,
-            pool_usd_per_day=864.0,
+            pool_usd_per_day=usd_per_day,
             qualifies=True,
             competing_samples=3,
         ),
     )
     monkeypatch.setattr(reward, "reward_candidates", lambda *a, **kw: [])
     monkeypatch.setattr(reward, "plan_quotes", lambda *a, **kw: [])
+    reward_runner.run_reward(
+        engine, {"yes": _book(0.48, 0.52), "no": _book(0.52, 0.48)}, []
+    )
+    return ledger, market, engine._reward_accruals[market.condition_id]
 
-    reward_runner.run_reward(engine, {"yes": _book(0.48, 0.52)}, [])
 
-    # 864 USD/day over the 10 s interval.
+def test_run_reward_persists_per_market_accrual(monkeypatch, tmp_path):
+    """A 10 s eligible quote is journaled and banked, not credited as cash."""
+    now = 1_000_000.0
+    day = reward_runner.utc_day(now)
+    today = datetime.fromtimestamp(now, UTC).date()
+    ledger, market, accrual = _run_reward_tick(
+        monkeypatch, tmp_path, now=now, eligible_s=10.0, usd_per_day=864.0
+    )
+
     expected = 864.0 * 10.0 / 86_400.0
+    assert isinstance(accrual, RewardDayAccrual)
+    assert accrual.pending_utc_day(today) == pytest.approx(expected)
+    assert accrual.pending_days() == (today,)
     assert ledger.reward_accrual_by_condition(day) == {
         market.condition_id: pytest.approx(expected)
     }
-    assert ledger.cash("RewardHarvester") == pytest.approx(1_000.0 + expected)
+    # The $1.00 minimum is a property of the day's total, applied at rollover:
+    # an accruing day is pending only, never cash.
+    assert ledger.cash("RewardHarvester") == pytest.approx(1_000.0)
     ledger.close()
+
+
+def test_run_reward_settles_a_completed_day_as_cash(monkeypatch, tmp_path):
+    """A UTC-day total at or above $1.00 is credited when the day rolls over."""
+    midnight = datetime(2026, 11, 10, tzinfo=UTC).timestamp()
+    now = midnight + 5.0  # 5 s past midnight, 15 s of the window banked yesterday
+    yesterday = date(2026, 11, 9)
+    today = date(2026, 11, 10)
+    ledger, market, accrual = _run_reward_tick(
+        monkeypatch, tmp_path, now=now, eligible_s=20.0, usd_per_day=10_000.0
+    )
+
+    prior = 10_000.0 * 15.0 / 86_400.0
+    current = 10_000.0 * 5.0 / 86_400.0
+    assert prior >= 1.0  # clears the venue floor, so it becomes cash
+    # Yesterday settled and was cleared; today is still accruing.
+    assert accrual.pending_utc_day(yesterday) == 0.0
+    assert accrual.pending_utc_day(today) == pytest.approx(current)
+    assert accrual.pending_days() == (today,)
+    assert ledger.cash("RewardHarvester") == pytest.approx(1_000.0 + prior)
+    # The journal keeps the pre-settlement increments for both payout periods.
+    assert ledger.reward_accrual_by_condition(yesterday.isoformat()) == {
+        market.condition_id: pytest.approx(prior)
+    }
+    assert ledger.reward_accrual_by_condition(today.isoformat()) == {
+        market.condition_id: pytest.approx(current)
+    }
+    ledger.close()
+
+
+def test_run_reward_does_not_credit_a_sub_floor_day(monkeypatch, tmp_path):
+    """A completed UTC day below $1.00 settles to nothing and credits no cash."""
+    midnight = datetime(2026, 11, 10, tzinfo=UTC).timestamp()
+    now = midnight + 5.0
+    yesterday = date(2026, 11, 9)
+    today = date(2026, 11, 10)
+    ledger, market, accrual = _run_reward_tick(
+        monkeypatch, tmp_path, now=now, eligible_s=20.0, usd_per_day=864.0
+    )
+
+    prior = 864.0 * 15.0 / 86_400.0
+    current = 864.0 * 5.0 / 86_400.0
+    assert prior < 1.0
+    # The day is settled either way; below the floor it pays zero and is cleared.
+    assert accrual.pending_utc_day(yesterday) == 0.0
+    assert accrual.pending_utc_day(today) == pytest.approx(current)
+    assert accrual.pending_days() == (today,)
+    assert ledger.cash("RewardHarvester") == pytest.approx(1_000.0)
+    assert ledger.reward_accrual_by_condition(yesterday.isoformat()) == {
+        market.condition_id: pytest.approx(prior)
+    }
+    ledger.close()
+
+
+def test_measured_accrual_does_not_count_our_own_score_twice():
+    """A snapshot that contains our resting order must not have it added again.
+
+    The venue's denominator is ``sum_makers Q_min``; the L2 snapshot a live
+    engine reads already carries our raw score, so adding ``our_score`` on top
+    of it divides our claim by itself twice. The same call against a book that
+    does *not* contain the order (the paper engine's simulated book) must add
+    the score back, so the two executions price the same order differently
+    unless the caller states which book it holds.
+    """
+    market = _market()
+    books = {"yes": _book(0.48, 0.52), "no": _book(0.48, 0.52)}
+    kwargs = {
+        "pool_usd_per_day": market.daily_reward,
+        "price": 0.49,
+        "shares": 200.0,
+        "min_size": 200.0,
+        "max_spread_cents": 3.0,
+        "leg_book": books["yes"],
+        "other_book": books["no"],
+        "competing": reward.CompetingEstimate(
+            mean=1_000.0, samples=4, variance=1.0, snapshot=1_000.0
+        ),
+    }
+    with_order = reward.measured_accrual(**kwargs, books_include_our_order=True)
+    without_order = reward.measured_accrual(**kwargs)
+    assert with_order is not None and without_order is not None
+
+    # ``our_raw`` is the unpenalised score the snapshot would carry: alpha x shares.
+    our_raw = with_order.our_score * reward.SINGLE_SIDED_PENALTY
+    expected_with = with_order.our_score / (1_000.0 - our_raw + with_order.our_score)
+    expected_without = without_order.our_score / (1_000.0 + without_order.our_score)
+    assert with_order.share == pytest.approx(expected_with, rel=1e-9)
+    assert without_order.share == pytest.approx(expected_without, rel=1e-9)
+    # Not adding our score twice is worth more than dividing by it twice.
+    assert with_order.share > without_order.share

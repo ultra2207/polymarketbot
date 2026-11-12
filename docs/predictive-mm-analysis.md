@@ -1,5 +1,9 @@
 # Predictive Market Making: What the Tape Supports, What Was Built
 
+> **Tools (2026-11-11).** The `scripts/*.py` named below were deleted in the
+> 2026-11-10 scripts cleanup and have no `python -m` replacement; their
+> commands no longer run. The measurements are kept as the record of that work.
+
 Compiled 2026-11-05 from the live tape (`data/tape`, 2026-11-04 00:00 UTC onward),
 the derived L3 queue (`data/derived/l3_queue`, 37 asset-hours), and the working
 record in `docs/two-week-results.md`. Every number states its window and sample;

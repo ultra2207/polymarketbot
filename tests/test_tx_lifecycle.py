@@ -13,6 +13,9 @@ import time
 
 import pytest
 
+from polymarketbot.fees import schedule_for_market
+from polymarketbot.live.engine import RealMoneyTradingEngine
+from polymarketbot.risk.fast_signer import keccak256
 from polymarketbot.strategy.onchain.core import (
     ALREADY_KNOWN,
     EXECUTION_REVERTED,
@@ -26,20 +29,18 @@ from polymarketbot.strategy.onchain.core import (
     normalise_endpoint,
     rpc_url,
 )
-from polymarketbot.risk.fast_signer import keccak256
 from polymarketbot.strategy.onchain.ctf import (
     MergeExecutionResult,
     PolygonCtfClient,
     SettlementOutcome,
 )
-from polymarketbot.live.engine import RealMoneyTradingEngine
-from polymarketbot.strategy.onchain.settlement import ROUTER
 from polymarketbot.strategy.onchain.pending import (
     PENDING,
     REVERTED,
     SUCCESS,
     PendingSettlementStore,
 )
+from polymarketbot.strategy.onchain.settlement import ROUTER
 
 TEST_KEY_HEX = "0x4c0883a69102937d6231471b5dbb6204db7e716b78ac5c7807e8b88f211d733b"
 CONDITION_ID = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
@@ -154,7 +155,7 @@ def _no_pol_price_network(monkeypatch):
 
 @pytest.fixture
 def _isolated_env(monkeypatch):
-    monkeypatch.setattr("polymarketbot.strategy.onchain.core._env_file", lambda: {})
+    monkeypatch.setattr("polymarketbot.strategy.onchain.core._env_file", dict)
     for name in ("POLYGON_RPC_URL", "POLYGON_RPC_URLS", "ETH_RPC_URL"):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
@@ -243,7 +244,7 @@ def test_rpc_retries_429_then_succeeds(monkeypatch):
     )
     client = ChainClient(url="https://polygon.drpc.org", session=session, min_interval_s=0.0)
 
-    assert client._rpc("eth_chainId", []) == "0x89"
+    assert client.block_number() == 0x89
     assert len(session.urls) == 2
 
 
@@ -310,14 +311,14 @@ def test_health_check_requires_polygon_and_a_fresh_head(monkeypatch):
 
 def test_store_is_idempotent_on_tx_hash():
     store = PendingSettlementStore()
-    fields = dict(
-        tx_hash="0xABC",
-        raw_tx="0x02f8",
-        nonce=3,
-        condition_id=CONDITION_ID,
-        kind="merge",
-        amount=10.0,
-    )
+    fields = {
+        "tx_hash": "0xABC",
+        "raw_tx": "0x02f8",
+        "nonce": 3,
+        "condition_id": CONDITION_ID,
+        "kind": "merge",
+        "amount": 10.0,
+    }
 
     assert store.record(**fields) is True
     assert store.record(**fields) is False
@@ -575,6 +576,11 @@ def _engine(tmp_path):
         dry_run=True,
         gas_fee_merge=0.01,
         auto_merge_threshold=1.0,
+        # The fixture market declares fees disabled; its schedule is derived
+        # from that payload (a measured zero), never assumed.
+        fee_schedule=schedule_for_market(
+            {"conditionId": "0xCOND", "feesEnabled": False}
+        ),
     )
     engine.dry_run = False
     engine._cost_basis_unknown = False

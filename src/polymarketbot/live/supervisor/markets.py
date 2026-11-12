@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any
 
 import requests
 
@@ -18,7 +18,7 @@ def _format_open_order_ids(orders: Any) -> str:
         return "unavailable (open-order read failed)"
     if not isinstance(orders, list):
         return f"unavailable (unexpected payload {type(orders).__name__})"
-    ids: List[str] = []
+    ids: list[str] = []
     for order in orders:
         if not isinstance(order, dict):
             continue
@@ -28,11 +28,32 @@ def _format_open_order_ids(orders: Any) -> str:
 
 
 def _compute_competing_score(
-    session: requests.Session, token_yes: str, max_spread_cents: float
-) -> Optional[float]:
+    session: requests.Session,
+    token_yes: str,
+    max_spread_cents: float,
+    token_no: str | None = None,
+) -> float | None:
+    """The venue's in-band score for the pair, or ``None`` when unmeasured.
+
+    The pool is divided against **both** outcome-token books, so a one-sided
+    reading is not the denominator the payout formula uses. A missing second
+    book is missing data, never a zero contribution.
+    """
     try:
         score, _, _ = get_real_l2_score(session, token_yes, max_spread_cents)
-    except Exception as exc:
+    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
         log.warning(f"L2 competing-score refresh failed: {exc}")
         return None
-    return score if score is not None and score > 0 else None
+    if score is None:
+        return None
+    total = float(score)
+    if token_no:
+        try:
+            score_no, _, _ = get_real_l2_score(session, token_no, max_spread_cents)
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            log.warning(f"L2 competing-score refresh failed for the NO book: {exc}")
+            return None
+        if score_no is None:
+            return None
+        total += float(score_no)
+    return total if total > 0 else None

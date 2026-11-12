@@ -13,17 +13,16 @@ Tests:
 from __future__ import annotations
 
 import sqlite3
+
 import pytest
 
 from polymarketbot.fees import (
     FeeSchedule,
     effective_maker_price,
     maker_fee_rebate,
-    maker_rebate,
     taker_fee,
 )
 from polymarketbot.live.engine import RealMoneyTradingEngine
-
 
 # ---------------------------------------------------------------------------
 # Test 1: Calculation across Standard, Sports, and Crypto Markets

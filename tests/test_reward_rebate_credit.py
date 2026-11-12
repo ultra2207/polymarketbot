@@ -23,7 +23,7 @@ import pytest
 from polymarketbot.fees import FeeSchedule, maker_fee_rebate
 from polymarketbot.paper.actions import Resting
 from polymarketbot.paper.pillars import reward_runner
-import polymarketbot.strategy.reward.decision as reward
+from polymarketbot.strategy.venue.reads import Print
 
 PRICE = 0.81
 SHARES = 20.0
@@ -78,15 +78,18 @@ def _quote() -> Resting:
     )
 
 
-def test_a_fill_on_a_fee_paying_market_credits_the_measured_rebate(monkeypatch):
+def _print(size: float = SHARES) -> Print:
+    """A SELL print at our quote, the flow a resting bid can actually take."""
+    return Print("tok", "0xcond", "SELL", PRICE, size, 30.0)
+
+
+def test_a_fill_on_a_fee_paying_market_credits_the_measured_rebate():
     """The rebate must equal the fee function's own output, not zero."""
-    monkeypatch.setattr(
-        reward, "measured_fill_shares", lambda *a, **kw: SHARES
-    )
     engine = _Engine()
 
     reward_runner.apply_resting_fills(
-        engine, {"tok": _quote()}, "RewardHarvester", {"tok": {}}, [], 30.0
+        engine, {"tok": _quote()}, "RewardHarvester", {"tok": {}}, [_print()],
+        30.0,
     )
 
     assert len(engine.ledger.buys) == 1, "the fill itself must still be booked"
@@ -95,19 +98,20 @@ def test_a_fill_on_a_fee_paying_market_credits_the_measured_rebate(monkeypatch):
     expected = maker_fee_rebate(PRICE, SHARES, SCHEDULE)
     assert expected > 0.0
     assert rebates[0]["amount"] == pytest.approx(expected)
-    assert engine._fills["RewardHarvester"] == 1
+    assert engine.ledger.buys[0]["shares"] == SHARES
+    assert engine.ledger.buys[0]["tag"] == "reward_fill"
 
 
-def test_a_fill_on_a_zero_fee_market_credits_nothing(monkeypatch):
+def test_a_fill_on_a_zero_fee_market_credits_nothing():
     """A zero-rate schedule yields no rebate row, and still books the fill."""
-    monkeypatch.setattr(reward, "measured_fill_shares", lambda *a, **kw: SHARES)
     engine = _Engine()
     engine.by_condition = {
         "0xcond": type("M", (), {"fee_schedule": FeeSchedule.zero()})()
     }
 
     reward_runner.apply_resting_fills(
-        engine, {"tok": _quote()}, "RewardHarvester", {"tok": {}}, [], 30.0
+        engine, {"tok": _quote()}, "RewardHarvester", {"tok": {}}, [_print()],
+        30.0,
     )
 
     assert maker_fee_rebate(PRICE, SHARES, FeeSchedule.zero()) == 0.0

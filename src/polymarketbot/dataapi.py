@@ -36,8 +36,9 @@ Notes
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 import requests
 
@@ -99,8 +100,7 @@ class DataAPIClient:
             if cursor:
                 query.append(("cursor", cursor))
             payload = self.get(path, query)
-            for row in payload.get("data") or []:
-                yield row
+            yield from payload.get("data") or []
             pages += 1
             cursor = (payload.get("pagination") or {}).get("next_cursor")
             if not cursor or (max_pages and pages >= max_pages):

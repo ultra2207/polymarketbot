@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Any, Optional, Union
+from types import TracebackType
+from typing import Any, Self
 
 import requests
 import websockets
@@ -67,7 +68,7 @@ class LivePolymarketFeed(
         self._trade_listeners: list[TradeCallback] = []
         self._event_queue: _EventQueue = _EventQueue()
         self._dispatch_queue: _DispatchQueue = _DispatchQueue()
-        self._dispatch_task: Optional[asyncio.Task] = None
+        self._dispatch_task: asyncio.Task | None = None
 
         # Maintained L2 books, rebuilt from `book` snapshots and `price_change`
         # deltas. Guarded by a lock because REST snapshots are refreshed from a
@@ -79,14 +80,21 @@ class LivePolymarketFeed(
         self._running: bool = False
         self._ws_connected: bool = False
         self._last_ws_message_time: float = 0.0
-        self._active_ws: Optional[websockets.WebSocketClientProtocol] = None
+        # Last *data* frame (a parsed book/trade message). Heartbeat PONGs keep
+        # the socket alive but carry no depth, so liveness for the REST fallback
+        # is measured from here, not from ``_last_ws_message_time``.
+        self._last_ws_data_time: float = 0.0
+        # Assets whose book was left incomplete by a delta we could not apply.
+        # They are re-seeded from a REST snapshot by the fallback poller.
+        self._desync_assets: set[str] = set()
+        self._active_ws: websockets.WebSocketClientProtocol | None = None
 
         # Background tasks
-        self._ws_task: Optional[asyncio.Task] = None
-        self._fallback_task: Optional[asyncio.Task] = None
+        self._ws_task: asyncio.Task | None = None
+        self._fallback_task: asyncio.Task | None = None
 
         # Network session
-        self._sync_session: Optional[requests.Session] = None
+        self._sync_session: requests.Session | None = None
 
         # Ensure DoH fallback is installed to prevent DNS drops
         install_doh_fallback()
@@ -104,7 +112,7 @@ class LivePolymarketFeed(
         return set(self._subscribed_tokens)
 
     @property
-    def last_message_age_seconds(self) -> Optional[float]:
+    def last_message_age_seconds(self) -> float | None:
         """Seconds since the last WebSocket frame (pings included).
 
         ``None`` means no frame has ever been received on this connection.
@@ -131,7 +139,7 @@ class LivePolymarketFeed(
     # -------------------------------------------------------------------------
     # Subscription Management
     # -------------------------------------------------------------------------
-    def subscribe(self, tokens: Union[str, list[str], set[str]]) -> None:
+    def subscribe(self, tokens: str | list[str] | set[str]) -> None:
         """Subscribe to order book and trade updates for one or more token IDs."""
         if isinstance(tokens, str):
             token_list = [tokens]
@@ -149,7 +157,7 @@ class LivePolymarketFeed(
         if self._ws_connected and self._active_ws is not None:
             asyncio.create_task(self._send_subscription(new_tokens))
 
-    def unsubscribe(self, tokens: Union[str, list[str], set[str]]) -> None:
+    def unsubscribe(self, tokens: str | list[str] | set[str]) -> None:
         """Unsubscribe from token IDs."""
         if isinstance(tokens, str):
             token_list = [tokens]
@@ -180,13 +188,13 @@ class LivePolymarketFeed(
         if callback in self._trade_listeners:
             self._trade_listeners.remove(callback)
 
-    async def get_next_event(self, timeout: Optional[float] = None) -> Optional[tuple[str, Any]]:
+    async def get_next_event(self, timeout: float | None = None) -> tuple[str, Any] | None:
         """Await the next event from the internal queue ('book', snapshot) or ('trade', trade)."""
         try:
             if timeout is not None:
                 return await asyncio.wait_for(self._event_queue.get(), timeout=timeout)
             return await self._event_queue.get()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
 
@@ -211,7 +219,7 @@ class LivePolymarketFeed(
         if self._active_ws is not None:
             try:
                 await self._active_ws.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - teardown must not raise
                 pass
             self._active_ws = None
 
@@ -219,7 +227,7 @@ class LivePolymarketFeed(
             self._ws_task.cancel()
             try:
                 await self._ws_task
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 - task teardown
                 pass
             self._ws_task = None
 
@@ -227,7 +235,7 @@ class LivePolymarketFeed(
             self._fallback_task.cancel()
             try:
                 await self._fallback_task
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 - task teardown
                 pass
             self._fallback_task = None
 
@@ -235,7 +243,7 @@ class LivePolymarketFeed(
             self._dispatch_task.cancel()
             try:
                 await self._dispatch_task
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110 - task teardown
                 pass
             self._dispatch_task = None
 
@@ -253,9 +261,14 @@ class LivePolymarketFeed(
 
         logger.info("LivePolymarketFeed stopped.")
 
-    async def __aenter__(self) -> "LivePolymarketFeed":
+    async def __aenter__(self) -> Self:
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.stop()

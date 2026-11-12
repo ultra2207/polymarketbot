@@ -1,18 +1,12 @@
-"""Execution and transport modules for Polymarket bot."""
+"""Execution support that live trading actually uses.
 
-from polymarketbot.execution.fast_cancel import (
-    CancelResult,
-    DedicatedCancellationPool,
-)
-from polymarketbot.execution.hft_pool import (
-    HftConnectionPool,
-    HftOrderResponse,
-)
-from polymarketbot.execution.presigned_cache import (
-    PreSignedOrder,
-    PreSignedOrderCache,
-    make_bucket_key,
-)
+The dedicated-cancel pool, the HFT connection pool and the pre-signed order
+cache were removed: no caller in ``src/`` enabled them, their documented
+latency claims were untrue (the fast-cancel HMAC was computed over a different
+body than it sent, so every cancel would 401), and a dormant money path that
+looks wired is worse than no path at all.
+"""
+
 from polymarketbot.execution.self_trade import (
     MakerOrderRecord,
     SelfTradeGuard,
@@ -21,15 +15,8 @@ from polymarketbot.execution.self_trade import (
 )
 
 __all__ = [
-    "CancelResult",
-    "DedicatedCancellationPool",
-    "HftConnectionPool",
-    "HftOrderResponse",
-    "PreSignedOrder",
-    "PreSignedOrderCache",
-    "make_bucket_key",
     "MakerOrderRecord",
-    "SelfTradeGuard",
     "STPAction",
     "STPCheckResult",
+    "SelfTradeGuard",
 ]

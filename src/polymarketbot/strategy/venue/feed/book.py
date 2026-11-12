@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -32,7 +32,7 @@ class _TokenBook:
     asks: dict[float, float] = field(default_factory=dict)
     tick_size: float = 0.01
     timestamp: float = field(default_factory=time.time)
-    hash: Optional[str] = None
+    hash: str | None = None
 
     def apply_change(self, side: str, price: float, size: float) -> bool:
         """Apply one delta level. ``side`` is the ladder side ("bid"/"ask").
@@ -56,7 +56,7 @@ class _TokenBook:
         levels[price] = size
         return True
 
-    def apply_top(self, best_bid: Optional[float], best_ask: Optional[float]) -> None:
+    def apply_top(self, best_bid: float | None, best_ask: float | None) -> None:
         """Move the top of book without touching deeper levels.
 
         A ``best_bid_ask`` frame asserts the best price but carries no size. The
@@ -79,7 +79,7 @@ class _TokenBook:
         self,
         asset_id: str,
         *,
-        timestamp: Optional[float] = None,
+        timestamp: float | None = None,
         source: str = "ws",
     ) -> OrderBookSnapshot:
         """Build a snapshot of the maintained book.
@@ -114,19 +114,17 @@ class _TokenBook:
         if adjusted:
             best_bid = snapshot.best_bid
             best_ask = snapshot.best_ask
+            # Both sides, or no price: a one-sided book has no mid and no
+            # spread, and an empty one certainly does not have a 0.50 mid.
             if best_bid > 0.0 and best_ask < 1.0 and best_ask >= best_bid:
                 snapshot.mid = round((best_bid + best_ask) / 2.0, 4)
                 snapshot.spread = round(best_ask - best_bid, 4)
-            elif best_bid > 0.0:
-                snapshot.mid = round(best_bid, 4)
-                snapshot.spread = 0.0
-            elif best_ask < 1.0:
-                snapshot.mid = round(best_ask, 4)
-                snapshot.spread = 0.0
             else:
-                snapshot.mid = 0.50
-                snapshot.spread = 0.0
-            snapshot.spread_cents = round(snapshot.spread * 100.0, 2)
+                snapshot.mid = None
+                snapshot.spread = None
+            snapshot.spread_cents = (
+                None if snapshot.spread is None else round(snapshot.spread * 100.0, 2)
+            )
 
         return snapshot
 
@@ -148,11 +146,27 @@ class _BookAggregationMixin:
         )
         with self._book_lock:
             self._books[asset_id] = book
+        self._desync_assets.discard(asset_id)
 
     def _clear_books(self) -> None:
         """Drop all maintained depth (used on WebSocket reconnect)."""
         with self._book_lock:
             self._books.clear()
+        self._desync_assets.clear()
+
+    def _mark_desynced(self, asset_id: str, reason: str) -> None:
+        """Flag one asset's book as incomplete so the REST poller re-seeds it.
+
+        Logged once per asset per desync episode: a schema change would
+        otherwise emit one line per delta for as long as it lasted.
+        """
+        first = asset_id not in self._desync_assets
+        self._desync_assets.add(asset_id)
+        if first:
+            logger.warning(
+                f"Book for {str(asset_id)[:12]} left desynced: {reason}; "
+                "a REST snapshot will re-seed it"
+            )
 
     def _book_for(self, asset_id: str) -> _TokenBook:
         """Return the maintained book for asset_id, creating an empty one if needed."""
@@ -164,7 +178,7 @@ class _BookAggregationMixin:
 
     def _apply_price_changes(
         self,
-        default_asset_id: Optional[str],
+        default_asset_id: str | None,
         changes: list[Any],
     ) -> dict[str, float]:
         """Apply ``price_changes`` deltas to the maintained books.
@@ -186,8 +200,12 @@ class _BookAggregationMixin:
                 size = _parse_float(_pick(change, payload, "size"), default=-1.0)
                 side = str(_pick(change, payload, "side") or "").upper()
                 if not (0.0 < price < 1.0) or size < 0.0:
-                    logger.debug(
-                        f"Ignoring malformed price_change for {str(asset_id)[:12]}: price={price} size={size}"
+                    # A delta we cannot read leaves this ladder missing a level.
+                    # The maintained book is no longer the venue's book, so it is
+                    # flagged for a REST re-seed instead of being quoted from.
+                    self._mark_desynced(
+                        asset_id,
+                        f"malformed price_change (price={price} size={size} side={side!r})",
                     )
                     continue
                 # `side` is the ladder side: BUY rows are bids, SELL rows asks.
@@ -196,7 +214,9 @@ class _BookAggregationMixin:
                 elif side == "SELL":
                     book_side = "ask"
                 else:
-                    logger.debug(f"Ignoring price_change with unknown side {side!r} for {str(asset_id)[:12]}")
+                    self._mark_desynced(
+                        asset_id, f"price_change with unknown side {side!r}"
+                    )
                     continue
 
                 ts_raw = _pick(change, payload, "timestamp")
@@ -218,8 +238,8 @@ class _BookAggregationMixin:
     def _update_book_top(
         self,
         asset_id: str,
-        best_bid: Optional[float],
-        best_ask: Optional[float],
+        best_bid: float | None,
+        best_ask: float | None,
         timestamp: float,
     ) -> OrderBookSnapshot:
         """Apply a top-of-book update and return the maintained book snapshot."""
@@ -233,7 +253,7 @@ class _BookAggregationMixin:
         self,
         asset_id: str,
         *,
-        timestamp: Optional[float] = None,
+        timestamp: float | None = None,
         source: str = "ws",
     ) -> OrderBookSnapshot:
         """Emit the maintained book for asset_id as an OrderBookSnapshot."""

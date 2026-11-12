@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.risk.fast_signer import V2_NEG_RISK_CTF_EXCHANGE
-
 
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
 """EIP-712 verifying contract for negative-risk markets (Polymarket CTF Exchange)."""
@@ -75,6 +74,15 @@ class ClobAPIError(RuntimeError):
         self.response_text = response_text
 
 
+class ClobMarketParamsUnreadable(ClobAPIError):
+    """A market payload omitted a parameter the order signature commits to.
+
+    Subclasses ``ClobAPIError`` so existing callers that already degrade on a
+    failed market read keep doing so, while callers that need the parameter can
+    distinguish "the venue did not publish it" from a transport failure.
+    """
+
+
 @dataclass
 class OrderPlacementResult:
     """Outcome of submitting an order to Polymarket CLOB."""
@@ -86,6 +94,6 @@ class OrderPlacementResult:
     price: float
     size: float
     raw_response: dict[str, Any] = field(default_factory=dict)
-    error_message: Optional[str] = None
+    error_message: str | None = None
     signature: str = ""
     is_dry_run: bool = False

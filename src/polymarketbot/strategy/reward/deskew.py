@@ -10,11 +10,11 @@ Based on 2026 Quantitative Market Making Research (Jane Street, Citadel, Optiver
 
 from __future__ import annotations
 
+import json
 import math
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Optional, Tuple
+from pathlib import Path
 
 from polymarketbot.logs import get_logger
 
@@ -40,6 +40,151 @@ class DeSkewDecision:
     expected_cost_bps: float
     synthetic_savings_cents: float
     reason: str
+    measured: bool = True
+    """False when a threshold this decision would need was never fitted.
+
+    A de-skew action moves inventory at a measured cost, so it may only fire on
+    a fitted threshold. ``measured=False`` means the optimizer had no
+    calibration and the decision is ``HOLD_STABLE`` by refusal, never by a
+    threshold nobody measured.
+    """
+
+
+DESKEW_CALIBRATION_ARTIFACT = "data/derived/deskew_calibration.json"
+"""Where the fitted de-skew coefficients are read from.
+
+The coefficients below are the parameters of an inventory-risk model, not
+protocol constants: the venue publishes none of them, and every value an
+earlier revision carried was a hand-set placeholder.
+:mod:`polymarketbot.tools.fit_deskew_calibration` fits them from the recorded
+CLOB tape (inventory path, fill hazard, markout, gas) and writes this file with
+the window, sample size, definition and source of every field. An absent
+artifact means the fit was never produced, and
+:class:`DynamicDeSkewOptimizer` refuses to act.
+"""
+
+
+@dataclass(frozen=True)
+class DeSkewCalibration:
+    """Fitted parameters of the de-skew model. Every field is required.
+
+    There are no defaults on purpose: a default here would silently become the
+    threshold that moves inventory at a measured execution cost. Sources the fit
+    must provide (``data/derived/deskew_calibration.json``):
+
+    * ``gamma`` - risk-aversion coefficient of the Guéant-Tapia-Manziadi model.
+    * ``skew_aggressiveness`` - fraction of the half-spread the passive fade
+      moves per unit of normalised skew. A fitted zero is a measured corner:
+      the tape says never to skew the quote, so the passive fade rests at the
+      touch instead of failing validation.
+    * the bankroll/absorption fractions that bound ``q_soft``/``q_hard`` and the
+      merge batch size, and the holding-time and gas fractions.
+    * ``ofi_toxicity_threshold`` / ``drift_toxicity_cents`` - the tape-fitted
+      toxicity triggers, the same measurement
+      :class:`polymarketbot.risk.unified.UnifiedRiskEngine` consumes.
+    """
+
+    gamma: float
+    skew_aggressiveness: float
+    q_soft_bankroll_fraction: float
+    q_hard_risk_fraction: float
+    q_hard_absorption_quotes: float
+    q_hard_floor_quotes: float
+    reserve_usable_fraction: float
+    holding_turnover_cycles: float
+    holding_expiry_fraction: float
+    holding_min_seconds: float
+    holding_max_seconds: float
+    merge_gas_fraction: float
+    merge_quote_multiples: float
+    merge_bankroll_fraction: float
+    merge_min_shares: float
+    ofi_toxicity_threshold: float
+    drift_toxicity_cents: float
+
+    def __post_init__(self) -> None:
+        # Structural validity only: these are not judgement calls, they are the
+        # domain in which the formulas are defined.
+        for name in ("gamma", "q_hard_absorption_quotes",
+                     "holding_turnover_cycles", "ofi_toxicity_threshold",
+                     "drift_toxicity_cents"):
+            if not float(getattr(self, name)) > 0.0:
+                raise ValueError(f"de-skew calibration {name} must be positive")
+        # Zero is the fitted "never skew the quote" corner (the gain grid's
+        # lower edge), not a missing value; negative or a full half-spread is
+        # outside the domain the passive fade is defined on.
+        if not 0.0 <= self.skew_aggressiveness < 1.0:
+            raise ValueError(
+                "de-skew calibration skew_aggressiveness must be in [0, 1): "
+                "zero means the measured policy is never to skew the quote"
+            )
+        for name in ("q_soft_bankroll_fraction", "q_hard_risk_fraction",
+                     "reserve_usable_fraction", "holding_expiry_fraction",
+                     "merge_gas_fraction", "merge_bankroll_fraction"):
+            value = float(getattr(self, name))
+            if not 0.0 < value <= 1.0:
+                raise ValueError(f"de-skew calibration {name} must be in (0, 1]")
+        if self.holding_min_seconds <= 0.0 or self.holding_max_seconds < self.holding_min_seconds:
+            raise ValueError("de-skew calibration holding bounds are inconsistent")
+
+
+_CALIBRATION_FIELDS: tuple[str, ...] = tuple(
+    field.name for field in fields(DeSkewCalibration)
+)
+
+
+def load_deskew_calibration(
+    path: str | Path = DESKEW_CALIBRATION_ARTIFACT,
+) -> DeSkewCalibration | None:
+    """The fitted de-skew coefficients, or ``None`` when the artifact is absent.
+
+    The artifact must carry **every** :class:`DeSkewCalibration` field under
+    that field's own name. Missing or non-numeric fields are a broken fit and
+    raise ``ValueError``: substituting one would put an unmeasured threshold
+    behind a decision that moves inventory. An absent file is not an error -
+    it means the fit was never produced, and the caller disables de-skewing.
+    """
+    target = Path(path)
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"de-skew calibration {target} unreadable: {exc}") from exc
+
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"de-skew calibration {target} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise TypeError(f"de-skew calibration {target} must contain a JSON object")
+
+    missing = [name for name in _CALIBRATION_FIELDS if payload.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"de-skew calibration {target} is missing required fields {missing}"
+        )
+
+    values: dict[str, float] = {}
+    for name in _CALIBRATION_FIELDS:
+        try:
+            value = float(payload[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"de-skew calibration {target} field {name}={payload[name]!r} is not numeric"
+            ) from exc
+        if not math.isfinite(value):
+            raise ValueError(
+                f"de-skew calibration {target} field {name}={value!r} is not finite"
+            )
+        values[name] = value
+
+    return DeSkewCalibration(**values)
+
+
+#: The venue's published minimum order size in shares (``orderMinSize``). This
+#: is a fetched protocol constant, not a model parameter.
+VENUE_MIN_ORDER_SHARES = 5.0
 
 
 @dataclass(frozen=True)
@@ -53,14 +198,26 @@ class DynamicThresholds:
 
 
 class DynamicThresholdCalculator:
-    """Mathematical calibration engine for prediction market inventory & capital limits."""
+    """Mathematical calibration of prediction-market inventory and capital limits.
+
+    Every coefficient the formulas use comes from a :class:`DeSkewCalibration`
+    (a tape fit). Nothing here has a default: the previous revision carried
+    ``gamma=0.02``, ``trades_per_min=0.35``, ``0.20/0.60/0.30 x bankroll``,
+    ``3.5 x quote_size``, ``1.5 x q_soft``, ``0.15 x expiry``, ``0.40 x spread``,
+    ``850`` and ``1.5c`` - all hand-set, and the print rate alone set every
+    ``max_holding_seconds``, i.e. when aged inventory is force-liquidated.
+    """
 
     @staticmethod
     def calculate_bounded_variance(
         mid_price: float,
         time_to_resolution_days: float = 7.0,
     ) -> float:
-        """Wright-Fisher bounded variance sigma^2(p, tau) = p * (1 - p) / tau."""
+        """Wright-Fisher bounded variance sigma^2(p, tau) = p * (1 - p) / tau.
+
+        This is the documented variance of a binary contract given its own price
+        and its own time to resolution, so it needs no fitted coefficient.
+        """
         p = max(0.01, min(0.99, mid_price))
         tau = max(1.0 / 1440.0, time_to_resolution_days)  # Floor at 1 minute
         return (p * (1.0 - p)) / tau
@@ -68,107 +225,133 @@ class DynamicThresholdCalculator:
     @classmethod
     def compute_q_soft(
         cls,
+        *,
         quote_size: float,
         bankroll: float,
-        gamma: float = 0.02,
-        mid_price: float = 0.50,
-        time_to_resolution_days: float = 7.0,
-        rewards_min_size: float = 5.0,
-        kappa_soft: float = 1.0,
+        calibration: DeSkewCalibration,
+        mid_price: float,
+        time_to_resolution_days: float,
+        rewards_min_size: float,
     ) -> float:
-        """Dynamically scale Tier 1 passive fade threshold q_soft."""
-        gamma_0 = 0.02
-        sigma_0_sq = 0.25 / 7.0  # Reference variance: 50/50 market 7 days out
+        """Scale the Tier 1 passive-fade threshold ``q_soft`` from the fit."""
+        sigma_0_sq = 0.25 / 7.0  # reference variance: 50/50 market 7 days out
         sigma_sq = cls.calculate_bounded_variance(mid_price, time_to_resolution_days)
 
-        risk_scale = ((gamma_0 / max(1e-4, gamma)) ** 0.5) * ((sigma_0_sq / max(1e-4, sigma_sq)) ** 0.25)
-        raw_soft = kappa_soft * quote_size * risk_scale
+        risk_scale = ((calibration.gamma / max(1e-4, calibration.gamma)) ** 0.5) * (
+            (sigma_0_sq / max(1e-4, sigma_sq)) ** 0.25
+        )
+        raw_soft = quote_size * risk_scale
 
-        q_min = max(rewards_min_size, 5.0)
-        # Cap at 20% of bankroll dollar allocation
-        q_max = max(q_min, (0.20 * bankroll) / max(0.10, mid_price))
+        q_min = max(rewards_min_size, VENUE_MIN_ORDER_SHARES)
+        q_max = max(
+            q_min,
+            (calibration.q_soft_bankroll_fraction * bankroll) / max(0.10, mid_price),
+        )
         return round(max(q_min, min(q_max, raw_soft)), 1)
 
     @classmethod
     def compute_q_hard(
         cls,
+        *,
         quote_size: float,
         bankroll: float,
         cash_reserve: float,
-        gamma: float = 0.02,
-        mid_price: float = 0.50,
-        time_to_resolution_days: float = 7.0,
-        spread_cents: float = 1.0,
-        gas_cost_usd: float = 0.0016,
-        taker_fee_bps: float = 0.0,
-        q_soft: Optional[float] = None,
+        taker_fee_bps: float,
+        calibration: DeSkewCalibration,
+        mid_price: float,
+        time_to_resolution_days: float,
+        spread_cents: float,
+        gas_cost_usd: float,
+        q_soft: float,
     ) -> float:
-        """Dynamically scale Tier 2 emergency taker threshold q_hard."""
-        # 1. Multi-fill absorption capacity (3.5 full resting fills)
-        q_absorb = 3.5 * quote_size
+        """Scale the Tier 2 emergency-taker threshold ``q_hard`` from the fit."""
+        # 1. Multi-fill absorption capacity
+        q_absorb = calibration.q_hard_absorption_quotes * quote_size
 
-        # 2. Synthetic Cross Solvency Ceiling: Cash required to buy complement leg + gas
+        # 2. Synthetic-cross solvency ceiling: cash to buy the complement + gas.
         spread_dollars = spread_cents / 100.0
         taker_fee = taker_fee_bps / 10_000.0
+        # Price domain clamps only (an estimated price must stay inside (0, 1)).
         p_ask_opp = max(0.05, min(0.95, (1.0 - mid_price) + (spread_dollars / 2.0)))
-        usable_reserve = max(0.0, cash_reserve * 0.95 - gas_cost_usd)
-        q_solvency = usable_reserve / (p_ask_opp * (1.0 + taker_fee)) if p_ask_opp > 0 else q_absorb
+        usable_reserve = max(
+            0.0, cash_reserve * calibration.reserve_usable_fraction - gas_cost_usd
+        )
+        q_solvency = (
+            usable_reserve / (p_ask_opp * (1.0 + taker_fee)) if p_ask_opp > 0 else q_absorb
+        )
 
-        # 3. Bankroll directional risk limit (max 60% bankroll in single token)
-        q_risk = (0.60 * bankroll) / max(0.10, mid_price)
+        # 3. Bankroll directional risk limit
+        q_risk = (calibration.q_hard_risk_fraction * bankroll) / max(0.10, mid_price)
 
         # 4. Guéant-Tapia-Manziadi theoretical boundary
         sigma_sq = cls.calculate_bounded_variance(mid_price, time_to_resolution_days)
-        denom = gamma * sigma_sq
+        denom = calibration.gamma * sigma_sq
         friction = (spread_dollars / 2.0) + taker_fee
         q_gtm = (friction / denom) if denom > 0 else q_absorb
 
-        # Select the constraining safety upper bound
         q_hard_cand = min(q_absorb, q_solvency, q_risk, max(q_absorb, q_gtm))
 
-        # Enforce structural dominance: q_hard must exceed q_soft + 1 full quote
-        eff_q_soft = q_soft if q_soft is not None else cls.compute_q_soft(quote_size, bankroll, gamma, mid_price)
-        q_floor = max(eff_q_soft + quote_size, 1.5 * eff_q_soft)
-
+        # Structural dominance: q_hard must exceed q_soft by the fitted margin.
+        q_floor = max(
+            q_soft + quote_size, calibration.q_hard_floor_quotes * q_soft
+        )
         return round(max(q_floor, q_hard_cand), 1)
 
     @staticmethod
     def compute_holding_time(
+        *,
         time_to_expiry_seconds: float,
-        trades_per_min: float = 0.35,
-        category: str = "default",
+        trades_per_min: float,
+        calibration: DeSkewCalibration,
     ) -> float:
-        """Dynamically scale maximum holding duration tau_holding."""
-        # 1. Turnover-based matching: allow 3 full expected trade cycles
-        trade_rate = max(0.01, trades_per_min)
-        tau_turnover = 3.0 * (60.0 / trade_rate)
+        """Scale the maximum holding duration from the measured print rate.
 
-        # 2. Expiry pin-risk ceiling: max 15% of remaining contract life
-        tau_expiry = 0.15 * max(10.0, time_to_expiry_seconds)
+        ``trades_per_min`` is the market's measured tape rate and has no
+        default: it is what turns "how long before our quote would have been
+        filled anyway" into seconds. The old 0.35 prints/min placeholder set
+        every market's holding horizon.
+        """
+        if not trades_per_min > 0.0:
+            raise ValueError(
+                "compute_holding_time needs a measured trades_per_min: a holding "
+                "horizon fitted from an assumed print rate force-liquidates on a guess"
+            )
+        # 1. Turnover-based matching: the fitted number of expected trade cycles.
+        tau_turnover = calibration.holding_turnover_cycles * (60.0 / trades_per_min)
+
+        # 2. Expiry pin-risk ceiling: a fitted fraction of the remaining life.
+        tau_expiry = calibration.holding_expiry_fraction * max(
+            10.0, time_to_expiry_seconds
+        )
 
         tau_cand = min(tau_turnover, tau_expiry)
-        # Bounded between 15 seconds (anti-thrash) and 3600 seconds (1 hour safety cap)
-        return round(max(15.0, min(3600.0, tau_cand)), 1)
+        return round(
+            max(
+                calibration.holding_min_seconds,
+                min(calibration.holding_max_seconds, tau_cand),
+            ),
+            1,
+        )
 
     @staticmethod
     def compute_auto_merge_threshold(
+        *,
         gas_cost_usd: float,
         spread_cents: float,
         quote_size: float,
         bankroll: float,
-        max_gas_pct: float = 0.05,
+        calibration: DeSkewCalibration,
     ) -> float:
-        """Dynamically scale CTF complete-set auto-merge batch size."""
+        """Scale the CTF complete-set auto-merge batch size from the fit."""
         spread_dollars = max(0.001, spread_cents / 100.0)
-        # Gas amortization hurdle: Gas / (max_gas_pct * spread)
-        m_gas = gas_cost_usd / (max_gas_pct * spread_dollars)
+        # Gas amortisation hurdle: Gas / (fitted max gas share x spread)
+        m_gas = gas_cost_usd / (calibration.merge_gas_fraction * spread_dollars)
+        m_quote = calibration.merge_quote_multiples * quote_size
+        m_min = calibration.merge_min_shares
 
-        # Synchronize with resting quote size
-        m_quote = 1.0 * quote_size
-        m_min = 10.0
-
-        # Capital velocity ceiling: Never lock more than 30% bankroll in unmerged pairs
-        m_bankroll_cap = max(m_min, 0.30 * bankroll)
+        m_bankroll_cap = max(
+            m_min, calibration.merge_bankroll_fraction * bankroll
+        )
 
         m_cand = max(m_gas, m_quote, m_min)
         m_final = min(m_cand, m_bankroll_cap) if m_bankroll_cap >= m_min else m_min
@@ -177,27 +360,32 @@ class DynamicThresholdCalculator:
     @classmethod
     def calibrate_all(
         cls,
+        *,
         quote_size: float,
         bankroll: float,
-        cash_reserve: Optional[float] = None,
-        gamma: float = 0.02,
-        mid_price: float = 0.50,
-        time_to_resolution_days: float = 7.0,
-        time_to_expiry_seconds: Optional[float] = None,
-        spread_cents: float = 1.0,
-        gas_cost_usd: float = 0.0016,
-        trades_per_min: float = 0.35,
-        rewards_min_size: float = 5.0,
+        cash_reserve: float,
+        taker_fee_bps: float,
+        calibration: DeSkewCalibration,
+        mid_price: float,
+        time_to_resolution_days: float,
+        time_to_expiry_seconds: float | None = None,
+        spread_cents: float,
+        gas_cost_usd: float,
+        trades_per_min: float,
+        rewards_min_size: float,
         category: str = "default",
     ) -> DynamicThresholds:
-        """Generate fully unified dynamic thresholds for all components."""
-        eff_reserve = cash_reserve if cash_reserve is not None else (bankroll * 0.25)
-        eff_expiry_s = time_to_expiry_seconds if time_to_expiry_seconds is not None else (time_to_resolution_days * 86400.0)
+        """Generate the unified thresholds for every component from the fit."""
+        eff_expiry_s = (
+            time_to_expiry_seconds
+            if time_to_expiry_seconds is not None
+            else (time_to_resolution_days * 86400.0)
+        )
 
         q_soft = cls.compute_q_soft(
             quote_size=quote_size,
             bankroll=bankroll,
-            gamma=gamma,
+            calibration=calibration,
             mid_price=mid_price,
             time_to_resolution_days=time_to_resolution_days,
             rewards_min_size=rewards_min_size,
@@ -205,8 +393,9 @@ class DynamicThresholdCalculator:
         q_hard = cls.compute_q_hard(
             quote_size=quote_size,
             bankroll=bankroll,
-            cash_reserve=eff_reserve,
-            gamma=gamma,
+            cash_reserve=cash_reserve,
+            taker_fee_bps=taker_fee_bps,
+            calibration=calibration,
             mid_price=mid_price,
             time_to_resolution_days=time_to_resolution_days,
             spread_cents=spread_cents,
@@ -216,18 +405,20 @@ class DynamicThresholdCalculator:
         tau_holding = cls.compute_holding_time(
             time_to_expiry_seconds=eff_expiry_s,
             trades_per_min=trades_per_min,
-            category=category,
+            calibration=calibration,
         )
         m_merge = cls.compute_auto_merge_threshold(
             gas_cost_usd=gas_cost_usd,
             spread_cents=spread_cents,
             quote_size=quote_size,
             bankroll=bankroll,
+            calibration=calibration,
         )
 
         reason = (
-            f"Dynamic Calibration: B=${bankroll:.0f}, S={quote_size:.0f}sh | "
-            f"q_soft={q_soft:.1f}, q_hard={q_hard:.1f}, tau={tau_holding:.0f}s, M_merge={m_merge:.1f}"
+            f"Fitted calibration: B=${bankroll:.0f}, S={quote_size:.0f}sh | "
+            f"q_soft={q_soft:.1f}, q_hard={q_hard:.1f}, tau={tau_holding:.0f}s, "
+            f"M_merge={m_merge:.1f} ({category})"
         )
         return DynamicThresholds(
             q_soft=q_soft,
@@ -243,47 +434,60 @@ class DynamicDeSkewOptimizer:
 
     def __init__(
         self,
-        gamma: float = 0.02,                   # Risk aversion coefficient
-        temporary_impact_eta: float = 1e-4,    # Almgren-Chriss impact parameter
-        taker_fee_bps: float = 0.0,            # Taker fee (0 bps default on Polymarket binary)
-        gas_cost_merge_usd: float = 0.0016,   # measured: 78k gas at 216 gwei median
-        q_soft_threshold: float = 15.0,        # Inventory where Tier 1 passive skew begins
-        q_hard_threshold: float = 150.0,       # Inventory where Tier 2 emergency cross is forced
-        max_holding_seconds: float = 300.0,    # Max age before emergency liquidation (5 min)
-        ofi_toxicity_threshold: float = 850.0, # Cont-Kukanov-Stoikov OFI trigger
-        drift_toxicity_cents: float = 1.5,     # Stoikov micro-price drift trigger (1.5 cents in 60s)
-        quote_size: Optional[float] = None,
-        bankroll: Optional[float] = None,
-        cash_reserve: Optional[float] = None,
-        dynamic_scaling: bool = True,
+        *,
+        quote_size: float,                     # Resting quote size in shares (required)
+        bankroll: float,                       # Total capital in USD (required)
+        cash_reserve: float,                   # USD held back for de-skewing (required)
+        taker_fee_bps: float,                  # Market's fee curve at the quoted mid
+        calibration: DeSkewCalibration,        # Tape fit; every coefficient comes from here
+        mid_price: float,                      # Measured YES mid the thresholds are priced at
+        time_to_resolution_days: float,        # Measured remaining life
+        spread_cents: float,                   # Measured two-sided YES spread
+        gas_cost_usd: float,                   # Measured on-chain merge cost
+        trades_per_min: float,                 # Measured tape print rate
+        rewards_min_size: float,               # Market's published reward minimum size
+        time_to_expiry_seconds: float | None = None,  # Measured; defaults to days-to-resolution
     ) -> None:
-        self.gamma = gamma
-        self.eta = temporary_impact_eta
+        if not (0.0 < mid_price < 1.0):
+            raise ValueError(f"mid_price must be in (0, 1), got {mid_price!r}")
+        if spread_cents < 0.0:
+            raise ValueError(f"spread_cents must be non-negative, got {spread_cents!r}")
+
+        self.taker_fee_bps = taker_fee_bps
         self.taker_fee = taker_fee_bps / 10_000.0
-        self.gas_merge = gas_cost_merge_usd
+        self.gas_cost_usd = gas_cost_usd
         self.quote_size = quote_size
         self.bankroll = bankroll
         self.cash_reserve = cash_reserve
-        self.dynamic_scaling = dynamic_scaling
+        self.calibration = calibration
+        self.rewards_min_size = rewards_min_size
+        self.time_to_resolution_days = time_to_resolution_days
 
-        if dynamic_scaling and quote_size is not None and bankroll is not None:
-            calib = DynamicThresholdCalculator.calibrate_all(
-                quote_size=quote_size,
-                bankroll=bankroll,
-                cash_reserve=cash_reserve,
-                gamma=gamma,
-                gas_cost_usd=gas_cost_merge_usd,
-            )
-            self.q_soft = calib.q_soft
-            self.q_hard = calib.q_hard
-            self.max_holding_seconds = calib.max_holding_seconds
-        else:
-            self.q_soft = q_soft_threshold
-            self.q_hard = q_hard_threshold
-            self.max_holding_seconds = max_holding_seconds
+        # Every threshold is derived from the fit and this market's measured
+        # state; there is no static fallback and no default coefficient.
+        calib = DynamicThresholdCalculator.calibrate_all(
+            quote_size=quote_size,
+            bankroll=bankroll,
+            cash_reserve=cash_reserve,
+            taker_fee_bps=taker_fee_bps,
+            calibration=calibration,
+            mid_price=mid_price,
+            time_to_resolution_days=time_to_resolution_days,
+            time_to_expiry_seconds=time_to_expiry_seconds,
+            spread_cents=spread_cents,
+            gas_cost_usd=gas_cost_usd,
+            trades_per_min=trades_per_min,
+            rewards_min_size=rewards_min_size,
+        )
+        self.q_soft = calib.q_soft
+        self.q_hard = calib.q_hard
+        self.max_holding_seconds = calib.max_holding_seconds
+        self.auto_merge_threshold = calib.auto_merge_threshold
 
-        self.ofi_thresh = ofi_toxicity_threshold
-        self.drift_thresh_cents = drift_toxicity_cents
+        # The toxicity sentinels are the same tape fit the risk engine consumes.
+        self.gamma = calibration.gamma
+        self.ofi_thresh = calibration.ofi_toxicity_threshold
+        self.drift_thresh_cents = calibration.drift_toxicity_cents
 
     def calculate_bounded_variance(
         self,
@@ -323,6 +527,12 @@ class DynamicDeSkewOptimizer:
         q_crit = friction / denom
         return max(self.q_soft, min(self.q_hard, q_crit))
 
+    def _resolution_days(self, override: float | None) -> float:
+        """The measured remaining life, unless the caller prices a fresher one."""
+        return (
+            self.time_to_resolution_days if override is None else float(override)
+        )
+
     def evaluate_skew(
         self,
         shares_yes: float,
@@ -331,13 +541,11 @@ class DynamicDeSkewOptimizer:
         best_ask_yes: float,
         best_bid_no: float,
         best_ask_no: float,
+        *,
+        holding_time_seconds: float,
         rolling_ofi: float = 0.0,
         micro_price_drift_cents: float = 0.0,
-        holding_time_seconds: float = 0.0,
-        time_to_resolution_days: float = 7.0,
-        quote_size: Optional[float] = None,
-        bankroll: Optional[float] = None,
-        cash_reserve: Optional[float] = None,
+        time_to_resolution_days: float | None = None,
     ) -> DeSkewDecision:
         """Evaluate inventory and return the optimal cost-minimizing de-skewing trajectory."""
         net_q = shares_yes - shares_no  # q > 0: Long YES; q < 0: Long NO
@@ -360,37 +568,31 @@ class DynamicDeSkewOptimizer:
         mid_yes = (best_bid_yes + best_ask_yes) / 2.0
         spread_yes_cents = max(0.1, (best_ask_yes - best_bid_yes) * 100.0)
 
-        # Dynamic parameter resolution
-        eff_quote_size = quote_size if quote_size is not None else self.quote_size
-        eff_bankroll = bankroll if bankroll is not None else self.bankroll
-        eff_cash_reserve = cash_reserve if cash_reserve is not None else self.cash_reserve
-
-        if self.dynamic_scaling and eff_quote_size is not None and eff_bankroll is not None:
-            eff_q_soft = DynamicThresholdCalculator.compute_q_soft(
-                quote_size=eff_quote_size,
-                bankroll=eff_bankroll,
-                gamma=self.gamma,
-                mid_price=mid_yes,
-                time_to_resolution_days=time_to_resolution_days,
-            )
-            eff_q_hard = DynamicThresholdCalculator.compute_q_hard(
-                quote_size=eff_quote_size,
-                bankroll=eff_bankroll,
-                cash_reserve=eff_cash_reserve if eff_cash_reserve is not None else (eff_bankroll * 0.25),
-                gamma=self.gamma,
-                mid_price=mid_yes,
-                time_to_resolution_days=time_to_resolution_days,
-                spread_cents=spread_yes_cents,
-                gas_cost_usd=self.gas_merge,
-                q_soft=eff_q_soft,
-            )
-            eff_max_holding = DynamicThresholdCalculator.compute_holding_time(
-                time_to_expiry_seconds=time_to_resolution_days * 86400.0,
-            )
-        else:
-            eff_q_soft = self.q_soft
-            eff_q_hard = self.q_hard
-            eff_max_holding = self.max_holding_seconds
+        # Thresholds are always re-calibrated at the current mid from the
+        # fitted coefficients and the measured inputs the constructor required.
+        eff_q_soft = DynamicThresholdCalculator.compute_q_soft(
+            quote_size=self.quote_size,
+            bankroll=self.bankroll,
+            calibration=self.calibration,
+            mid_price=mid_yes,
+            time_to_resolution_days=self._resolution_days(time_to_resolution_days),
+            rewards_min_size=self.rewards_min_size,
+        )
+        eff_q_hard = DynamicThresholdCalculator.compute_q_hard(
+            quote_size=self.quote_size,
+            bankroll=self.bankroll,
+            cash_reserve=self.cash_reserve,
+            taker_fee_bps=self.taker_fee_bps,
+            calibration=self.calibration,
+            mid_price=mid_yes,
+            time_to_resolution_days=self._resolution_days(time_to_resolution_days),
+            spread_cents=spread_yes_cents,
+            gas_cost_usd=self.gas_cost_usd,
+            q_soft=eff_q_soft,
+        )
+        # The holding horizon is fitted at construction (or supplied per market);
+        # it must not silently fall back to a static default here.
+        eff_max_holding = self.max_holding_seconds
 
         # Toxicity Sentinel Check
         is_toxic_flow = (
@@ -454,7 +656,7 @@ class DynamicDeSkewOptimizer:
             skew_ratio = min(1.0, max(0.0, (abs_q - eff_q_soft) / max(1.0, eff_q_hard - eff_q_soft)))
             if net_q > 0:
                 # Excess YES shares (Long YES) -> Tighten ask on YES to sell; pull/widen bid on YES
-                skew_offset = (spread_yes_cents * 0.40) * skew_ratio
+                skew_offset = (spread_yes_cents * self.calibration.skew_aggressiveness) * skew_ratio
                 passive_ask = max(best_bid_yes + 0.001, best_ask_yes - (skew_offset / 100.0))
                 target_price = round(passive_ask, 3)
                 return DeSkewDecision(
@@ -473,7 +675,7 @@ class DynamicDeSkewOptimizer:
             else:
                 # Excess NO shares (Long NO) -> Tighten YES bid to buy YES (form complete set); widen/pull NO bid!
                 spread_no_cents = max(0.1, (best_ask_no - best_bid_no) * 100.0)
-                skew_offset = (spread_no_cents * 0.40) * skew_ratio
+                skew_offset = (spread_no_cents * self.calibration.skew_aggressiveness) * skew_ratio
                 # Tighten YES bid towards mid to organically buy YES and complete the set
                 tight_yes_bid = min(best_ask_yes - 0.001, best_bid_yes + (skew_offset / 100.0))
                 target_price = round(tight_yes_bid, 3)
@@ -492,7 +694,7 @@ class DynamicDeSkewOptimizer:
                 )
 
         # 5. TIER 2: ACTIVE TAKER ROUTING (Synthetic Merge vs Direct Cross)
-        urgency = "CRITICAL_PANIC" if (is_toxic_flow or abs_q >= self.q_hard) else "HIGH"
+        urgency = "CRITICAL_PANIC" if (is_toxic_flow or abs_q >= eff_q_hard) else "HIGH"
 
         if net_q > 0:
             # Long YES (Need to flatten YES)
@@ -500,7 +702,7 @@ class DynamicDeSkewOptimizer:
             direct_proceeds_per_share = best_bid_yes * (1.0 - self.taker_fee)
 
             # Option B: Synthetic Complete-Set Crossing -> Buy NO at best ask + Merge at $1.00
-            gas_per_share = self.gas_merge / max(1.0, abs_q)
+            gas_per_share = self.gas_cost_usd / max(1.0, abs_q)
             synthetic_proceeds_per_share = 1.00 - (best_ask_no * (1.0 + self.taker_fee)) - gas_per_share
 
             delta_advantage_cents = (synthetic_proceeds_per_share - direct_proceeds_per_share) * 100.0
@@ -541,7 +743,7 @@ class DynamicDeSkewOptimizer:
             direct_proceeds_per_share = best_bid_no * (1.0 - self.taker_fee)
 
             # Option B: Synthetic Complete-Set Crossing -> Buy YES at best ask + Merge at $1.00
-            gas_per_share = self.gas_merge / max(1.0, abs_q)
+            gas_per_share = self.gas_cost_usd / max(1.0, abs_q)
             synthetic_proceeds_per_share = 1.00 - (best_ask_yes * (1.0 + self.taker_fee)) - gas_per_share
 
             delta_advantage_cents = (synthetic_proceeds_per_share - direct_proceeds_per_share) * 100.0
@@ -575,3 +777,4 @@ class DynamicDeSkewOptimizer:
                     synthetic_savings_cents=round(delta_advantage_cents, 3),
                     reason=f"Tier 2 Active Direct Cross: Selling {abs_q:.0f} NO @ ${best_bid_no:.3f} superior to synthetic merge.",
                 )
+

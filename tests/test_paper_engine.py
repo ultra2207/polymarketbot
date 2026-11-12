@@ -134,13 +134,15 @@ def test_reward_fill_uses_measured_tape_flow(tmp_path, monkeypatch):
     # No level ahead at our price: the full 50-share print fills us.
     assert lots[0].shares == pytest.approx(50.0)
     assert engine.ledger.cash("RewardHarvester") == pytest.approx(100.0 - 50.0 * 0.48)
-    # A BUY print (taker buying) cannot fill our resting bid.
+    # A print above our bid is not at our price and is not a trade-through:
+    # under FIFO it cannot fill the order. (A print *below* a resting bid is
+    # the tracker's fill case: it means the taker swept through us.)
     engine.reward_quotes["y4"] = engine_mod.Resting(
         "RewardHarvester", "c4", "y4", 0.48, 100.0, 20.0, 0.0
     )
-    buy_prints = [engine_mod.venue.Print("y4", "c4", "BUY", 0.47, 500.0, now)]
+    above_prints = [engine_mod.venue.Print("y4", "c4", "BUY", 0.49, 500.0, now)]
     engine._apply_resting_fills(engine.reward_quotes, "RewardHarvester", books,
-                                buy_prints, now)
+                                above_prints, now)
     assert engine.ledger.positions("RewardHarvester")[0].shares == pytest.approx(50.0)
     engine.ledger.close()
 

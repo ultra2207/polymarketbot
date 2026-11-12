@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.clob.common import ClobAPIError, OrderPlacementResult
@@ -16,6 +18,62 @@ logger = get_logger("clob_client")
 def _is_order_version_mismatch(text: str) -> bool:
     """True when the CLOB rejected an order because its signed version is stale."""
     return "order_version_mismatch" in str(text).lower()
+
+
+# Documented order-time HTTP statuses (docs.polymarket.com/resources/error-codes):
+# 425 = matching engine restarting, 429 = throttled, 503 = cancel-only/post-only
+# mode. None of them is a permanent rejection of the order.
+_RESTART_STATUSES = (425, 429, 503)
+_RESTART_LABELS = {425: "RESTARTING", 429: "THROTTLED", 503: "RESTRICTED"}
+
+
+def _retry_after_seconds(err: ClobAPIError) -> float | None:
+    """Server-supplied retry delay from an order rejection, or None.
+
+    The venue publishes it as ``retry_after_seconds`` in the body and as the
+    ``Retry-After`` header. Only a value the server actually sent is used; no
+    delay is invented when the response carries none.
+    """
+    text = str(getattr(err, "response_text", "") or "")
+    if text:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("retry_after_seconds", "retryAfterSeconds"):
+                value = payload.get(key)
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and float(value) >= 0.0
+                ):
+                    return float(value)
+
+    match = re.search(r'retry_after_seconds"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)', text)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+def _order_response_outcome(data: Any) -> tuple[str, str]:
+    """Classify one ``POST /order`` body as ``("ok", order_id)`` or ``("rejected", reason)``.
+
+    A ``200`` body is not a placement. Polymarket answers per-order rejections
+    (post-only mode, batch items) with ``success: true`` and an empty
+    ``orderID`` plus an ``errorMsg``, so the *order id* is the only proof that
+    an order exists. A body without an explicit ``success`` is treated as a
+    rejection rather than assumed successful.
+    """
+    success = data.get("success")
+    order_id = str(data.get("orderID") or data.get("id") or "")
+    error = data.get("errorMsg") or data.get("error") or ""
+    if order_id and error:
+        return "rejected", f"{error} (order id {order_id})"
+    if order_id and success is not False:
+        return "ok", order_id
+    return "rejected", str(error or f"venue returned no order id (success={success!r})")
+
 
 
 class DispatchMixin:
@@ -47,7 +105,6 @@ class DispatchMixin:
         order_version = signed.order_version
         sig = signed.signature
         payload = signed.payload
-        raw_bytes = signed.raw_bytes
 
         if self.dry_run:
             mock_id = f"mock_ord_{uuid.uuid4().hex[:12]}"
@@ -89,38 +146,20 @@ class DispatchMixin:
         # -------------------------------------------------------------
         # Live Placement via HFT Connection Pool
         # -------------------------------------------------------------
-        if self.hft_pool is not None:
-            resp = self.hft_pool.place_order(raw_bytes if raw_bytes is not None else payload)
-            data = resp.data
-            if resp.success and isinstance(data, dict) and data.get("success", True):
-                order_id = str(data.get("orderID") or data.get("id") or "")
-                logger.info(
-                    f"Live CLOB order placed via HFT pool: ID={order_id} "
-                    f"(v{order_version} {side_norm} {rounded_size} @ ${rounded_price} in {resp.latency_ms:.2f}ms)"
-                )
-                if self.self_trade_guard is not None:
-                    self.self_trade_guard.register_maker_order(
-                        order_id=order_id,
-                        token_id=token_str,
-                        side=side_norm,
-                        price=rounded_price,
-                        size=rounded_size,
-                    )
-                return OrderPlacementResult(
-                    success=True,
-                    order_id=order_id,
-                    status="LIVE",
-                    side=side_norm,
-                    price=rounded_price,
-                    size=rounded_size,
-                    raw_response=data,
-                    signature=sig,
-                    is_dry_run=False,
-                )
-            err = (data.get("errorMsg") or data.get("error") if isinstance(data, dict) else resp.error) or "HFT order rejected"
-            logger.error(f"HFT CLOB order placement failed: {err}")
+        restricted_until = float(getattr(self, "_order_restricted_until", 0.0) or 0.0)
+        if restricted_until > time.time():
+            remaining = restricted_until - time.time()
+            logger.warning(
+                f"CLOB order suppressed: the venue is restarting/throttling "
+                f"({remaining:.0f}s left of its own retry delay)"
+            )
             return self._placement_failure(
-                "REJECTED", str(err), side, price, size, raw=data if isinstance(data, dict) else {}, signature=sig
+                "RESTRICTED",
+                f"venue restriction in force for another {remaining:.0f}s",
+                side,
+                price,
+                size,
+                signature=sig,
             )
 
         path = "/order"
@@ -148,11 +187,27 @@ class DispatchMixin:
                     )
                     if isinstance(refreshed, OrderPlacementResult):
                         return refreshed
-                    order_version, fast_order, payload = refreshed
+                    order_version, _fast_order, payload = refreshed
                     sig = payload.get("signature") or payload.get("order", {}).get("signature", "")
                     continue
                 status = "NETWORK_ERROR" if e.status_code == 0 else "REJECTED"
-                logger.error(f"CLOB order placement failed: {e}")
+                if e.status_code in _RESTART_STATUSES:
+                    # Restart / throttle / restricted mode, not a rejection of the
+                    # order. Honour the server's own retry delay so the next ticks
+                    # do not hammer a restarting engine; never sleep the tick.
+                    delay = _retry_after_seconds(e)
+                    status = _RESTART_LABELS.get(e.status_code, "RESTRICTED")
+                    if delay is not None:
+                        self._order_restricted_until = max(
+                            float(getattr(self, "_order_restricted_until", 0.0) or 0.0),
+                            time.time() + delay,
+                        )
+                    logger.warning(
+                        f"CLOB order not accepted ({status}): {e}"
+                        + (f"; venue asked for {delay:.1f}s" if delay is not None else "")
+                    )
+                else:
+                    logger.error(f"CLOB order placement failed: {e}")
                 return self._placement_failure(status, str(e), side, price, size, signature=sig)
 
             if not isinstance(data, dict):
@@ -165,8 +220,9 @@ class DispatchMixin:
                     signature=sig,
                 )
 
-            if not data.get("success", True):
-                err = data.get("errorMsg") or data.get("error") or "order rejected"
+            outcome, detail = _order_response_outcome(data)
+            if outcome != "ok":
+                err = detail or "order not placed"
                 if not retried_version and _is_order_version_mismatch(f"{err} {data}"):
                     retried_version = True
                     refreshed = self._retry_with_refreshed_version(
@@ -185,7 +241,7 @@ class DispatchMixin:
                     )
                     if isinstance(refreshed, OrderPlacementResult):
                         return refreshed
-                    order_version, fast_order, payload = refreshed
+                    order_version, _fast_order, payload = refreshed
                     sig = payload.get("signature") or payload.get("order", {}).get("signature", "")
                     continue
                 logger.error(f"CLOB order placement rejected: {err}")
@@ -193,7 +249,7 @@ class DispatchMixin:
                     "REJECTED", str(err), side, price, size, raw=data, signature=sig
                 )
 
-            order_id = str(data.get("orderID") or data.get("id") or "")
+            order_id = detail
             logger.info(
                 f"Live CLOB order placed successfully: ID={order_id} "
                 f"(v{order_version} {side_norm} {rounded_size} @ ${rounded_price})"

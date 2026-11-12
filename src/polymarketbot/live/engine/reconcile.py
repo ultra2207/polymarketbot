@@ -53,7 +53,6 @@ class ReconcileMixin:
                     continue
                 if not self._order_matches_market(ord_info):
                     continue
-                self._canceled_order_ids.add(order_id)
                 if self.clob_client.cancel_order(order_id):
                     canceled += 1
                 else:
@@ -227,12 +226,20 @@ class ReconcileMixin:
                 return False
 
             if held:
-                if self.shares_yes > 1e-12 and mid_yes is not None:
-                    if self._cost_basis_unknown and self.avg_cost_yes <= 0.0:
-                        self.avg_cost_yes = float(mid_yes)
-                if self.shares_no > 1e-12 and mid_no is not None:
-                    if self._cost_basis_unknown and self.avg_cost_no <= 0.0:
-                        self.avg_cost_no = float(mid_no)
+                if (
+                    self.shares_yes > 1e-12
+                    and mid_yes is not None
+                    and self._cost_basis_unknown
+                    and self.avg_cost_yes <= 0.0
+                ):
+                    self.avg_cost_yes = float(mid_yes)
+                if (
+                    self.shares_no > 1e-12
+                    and mid_no is not None
+                    and self._cost_basis_unknown
+                    and self.avg_cost_no <= 0.0
+                ):
+                    self.avg_cost_no = float(mid_no)
                 if (
                     (self.shares_yes <= 0.0 or self.avg_cost_yes > 0.0)
                     and (self.shares_no <= 0.0 or self.avg_cost_no > 0.0)

@@ -1,5 +1,10 @@
 # Does UMA oracle state predict a losing-token discount?
 
+> **Tools (2026-11-11).** The `scripts/*.py` named below were deleted in the
+> 2026-11-10 scripts cleanup and have no `python -m` replacement, so those
+> commands no longer run. The decoder they used is archived at
+> `archive/data/uma.py`. The measurements are kept as the record of that study.
+
 Test of the proposal `cross-uma-liveness-convergence`: *when a market's resolution is
 proposed, the losing token keeps trading above 0 during the liveness window, so
 `YES + NO < 1` and the discount decays toward 1 as liveness expires.*

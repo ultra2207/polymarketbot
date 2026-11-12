@@ -20,16 +20,36 @@ Synthesizes:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from polymarketbot.fill_model import FillModel, get_fill_model
 from polymarketbot.logs import get_logger
+from polymarketbot.strategy.reward.accrual import REWARD_ELIGIBILITY_SECONDS
 
 logger = get_logger("queue_valuation")
 
 YEAR_SECONDS = 365.25 * 86_400.0
+
+
+def _validated_fee_rate(taker_fee_rate: float | None, where: str) -> float:
+    """Return the measured taker fee rate, refusing to price an exit as free.
+
+    ``0.0`` is a valid *measured* rate (a market whose ``feeSchedule`` has
+    ``feesEnabled is False``); ``None`` or an impossible value is a refusal.
+    """
+    if taker_fee_rate is None:
+        raise ValueError(
+            f"{where}: taker_fee_rate is required (pass FeeSchedule.rate for the "
+            "market); an unpriced taker exit must not be treated as free"
+        )
+    rate = float(taker_fee_rate)
+    if not math.isfinite(rate) or rate < 0.0:
+        raise ValueError(
+            f"{where}: taker_fee_rate={taker_fee_rate!r} is not a measured fee rate"
+        )
+    return rate
 
 
 @dataclass
@@ -44,12 +64,12 @@ class QueueParameterFit:
     so callers can log exactly which values were measured, proxied, or missing.
     """
 
-    trade_rate_shares_sec: Optional[float] = None
-    cancel_intensity_per_sec: Optional[float] = None
-    kyle_lambda: Optional[float] = None
-    volatility_annualized: Optional[float] = None
-    capital_hurdle_annual: Optional[float] = None
-    var_per_second: Optional[float] = None
+    trade_rate_shares_sec: float | None = None
+    cancel_intensity_per_sec: float | None = None
+    kyle_lambda: float | None = None
+    volatility_annualized: float | None = None
+    capital_hurdle_annual: float | None = None
+    var_per_second: float | None = None
     samples: int = 0
 
     def set_capital_hurdle(self, annual_rate: float) -> None:
@@ -61,12 +81,12 @@ class QueueParameterFit:
         self,
         *,
         dt: float,
-        trade_rate_sample: Optional[float],
+        trade_rate_sample: float | None,
         cancelled_shares: float,
         previous_depth: float,
         abs_mid_change: float,
         abs_signed_flow_shares: float,
-        var_per_second_sample: Optional[float],
+        var_per_second_sample: float | None,
     ) -> None:
         """Fold one full radar-sweep interval into the EWMA estimates.
 
@@ -79,7 +99,7 @@ class QueueParameterFit:
         self.samples += 1
         alpha = 2.0 / (self.samples + 1.0)
 
-        def ewma(old: Optional[float], new: float) -> float:
+        def ewma(old: float | None, new: float) -> float:
             return new if old is None else (1.0 - alpha) * old + alpha * new
 
         if trade_rate_sample is not None and trade_rate_sample > 0.0:
@@ -96,23 +116,23 @@ class QueueParameterFit:
 
     def build_model(
         self,
-        proxies: Dict[str, float],
-    ) -> Tuple[Optional["QueuePriorityValuationModel"], Dict[str, Any]]:
+        proxies: dict[str, float],
+    ) -> tuple[QueuePriorityValuationModel | None, dict[str, Any]]:
         """Construct the model from measurements, falling back to live proxies.
 
         Returns ``(model, sources)``. ``model`` is ``None`` only when a required
         parameter has neither a measurement nor a live proxy, in which case the
         caller must not silently substitute a hardcoded default.
         """
-        sources: Dict[str, Any] = {}
-        values: Dict[str, Optional[float]] = {}
+        sources: dict[str, Any] = {}
+        values: dict[str, float | None] = {}
 
         def pick(
             name: str,
-            measured: Optional[float],
-            proxy: Optional[float],
+            measured: float | None,
+            proxy: float | None,
             allow_zero: bool = False,
-        ) -> Optional[float]:
+        ) -> float | None:
             if measured is not None and (measured > 0.0 or (allow_zero and measured == 0.0)):
                 sources[name] = "measured"
                 return float(measured)
@@ -205,9 +225,9 @@ class PolygonPoSEnvironment:
     def measured(
         cls,
         chain_client: Any = None,
-        pol_usd_price: Optional[float] = None,
-        rpc_urls: Optional[tuple[str, ...]] = None,
-    ) -> "PolygonPoSEnvironment":
+        pol_usd_price: float | None = None,
+        rpc_urls: tuple[str, ...] | None = None,
+    ) -> PolygonPoSEnvironment:
         """Build from live gas and POL/USD measurements; raise when unmeasurable.
 
         ``base_fee_gwei`` receives the *all-in* price with a zero tip, so a
@@ -258,29 +278,59 @@ class QueueValuationResult:
 
 
 class QueuePriorityValuationModel:
-    """Quantitative valuation of FIFO limit order queue priority."""
+    """Quantitative valuation of FIFO limit order queue priority.
+
+    Every parameter is a measurement or a live fit
+    (:class:`QueueParameterFit`); the constructor takes no defaults and refuses
+    non-positive scale parameters. A caller with no measured microstructure
+    must refuse to value queue priority rather than value it at a hardcoded
+    representative market.
+    """
 
     def __init__(
         self,
-        trade_arrival_rate_shares_sec: float = 25.0,  # Average fill volume rate at touch
-        cancellation_rate_intensity: float = 0.05,    # Intensity of queue cancellations ahead
-        kyle_lambda: float = 0.00015,                  # Kyle's lambda price impact parameter
-        volatility_annualized: float = 0.45,           # Implied probability volatility
-        annual_capital_hurdle_rate: float = 0.12,      # 12% cost of capital
-        fill_model: Optional[FillModel] = None,        # Measured model; defaults to data/derived/fill_model.json
+        *,
+        trade_arrival_rate_shares_sec: float,
+        cancellation_rate_intensity: float,
+        kyle_lambda: float,
+        volatility_annualized: float,
+        annual_capital_hurdle_rate: float,
+        fill_model: FillModel | None = None,        # Measured model; defaults to data/derived/fill_model.json
     ) -> None:
-        self.trade_rate = max(1.0, trade_arrival_rate_shares_sec)
-        self.cancel_rate = max(0.001, cancellation_rate_intensity)
-        self.kyle_lambda = kyle_lambda
-        self.volatility = volatility_annualized
-        self.r_cost = annual_capital_hurdle_rate / (365.25 * 86_400.0)
+        trade_rate = float(trade_arrival_rate_shares_sec)
+        cancel_rate = float(cancellation_rate_intensity)
+        kyle = float(kyle_lambda)
+        volatility = float(volatility_annualized)
+        hurdle = float(annual_capital_hurdle_rate)
+        measured = {
+            "trade_arrival_rate_shares_sec": trade_rate,
+            "cancellation_rate_intensity": cancel_rate,
+            "kyle_lambda": kyle,
+            "volatility_annualized": volatility,
+            "annual_capital_hurdle_rate": hurdle,
+        }
+        for name, value in measured.items():
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"QueuePriorityValuationModel: {name}={value!r} is not a measured value"
+                )
+        if trade_rate <= 0.0:
+            raise ValueError(
+                "QueuePriorityValuationModel: trade_arrival_rate_shares_sec must be a "
+                "positive measured arrival rate"
+            )
+        self.trade_rate = trade_rate
+        self.cancel_rate = cancel_rate
+        self.kyle_lambda = kyle
+        self.volatility = volatility
+        self.r_cost = hurdle / YEAR_SECONDS
         self.fill_model = fill_model
 
     def calculate_fill_probability(
         self,
-        queue_ahead: Optional[float],
+        queue_ahead: float | None,
         quote_size: float,
-        level_size_shares: Optional[float] = None,
+        level_size_shares: float | None = None,
     ) -> float:
         """Print-conditional P(fill) for a quote at a level with a measured queue.
 
@@ -330,10 +380,13 @@ class QueuePriorityValuationModel:
         quote_size: float,
         queue_ahead: float,
         half_spread_cents: float,
-        token_mid_price: float = 0.50,
-        level_size_shares: Optional[float] = None,
+        token_mid_price: float,
+        level_size_shares: float | None = None,
     ) -> QueueValuationResult:
         """Evaluate the embedded economic option value of resting queue position.
+
+        ``token_mid_price`` is the measured mid: it is the capital tied up per
+        share, so the caller supplies it instead of a representative price.
 
         Deviation: ``queue_ahead`` includes better-price depth (strict
         ``spread < quote``), so the fill ratio is clamped at 1.0 and the measured
@@ -422,14 +475,21 @@ def solve_inventory_liquidation_friction(
     p_bid: float,
     p_ask_opp: float,
     gas_merge_usd: float,
-    taker_fee_rate: float = 0.0,
+    taker_fee_rate: float,
 ) -> LiquidationFrictionResult:
     """Solve the closed-form minimum friction for flattening residual inventory q.
 
     Option A: Sell q into p_bid. Cost = q * (p_mid - p_bid + fee).
     Option B: Buy q of opposite token at p_ask_opp + CTF merge.
               Cost = q * (p_ask_opp - (1.00 - p_mid) + fee) + gas_merge.
+
+    ``taker_fee_rate`` is required: the market's measured
+    :attr:`polymarketbot.fees.FeeSchedule.rate`. A missing rate is a refusal,
+    never a free exit.
     """
+    fee_rate = _validated_fee_rate(
+        taker_fee_rate, "solve_inventory_liquidation_friction"
+    )
     abs_q = abs(q)
     if abs_q < 1e-6:
         return LiquidationFrictionResult(
@@ -445,13 +505,13 @@ def solve_inventory_liquidation_friction(
         )
 
     # Route A: Direct Crossing
-    fee_direct = p_bid * taker_fee_rate
+    fee_direct = p_bid * fee_rate
     cost_direct = abs_q * (p_mid - p_bid + fee_direct)
     proceeds_direct = abs_q * (p_bid - fee_direct)
 
     # Route B: Synthetic Complete-Set Completion
     p_mid_opp = 1.00 - p_mid
-    fee_opp = p_ask_opp * taker_fee_rate
+    fee_opp = p_ask_opp * fee_rate
     cost_synthetic = abs_q * (p_ask_opp - p_mid_opp + fee_opp) + gas_merge_usd
     proceeds_synthetic = abs_q * 1.00 - abs_q * (p_ask_opp + fee_opp) - gas_merge_usd
 
@@ -506,7 +566,7 @@ class SwitchingCostDecomposition:
     total_switching_cost_usd: float
     liquidation_route: LiquidationRoute
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "queue_value_lost_usd": round(self.queue_value_lost_usd, 4),
             "liquidation_friction_usd": round(self.liquidation_friction_usd, 4),
@@ -536,15 +596,24 @@ class CapitalMigrationEngine:
 
     def __init__(
         self,
-        gas_env: Optional[PolygonPoSEnvironment] = None,
-        ctf_profile: Optional[CTFGasProfile] = None,
-        queue_model: Optional[QueuePriorityValuationModel] = None,
+        gas_env: PolygonPoSEnvironment | None = None,
+        ctf_profile: CTFGasProfile | None = None,
+        *,
+        queue_model: QueuePriorityValuationModel,
         safety_hurdle_pct: float = 0.0,
     ) -> None:
         # No default environment: an unmeasured fee market must not be invented.
+        # No default queue model: its parameters set both scale and shape, so a
+        # caller without a fit must refuse instead of valuing queue priority at
+        # a representative market.
+        if queue_model is None:
+            raise ValueError(
+                "CapitalMigrationEngine requires a measured queue model; build one "
+                "with QueueParameterFit.build_model and refuse when it returns None"
+            )
         self.gas_env = gas_env
         self.ctf_profile = ctf_profile or CTFGasProfile()
-        self.queue_model = queue_model or QueuePriorityValuationModel()
+        self.queue_model = queue_model
         self.safety_hurdle_pct = safety_hurdle_pct
 
     def compute_queue_loss(
@@ -554,18 +623,21 @@ class CapitalMigrationEngine:
         queue_ahead_bid: float,
         queue_ahead_ask: float,
         half_spread_cents: float,
-        mid_price: float = 0.50,
-        queue_model: Optional[QueuePriorityValuationModel] = None,
-        level_size_bid: Optional[float] = None,
-        level_size_ask: Optional[float] = None,
+        mid_price: float,
+        queue_model: QueuePriorityValuationModel | None = None,
+        level_size_bid: float | None = None,
+        level_size_ask: float | None = None,
     ) -> float:
         """Value of FIFO queue priority surrendered upon cancellation.
 
-        ``queue_model`` lets the caller inject a model fitted from measured
-        microstructure instead of the constructor default. ``level_size_bid`` /
-        ``level_size_ask`` are the displayed depths at the quote price levels
-        (the fill model's ``pre_size_at_level``); omitting them falls back to
-        the measured isotonic ratio buckets (GAP: no level depth measured).
+        ``mid_price`` is the measured mid of the market being left: it is the
+        capital tied up per share, so the caller supplies it rather than a
+        representative price. ``queue_model`` lets the caller inject a model
+        fitted from measured microstructure instead of the constructor's.
+        ``level_size_bid`` / ``level_size_ask`` are the displayed depths at the
+        quote price levels (the fill model's ``pre_size_at_level``); omitting
+        them falls back to the measured isotonic ratio buckets (GAP: no level
+        depth measured).
         """
         model = queue_model or self.queue_model
         val_bid = model.evaluate_queue_value(
@@ -589,17 +661,18 @@ class CapitalMigrationEngine:
     def compute_downtime_cost(
         self,
         daily_yield_a: float,
-        latency_seconds: float = 4.5,
+        latency_seconds: float,
     ) -> float:
         """Forgone yield over the measured unquoted interval.
 
-        ``latency_seconds`` is the whole interval the market is unquoted, so a
-        cancel-then-place move passes both measured flights and nothing else:
-        the published scoring rule has **no minimum rest time** (the venue
-        samples the book once per minute and scores what rests at that instant,
-        ``docs.polymarket.com/programs/liquidity-rewards``), so an order begins
-        accruing as soon as it lands. The default is a placeholder; measured
-        callers always supply the round trip they actually observe.
+        ``latency_seconds`` is the whole interval the market is unquoted: a
+        cancel-then-place move passes both measured flights **plus** the venue's
+        documented 3.5 s eligibility age ("Orders must be active on the book for
+        a minimum of 3.5 seconds to be eligible",
+        ``data/raw/docs/llms-full.txt:53855``), during which the new order rests
+        but earns nothing. An earlier revision asserted there was no minimum
+        rest time and so understated the downtime of every migration. It is
+        required: a placeholder round trip must not silently price the downtime.
         """
         return daily_yield_a * (max(0.0, latency_seconds) / 86_400.0)
 
@@ -615,15 +688,25 @@ class CapitalMigrationEngine:
         queue_ahead_ask: float,
         half_spread_cents_a: float,
         daily_yield_a: float,
+        taker_fee_rate: float,
+        transit_latency_seconds: float,
         has_matched_complete_sets: bool = True,
-        transit_latency_seconds: float = 4.5,
-        taker_fee_rate: float = 0.0,
     ) -> SwitchingCostDecomposition:
         """Compute the full economic switching friction: Cost_switch(A -> B).
 
-        Raises :class:`GasUnmeasured` when no measured fee market is available:
-        an unpriced merge must not be treated as free.
+        ``taker_fee_rate`` is the market's measured
+        :attr:`polymarketbot.fees.FeeSchedule.rate`; without it the taker exit
+        is unmeasured and the call refuses. Raises :class:`GasUnmeasured` when
+        no measured fee market is available: an unpriced merge must not be
+        treated as free.
+
+        ``transit_latency_seconds`` is one measured one-way CLOB round trip and
+        has no default: the previous 4.5 s placeholder was 8-14x the measured
+        p50 (322-570 ms) and priced every migration's downtime on it.
         """
+        fee_rate = _validated_fee_rate(
+            taker_fee_rate, "CapitalMigrationEngine.compute_switching_cost"
+        )
         env = self.gas_env
         if env is None:
             env = PolygonPoSEnvironment.measured()
@@ -647,7 +730,7 @@ class CapitalMigrationEngine:
             p_bid=p_bid_a,
             p_ask_opp=p_ask_opp_a,
             gas_merge_usd=merge_gas,
-            taker_fee_rate=taker_fee_rate,
+            taker_fee_rate=fee_rate,
         )
 
         # 3. Gas Fees: off-chain cancel is $0.00; mergePositions is merge_gas
@@ -660,18 +743,21 @@ class CapitalMigrationEngine:
             gas_fees = 0.0
 
         # 4. Downtime Opportunity Cost
-        # A migration is sequential: the old quote must pay its cancel flight
-        # and the new quote pays its placement flight, and the quote accrues
-        # from the moment it lands - the published rule has no minimum rest
-        # time. One transit latency cannot cover the unquoted interval of a
-        # cancel-then-place move.
+        # A migration is sequential: the old quote pays its cancel flight, the
+        # new quote pays its placement flight, and it earns nothing until it has
+        # rested the venue's 3.5 s eligibility age. One transit latency cannot
+        # cover the unquoted interval of a cancel-then-place move.
         opp_cost = self.compute_downtime_cost(
             daily_yield_a=daily_yield_a,
-            latency_seconds=2.0 * max(0.0, transit_latency_seconds),
+            latency_seconds=(
+                2.0 * max(0.0, transit_latency_seconds) + REWARD_ELIGIBILITY_SECONDS
+            ),
         )
 
-        # Baseline switching friction (network transit, order cancel/replacement latency)
-        total_cost = max(0.02, q_loss + liq.optimal_friction_usd + gas_fees + opp_cost)
+        # The total is the sum of measured components. A former ``max(0.02, ...)``
+        # floor added $0.02 of switching friction that no measurement produced,
+        # so a migration whose whole cost was $0.005 was priced at 4x.
+        total_cost = q_loss + liq.optimal_friction_usd + gas_fees + opp_cost
 
         return SwitchingCostDecomposition(
             queue_value_lost_usd=q_loss,
@@ -687,9 +773,15 @@ class CapitalMigrationEngine:
         y_net_a_daily: float,
         y_net_b_daily: float,
         switching_cost_usd: float,
-        holding_horizon_hours: float = 4.0,
+        holding_horizon_hours: float,
     ) -> HurdleDecision:
-        """Evaluate the Net Alpha condition: Delta_Yield * Tau >= Cost_switch."""
+        """Evaluate the Net Alpha condition: Delta_Yield * Tau >= Cost_switch.
+
+        ``holding_horizon_hours`` is how long the caller expects to hold the
+        destination, and it converts a one-off switching cost into a daily rate,
+        so it has no default: the former 4 h placeholder made a $1 cost a
+        $6/day hurdle, three-fold the answer a 12 h hold gives.
+        """
         tau_days = max(1.0 / 24.0, holding_horizon_hours / 24.0)
         delta_y = y_net_b_daily - y_net_a_daily
 

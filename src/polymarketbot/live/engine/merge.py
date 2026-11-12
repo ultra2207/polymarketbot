@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.onchain.ctf import MergeExecutionResult
@@ -38,15 +37,15 @@ class _CtfMergeOutcome:
 
     result: MergeExecutionResult
     apply: bool
-    chain_yes: Optional[float] = None
-    chain_no: Optional[float] = None
-    balance_read_error: Optional[BaseException] = None
+    chain_yes: float | None = None
+    chain_no: float | None = None
+    balance_read_error: BaseException | None = None
 
 
 class MergeMixin:
     """Single-flight CTF complete-set merges."""
 
-    def trigger_ctf_merge(self, amount_sets: Optional[float] = None) -> Optional[MergeExecutionResult]:
+    def trigger_ctf_merge(self, amount_sets: float | None = None) -> MergeExecutionResult | None:
         """Merge complete sets only when real on-chain settlement is possible.
 
         The inventory and cash mutation is driven exclusively by a confirmed
@@ -77,9 +76,21 @@ class MergeMixin:
         with self._lock:
             self._settlement_inflight.discard(self.condition_id)
 
+    def run_pending_ctf_merge(self) -> MergeExecutionResult | None:
+        """Run a merge a fill requested, with the engine lock released.
+
+        ``_apply_fill`` books fills under ``self._lock`` and cannot itself
+        broadcast: phase 2 waits on an RPC round trip and a block. The flag it
+        sets is consumed here, after the caller's lock scope ends.
+        """
+        if not getattr(self, "_merge_requested", False):
+            return None
+        self._merge_requested = False
+        return self.trigger_ctf_merge()
+
     def _claim_ctf_merge(
-        self, amount_sets: Optional[float]
-    ) -> Optional[_CtfMergePreflight]:
+        self, amount_sets: float | None
+    ) -> _CtfMergePreflight | None:
         """Phase 1: under the lock, snapshot merge state and claim the marker.
 
         Nothing here touches SQLite, the chain or the venue: every blocking call
@@ -148,7 +159,7 @@ class MergeMixin:
 
     def _execute_ctf_merge(
         self, preflight: _CtfMergePreflight
-    ) -> Optional[_CtfMergeOutcome]:
+    ) -> _CtfMergeOutcome | None:
         """Phase 2: every settlement I/O call, with no engine lock held.
 
         Returns None for a refusal (already logged), otherwise the receipt plus
@@ -175,7 +186,7 @@ class MergeMixin:
         addr = preflight.addr
         sets_to_merge = preflight.sets_to_merge
         route = SettlementRoute.CTF_MERGE
-        meta: Optional[dict] = None
+        meta: dict | None = None
         if not preflight.dry_run:
             if not addr:
                 logger.error(
@@ -193,7 +204,7 @@ class MergeMixin:
                 try:
                     chain_yes = float(self.ctf_client.get_position_balance(self.asset_id_yes, addr))
                     chain_no = float(self.ctf_client.get_position_balance(self.asset_id_no, addr))
-                except Exception as e:
+                except (RuntimeError, ValueError, KeyError, TypeError, OSError) as e:
                     logger.error(f"Settlement aborted: on-chain token balances are unverifiable: {e}")
                     return None
                 if chain_yes + 1e-9 < sets_to_merge or chain_no + 1e-9 < sets_to_merge:
@@ -267,9 +278,9 @@ class MergeMixin:
 
         # Post-merge chain re-read stays in the unlocked phase; phase 3 applies
         # whatever it returned and falls back to the local decrement on failure.
-        chain_yes: Optional[float] = None
-        chain_no: Optional[float] = None
-        balance_read_error: Optional[BaseException] = None
+        chain_yes: float | None = None
+        chain_no: float | None = None
+        balance_read_error: BaseException | None = None
         if not preflight.dry_run and route is SettlementRoute.CTF_MERGE:
             try:
                 chain_yes = float(
@@ -278,7 +289,7 @@ class MergeMixin:
                 chain_no = float(
                     self.ctf_client.get_position_balance(self.asset_id_no, addr)
                 )
-            except Exception as e:
+            except (RuntimeError, ValueError, KeyError, TypeError, OSError) as e:
                 balance_read_error = e
         return _CtfMergeOutcome(
             result=res,

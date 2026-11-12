@@ -14,12 +14,12 @@ from __future__ import annotations
 import pytest
 
 from polymarketbot.risk.fast_signer import (
-    ORDER_V2_TYPE_STRING,
-    FastEIP712SignerV2,
-    OrderV2,
     _SECP256K1_G,
     _SECP256K1_N,
     _SECP256K1_P,
+    ORDER_V2_TYPE_STRING,
+    FastEIP712SignerV2,
+    OrderV2,
     _point_add,
     _point_mul,
     keccak256,

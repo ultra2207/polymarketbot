@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import sqlite3
 
-
 from polymarketbot.strategy.reward.reconciler import format_report, reconcile_day
 
 _SCHEMA = """

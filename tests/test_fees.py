@@ -7,14 +7,18 @@ tables are displayed to cents, so the assertion tolerance is +/- 0.005 USDC per
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 
 from polymarketbot.fees import (
     FeeSchedule,
+    FeeScheduleUnreadable,
     era_schedule,
     fee_category,
     fee_curve_peak_rate,
     maker_rebate,
+    schedule_for_market,
     taker_fee,
 )
 
@@ -158,6 +162,87 @@ def test_schedule_from_market_falls_back_to_era():
     assert s.rate == pytest.approx(0.05)
 
 
+# ------------------------------------------------------ live Gamma fee payload
+# The per-market feeSchedule is authoritative (docs/fees.md). A payload that
+# cannot be parsed is a refusal; only a measured zero may be priced as free.
+
+
+def test_schedule_for_market_reads_the_published_payload():
+    market = {
+        "conditionId": "0xabc",
+        "feesEnabled": True,
+        "feeSchedule": {"rate": 0.07, "exponent": 1, "takerOnly": True,
+                        "rebateRate": 0.2},
+    }
+    schedule = schedule_for_market(market)
+    assert schedule.source == "gamma"
+    assert schedule.rate == pytest.approx(0.07)
+    assert schedule.rebate_rate == pytest.approx(0.2)
+    # 100 shares at 50c is the published 1.75 USDC peak for the crypto rate.
+    assert taker_fee(100, 0.5, schedule) == pytest.approx(1.75)
+
+
+def test_schedule_for_market_reads_the_fees_key():
+    schedule = schedule_for_market({"conditionId": "0xabc", "fees": {"rate": 0.05}})
+    assert schedule.rate == pytest.approx(0.05)
+
+
+def test_schedule_for_market_disabled_fees_are_an_explicit_zero():
+    schedule = schedule_for_market({"conditionId": "0xabc", "feesEnabled": False})
+    assert schedule == FeeSchedule.zero()
+    assert schedule.source == "zero"
+
+
+def test_schedule_for_market_missing_fee_fields_are_zero():
+    # A market created before fees existed carries none of the fee fields.
+    assert schedule_for_market({"conditionId": "0xabc"}) == FeeSchedule.zero()
+
+
+@pytest.mark.parametrize("payload", [
+    {"rate": "not-a-number"},
+    {"rate": None},
+    {"exponent": [1]},
+    "rate=0.07",
+    [],
+    {},
+])
+def test_schedule_for_market_malformed_payload_raises(payload):
+    market = {"conditionId": "0xbad", "feesEnabled": True, "feeSchedule": payload}
+    with pytest.raises(FeeScheduleUnreadable) as err:
+        schedule_for_market(market)
+    assert "0xbad" in str(err.value)
+    assert repr(payload) in str(err.value)
+
+
+def test_schedule_for_market_declared_fees_without_schedule_raises():
+    with pytest.raises(FeeScheduleUnreadable):
+        schedule_for_market({"conditionId": "0xbad", "feesEnabled": True})
+
+
+_GAMMA_ROW = {
+    "conditionId": "0xabc",
+    "outcomes": '["Yes", "No"]',
+    "clobTokenIds": '["1", "2"]',
+    "orderPriceMinTickSize": 0.01,
+    "orderMinSize": 5,
+}
+
+
+def test_parse_market_propagates_an_unreadable_schedule():
+    from polymarketbot.strategy.venue.reads import parse_market
+
+    with pytest.raises(FeeScheduleUnreadable):
+        parse_market({**_GAMMA_ROW, "feeSchedule": {"rate": "nope"}})
+
+
+def test_parse_market_keeps_disabled_fees_as_zero():
+    from polymarketbot.strategy.venue.reads import parse_market
+
+    market = parse_market({**_GAMMA_ROW, "feesEnabled": False})
+    assert market is not None
+    assert market.fee_schedule == FeeSchedule.zero()
+
+
 # ---------------------------------------------------------------- point-in-time
 # Gamma publishes only the *current* schedule, so a market created before fees
 # existed still shows today's rate. Pricing a 2025 fill from that rate charges
@@ -262,58 +347,14 @@ def test_observed_fee_types_match_era_end_state():
 
 # ---------------------------------------------------------------------------
 # Taker Rebate Program
+#
+# The published worked examples and the tier ladder are pinned on the
+# config-driven model in ``test_global_taker_rebate_ladder_and_weighted_volume``
+# below. The former hand-written duplicate of that ladder (``weighted_volume``,
+# ``taker_tier``, ``taker_rebate``, ``turnover_needed_for_tier``) is deleted: it
+# was dead code carrying a second copy of every threshold, so the two could
+# disagree without any test noticing.
 # ---------------------------------------------------------------------------
-
-def test_weighted_volume_matches_published_example():
-    """Politics, 1,000 shares at 0.40 => 400 * 0.60 * 1.3 = 312 wV."""
-    from polymarketbot.fees import weighted_volume
-    assert weighted_volume(400.0, 0.40, "politics") == pytest.approx(312.0)
-
-
-def test_weighted_volume_price_matters():
-    """Two $50 crypto trades; the cheap one earns more (0.95 vs 0.50 upside)."""
-    from polymarketbot.fees import weighted_volume
-    cheap = weighted_volume(50.0, 0.05, "crypto")
-    rich = weighted_volume(50.0, 0.50, "crypto")
-    assert cheap == pytest.approx(109.25)
-    assert rich == pytest.approx(57.5)
-    assert cheap > rich
-
-
-def test_geopolitics_earns_no_weighted_volume():
-    from polymarketbot.fees import weighted_volume
-    assert weighted_volume(1_000.0, 0.40, "geopolitics") == 0.0
-
-
-def test_tier_boundaries():
-    from polymarketbot.fees import taker_tier
-    assert taker_tier(0) == ("None", 0.0)
-    assert taker_tier(1_999) == ("None", 0.0)
-    assert taker_tier(2_000) == ("Bronze", 0.03)
-    assert taker_tier(19_999)[0] == "Bronze"
-    assert taker_tier(20_000) == ("Silver", 0.08)
-    assert taker_tier(10_000_000)[0] == "Obsidian"
-
-
-def test_rebate_does_not_exist_before_launch():
-    """The program opened 2026-05-28; a 2026-04 fee cannot have been rebated."""
-    from polymarketbot.fees import taker_rebate
-    assert taker_rebate(10.0, 1_000_000, "2026-04-01", 0.5, "crypto") == 0.0
-    assert taker_rebate(10.0, 1_000_000, "2026-07-01", 0.5, "crypto") > 0.0
-
-
-def test_rebate_is_small_at_entry_tier():
-    """The point of the model: Bronze rebate is a rounding error versus a 2c spread."""
-    from polymarketbot.fees import taker_rebate
-    fee_at_peak = 0.07 * (0.5 * 0.5)      # crypto peak fee per share
-    rebate = taker_rebate(fee_at_peak, 2_500, "2026-07-01", 0.5, "crypto")
-    assert rebate < 0.002, "Bronze rebate should be well under a fifth of a cent"
-
-
-def test_turnover_needed_for_gold_is_out_of_reach_at_small_size():
-    from polymarketbot.fees import turnover_needed_for_tier
-    turns = turnover_needed_for_tier(200_000, 2_000, 0.5, "crypto")
-    assert turns > 80, "reaching Gold at $2k capital would need an implausible turnover"
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +438,11 @@ def test_venue_is_resolved_from_the_endpoint() -> None:
 def test_global_category_table_still_matches_the_published_rates() -> None:
     """The global schedule is per category; the US Theta ladder must not leak
     into it. Rates from docs.polymarket.com/trading/fees, read 2026-11-10."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from polymarketbot.fees import us_taker_fee
 
-    when = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    when = datetime(2026, 11, 10, tzinfo=UTC)
     published = {
         "crypto": 0.07,
         "sports": 0.05,

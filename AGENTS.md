@@ -37,6 +37,11 @@ runs have already wasted hours here.
   timers (e.g. 15–30s) when waiting on background subagents or long tasks. Wait
   and check on a ~3-minute (180s) cadence to prevent wasting LLM context tokens,
   relying on reactive notifications to wake execution when subagents finish.
+- **Run only the tests that cover the files you changed.** The full suite is a
+  ~90-second default this repo kept paying for; it is not a verification step for
+  a one-function edit. Run the targeted test files (or the single test) for the
+  code touched, plus a bounded smoke of the changed path. Run the full suite only
+  when the user explicitly asks for it.
 
 
 ## Where code lives

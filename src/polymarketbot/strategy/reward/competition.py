@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.strategy.books import mid
 from polymarketbot.strategy.reward.scoring import (
@@ -35,12 +35,21 @@ PROTOCOL_SAMPLE_INTERVAL_S = _SECONDS_PER_DAY / float(PROTOCOL_EPOCH_SAMPLES)
 MIN_CONFIDENT_SAMPLES = 2
 
 
+def _utc_day_start(now: float) -> float:
+    """The UTC epoch boundary at or before ``now``, in POSIX seconds.
+
+    The venue's epoch is a UTC day (samples at 60 s cadence over 86,400 s), so
+    this is the instant a competing-score window resets.
+    """
+    return math.floor(float(now) / _SECONDS_PER_DAY) * _SECONDS_PER_DAY
+
+
 @dataclass(frozen=True)
 class CompetingEstimate:
     """Epoch-average competing score estimated from measured samples.
 
-    ``mean`` is the arithmetic mean of the window's readings and is the
-    denominator used for ranking and accrual; ``samples`` states how many
+    ``mean`` is the arithmetic mean of the current UTC day's readings and is
+    the denominator used for ranking and accrual; ``samples`` states how many
     venue-cadence snapshots it came from; ``variance`` is the unbiased sample
     variance of the window (``None`` below two samples, where it is undefined);
     ``snapshot`` is the latest raw reading. ``low_confidence`` is True below
@@ -51,7 +60,7 @@ class CompetingEstimate:
 
     mean: float
     samples: int
-    variance: Optional[float]
+    variance: float | None
     snapshot: float
 
     @property
@@ -73,16 +82,27 @@ class CompetingEstimate:
 
 
 class CompetingScoreWindow:
-    """Rolling window of measured competing scores, one reading per venue interval.
+    """Window of measured competing scores over the current **UTC day**.
 
     The venue divides a maker's score by the epoch average of the competing
-    book, over up to 1,440 samples. A single L2 snapshot is not that average:
-    measured on the paper engine it moved the implied reward rate 4.5x between
-    ticks ($104 -> $472.91/day, 49.37 %/day, window 9 of 2026-11-10) while the
-    time-averaged equity delta over the same 30 minutes was $286/day. This
-    window keeps at most one reading per :data:`PROTOCOL_SAMPLE_INTERVAL_S`
-    over one epoch and reports the mean, the count and the variance, so every
-    denominator can state how much evidence stands behind it.
+    book, over up to 1,440 samples, and the epoch is a UTC day. A single L2
+    snapshot is not that average: measured on the paper engine it moved the
+    implied reward rate 4.5x between ticks ($104 -> $472.91/day, 49.37 %/day,
+    window 9 of 2026-11-10) while the time-averaged equity delta over the same
+    30 minutes was $286/day. This window keeps at most one reading per
+    :data:`PROTOCOL_SAMPLE_INTERVAL_S` and reports the mean, the count and the
+    variance, so every denominator can state how much evidence stands behind
+    it.
+
+    The window is the current UTC day, not a trailing span of samples: readings
+    from a previous UTC day are dropped at the boundary, so the mean's
+    denominator is only the current day's evidence. That is what the venue
+    averages - a trailing window would keep yesterday's book in the
+    denominator for the first hours of today and mix two epochs. Within the
+    day the evidence is bounded by the day's elapsed time: at most
+    ``elapsed / PROTOCOL_SAMPLE_INTERVAL_S`` readings exist, so a mean taken
+    minutes after the reset is labelled low-confidence rather than presented
+    as the day's rate.
 
     A reading is only taken when the cadence has elapsed; the window itself is
     pure state, the caller supplies ``now``.
@@ -93,7 +113,11 @@ class CompetingScoreWindow:
         self._readings: dict[str, list[tuple[float, float]]] = {}
 
     def _prune(self, condition_id: str, now: float) -> list[tuple[float, float]]:
-        cutoff = now - self._horizon_s
+        # Two independent bounds: the current UTC day (the venue's epoch, which
+        # resets at midnight), and the trailing horizon (a shorter one when a
+        # caller asks for it). ``max`` keeps both, so a window never spans a
+        # day boundary.
+        cutoff = max(_utc_day_start(now), float(now) - self._horizon_s)
         series = self._readings.get(condition_id)
         if not series:
             return []
@@ -122,8 +146,8 @@ class CompetingScoreWindow:
         self,
         condition_id: str,
         now: float,
-        snapshot: Optional[float] = None,
-    ) -> Optional[CompetingEstimate]:
+        snapshot: float | None = None,
+    ) -> CompetingEstimate | None:
         """Window mean and its provenance; ``None`` when nothing was measured."""
         series = self._prune(condition_id, now)
         if not series:
@@ -181,7 +205,7 @@ class CompetingDetail:
 
 def market_competing_detail(
     market: Market, books: dict[str, dict[str, Any]]
-) -> Optional[CompetingDetail]:
+) -> CompetingDetail | None:
     """Side-resolved measured competing score of a binary market's pair.
 
     Returns ``None`` under the same conditions as
@@ -237,7 +261,7 @@ def market_competing_detail(
 
 def market_competing_score(
     market: Market, books: dict[str, dict[str, Any]]
-) -> Optional[float]:
+) -> float | None:
     """The market's MEASURED in-band competing score, summed over both tokens.
 
     Source: the venue's own L2 snapshot for **both** outcome-token books, each

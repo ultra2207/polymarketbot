@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from typing import List, Optional
 
 from polymarketbot.logs import get_logger
 
@@ -19,19 +18,34 @@ class CtfRedeemMixin:
     def redeem_positions(
         self,
         condition_id: str,
-        index_sets: Optional[List[int]] = None,
-        collateral_token: Optional[str] = None,
+        index_sets: list[int] | None = None,
+        collateral_token: str | None = None,
         parent_collection_id: str = ZERO_BYTES32,
-        pol_usd_price: Optional[float] = None,
+        pol_usd_price: float | None = None,
     ) -> RedeemExecutionResult:
         """Execute or simulate on-chain CTF position redemption for resolved markets."""
         indices = list(index_sets or [1, 2])
-        calldata = self.encode_redeem_positions(
-            condition_id=condition_id,
-            index_sets=indices,
-            collateral_token=collateral_token,
-            parent_collection_id=parent_collection_id,
-        )
+        try:
+            calldata = self.encode_redeem_positions(
+                condition_id=condition_id,
+                index_sets=indices,
+                collateral_token=collateral_token,
+                parent_collection_id=parent_collection_id,
+            )
+        except ValueError as exc:
+            logger.error(
+                f"CTF redeemPositions refused for condition {condition_id[:14]}: {exc}"
+            )
+            return RedeemExecutionResult(
+                success=False,
+                tx_hash="",
+                condition_id=condition_id,
+                index_sets=indices,
+                gas_fee_usd=0.0,
+                gas_units_used=0,
+                error=f"invalid redeem calldata: {exc}",
+                is_dry_run=bool(self.dry_run),
+            )
 
         live_key_error = self._live_without_key_reason()
         if live_key_error is not None:

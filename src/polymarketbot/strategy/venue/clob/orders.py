@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Optional, Union
+from typing import Any
 
 from polymarketbot.execution.self_trade import STPAction
 from polymarketbot.logs import get_logger
@@ -31,7 +31,7 @@ class OrderMixin:
         price: float,
         size: float,
         *,
-        raw: Optional[dict[str, Any]] = None,
+        raw: dict[str, Any] | None = None,
         signature: str = "",
     ) -> OrderPlacementResult:
         return OrderPlacementResult(
@@ -54,9 +54,10 @@ class OrderMixin:
         price: float,
         size: float,
         *,
-        tick_size: Optional[float],
-        neg_risk: Optional[bool],
-    ) -> Union[_PreparedOrder, OrderPlacementResult]:
+        tick_size: float | None,
+        neg_risk: bool | None,
+        min_order_usd: float | None,
+    ) -> _PreparedOrder | OrderPlacementResult:
         """Validate an order request and snap price/size to the market tick.
 
         Returns ``_PreparedOrder`` on success or a REJECTED
@@ -132,6 +133,20 @@ class OrderMixin:
                 price,
                 size,
             )
+        # The venue's ``orderMinSize`` is a USDC notional (Gamma docs: "Minimum
+        # order size in USDC; the CLOB rejects orders below this threshold").
+        # Checking it here spends no signing round trip and no rejection.
+        if min_order_usd is not None and min_order_usd > 0.0:
+            notional = rounded_size * rounded_price
+            if notional + 1e-9 < min_order_usd:
+                return self._placement_failure(
+                    "REJECTED",
+                    f"order notional ${notional:.4f} is below the market's minimum "
+                    f"${min_order_usd:.2f}",
+                    side,
+                    price,
+                    size,
+                )
 
         return _PreparedOrder(
             token_id=token_str,
@@ -151,11 +166,12 @@ class OrderMixin:
         price: float,
         size: float,
         *,
-        tick_size: Optional[float] = None,
-        fee_rate_bps: int = 0,
+        tick_size: float | None = None,
+        fee_rate_bps: int | None = None,
+        min_order_usd: float | None = None,
         expiration: int = 0,
         order_type: str = "GTC",
-        neg_risk: Optional[bool] = None,
+        neg_risk: bool | None = None,
         post_only: bool = False,
         metadata: str = ZERO_BYTES32_HEX,
         builder_code: str = ZERO_BYTES32_HEX,
@@ -169,6 +185,13 @@ class OrderMixin:
             - ``tick_size``/``neg_risk`` default to ``GET /tick-size`` and
               ``GET /neg-risk`` for the token (cached), so live orders never use a
               guessed market parameter. Dry-run uses 0.01 / False offline.
+            - ``min_order_usd`` is the market's published ``orderMinSize`` (USDC
+              notional). Supplied, a sub-minimum order is refused locally; the
+              venue's own rejection costs a signing and submit round trip.
+            - ``fee_rate_bps`` is the market's own ``fee_rate_bps``. The signed V1
+              struct commits to it, so a V1 order without it is refused instead of
+              being signed with a zero taker fee; the V2 struct carries no fee
+              field and ignores it.
             - The order version comes from ``GET /version``; an
               ``order_version_mismatch`` rejection refetches the version once and
               retries the order exactly once.
@@ -176,6 +199,7 @@ class OrderMixin:
         In dry-run mode, computes the authentic EIP-712 signature and records
         the order locally without sending real funds to CLOB.
         """
+        fee_bps = 0 if fee_rate_bps is None else int(fee_rate_bps)
         try:
             prepared = self._prepare_order(
                 token_id,
@@ -184,6 +208,7 @@ class OrderMixin:
                 size,
                 tick_size=tick_size,
                 neg_risk=neg_risk,
+                min_order_usd=min_order_usd,
             )
             if isinstance(prepared, OrderPlacementResult):
                 return prepared
@@ -217,7 +242,7 @@ class OrderMixin:
 
             signed = self._sign_order(
                 prepared,
-                fee_rate_bps=int(fee_rate_bps),
+                fee_rate_bps=fee_bps,
                 expiration=int(expiration),
                 order_type=order_type,
                 metadata=metadata,
@@ -230,14 +255,14 @@ class OrderMixin:
         except ValueError as e:
             logger.error(f"Invalid order parameters: {e}")
             return self._placement_failure("REJECTED", str(e), side, price, size)
-        except Exception as e:
+        except (TypeError, KeyError) as e:
             logger.error(f"Failed to generate signed order payload: {e}")
             return self._placement_failure("ERROR", str(e), side, price, size)
 
         return self._dispatch_order(
             prepared,
             signed,
-            fee_rate_bps=int(fee_rate_bps),
+            fee_rate_bps=fee_bps,
             expiration=int(expiration),
             order_type=order_type,
             metadata=metadata,

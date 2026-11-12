@@ -21,14 +21,28 @@ historical lookup return zero rows.
 
 Rate limits: 300 req/10s on `/markets`, 500 on `/events`. This client defaults
 to 10 req/s.
+
+Errors
+------
+Three classes, because the caller acts differently on each:
+
+* :class:`GammaTransportError` - the request never completed (connection,
+  timeout). Retried with backoff.
+* :class:`GammaHTTPError` - the venue answered 429 or 5xx (retried) or any
+  other 4xx (raised immediately: retrying a malformed request cannot fix it,
+  and it used to burn five backoffs and 20+ seconds per call).
+* :class:`GammaUnparseable` - a 2xx body that is not JSON. Retried, because a
+  truncated body can be a proxy artefact, and raised as itself if it survives.
 """
 
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 import requests
 
@@ -39,6 +53,33 @@ logger = get_logger("gamma")
 
 BASE = "https://gamma-api.polymarket.com"
 MAX_BATCH = 100
+# A venue that answers 429 with a multi-hour Retry-After must fail the request,
+# not freeze the caller for the duration; the walk retries on its next tick.
+MAX_RETRY_SLEEP_S = 60.0
+
+
+class GammaError(RuntimeError):
+    """A Gamma request that could not be completed."""
+
+
+class GammaTransportError(GammaError):
+    """The request never reached an answer (DNS, connect, TLS, timeout)."""
+
+
+class GammaHTTPError(GammaError):
+    """Gamma answered with a non-retryable status, or retries ran out on a 4xx/5xx."""
+
+    def __init__(self, status: int, path: str, detail: str = "") -> None:
+        self.status = status
+        self.path = path
+        message = f"GET {path} -> HTTP {status}"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
+
+
+class GammaUnparseable(GammaError):
+    """A 2xx response whose body is not the JSON the caller asked for."""
 
 
 @dataclass
@@ -48,34 +89,66 @@ class GammaClient:
     max_retries: int = 5
     session: requests.Session = field(default_factory=requests.Session)
     _last_call: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
         self.session.headers.setdefault("User-Agent", "polymarketbot-research/0.1")
 
     def _throttle(self) -> None:
-        wait = self.min_interval_s - (time.monotonic() - self._last_call)
-        if wait > 0:
-            time.sleep(wait)
-        self._last_call = time.monotonic()
+        # One client is shared by the universe walker and the metadata refresh;
+        # an unlocked read/modify of `_last_call` let two threads both see an
+        # expired wait and fire together, which is the burst the venue resets.
+        with self._lock:
+            wait = self.min_interval_s - (time.monotonic() - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+
+    @staticmethod
+    def _retry_after_s(response: requests.Response, attempt: int) -> float:
+        """Seconds to rest after a 429: the header when it is a number, else linear backoff."""
+        raw = response.headers.get("Retry-After")
+        if raw:
+            try:
+                return max(0.0, min(float(raw), MAX_RETRY_SLEEP_S))
+            except ValueError:
+                pass  # HTTP-date form; fall back to linear backoff
+        return min(2.0 * (attempt + 1), MAX_RETRY_SLEEP_S)
 
     def get(self, path: str, params: dict | list[tuple] | None = None) -> Any:
-        last: Exception | None = None
+        last: GammaError | None = None
         for attempt in range(self.max_retries):
             self._throttle()
             try:
-                r = self.session.get(f"{BASE}{path}", params=params, timeout=self.timeout_s)
-                if r.status_code == 429:
-                    time.sleep(float(r.headers.get("Retry-After", 2 * (attempt + 1))))
-                    continue
-                if r.status_code >= 500:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                r.raise_for_status()
+                r = self.session.get(
+                    f"{BASE}{path}", params=params, timeout=self.timeout_s
+                )
+            except requests.RequestException as exc:
+                last = GammaTransportError(f"GET {path}: {exc}")
+                time.sleep(min(1.5 * (attempt + 1), MAX_RETRY_SLEEP_S))
+                continue
+            if r.status_code == 429:
+                last = GammaHTTPError(429, path, "rate limited")
+                time.sleep(self._retry_after_s(r, attempt))
+                continue
+            if r.status_code >= 500:
+                last = GammaHTTPError(r.status_code, path)
+                time.sleep(min(1.5 * (attempt + 1), MAX_RETRY_SLEEP_S))
+                continue
+            if r.status_code >= 400:
+                # 4xx other than 429 is the caller's request. It used to be
+                # caught by the blanket handler and retried five times.
+                raise GammaHTTPError(r.status_code, path, r.text[:200])
+            try:
                 return r.json()
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                time.sleep(1.5 * (attempt + 1))
-        raise RuntimeError(f"GET {path} failed after {self.max_retries} attempts: {last}")
+            except ValueError as exc:
+                last = GammaUnparseable(f"GET {path}: body is not JSON ({exc})")
+                time.sleep(min(1.5 * (attempt + 1), MAX_RETRY_SLEEP_S))
+        if isinstance(last, GammaUnparseable):
+            raise last
+        raise GammaError(
+            f"GET {path} failed after {self.max_retries} attempts: {last}"
+        ) from last
 
     # ------------------------------------------------------------------ markets
     def market(self, condition_id: str) -> dict | None:
@@ -162,8 +235,7 @@ class GammaClient:
         while True:
             payload = self.markets_keyset(closed=closed, version=version,
                                           after_cursor=cursor, extra=extra)
-            for m in payload.get("markets") or []:
-                yield m
+            yield from payload.get("markets") or []
             pages += 1
             cursor = payload.get("next_cursor")
             if not cursor or (max_pages and pages >= max_pages):

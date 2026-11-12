@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.clob import ClobAPIError
@@ -20,10 +19,10 @@ class PreflightReport:
     rpc_connected: bool
     wallet_address: str
     usdc_balance: float
-    pol_balance: float
+    pol_balance: float | None
     allowances_approved: bool
     dry_run_mode: bool
-    recommendations: List[str] = field(default_factory=list)
+    recommendations: list[str] = field(default_factory=list)
     free_cash: float = 0.0
     locked_cash: float = 0.0
     order_version: int = 0
@@ -37,7 +36,8 @@ class PreflightReport:
             f"  - Free Cash: ${self.free_cash:.2f}",
             f"  - Locked (resting BUY notional): ${self.locked_cash:.2f}",
             f"  - USDC Balance: ${self.usdc_balance:.2f}",
-            f"  - POL Gas Balance: {self.pol_balance:.4f} POL",
+            "  - POL Gas Balance: "
+            + (f"{self.pol_balance:.4f} POL" if self.pol_balance is not None else "unmeasured"),
             f"  - CLOB Order Version: {self.order_version}",
             f"  - CTF Allowances: {'APPROVED' if self.allowances_approved else 'UNAPPROVED / PENDING'}",
         ]
@@ -65,7 +65,7 @@ class PreflightMixin:
             api_ok = bool(self.clob_client.credentials.is_configured)
             format_errors = list(self.clob_client.credentials.validate_formatting())
             has_key = bool(self.clob_client.credentials.has_signing_key)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - a preflight report must never raise
             api_ok = False
             format_errors = [str(e)]
             has_key = False
@@ -81,15 +81,15 @@ class PreflightMixin:
                 rpc_reason = f"Polygon RPC health check failed: {detail}"
             else:
                 rpc_ok = self.ctf_client.chain_client.block_number() > 0
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a preflight report must never raise
             rpc_ok = False
             rpc_reason = f"Polygon RPC health check failed: {exc}"
 
         free_cash = float(self.cash)
         locked_cash = float(self._compute_locked_cash())
-        allowance_error: Optional[str] = None
+        allowance_error: str | None = None
         approved = False
-        balance_error: Optional[str] = None
+        balance_error: str | None = None
         try:
             balance = self.clob_client.get_balance()
             self.cash = float(balance["available"])
@@ -106,9 +106,6 @@ class PreflightMixin:
         try:
             order_version = int(self._order_version_safe())
         except ClobAPIError as e:
-            order_version = 0
-            recs.append(f"CLOB order version could not be resolved: {e}")
-        except Exception as e:
             order_version = 0
             recs.append(f"CLOB order version could not be resolved: {e}")
 
@@ -138,13 +135,24 @@ class PreflightMixin:
         pol_error_ok = True
         if addr:
             try:
-                self.pol_balance = self.ctf_client.get_pol_balance(addr)
-            except Exception as e:
+                pol = self.ctf_client.get_pol_balance(addr)
+            except Exception as e:  # noqa: BLE001 - a preflight report must never raise
+                pol = None
                 pol_error_ok = False
                 recs.append(f"POL gas balance could not be read from RPC: {e}")
-        if self.pol_balance < 0.05:
+            else:
+                if pol is None:
+                    pol_error_ok = False
+                    recs.append(
+                        "POL gas balance could not be measured (no RPC figure); "
+                        "CTF merges need gas."
+                    )
+                else:
+                    self.pol_balance = float(pol)
+        current_pol = self.pol_balance
+        if current_pol is not None and current_pol < 0.05:
             recs.append(
-                f"POL Gas balance is low ({self.pol_balance:.4f} POL). Deposit at least 1-2 POL for CTF merges."
+                f"POL Gas balance is low ({current_pol:.4f} POL). Deposit at least 1-2 POL for CTF merges."
             )
         if not approved:
             ready = False
@@ -211,9 +219,19 @@ class PreflightMixin:
             addr = str(getattr(self.clob_client, "maker_address", "") or "")
             if addr:
                 try:
-                    self.pol_balance = float(self.ctf_client.get_pol_balance(addr))
-                except Exception as e:
+                    pol = self.ctf_client.get_pol_balance(addr)
+                except Exception as e:  # noqa: BLE001 - balance sync must never raise
                     logger.warning(f"Failed to read POL gas balance for {addr}: {e}")
+                else:
+                    if pol is None:
+                        # Unmeasured stays unmeasured: the last figure is kept
+                        # rather than replaced by a fabricated zero.
+                        logger.warning(
+                            f"POL gas balance for {addr} was not measurable; "
+                            f"keeping the last figure ({self.pol_balance})"
+                        )
+                    else:
+                        self.pol_balance = float(pol)
 
         self.total_wallet_balance = (
             self.get_cash() + self.get_locked_cash() + self._inventory_value()

@@ -6,7 +6,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any
 
 import orjson
 
@@ -16,8 +16,10 @@ from polymarketbot.strategy.venue.clob.common import (
     ZERO_ADDRESS,
     ZERO_BYTES32_HEX,
 )
-from polymarketbot.strategy.venue.clob.ticks import compute_order_amounts, round_price_to_tick
-
+from polymarketbot.strategy.venue.clob.ticks import (
+    compute_order_amounts,
+    round_price_to_tick,
+)
 
 # Order salts: random 63-bit value with a process-local counter in the low 31 bits.
 # Two orders created in the same millisecond can never collide (audit S17).
@@ -55,9 +57,9 @@ class _PreparedOrder:
 class _SignedOrder:
     """Signed payload ready for dispatch."""
 
-    order: Optional[Union[FastOrder, OrderV2]]
+    order: FastOrder | OrderV2 | None
     payload: dict[str, Any]
-    raw_bytes: Optional[bytes]
+    raw_bytes: bytes | None
     signature: str
     order_version: int
 
@@ -72,19 +74,19 @@ class SignedOrderMixin:
         side: str,  # "BUY" or "SELL"
         price: float,
         size: float,
-        salt: Optional[int] = None,
+        salt: int | None = None,
         expiration: int = 0,
-        signature_type: Optional[int] = None,
-        fee_rate_bps: int = 0,
+        signature_type: int | None = None,
+        fee_rate_bps: int | None = None,
         neg_risk: bool = False,
         order_type: str = "GTC",
         tick_size: float = DEFAULT_TICK_SIZE,
         metadata: str = ZERO_BYTES32_HEX,
         builder_code: str = ZERO_BYTES32_HEX,
-        timestamp: Optional[int] = None,
+        timestamp: int | None = None,
         post_only: bool = False,
-        order_version: Optional[int] = None,
-    ) -> tuple[Union[FastOrder, OrderV2], dict[str, Any]]:
+        order_version: int | None = None,
+    ) -> tuple[FastOrder | OrderV2, dict[str, Any]]:
         """Create the order struct and generate an authentic EIP-712 signature.
 
         Order version is selected from the cached ``GET /version`` (or the
@@ -140,6 +142,13 @@ class SignedOrderMixin:
             raise ValueError(
                 "signature_type 3 (POLY_1271 Deposit Wallet) requires CLOB order version 2"
             )
+        if version == 1 and fee_rate_bps is None:
+            # The V1 struct carries ``feeRateBps`` in the signed payload: a
+            # defaulted zero would tell the exchange this order is fee-free.
+            raise ValueError(
+                "fee_rate_bps is required for a V1 order (the signed struct commits "
+                "to it); pass the market's own fee rate"
+            )
         if sig_type == 3 and not self.credentials.address:
             raise ValueError(
                 "signature_type 3 requires the Deposit Wallet address "
@@ -163,7 +172,7 @@ class SignedOrderMixin:
                 order_ts_ms = (
                     int(timestamp) if timestamp is not None else int(time.time() * 1000)
                 )
-                order: Union[FastOrder, OrderV2] = OrderV2(
+                order: FastOrder | OrderV2 = OrderV2(
                     salt=order_salt,
                     maker=self.maker_address,
                     signer=order_signer,
@@ -202,6 +211,11 @@ class SignedOrderMixin:
                 # CLOB expects the owner field to be the API key UUID, not an address.
                 payload["owner"] = self.credentials.api_key
                 payload["orderType"] = str(order_type or "GTC")
+                # ``postOnly`` is a top-level request field, not part of the
+                # signed struct: without it the order is submitted as a plain
+                # GTC and may cross the book as a taker.
+                if post_only:
+                    payload["postOnly"] = True
         return order, payload
 
     @staticmethod
@@ -222,25 +236,9 @@ class SignedOrderMixin:
     ) -> _SignedOrder:
         """Sign ``prepared``, preferring an exact pre-signed cached payload."""
         order_version = self._resolve_order_version()
-        order: Optional[Union[FastOrder, OrderV2]] = None
-        payload: Optional[dict[str, Any]] = None
-        raw_bytes: Optional[bytes] = None
+        order: FastOrder | OrderV2 | None = None
+        payload: dict[str, Any] | None = None
         signature = ""
-
-        if self.presigned_cache is not None:
-            cached = self.presigned_cache.pop_order(
-                token_id=prepared.token_id,
-                side=prepared.side,
-                price=prepared.rounded_price,
-                size=prepared.rounded_size,
-                tick_size=prepared.tick_size,
-            )
-            if cached is not None:
-                order = cached.order
-                payload = cached.payload
-                raw_bytes = cached.raw_json_bytes
-                signature = cached.signature
-                order_version = cached.version
 
         if payload is None:
             order, payload = self.build_signed_order(
@@ -259,12 +257,11 @@ class SignedOrderMixin:
                 order_version=order_version,
             )
             signature = payload.get("signature") or payload.get("order", {}).get("signature", "")
-            raw_bytes = orjson.dumps(payload)
 
         return _SignedOrder(
             order=order,
             payload=payload,
-            raw_bytes=raw_bytes,
+            raw_bytes=orjson.dumps(payload),
             signature=signature,
             order_version=order_version,
         )

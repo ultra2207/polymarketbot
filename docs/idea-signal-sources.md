@@ -6,8 +6,9 @@ the retired idea-signal builder (`--slug <slug>`); every table below passed the
 runner's validation (required `asset_id`/`ts_ms`, numeric signals, no duplicate
 `(asset_id, ts_ms)`).
 
-Rows are per `(asset_id, ts_ms)` on a fixed grid, and the replay harness joins
-them **as-of backwards** (`scripts/replay_all_markets.py::SignalBook`), so a row
+Rows are per `(asset_id, ts_ms)` on a fixed grid, and the (deleted) replay
+harness joined them **as-of backwards** (`scripts/replay_all_markets.py::SignalBook`,
+removed in the 2026-11-10 scripts cleanup), so a row
 stays valid from its `ts_ms` until the next row for that asset. A snapshot too
 stale to use stays in the table: the module, not the SQL, applies the max-age
 cut-off (that is how "absent, not zero" is implemented).

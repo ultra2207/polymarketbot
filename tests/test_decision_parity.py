@@ -11,7 +11,7 @@ pins that: every case runs the same fixed fixture through
   and
 * the **live path**: ``live/quoting.QuotingMixin`` - the neutral maker quoting
   that places the live bids, plus ``compute_quote_scores`` /
-  ``_measure_reward_score`` / ``get_current_daily_yield``, which is how the live
+  ``get_current_daily_yield``, which is how the live
   engine prices the reward on those bids,
 
 and asserts identical output.
@@ -37,8 +37,9 @@ accept/refuse gate on either side breaks an ``==`` or a ``pytest.approx`` here.
 The refuse cases pin the three semantics the live path adopted from the paper
 pillar (it used to hold a second opinion on each):
 
-* a **sub-floor** daily payout is zero, not a small cash amount (the venue's
-  published $1.00/day term),
+* a **sub-floor** daily payout is a real unfloored rate, banked per UTC day
+  behind the venue's $1.00 minimum and only credited when that day's total
+  clears it - never zeroed at the instant and never paid as partial cash,
 * only the **resting** quote is scored - never the configured spread offset -
   so a quote sitting at the band edge earns nothing,
 * a missing book or a missing measured competing denominator is **unmeasured**
@@ -51,9 +52,10 @@ import dataclasses
 
 import pytest
 
-import polymarketbot.strategy.reward.quote_candidates as quote_candidates
+from polymarketbot.fees import FeeSchedule, schedule_for_market
 from polymarketbot.live.base import BaseMarketMakingEngine, PositionView
 from polymarketbot.strategy.books import mid, qualifying_score
+from polymarketbot.strategy.reward import quote_candidates
 from polymarketbot.strategy.reward.decision import (
     measured_accrual,
     plan_quotes,
@@ -75,6 +77,16 @@ CAPITAL = 19.6
 # The live engine's configured distance from the mid. One venue tick, i.e. the
 # same distance ``bid + tick`` sits from the mid on a two-tick-wide book.
 SPREAD_OFFSET_CENTS = 1.0
+
+
+def _fee_schedule() -> FeeSchedule:
+    """The fixture market's schedule: fees disabled, so an explicit zero.
+
+    ``schedule_for_market`` is the only fee authority. The harness models the
+    same zero-fee market as ``_market()``, and a Gamma payload that disables
+    fees returns ``FeeSchedule.zero()`` - never a guessed rate.
+    """
+    return schedule_for_market({"conditionId": "0xPARITY", "feesEnabled": False})
 
 
 def _market(max_spread_cents: float = MAX_SPREAD_CENTS) -> Market:
@@ -170,6 +182,13 @@ class _HarnessEngine(BaseMarketMakingEngine):
             competing_score_override=competing_score,
             db_path=tmp_path / "parity.db",
             ledger_path=tmp_path / "parity_ledger.json",
+            # The live engine takes the market's published fee schedule, the
+            # capital it is trading and the cash it holds back. This harness
+            # models the fixture's zero-fee market, all of its cash as
+            # bankroll, and no reserved cash (``get_locked_cash()`` is 0).
+            fee_schedule=_fee_schedule(),
+            bankroll_usd=float(cash),
+            cash_reserve_usd=0.0,
         )
         self.quote_tick_size = TICK
 
@@ -322,7 +341,6 @@ def test_in_band_yes_leg_decision_matches(tmp_path, measured_cell):
         engine._cancel_quote("BUY_NO")
         q_min, _q_one, _q_two = engine.compute_quote_scores()
         assert q_min == pytest.approx(accrual.our_score, rel=1e-12)
-        assert engine._measure_reward_score() == pytest.approx(accrual.our_score, rel=1e-12)
         assert engine.get_current_daily_yield() == pytest.approx(
             accrual.usd_per_day, rel=1e-9
         )
@@ -371,7 +389,6 @@ def test_in_band_no_leg_decision_matches(tmp_path, measured_cell):
         q_min, q_one, q_two = engine.compute_quote_scores()
         assert q_two > 0.0 and q_one == 0.0
         assert q_min == pytest.approx(accrual.our_score, rel=1e-12)
-        assert engine._measure_reward_score() == pytest.approx(accrual.our_score, rel=1e-12)
         assert engine.get_current_daily_yield() == pytest.approx(
             accrual.usd_per_day, rel=1e-9
         )
@@ -406,7 +423,6 @@ def test_out_of_band_book_is_refused_by_both_paths(tmp_path, measured_cell):
         # the paper pillar refuses to claim a payout for it.
         engine._cancel_quote("BUY_NO")
         assert engine.compute_quote_scores() == (0.0, 0.0, 0.0)
-        assert engine._measure_reward_score() == 0.0
         assert engine.get_current_daily_yield() == 0.0
     finally:
         engine.close()
@@ -437,17 +453,19 @@ def test_capital_below_minimum_lot_is_refused_by_both_paths(tmp_path, measured_c
 
 
 # ---------------------------------------------------------------------------
-# Case 5: sub-floor pool - the venue pays nothing, both paths report nothing
+# Case 5: sub-$1/day pool - the rate is real, the payout waits for the day total
 # ---------------------------------------------------------------------------
 
-def test_sub_floor_pool_pays_nothing_in_both_paths(tmp_path, measured_cell):
+def test_sub_floor_pool_is_not_zeroed_at_the_instant(tmp_path, measured_cell):
     books = _books(0.42, 0.46)
     pool = 10.0  # a day's pool this quote's share cannot lift over $1.00
     market = dataclasses.replace(_market(), daily_reward=pool)
 
-    # Paper: the payout for the lot both paths would rest is below the floor, so
-    # there is no payout, and the allocator cannot clear its minimum floor
-    # capital, so it quotes nothing.
+    # Paper: measured_accrual reports this quote's real, unfloored share of the
+    # pool. The venue's $1.00 minimum is a property of a market's UTC-day total,
+    # applied at rollover - never of an instantaneous rate - so zeroing it here
+    # would discard a real accrual. The allocator still refuses to spend capital
+    # on a plan whose expected day cannot clear the floor, so it quotes nothing.
     assert plan_quotes(
         reward_candidates([market], books, [], fill_horizon_s=30.0), CAPITAL, {}
     ) == []
@@ -462,8 +480,10 @@ def test_sub_floor_pool_pays_nothing_in_both_paths(tmp_path, measured_cell):
         competing=None,
     )
     assert accrual is not None
-    assert accrual.qualifies is False
-    assert accrual.usd_per_day == 0.0
+    assert accrual.qualifies is True
+    # Raw rate: 10 * 4.2667 / (144.0 + 4.2667) = $0.2878/day, unfloored.
+    assert accrual.usd_per_day == pytest.approx(0.2878, abs=1e-3)
+    assert 0.0 < accrual.usd_per_day < 1.0
 
     engine = _engine(
         tmp_path, books, cash=CAPITAL, max_spread=MAX_SPREAD_CENTS, daily_reward=pool
@@ -472,12 +492,13 @@ def test_sub_floor_pool_pays_nothing_in_both_paths(tmp_path, measured_cell):
         engine._execute_neutral_maker_quoting(0.44, 0.42, 0.46, 1000.0)
         # The quote still scores (live places it for spread capture)...
         assert engine.compute_quote_scores()[0] > 0.0
-        # ...but the sub-floor share is worth zero to the venue, so it is not a
-        # yield: the old live answer here was that raw sub-floor share (0.8163).
-        score = engine._measure_reward_score()
-        assert score is not None and score > 0.0
+        # ...and the unfloored gross is the same sub-$1/day rate the paper path
+        # banks. It is not payable cash: the live yield stays 0.0 until a
+        # completed UTC day's total clears the $1.00 floor at settlement.
+        score = engine.compute_quote_scores()[0]
+        assert score > 0.0
         gross = pool * score / (score + accrual.competing_score)
-        assert gross < 1.0  # the number the live path used to report, sub-floor
+        assert gross < 1.0
         assert engine.get_current_daily_yield() == 0.0
     finally:
         engine.close()
@@ -515,6 +536,8 @@ def test_no_book_is_unmeasured_in_both_paths(tmp_path, measured_cell):
         max_spread=MAX_SPREAD_CENTS,
     )
     try:
+        # Only the measurement hook distinguishes an unmeasured book (None)
+        # from a measured zero; compute_quote_scores() collapses both to 0.0.
         assert engine._measure_reward_score() is None
         assert engine.get_current_daily_yield() == 0.0
     finally:

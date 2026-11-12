@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.books import best_ask, best_bid, mid
@@ -23,7 +23,7 @@ log = get_logger("polymarketbot.strategy.reward.decision")
 
 def _cheaper_leg(
     market: Market, books: dict[str, dict[str, Any]]
-) -> Optional[tuple[float, str, dict[str, Any]]]:
+) -> tuple[float, str, dict[str, Any]] | None:
     """(leg mid, token_id, book) for the lower-priced leg of a binary market.
 
     The leg price is ``mid`` of a token below 0.5, otherwise ``1 - mid`` of the
@@ -31,7 +31,7 @@ def _cheaper_leg(
     neither does, returns ``None``.  Units: the mid is a fraction of 1.00 USDC
     per share; the token id is the leg's CLOB token.
     """
-    best: Optional[tuple[float, str, dict[str, Any]]] = None
+    best: tuple[float, str, dict[str, Any]] | None = None
     for index, token_id in enumerate(market.token_ids):
         book = books.get(token_id)
         if not isinstance(book, dict):
@@ -58,9 +58,9 @@ def reward_candidates(
     markets: list[Market],
     books: dict[str, dict[str, Any]],
     tape_prints: list[Print],
-    fill_horizon_s: Optional[float] = None,
-    competitor: Optional[CompetingScoreWindow] = None,
-    now: Optional[float] = None,
+    fill_horizon_s: float | None = None,
+    competitor: CompetingScoreWindow | None = None,
+    now: float | None = None,
 ) -> list[dict[str, Any]]:
     """Allocator candidate dicts for every market quoting inside the band.
 
@@ -160,7 +160,7 @@ def reward_candidates(
         detail = market_competing_detail(market, books)
         if detail is None:
             continue
-        estimate: Optional[CompetingEstimate] = None
+        estimate: CompetingEstimate | None = None
         if competitor is not None:
             if now is None:
                 raise ValueError(
@@ -173,7 +173,7 @@ def reward_candidates(
         samples = 1 if estimate is None else estimate.samples
         low_confidence = True if estimate is None else estimate.low_confidence
         min_size = max(market.reward_min_size, market.min_order)
-        fill_yield: Optional[MarketFillYield] = None
+        fill_yield: MarketFillYield | None = None
         if fill_horizon_s is not None:
             # With a stated quote horizon the fill side is mandatory: a bid
             # whose chance of filling is unmeasured cannot be priced against

@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-import polymarketbot.tools.fill_calibration as fill_calibration
+from polymarketbot.tools import fill_calibration
 
 NS = 1_000_000_000
 RATIOS = (0.0, 0.1, 0.25, 0.4, 0.6, 0.8, 0.95, 1.0)

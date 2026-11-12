@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional, Union
+from typing import Any
 
 import requests
 
-from polymarketbot.execution.fast_cancel import DedicatedCancellationPool
-from polymarketbot.execution.hft_pool import HftConnectionPool
-from polymarketbot.execution.presigned_cache import PreSignedOrderCache
 from polymarketbot.execution.self_trade import SelfTradeGuard
 from polymarketbot.logs import get_logger
 from polymarketbot.net import install_doh_fallback
@@ -68,17 +65,14 @@ class LiveClobClient(
 
     def __init__(
         self,
-        credentials: Optional[ClobAuthCredentials] = None,
+        credentials: ClobAuthCredentials | None = None,
         base_url: str = DEFAULT_CLOB_HOST,
         chain_id: int = DEFAULT_CHAIN_ID,
         verifying_contract: str = DEFAULT_CTF_EXCHANGE,
         timeout: float = 5.0,
         dry_run: bool = False,
-        use_fast_cancel_pool: bool = False,
-        use_hft_pool: bool = False,
-        presigned_cache: Optional[PreSignedOrderCache] = None,
-        self_trade_guard: Optional[SelfTradeGuard] = None,
-        order_version: Optional[int] = None,
+        self_trade_guard: SelfTradeGuard | None = None,
+        order_version: int | None = None,
     ) -> None:
         self.credentials = credentials or ClobAuthCredentials.from_env()
         self.base_url = base_url.rstrip("/")
@@ -87,13 +81,11 @@ class LiveClobClient(
         self.timeout = timeout
         self.signature_type = int(self.credentials.signature_type)
 
-        # HFT execution components
-        self.presigned_cache = presigned_cache
         self.self_trade_guard = self_trade_guard
 
         # CLOB order version: resolved from GET /version unless injected.
         self._version_lock = threading.Lock()
-        self._order_version: Optional[int] = None
+        self._order_version: int | None = None
         if order_version is not None:
             self._validate_order_version(order_version)
             self._order_version = int(order_version)
@@ -101,6 +93,11 @@ class LiveClobClient(
         # Per-token market parameter caches (filled by get_tick_size/get_neg_risk).
         self._tick_size_cache: dict[str, float] = {}
         self._neg_risk_cache: dict[str, bool] = {}
+
+        # Epoch seconds until which the venue asked us not to submit orders
+        # (matching-engine restart / throttle). Set only from the server's own
+        # ``retry_after_seconds``; never from a local constant.
+        self._order_restricted_until: float = 0.0
 
         # Enable dry_run if explicitly requested or if credentials are unconfigured/incomplete
         self.dry_run = dry_run or not self.credentials.is_fully_configured
@@ -123,7 +120,7 @@ class LiveClobClient(
         self._signing_key = self.credentials.private_key or (
             MOCK_TEST_PRIVATE_KEY if self.dry_run else ""
         )
-        self._signers: dict[str, Union[FastOrderSigner, FastEIP712SignerV2]] = {}
+        self._signers: dict[str, FastOrderSigner | FastEIP712SignerV2] = {}
         self._signer_lock = threading.Lock()
         self._sign_lock = threading.Lock()
 
@@ -131,7 +128,7 @@ class LiveClobClient(
         # are created on demand by version/contract.
         try:
             self.signer = self._signer_for(1, self.verifying_contract)
-        except Exception as e:
+        except (ValueError, TypeError) as e:
             logger.warning(
                 f"Failed to initialize FastOrderSigner with key ({e}). "
                 f"Falling back to mock test signer in safe dry-run mode."
@@ -157,7 +154,7 @@ class LiveClobClient(
 
         try:
             install_doh_fallback()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - DoH DNS patch is best-effort
             pass
 
         # Thread-safe HTTP: one requests.Session per thread (audit S12).
@@ -167,32 +164,6 @@ class LiveClobClient(
         self._sessions_lock = threading.Lock()
         self._sessions: list[requests.Session] = []
 
-        # Dedicated low-latency cancellation pool
-        self._fast_cancel_pool: Optional[DedicatedCancellationPool] = None
-        if use_fast_cancel_pool and not self.dry_run:
-            try:
-                host = self.base_url.removeprefix("https://").removeprefix("http://").split("/")[0]
-                self._fast_cancel_pool = DedicatedCancellationPool(host=host, auto_warm=False)
-            except Exception as e:
-                logger.warning(f"Failed to initialize fast cancel pool: {e}")
-
-        # Dedicated pre-warmed HFT execution and cancellation pool
-        self.hft_pool: Optional[HftConnectionPool] = None
-        if use_hft_pool and not self.dry_run:
-            try:
-                host = self.base_url.removeprefix("https://").removeprefix("http://").split("/")[0]
-                self.hft_pool = HftConnectionPool(
-                    host=host,
-                    pool_size=4,
-                    timeout=self.timeout,
-                    api_key=self.credentials.api_key,
-                    api_secret=self.credentials.api_secret,
-                    passphrase=self.credentials.passphrase,
-                    signer_address=self.signer_address,
-                    auto_warm=False,
-                )
-            except Exception as e:
-                logger.warning(f"Failed to initialize HFT connection pool: {e}")
 
         # Simulated state for dry-run tracking
         self._mock_orders: dict[str, dict[str, Any]] = {}
@@ -206,12 +177,12 @@ class LiveClobClient(
         try:
             clean_pk = self.credentials.private_key.removeprefix("0x").removeprefix("0X")
             return private_key_to_address(bytes.fromhex(clean_pk))
-        except Exception:
+        except (ValueError, TypeError):
             return ""
 
     def _signer_for(
         self, order_version: int, verifying_contract: str
-    ) -> Union[FastOrderSigner, FastEIP712SignerV2]:
+    ) -> FastOrderSigner | FastEIP712SignerV2:
         """Return the cached EIP-712 signer for (order version, verifying contract).
 
         Negative-risk markets use a different exchange contract and each order

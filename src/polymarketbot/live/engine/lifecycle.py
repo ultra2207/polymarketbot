@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import sqlite3
+import time
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.clob import ClobAPIError
@@ -27,7 +28,6 @@ class LifecycleMixin:
                 if not order_id:
                     self.active_quotes.pop(qid, None)
                     continue
-                self._canceled_order_ids.add(order_id)
                 if not self.clob_client.cancel_order(order_id):
                     qdata["status"] = "CANCELLING"
 
@@ -55,6 +55,14 @@ class LifecycleMixin:
                 else:
                     self._release_reserved_cash(qdata)
                     self.active_quotes.pop(qid, None)
+                    # The queue record must die with the order, or a later
+                    # re-place at the same price inherits a cancelled order's
+                    # queue position.
+                    side = str(qdata.get("token_side", "")).upper()
+                    self.micro_risk.on_cancel(
+                        self.asset_id_yes if side == "YES" else self.asset_id_no,
+                        order_id,
+                    )
             self.locked_cash = self._compute_locked_cash()
             confirmed = not remaining_ids
             if confirmed:
@@ -65,10 +73,32 @@ class LifecycleMixin:
                 )
             return confirmed
 
-    def evaluate_quotes(self, timestamp: Optional[float] = None) -> None:
-        """Serialize quoting against fill/reconcile threads (RLock, re-entrant)."""
+    def evaluate_quotes(self, timestamp: float | None = None) -> None:
+        """Serialize quoting against fill/reconcile threads (RLock, re-entrant).
+
+        Two refusals happen before any quote is priced:
+
+        * the book snapshot this tick would quote from is older than the
+          engine's own reprice interval (the mark has already moved);
+        * the quote distance is unmeasured, so there is no defensible price.
+        """
         with self._lock:
-            super().evaluate_quotes(timestamp)
+            ts = timestamp if timestamp is not None else time.time()
+            if self.spread_offset_cents is None:
+                logger.warning(
+                    "Quoting skipped: spread_offset_cents is unmeasured "
+                    f"(condition {self.condition_id[:12]})"
+                )
+                return
+            age = self.quote_book_age_seconds(ts)
+            if age is None or age > self.min_reprice_interval_s:
+                logger.warning(
+                    f"Quoting skipped for {self.condition_id[:12]}: book snapshot "
+                    f"{'missing' if age is None else f'{age:.2f}s old'} exceeds the "
+                    f"measured reprice interval ({self.min_reprice_interval_s:.2f}s)"
+                )
+                return
+            super().evaluate_quotes(ts)
 
     def halt_trading(self, reason: str, cancel: bool = True) -> None:
         """Disable quoting and record why; by default also cancel resting orders.
@@ -99,7 +129,7 @@ class LifecycleMixin:
         logger.info("Trading resumed")
         return True
 
-    def update_quote_size(self, new_quote_size: float, timestamp: Optional[float] = None) -> bool:
+    def update_quote_size(self, new_quote_size: float, timestamp: float | None = None) -> bool:
         """Apply governor sizing only when it is a material, in-limit change."""
         new_size = float(new_quote_size)
         current = float(self.quote_size)
@@ -130,7 +160,7 @@ class LifecycleMixin:
                     logger.info(
                         f"Shutdown: {pending} markout horizon(s) not reached; left NULL"
                     )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - shutdown must reach quote cancellation
             logger.warning(f"Shutdown: markout tracker stop failed: {e}")
         try:
             confirmed = self.cancel_all_quotes()
@@ -141,15 +171,15 @@ class LifecycleMixin:
                     "Shutdown: venue did not confirm that all quotes are cancelled; "
                     "verify open orders before restarting"
                 )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - shutdown must still close persistence
             logger.error(f"Shutdown: quote cancellation failed: {e}")
         try:
             self.flush_wal()
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.warning(f"Shutdown: WAL checkpoint failed: {e}")
         if self._conn is not None:
             try:
                 self._conn.close()
-            except Exception:
-                pass
+            except sqlite3.Error as e:
+                logger.debug(f"Shutdown: SQLite close failed: {e}")
             self._conn = None

@@ -6,10 +6,98 @@ import pytest
 
 from polymarketbot.dataapi import DataAPIClient
 from polymarketbot.fees import FeeSchedule
-from polymarketbot.gamma import GammaClient
+from polymarketbot.gamma import (
+    GammaClient,
+    GammaError,
+    GammaHTTPError,
+    GammaUnparseable,
+)
 
 
 # --------------------------------------------------------------------- gamma
+class FakeResponse:
+    def __init__(self, status: int, payload=None, text: str = "", headers=None):
+        self.status_code = status
+        self._payload = payload
+        self.text = text
+        self.headers = headers or {}
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class FakeSession:
+    """Serves canned responses in order and records how often it was asked."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+        self.headers: dict[str, str] = {}
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _client(responses, **kwargs) -> GammaClient:
+    return GammaClient(
+        min_interval_s=0.0, session=FakeSession(responses), **kwargs
+    )
+
+
+def test_gamma_4xx_is_not_retried():
+    client = _client([FakeResponse(404, text="not found")])
+    with pytest.raises(GammaHTTPError) as excinfo:
+        client.get("/markets", {"limit": 1})
+    assert excinfo.value.status == 404
+    assert client.session.calls == 1  # a malformed request cannot be fixed by waiting
+
+
+def test_gamma_429_exhaustion_names_the_status():
+    client = _client(
+        [FakeResponse(429, headers={"Retry-After": "0"})] * 2, max_retries=2
+    )
+    with pytest.raises(GammaError) as excinfo:
+        client.get("/markets")
+    assert "429" in str(excinfo.value)  # used to end in ": None"
+    assert client.session.calls == 2
+
+
+def test_gamma_500_then_success_retries(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr("polymarketbot.gamma.time.sleep", slept.append)
+    client = _client([FakeResponse(503), FakeResponse(200, {"markets": []})])
+    assert client.get("/markets") == {"markets": []}
+    assert client.session.calls == 2
+    assert len(slept) == 1  # the retry rested before the second attempt
+
+
+def test_gamma_unparseable_body_is_its_own_error(monkeypatch):
+    monkeypatch.setattr("polymarketbot.gamma.time.sleep", lambda _s: None)
+    client = _client([FakeResponse(200, ValueError("bad json"))] * 2, max_retries=2)
+    with pytest.raises(GammaUnparseable):
+        client.get("/markets")
+
+
+def test_gamma_transport_error_is_retried_then_reported(monkeypatch):
+    import requests
+
+    monkeypatch.setattr("polymarketbot.gamma.time.sleep", lambda _s: None)
+    client = _client(
+        [requests.ConnectionError("reset"), requests.ConnectionError("reset")],
+        max_retries=2,
+    )
+    with pytest.raises(GammaError) as excinfo:
+        client.get("/markets")
+    assert not isinstance(excinfo.value, GammaHTTPError)
+    assert client.session.calls == 2
+
+
 def test_parse_ids_handles_json_string():
     # clobTokenIds arrives as a JSON string, not a list
     assert GammaClient.parse_ids('["123", "456"]') == ["123", "456"]

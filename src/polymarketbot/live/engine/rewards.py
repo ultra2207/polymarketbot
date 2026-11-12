@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from typing import Any
 
 from polymarketbot.logs import get_logger
+from polymarketbot.strategy.venue.clob import ClobAPIError
 
 logger = get_logger("real_money_engine")
 
@@ -47,7 +49,7 @@ class RewardMixin:
                     is_scoring = bool(score_res.get("scoring", False))
                     qdata["scoring"] = is_scoring
                     self.verified_scoring_orders[order_id] = is_scoring
-        except Exception as e:
+        except (ClobAPIError, sqlite3.Error, KeyError, TypeError, ValueError, OSError) as e:
             logger.debug(f"Failed to sync ground-truth rewards: {e}")
 
     def _record_reward_payouts(self, daily_data: dict[str, Any], source: str) -> None:

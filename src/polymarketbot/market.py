@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -21,4 +20,4 @@ class MarketConfig:
     rewards_min_size: float
     rewards_max_spread: float  # in cents
     tokens: list[TokenConfig] = field(default_factory=list)
-    event_id: Optional[str] = None  # Gamma event grouping for correlated-event caps
+    event_id: str | None = None  # Gamma event grouping for correlated-event caps

@@ -7,7 +7,6 @@ safety gates and the public class the rest of the bot imports.
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.risk.fast_signer import private_key_to_address
@@ -47,14 +46,14 @@ class PolygonCtfClient(
 
     def __init__(
         self,
-        rpc_url: Optional[str] = None,
-        private_key: Optional[str] = None,
+        rpc_url: str | None = None,
+        private_key: str | None = None,
         ctf_address: str = CTF_CONTRACT_POLYGON,
         collateral_address: str = DEFAULT_COLLATERAL_USDC,
-        chain_client: Optional[ChainClient] = None,
+        chain_client: ChainClient | None = None,
         dry_run: bool = False,
         signature_type: int = 0,
-        settlement_store: Optional[PendingSettlementStore] = None,
+        settlement_store: PendingSettlementStore | None = None,
     ) -> None:
         self.ctf_address = ctf_address.lower()
         self.collateral_address = collateral_address.lower()
@@ -69,7 +68,7 @@ class PolygonCtfClient(
         # 2 = POLY_GNOSIS_SAFE. Only an EOA can be settled by this signer.
         self.signature_type = int(signature_type)
 
-        self._private_key_bytes: Optional[bytes] = None
+        self._private_key_bytes: bytes | None = None
         self.signer_address: str = ""
         if self.private_key:
             try:
@@ -83,7 +82,7 @@ class PolygonCtfClient(
         # No fee-market environment is built here: it would carry invented
         # defaults. Resolve one from measurement at the point of use with
         # ``PolygonPoSEnvironment.measured(...)``.
-        self.pos_env: Optional[PolygonPoSEnvironment] = None
+        self.pos_env: PolygonPoSEnvironment | None = None
 
         # Every live settlement is written here before it is broadcast. The
         # engine replaces this with a store bound to the engine database so the
@@ -121,7 +120,7 @@ class PolygonCtfClient(
             and self.signature_type == 0
         )
 
-    def _settlement_refusal_reason(self) -> Optional[str]:
+    def _settlement_refusal_reason(self) -> str | None:
         if self.dry_run:
             return "client is in dry-run mode"
         if self.signature_type != 0:
@@ -134,7 +133,7 @@ class PolygonCtfClient(
             return "no valid POLY_PRIVATE_KEY available for signing"
         return None
 
-    def _live_without_key_reason(self) -> Optional[str]:
+    def _live_without_key_reason(self) -> str | None:
         """Refuse a live-mode request that has no usable signing key.
 
         Without this, `dry_run=False` plus an absent key silently degrades to a

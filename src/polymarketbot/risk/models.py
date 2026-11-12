@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any
 
 
 class RiskStatus(str, Enum):
@@ -44,8 +44,8 @@ class CircuitBreakerEvent:
     timestamp: float
     reason: CircuitBreakerReason
     details: str
-    condition_id: Optional[str] = None
-    asset_id: Optional[str] = None
+    condition_id: str | None = None
+    asset_id: str | None = None
     action_taken: str = "CANCEL_QUOTES"
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,17 +65,17 @@ class RiskConfig:
 
     # 1. Hard Capital & Position Limits
     total_bankroll_usd: float = 300.0  # Max allocated bankroll ($300)
-    max_position_cost_per_market: Optional[float] = None  # None = dynamically derived from concentration pct
-    max_position_shares_per_token: Optional[float] = None  # None = dynamically derived
-    max_portfolio_inventory_usd: Optional[float] = None  # None = dynamically derived
+    max_position_cost_per_market: float | None = None  # None = dynamically derived from concentration pct
+    max_position_shares_per_token: float | None = None  # None = dynamically derived
+    max_portfolio_inventory_usd: float | None = None  # None = dynamically derived
     max_portfolio_inventory_shares: float = 400.0  # Max total inventory shares
     max_quote_size_shares: float = 50.0  # Max single quote size in shares
     # Correlated-event cap: the sum of all positions in one Gamma event (e.g.
     # every outcome of a negRisk election) cannot exceed this. 50% of bankroll
     # is stricter than the 75% per-market cap, so a multi-outcome event cannot
     # consume the whole concentrated allocation.
-    max_event_inventory_usd: Optional[float] = None
-    max_event_position_cost_usd: Optional[float] = None
+    max_event_inventory_usd: float | None = None
+    max_event_position_cost_usd: float | None = None
     event_concentration_pct: float = 0.50
     max_active_markets: int = 5  # Multi-market scaling cap
     allow_short: bool = True  # Paper engines model covering shorts; the live engine sets False (long-only)
@@ -127,9 +127,9 @@ class RiskConfig:
             self.max_drawdown_usd = round(self.total_bankroll_usd * self.max_drawdown_pct, 2)
 
     # 2. Max Drawdown Circuit Breakers
-    daily_loss_limit_usd: Optional[float] = None  # Dynamically derived from daily_loss_limit_pct
+    daily_loss_limit_usd: float | None = None  # Dynamically derived from daily_loss_limit_pct
     daily_loss_limit_pct: float = 0.05  # 5% daily loss limit
-    max_drawdown_usd: Optional[float] = None  # Dynamically derived from max_drawdown_pct
+    max_drawdown_usd: float | None = None  # Dynamically derived from max_drawdown_pct
     max_drawdown_pct: float = 0.10  # 10% max drawdown limit
 
     # 3. Price Jump & Volatility Circuit Breaker
@@ -139,7 +139,9 @@ class RiskConfig:
     max_price_jump_cooldown_seconds: float = 3600.0  # Hard cap so a pathological jump cannot cooldown forever
 
     # 4. Asymmetric Toxicity / Inventory Skew Limiter
-    consecutive_fills_threshold: int = 3  # 2-3 consecutive fills in same direction
+    # ``consecutive_fills_threshold`` is not a field here on purpose: it is a
+    # strategy calibration with no measured default, so UnifiedRiskEngine
+    # requires it from the caller's configuration (see risk/unified.py).
     toxicity_action: str = "widen"  # "widen" or "suppress"
     toxicity_spread_penalty_cents: float = 1.5  # Extra spread penalty if widening
     toxicity_size_reduction_pct: float = 0.5  # Reduce quote size by 50% when widened
@@ -148,9 +150,7 @@ class RiskConfig:
     # 5. Gas & Complete-Set Merge Manager
     min_merge_threshold_shares: float = 30.0  # Small capital merge threshold (25-50 shares, default 30)
     min_merge_notional_usd: float = 0.0  # Min captured spread (USD) a merge must unlock; 0 = no gate, live engine sets it
-    gas_fee_usd: float = 0.015  # Polygon CTF mergePositions gas fee ($0.015)
-    max_gas_spread_pct: float = 0.05  # Gas fee cannot exceed 5% of captured spread
-    assumed_spread_cents: float = 1.0  # Baseline 1.0c spread per share for gas viability
+    max_gas_spread_pct: float = 0.05  # Gas fee cannot exceed 5% of the measured captured spread
     daily_gas_cap_usd: float = 1.50  # Hard daily gas cap ($1.50)
 
     # 6. Emergency Kill-Switch & Disconnect Monitor
@@ -171,15 +171,15 @@ class MarketRiskState:
 
     condition_id: str
     asset_id: str
-    price_history: Deque[Tuple[float, float]] = field(default_factory=deque)  # (timestamp, mid_price)
+    price_history: deque[tuple[float, float]] = field(default_factory=deque)  # (timestamp, mid_price)
     consecutive_buys: int = 0
     consecutive_sells: int = 0
-    last_fill_side: Optional[str] = None
+    last_fill_side: str | None = None
     last_fill_timestamp: float = 0.0
     cooldown_until: float = 0.0
     is_toxic_widened: bool = False
     is_toxic_suppressed: bool = False
-    toxic_side: Optional[str] = None
+    toxic_side: str | None = None
     last_jump_detected_time: float = 0.0
     status: RiskStatus = RiskStatus.HEALTHY
 
@@ -206,7 +206,7 @@ class PortfolioRiskState:
     kill_switch_active: bool = False
     is_halted: bool = False
     last_heartbeat_timestamp: float = field(default_factory=time.time)
-    circuit_breaker_events: List[CircuitBreakerEvent] = field(default_factory=list)
+    circuit_breaker_events: list[CircuitBreakerEvent] = field(default_factory=list)
 
     @property
     def total_pnl(self) -> float:

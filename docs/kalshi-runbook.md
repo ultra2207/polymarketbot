@@ -1,5 +1,14 @@
 # Kalshi integration runbook
 
+> **Status (2026-11-11).** The Kalshi subsystem this runbook documents is **gone from the
+> tree**: `src/polymarketbot/kalshi_auth.py`, `polymarketbot.tools.kalshi_probe`,
+> `polymarketbot.data.kalshi_*`, the collector's `kalshi`/`kalshi_books` streams and
+> `paper_trading/kalshi_signal.py` were deleted with the collector (commit `999ec0a`) and
+> `scripts/` (commit `76886b5`). Every command below raises `ModuleNotFoundError`, and the
+> "State" column in §1 describes what ran on 2026-11-06, not what runs now. The file is kept
+> as the record of the signing contract, the rate-limit arithmetic and the measured basis;
+> nothing in the live or paper path uses Kalshi today.
+
 What exists, how to run it, what is measured, and what is still unmeasured.
 Numbers are from this repo on 2026-11-06; each states its sample.
 
@@ -73,10 +82,11 @@ exception class.
 # candles: resumable, one (ticker, month) per file; ~220-290 s per 30 tickers
 .venv/Scripts/python.exe -m polymarketbot.data.kalshi_backfill --offset 0 --limit 30 --days 90
 
-# paper engine with the cross-venue signal (threshold unmeasured: 0.01 is a placeholder)
-.venv/Scripts/python.exe scripts/run_paper_trading.py --markets 1 --duration 600 \
-  --orchestrator --orchestrator-policy queue_aware \
-  --orchestrator-signal kalshi --orchestrator-kalshi-threshold 0.01
+# paper engine: `scripts/run_paper_trading.py` was deleted in the 2026-11-10
+# scripts cleanup. The entry point is now `polymarketbot.paper.main`, which has
+# no `--markets`/`--orchestrator*` flags (the Kalshi cross-venue signal went
+# with the Kalshi streams). The command below runs the paper engine alone.
+.venv/Scripts/python.exe -m polymarketbot.paper.main --duration 600
 ```
 
 Supervision: Windows task `\PolymarketCollector` runs

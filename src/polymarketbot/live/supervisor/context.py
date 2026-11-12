@@ -16,8 +16,9 @@ here instead of the phases importing the classes directly.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 
 @dataclass
@@ -53,22 +54,23 @@ class RunContext:
     # Wallet and the sizing cap derived from it.
     total_wallet: float = 0.0
     budget_pct: float = 0.0
-    max_budget: Optional[float] = None
+    max_budget: float | None = None
     trading_bankroll: float = 0.0
     quote_sz: float = 0.0
     spread_off: float = 0.0
+    spread_policy: dict[str, Any] | None = None
     daily_rew: float = 0.0
     max_spr: float = 0.0
     min_sz: float = 0.0
     competing_override: bool = False
-    comp_score: Optional[float] = None
+    comp_score: float | None = None
 
     # The market, the feed and the engine that trade it.
     market: dict[str, Any] = field(default_factory=dict)
     feed: Any = None
     engine: Any = None
     recorder: Any = None
-    order_version: Optional[int] = None
+    order_version: int | None = None
 
     # Loop bookkeeping.
     l2_session: Any = None
@@ -83,6 +85,10 @@ class RunContext:
     last_render: float = 0.0
     last_quote_eval: float = 0.0
     last_redeem_attempt: float = 0.0
+    last_refit_at: float = 0.0
+    refit_task: Any = None
+    refit_process: Any = None
+    refit_failures: int = 0
     feed_halt_active: bool = False
     market_halt_done: bool = False
     quotes_cancelled: bool = False
@@ -92,5 +98,5 @@ class RunContext:
     running: bool = True
 
     # Outcome.
-    final_telemetry: Optional[dict[str, Any]] = None
+    final_telemetry: dict[str, Any] | None = None
     exit_code: int = 0

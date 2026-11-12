@@ -10,18 +10,35 @@ Covers audit items S3 (risk half), S14 and M2:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
-from polymarketbot.risk.manager import GasMergeManager, PriceVolatilityMonitor, RiskManager
+from polymarketbot.risk.manager import (
+    GasMergeManager,
+    PriceVolatilityMonitor,
+    RiskManager,
+)
 from polymarketbot.risk.models import CircuitBreakerReason, RiskConfig, RiskStatus
 
 T0 = 1_700_000_000.0  # fixed epoch so tests are deterministic
 
+# The account state validate_quote requires: it has no defaults, because a
+# forgotten position or cash balance used to gate the quote against an account
+# that does not exist. ``_ACCOUNT`` carries a $300 balance and an existing
+# 12-share long so the long-only SELL cases keep their original meaning.
+_ACCOUNT = {
+    "current_pos_shares": 12.0,
+    "current_pos_cost": 5.88,
+    "current_portfolio_inventory_usd": 5.88,
+    "current_cash_usd": 300.0,
+    "mid_price": 0.50,
+}
+_ACCOUNT_NO_POS = {**_ACCOUNT, "current_pos_shares": 0.0, "current_pos_cost": 0.0}
+
 
 def _day(day_of_month: int) -> float:
-    return datetime(2026, 1, day_of_month, tzinfo=timezone.utc).timestamp()
+    return datetime(2026, 1, day_of_month, tzinfo=UTC).timestamp()
 
 
 # =========================================================================
@@ -55,7 +72,7 @@ def test_cooldown_shows_warning_then_auto_clears_to_healthy():
     rm.update_market_price("tok", "cid", 0.53, timestamp=T0 + 1.0)
 
     allowed, reason, size, _ = rm.validate_quote(
-        "tok", "cid", "BUY", 0.50, 10.0, timestamp=T0 + 2.0
+        "tok", "cid", "BUY", 0.50, 10.0, **_ACCOUNT, timestamp=T0 + 2.0
     )
     assert allowed is False
     assert "cooldown" in reason.lower()
@@ -71,7 +88,9 @@ def test_cooldown_shows_warning_then_auto_clears_to_healthy():
     assert "tok" not in rm.volatility_monitor.cooldowns
     assert rm.market_states["tok"].status == RiskStatus.HEALTHY
 
-    allowed, _, size, _ = rm.validate_quote("tok", "cid", "BUY", 0.50, 10.0, timestamp=T0 + 302.0)
+    allowed, _, size, _ = rm.validate_quote(
+        "tok", "cid", "BUY", 0.50, 10.0, **_ACCOUNT, timestamp=T0 + 302.0
+    )
     assert allowed is True and size == 10.0
 
 
@@ -177,8 +196,8 @@ def test_auto_clear_never_clears_a_permanent_halt():
 
 def test_sell_is_capped_at_owned_shares_when_shorting_disabled():
     rm = RiskManager(RiskConfig(allow_short=False))
-    allowed, reason, size, price = rm.validate_quote(
-        "tok", "cid", "SELL", 0.49, 40.0, current_pos_shares=12.0
+    allowed, _reason, size, price = rm.validate_quote(
+        "tok", "cid", "SELL", 0.49, 40.0, **{**_ACCOUNT, "current_pos_shares": 12.0}
     )
     assert allowed is True
     assert size == 12.0
@@ -188,7 +207,7 @@ def test_sell_is_capped_at_owned_shares_when_shorting_disabled():
 def test_sell_with_no_owned_shares_is_rejected_when_shorting_disabled():
     rm = RiskManager(RiskConfig(allow_short=False))
     allowed, reason, size, _ = rm.validate_quote(
-        "tok", "cid", "SELL", 0.49, 40.0, current_pos_shares=0.0
+        "tok", "cid", "SELL", 0.49, 40.0, **_ACCOUNT_NO_POS
     )
     assert allowed is False
     assert size == 0.0
@@ -198,7 +217,7 @@ def test_sell_with_no_owned_shares_is_rejected_when_shorting_disabled():
 def test_sell_without_inventory_is_allowed_when_shorts_enabled():
     rm = RiskManager(RiskConfig(allow_short=True))
     allowed, _, size, _ = rm.validate_quote(
-        "tok", "cid", "SELL", 0.49, 40.0, current_pos_shares=0.0
+        "tok", "cid", "SELL", 0.49, 40.0, **_ACCOUNT_NO_POS
     )
     assert allowed is True
     assert size == 40.0
@@ -212,20 +231,38 @@ def test_merge_below_notional_is_rejected():
     cfg = RiskConfig(min_merge_threshold_shares=1.0, min_merge_notional_usd=1.0)
     gm = GasMergeManager(cfg)
 
-    can, reason = gm.can_merge(shares=5.0, captured_spread_usd=0.5)
+    can, reason = gm.can_merge(
+        shares=5.0, captured_spread_usd=0.5, gas_fee_usd=0.001
+    )
     assert can is False
     assert "below minimum merge notional" in reason
 
-    can, reason = gm.can_merge(shares=5.0, captured_spread_usd=1.5)
+    can, reason = gm.can_merge(
+        shares=5.0, captured_spread_usd=1.5, gas_fee_usd=0.001
+    )
     assert can is True
 
 
-def test_default_merge_gate_is_unchanged():
+def test_merge_gate_requires_measured_spread_and_gas():
     gm = GasMergeManager(RiskConfig())
-    can, reason = gm.can_merge(shares=30.0)
+    # A 30-share merge at a measured $0.30 captured spread with $0.01 gas.
+    can, reason = gm.can_merge(
+        shares=30.0, captured_spread_usd=0.30, gas_fee_usd=0.01
+    )
     assert can is True
     assert "permitted" in reason.lower()
 
-    can, reason = gm.can_merge(shares=20.0)
+    can, reason = gm.can_merge(
+        shares=20.0, captured_spread_usd=0.30, gas_fee_usd=0.01
+    )
     assert can is False
     assert "below small capital threshold" in reason
+
+    # Neither the captured spread nor the gas price has a fallback any more:
+    # the old defaults were 1c/share and $0.015.
+    can, reason = gm.can_merge(shares=30.0, captured_spread_usd=None, gas_fee_usd=0.01)
+    assert can is False
+    assert "unmeasured" in reason.lower()
+    can, reason = gm.can_merge(shares=30.0, captured_spread_usd=0.30, gas_fee_usd=None)
+    assert can is False
+    assert "unmeasured" in reason.lower()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 import requests
 
@@ -18,7 +17,7 @@ logger = get_logger("rewards_scanner")
 
 def fetch_tick_size(
     session: requests.Session, token_id: str, timeout: float = 6.0
-) -> Optional[float]:
+) -> float | None:
     """The venue's published price tick for one token, or ``None``.
 
     Source: ``GET /tick-size?token_id=...`` -> ``minimum_tick_size``. The CLOB
@@ -51,7 +50,7 @@ def fetch_tick_size(
 
 def fetch_book_spread_cents(
     session: requests.Session, token_id: str, timeout: float = 4.0
-) -> Optional[float]:
+) -> float | None:
     """The venue's live bid-ask spread for one token, in cents, or ``None``.
 
     A maker captures the half-spread it actually quotes into, so the spread has
@@ -99,7 +98,7 @@ def get_real_l2_score(
     token_id: str,
     max_spread_cents: float,
     timeout: float = 4.0,
-) -> tuple[Optional[float], Optional[float], Optional[float]]:
+) -> tuple[float | None, float | None, float | None]:
     """Measure the venue's in-band competing score from the live L2 book.
 
     Returns ``(competing_score, total_qualifying_shares, mid)``, each
@@ -215,6 +214,6 @@ def get_real_l2_score(
         if stale is not None:
             return stale
         return unknown
-    except Exception as e:
+    except (ValueError, KeyError, TypeError) as e:
         logger.debug(f"Error fetching order book for {token_id[:14]}: {e}")
         return unknown

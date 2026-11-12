@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import statistics
 import time
 from pathlib import Path
-from typing import Optional, Tuple
 
 from polymarketbot.logs import get_logger
 
@@ -15,13 +15,13 @@ logger = get_logger("ctf_client")
 # deltas are the measured inter-block time; an absent tape yields ``None`` so
 # callers queue the on-chain action and report the gap instead of assuming 0 s.
 DEFAULT_POLYGON_GAS_TAPE = Path(__file__).resolve().parents[5] / "data" / "tape" / "polygon_gas"
-_BLOCK_INTERVAL_CACHE: dict[str, Tuple[float, Optional[float]]] = {}
+_BLOCK_INTERVAL_CACHE: dict[str, tuple[float, float | None]] = {}
 
 
 def load_measured_block_interval_s(
-    tape_dir: Optional[str] = None,
+    tape_dir: str | None = None,
     refresh_s: float = 300.0,
-) -> Optional[float]:
+) -> float | None:
     """Measured mean Polygon PoS block interval, in seconds.
 
     Reads the newest ``polygon_gas`` partitions, keeps consecutive block
@@ -36,7 +36,7 @@ def load_measured_block_interval_s(
     if cached is not None and now - cached[0] < refresh_s:
         return cached[1]
 
-    value: Optional[float] = None
+    value: float | None = None
     try:
         files = sorted(Path(key).glob("date=*/hour=*/*.parquet"))
         if files:
@@ -52,7 +52,7 @@ def load_measured_block_interval_s(
                 )
             )
             deltas = []
-            for (b0, t0), (b1, t1) in zip(pairs, pairs[1:]):
+            for (b0, t0), (b1, t1) in itertools.pairwise(pairs):
                 if b0 is None or b1 is None or t0 is None or t1 is None:
                     continue
                 if b1 != b0 + 1:
@@ -73,7 +73,7 @@ def load_measured_block_interval_s(
     return value
 
 
-def load_persisted_rpc_rtt_s(path: Optional[str] = None) -> Optional[float]:
+def load_persisted_rpc_rtt_s(path: str | None = None) -> float | None:
     """Measured Polygon RPC round trip persisted by the latency probe, if any.
 
     The probe currently records CLOB/Gamma/Binance endpoints; a ``polygon_rpc``
@@ -91,6 +91,6 @@ def load_persisted_rpc_rtt_s(path: Optional[str] = None) -> Optional[float]:
             ms = entry.get("ttfb_p50_ms")
             if ms is not None and float(ms) > 0.0:
                 return float(ms) / 1000.0
-    except Exception:
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
     return None

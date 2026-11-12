@@ -3,6 +3,28 @@
 The 14-day tape collector. One process, one asyncio loop, one writer thread, a
 JSONL write-ahead log per table, and hourly Parquet parts.
 
+> **Status (2026-11-11).** Most of the tooling this runbook names no longer
+> resolves: the collector was deleted in commit `999ec0a` and the `scripts/`
+> folder in commit `76886b5`, so `polymarketbot.data.collector`,
+> `polymarketbot.ops.*`, `polymarketbot.data.builders.*`,
+> `polymarketbot.data.uma_replay` and every `scripts/*.py` below raise
+> `ModuleNotFoundError`. The tape contract and the measured numbers are kept
+> because they are the record of what was collected. The two recorders that do
+> run are `uv run python -m polymarketbot.tools.reward_tape` (`clob_trades`)
+> and `uv run python -m polymarketbot.tools.crypto_updown_books`
+> (`books_live`).
+
+> **Reading the tape with pyarrow (2026-11-11).** The parts were written by three
+> recorders and disagree on column *types* in three columns (measured on all 638
+> `clob_trades` parts: `shard` int16/int64, `fee_rate_bps` double/null,
+> `transaction_hash` large_string/null). DuckDB coerces this, which is why the
+> harvester works; `pq.read_table(tree)` fails on the hive `date` column
+> (`date32` vs `dictionary<string>`) and `pq.read_table(parts)` fails on
+> `Unsupported cast from double to null`. Use
+> `polymarketbot.tools.tape_reader.read_tape(...)`, which unifies the types per
+> part and names the column and part if two types genuinely cannot be
+> reconciled.
+
 ## Why this exists
 
 `report.md` and `docs/two-week-data-plan.md` define the institutional data
@@ -329,8 +351,8 @@ plus the adapter lifecycle: `QuestionInitialized`/`QuestionUpdated`,
 `QuestionEmergencyResolved`, `QuestionPaused`/`QuestionUnpaused`,
 `QuestionFlagged`/`QuestionFlaggedForAdminResolution`,
 `ResolutionDataRequested`, and `AncillaryDataUpdated`. Decoding is keyed by
-`(contract, topic0)` from the verified ABIs in
-`src/polymarketbot/data/uma.py`; a known topic from an unexpected address is
+`(contract, topic0)` from the verified ABIs in the archived decoder
+`archive/data/uma.py`; a known topic from an unexpected address is
 rejected rather than mis-decoded.
 
 **Market mapping.** OO logs carry `keccak256(ancillaryData)` and the question
@@ -460,7 +482,7 @@ the 2026-11-01 Gamma snapshot predates most of the current universe. Refresh
 the fields keyed by the live manifest:
 
 ```bash
-.venv/Scripts/python.exe -m polymarketbot.data.refresh_universe_metadata
+uv run python -c "from polymarketbot.data.universe_metadata import refresh; print(refresh())"
 ```
 
 That is 25 Gamma requests (~8 s for 2,496 markets). It writes
@@ -475,8 +497,8 @@ and backtest scripts prefer the live table over the snapshot; as of
 
 ## UMA resolution events (derived)
 
-`data/derived/uma_events.parquet` is rebuilt from `polygon_logs` by
-`polymarketbot.data.uma_replay`. It answers the questions Gamma cannot: when a price was
+`data/derived/uma_events.parquet` was rebuilt from `polygon_logs` by the
+(now retired) `polymarketbot.data.uma_replay`. It answers the questions Gamma cannot: when a price was
 requested, who proposed it, at what price, whether it was disputed, when the
 proposal expires, and when it settled.
 
@@ -522,8 +544,8 @@ versions emit `QuestionReset(bytes32)`, `QuestionPaused(bytes32)` and
 The full set (18 topic0s, including `QuestionUpdated`, `QuestionReset`,
 `QuestionPaused`, `QuestionUnpaused`, `QuestionSettled`,
 `QuestionFlaggedForAdminResolution`, `QuestionFlagged`,
-`QuestionEmergencyResolved`, `AncillaryDataUpdated`) is `TOPIC0S` in
-`src/polymarketbot/data/uma.py`. Admin events (`NewAdmin`, `RemovedAdmin`,
+`QuestionEmergencyResolved`, `AncillaryDataUpdated`) is `TOPIC0S` in the
+archived `archive/data/uma.py`. Admin events (`NewAdmin`, `RemovedAdmin`,
 `Authorize`/`Deauthorize`) are deliberately not decoded.
 
 `ProposePrice` topic0 and payload shape were checked against a live log at block
@@ -557,12 +579,13 @@ is worse than a parse at the query site.
 ### Running the replay
 
 ```bash
-.venv/Scripts/python.exe -m polymarketbot.data.uma_replay
-# decode everything again, replacing the output
-.venv/Scripts/python.exe -m polymarketbot.data.uma_replay --reset
+# retired: `polymarketbot.data.uma_replay` was deleted with the collector in
+# commit 999ec0a, so `data/derived/uma_events.parquet` is frozen at the 2026-11-06
+# tape. The verified decoder those topic0s come from is archived at
+# archive/data/uma.py and is not wired into a running process.
 ```
 
-The script scans `data/tape/polygon_logs/**/*.parquet` oldest first, filters on
+The retired script scanned `data/tape/polygon_logs/**/*.parquet` oldest first, filters on
 the four configured addresses above, and appends decoded rows to
 `data/derived/uma_events.parquet` with an atomic `.tmp` + `os.replace`.
 `data/derived/uma_events.parts.json` records every part already scanned
@@ -808,8 +831,11 @@ used.
 are written one Parquet part per probe run:
 
 ```bash
-# 5 rounds per venue, ~7 s total; a probe is a short job, not a collector stream
-.venv/Scripts/python.exe scripts/measure_lead_time.py --probe-only --count 5 --interval 1
+# retired: scripts/measure_lead_time.py was deleted in the 2026-11-10 scripts
+# cleanup and has no `python -m` replacement, so these rows can no longer be
+# produced. The surviving latency instrument is
+#   uv run python -m polymarketbot.tools.latency_probe
+# which measures DNS/TCP/TLS/TTFB only - it does not measure clock offsets.
 ```
 
 The local resolver intermittently fails `clob.polymarket.com`, so the script
@@ -840,12 +866,9 @@ report prints the age of the newest sample so a stale offset is visible.
 ### Measuring the lead
 
 ```bash
-# newest hour with both tables, 15 min of it, auto-linked from the manifest
-.venv/Scripts/python.exe scripts/measure_lead_time.py --minutes 15
-
-# explicit links when the reward-filtered universe holds no crypto markets
-.venv/Scripts/python.exe scripts/measure_lead_time.py --hour 20261104T01 --minutes 10 \
-  --link BTCUSDT=<token_id>,<token_id> --link ETHUSDT=<token_id>
+# retired: scripts/measure_lead_time.py was deleted in the 2026-11-10 scripts
+# cleanup; no `python -m` replacement exists. The method and the numbers below
+# are the record of what it measured; they cannot be reproduced from this tree.
 ```
 
 The script takes every Binance `bookTicker` row whose bid or ask changed, and
@@ -894,8 +917,8 @@ snipe**. Status on 2026-11-05: **PASS**, with the clock fixed on our side.
   correction to **339 ms**; the earlier 1,268 ms came from four samples plus
   stale parts being intersected together. 40 samples gave the same ~0.32 s
   floor; the CLOB's whole-second answer and the ~160 ms RTT are the limit.
-* Our order path is measured without placing an order:
-  `scripts/bench_cancel_path.py` gives local cancel-auth p99 **0.012 ms** plus
+* Our order path is measured without placing an order: the retired
+  `scripts/bench_cancel_path.py` gave local cancel-auth p99 **0.012 ms** plus
   CLOB min RTT **217.5 ms** → a **217.5 ms upper bound** (one full RTT is
   conservative; the forward leg is less).
 * Measured window 06:00–06:10 UTC: quote p50 **52.7 ms**, taker p50
@@ -1051,15 +1074,17 @@ below the old 3,000-market sweep.
 One reader per question, each writing `data/derived/` and stating its window,
 sample size, and n/a rules. They read the tape; none sits in the collector path.
 
-| Script | Answers | Main caveat it prints |
+| Tool | Answers | Main caveat it prints |
 |---|---|---|
-| `polymarketbot.tools.market_scorecard` | Per-condition spread, markout(300 s), fee/share, `edge = half_spread − markout − fee`, Gate 1, reward/capital | fee coverage: 832/834 traded conditions (2026-11-05 window) via `universe_metadata`; the 2026-11-01 snapshot alone covers 138/647; passes with n<30 are marked, not measurements |
+| `polymarketbot.tools.market_scorecard` — retired 2026-11-10, no replacement | Per-condition spread, markout(300 s), fee/share, `edge = half_spread − markout − fee`, Gate 1, reward/capital | fee coverage: 832/834 traded conditions (2026-11-05 window) via `universe_metadata`; the 2026-11-01 snapshot alone covers 138/647; passes with n<30 are marked, not measurements |
 | `polymarketbot.tools.fill_calibration` | P(fill) by pre-event queue ratio × size, isotonic + logistic | `queue_ratio=1` is a separate regime (0/3,376 fills); strict-penetration sensitivity printed |
 | `polymarketbot.tools.ctf_quote_fill_horizon` | Horizon-matched P(fill) for a buy at `best_bid + tick`, per requote lifetime / tick / minimum order | print-conditional, not joint: `fill_model.json` has no arrival rate and overstates a one-tick quote ~2,000×; the sample is 3 of 72 recorded tape hours (hour=10 of 2026-11-04/05/06), 8.77M placements |
-| `scripts/scan_toxicity.py` | Signed markout(30 s/5 m), trade imbalance, OFI per condition × 5 min | OFI flags a no-trade bucket; wide matched quotes dropped |
-| `scripts/backtest_quotes.py` | Quote episodes on one L3 asset-hour: observed fill rate, spread capture, markout, gas | shadow-order fill count is an optimistic upper bound; one asset-hour is not a strategy result |
-| `scripts/report_kalshi_basis.py` | Polymarket vs Kalshi mid basis, spreads, lead-lag | only 76 mapped pairs are quoted on both sides; the panel needs ≥30 pairs |
-| `scripts/bench_cancel_path.py` | Our Binance-trigger → CLOB-cancel path upper bound | no order is sent; one full RTT is conservative |
+| `polymarketbot.tools.fit_deskew_calibration` | Every `DeSkewCalibration` coefficient: inventory-conditional adverse loss (q_soft/q_hard), solved GTM/A-S gamma, skew-gain replay, holding/turnover and merge batch, OFI/drift tails | one stated preference, the loss probability (`--loss-probability`, default 1 %); the measured `1−alpha` loss already exceeds the spread capture in the smallest inventory bucket, so q_soft = q_hard and the tool reports that exceedance rather than inventing a band |
+| `polymarketbot.tools.fit_reserve` | `reserve_calibration.json`: horizon jump quantile, 1 − mean pairwise shock correlation, measured merge-action counts, measured merge gas floor | needs the de-skew fit for its horizon and merge batch; the diversification weight is 1 − correlation, so uncorrelated books reserve the full L2 norm |
+| `scan_toxicity.py` — retired 2026-11-10, no replacement | Signed markout(30 s/5 m), trade imbalance, OFI per condition × 5 min | OFI flags a no-trade bucket; wide matched quotes dropped |
+| `backtest_quotes.py` — retired 2026-11-10, no replacement | Quote episodes on one L3 asset-hour: observed fill rate, spread capture, markout, gas | shadow-order fill count is an optimistic upper bound; one asset-hour is not a strategy result |
+| `report_kalshi_basis.py` — retired 2026-11-10, no replacement | Polymarket vs Kalshi mid basis, spreads, lead-lag | only 76 mapped pairs are quoted on both sides; the panel needs ≥30 pairs |
+| `bench_cancel_path.py` — retired 2026-11-10, no replacement | Our Binance-trigger → CLOB-cancel path upper bound | no order is sent; one full RTT is conservative |
 
 Measured on the 2026-11-05 tape (1–6 h windows):
 

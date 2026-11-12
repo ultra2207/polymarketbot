@@ -27,8 +27,10 @@ class _DecodeMixin:
 
         try:
             data = json.loads(raw_data)
-        except Exception:
+        except json.JSONDecodeError:
             return
+        # A parsed frame is data traffic; PONG-only sockets never reach here.
+        self._last_ws_data_time = time.time()
 
         messages = data if isinstance(data, list) else [data]
 

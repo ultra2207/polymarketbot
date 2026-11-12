@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 from polymarketbot.logs import get_logger
 
 from . import gas as _gas
-from .constants import (
-    _MAX_MAX_FEE_WEI,
-    _MAX_PRIORITY_FEE_WEI,
-    _MIN_MAX_FEE_WEI,
-    _MIN_PRIORITY_FEE_WEI,
-)
 
 logger = get_logger("ctf_client")
 
@@ -20,15 +12,15 @@ logger = get_logger("ctf_client")
 class CtfFeeMixin:
     """Gas cost estimates and the signed fee caps."""
 
-    def get_dynamic_gas_price_gwei(self) -> Optional[float]:
+    def get_dynamic_gas_price_gwei(self) -> float | None:
         """Measured all-in gas price in Gwei, or None when unmeasurable."""
         return _gas.get_dynamic_gas_price_gwei(self.chain_client)
 
     def estimate_merge_cost_usd(
         self,
-        pol_usd_price: Optional[float] = None,
-        gas_units: Optional[int] = None,
-    ) -> Optional[float]:
+        pol_usd_price: float | None = None,
+        gas_units: int | None = None,
+    ) -> float | None:
         """Dollar cost of one complete-set merge, or None when gas is unmeasured."""
         px = pol_usd_price if pol_usd_price is not None else _gas.get_dynamic_pol_usd_price()
         units = gas_units or self.gas_profile.gas_merge_direct_typical
@@ -42,9 +34,9 @@ class CtfFeeMixin:
 
     def calculate_optimal_merge_threshold(
         self,
-        gas_cost_usd: Optional[float] = None,
+        gas_cost_usd: float | None = None,
         fee_basis_points: float = 0.0,
-        pol_usd_price: Optional[float] = None,
+        pol_usd_price: float | None = None,
     ) -> float:
         """Calculate optimal complete set merge threshold using dynamic gas cost."""
         cost = (
@@ -60,8 +52,8 @@ class CtfFeeMixin:
         )
 
     def estimate_gas_fee(
-        self, pol_usd_price: Optional[float] = None
-    ) -> Tuple[Optional[float], Optional[float], int]:
+        self, pol_usd_price: float | None = None
+    ) -> tuple[float | None, float | None, int]:
         """Estimate dynamic Polygon PoS gas fee for mergePositions.
 
         Returns:
@@ -83,7 +75,7 @@ class CtfFeeMixin:
         return round(gas_fee_usd, 4), round(gas_price_gwei, 1), gas_units
 
 
-    def _eip1559_fee_params_wei(self) -> Tuple[int, int]:
+    def _eip1559_fee_params_wei(self) -> tuple[int, int]:
         """(maxPriorityFeePerGas, maxFeePerGas) in Wei from the measured gas price.
 
         Raises :class:`GasUnmeasured` when no price can be measured: signing a
@@ -95,36 +87,48 @@ class CtfFeeMixin:
                 "cannot sign a settlement: no measured Polygon gas price"
             )
         oracle_gwei = float(measured)
-        base_fee_gwei = 0.0
+        # Both fee fields come from the chain's own numbers. There is no Gwei
+        # floor and no "× 1.25 headroom": a hand-set clamp used to override the
+        # measured oracle in both directions (a 25 Gwei floor paid 25× over a
+        # 1 Gwei network, a 50 Gwei tip ceiling capped a congested one).
         try:
             block = self.chain_client._rpc("eth_getBlockByNumber", ["latest", False])
-            if isinstance(block, dict) and block.get("baseFeePerGas"):
-                base_fee_gwei = int(str(block["baseFeePerGas"]), 16) / 1e9
-        except Exception as exc:  # noqa: BLE001 - oracle still provides a floor
-            logger.debug(f"baseFeePerGas lookup failed, deriving from gas oracle: {exc}")
-
+        except Exception as exc:
+            raise _gas.GasUnmeasured(
+                f"cannot sign a settlement: latest block unreadable ({exc})"
+            ) from exc
+        if not isinstance(block, dict) or not block.get("baseFeePerGas"):
+            raise _gas.GasUnmeasured(
+                "cannot sign a settlement: latest block publishes no baseFeePerGas"
+            )
+        base_fee_gwei = int(str(block["baseFeePerGas"]), 16) / 1e9
         if base_fee_gwei <= 0.0:
-            base_fee_gwei = oracle_gwei * 0.7
+            # A zero base fee is a pre-1559 block; the oracle price alone is then
+            # the whole fee and there is no tip to derive.
+            max_fee_gwei = oracle_gwei
+            return round(max_fee_gwei * 1e9), round(max_fee_gwei * 1e9)
 
-        priority_gwei = min(
-            _MAX_PRIORITY_FEE_WEI / 1e9,
-            max(_MIN_PRIORITY_FEE_WEI / 1e9, oracle_gwei - base_fee_gwei),
-        )
-        # Headroom over the next base fee: EIP-1559 requires maxFee >= base + tip.
-        max_fee_gwei = min(
-            _MAX_MAX_FEE_WEI / 1e9,
-            max(
-                _MIN_MAX_FEE_WEI / 1e9,
-                oracle_gwei,
-                base_fee_gwei * 1.25 + priority_gwei,
-            ),
-        )
-        return int(round(priority_gwei * 1e9)), int(round(max_fee_gwei * 1e9))
+        priority_gwei = max(0.0, oracle_gwei - base_fee_gwei)
+        # EIP-1559's own next-block projection from gasUsed vs the target, so the
+        # cap follows the chain's schedule instead of a fixed multiplier.
+        next_base_gwei = base_fee_gwei
+        try:
+            gas_used = int(str(block["gasUsed"]), 16)
+            gas_limit = int(str(block["gasLimit"]), 16)
+            target = gas_limit / 2.0
+            if target > 0.0:
+                next_base_gwei = max(
+                    0.0, base_fee_gwei * (1.0 + (gas_used - target) / target / 8.0)
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.debug(f"next base fee unprojectable ({exc}); using the current base fee")
+        max_fee_gwei = max(oracle_gwei, next_base_gwei + priority_gwei)
+        return round(priority_gwei * 1e9), round(max_fee_gwei * 1e9)
 
 
     def estimate_gas_fee_redeem(
-        self, pol_usd_price: Optional[float] = None
-    ) -> Tuple[Optional[float], Optional[float], int]:
+        self, pol_usd_price: float | None = None
+    ) -> tuple[float | None, float | None, int]:
         """Dollar gas for redeemPositions, or None when either input is unmeasured.
 
         Returns:

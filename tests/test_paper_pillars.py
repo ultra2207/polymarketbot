@@ -14,9 +14,9 @@ import time
 
 import pytest
 
+import polymarketbot.strategy.reward.decision as reward
 from polymarketbot.fees import FeeSchedule
 from polymarketbot.strategy.books import shares_at
-import polymarketbot.strategy.reward.decision as reward
 from polymarketbot.strategy.venue.reads import Market, Print
 
 
@@ -317,8 +317,10 @@ def test_reward_resting_notional_never_exceeds_cash():
     new = _run_ticks(ticks, cash, reward.plan_quotes, accrual_per_tick=0.4)
 
     # The compound plan spends the whole balance again while earlier quotes
-    # still rest, so it over-commits; the reserve ledger cannot.
-    assert max(reserved for _balance, reserved in old) > cash * 1.1, old
+    # still rest, so it over-commits; the reserve ledger cannot. The measured
+    # reserve (calibrated shock quantile) now sizes the ideal quotes smaller, so
+    # the contrast is over-commit vs none, not a fixed 10 % margin.
+    assert max(reserved for _balance, reserved in old) > cash, old
     for balance, reserved in new:
         assert reserved <= balance + 1e-6, new
     assert max(reserved for _balance, reserved in new) > 0.0, new
@@ -336,9 +338,13 @@ def test_reward_reserve_trims_resting_bids_that_no_longer_fit():
         reward.allocate(candidates, bankroll_usd=cash), candidates, books
     )
     assert len(ideal) == 2
-    # Both bids are already resting 20 % above what this tick's cash covers, so
-    # the cheaper half of the book has to go rather than over-commit.
-    bloated = {q.token_id: (q.price, q.shares * 1.2) for q in ideal}
+    # Both bids are already resting above what this tick's cash covers, so the
+    # cheaper half of the book has to go rather than over-commit. Scale the
+    # stale sizes to the calibrated quote size instead of a fixed 20 %: the
+    # reserve now sizes the ideal book from the measured shock quantile.
+    ideal_notional = sum(q.price * q.shares for q in ideal)
+    factor = (cash / ideal_notional) * 1.05
+    bloated = {q.token_id: (q.price, q.shares * factor) for q in ideal}
     assert sum(price * shares for price, shares in bloated.values()) > cash
     kept = reward.commit_quotes(ideal, cash, bloated)
     assert len(kept) == 1
@@ -351,7 +357,14 @@ def test_reward_reserve_trims_resting_bids_that_no_longer_fit():
 
 
 def test_reward_markout_has_no_invented_constant():
-    """An unmeasured markout adds no cost; a measured one is linear."""
-    assert reward.markout_cost_usd(100.0, None) == 0.0
+    """An unmeasured markout is missing (None), never a zero cost.
+
+    Zero is the measured value of *no adverse move*, so returning ``0.0`` for a
+    missing measurement would state that an unmeasured fill was benign. A
+    measured ``0.0`` is a real reading and stays a number; a measured one is
+    linear in size.
+    """
+    assert reward.markout_cost_usd(100.0, None) is None
+    assert reward.markout_cost_usd(100.0, 0.0) == 0.0
     assert reward.markout_cost_usd(0.0, -0.209) == 0.0
     assert reward.markout_cost_usd(100.0, -0.209) == pytest.approx(-0.209)

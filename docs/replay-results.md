@@ -4,6 +4,12 @@ Status of the automated strategy-search pipeline described in `plan.md`.
 Numbers here are from `scripts/replay_all_markets.py` on the live tape; every
 claim is reproducible with the command shown.
 
+> **Status (2026-11-11).** `scripts/replay_all_markets.py` and the rest of
+> `scripts/` were deleted in the 2026-11-10 scripts cleanup
+> (`docs/code-quality-cleanup-plan.md` Appendix A), so the commands below no
+> longer resolve. The measured results are kept as the record of what the
+> harness produced.
+
 ## What exists
 
 | piece | file | state |
@@ -48,9 +54,9 @@ inventory_mtm + rewards` reconciles to the cent, including short inventory
 Command:
 
 ```
-.venv/Scripts/python.exe scripts/replay_all_markets.py \
-  --minutes 10 --max-markets 500 --order-by liquidity \
-  --strategies reactionary,queue_aware_ofi --tag wave0
+# retired: scripts/replay_all_markets.py was deleted in the 2026-11-10 scripts
+# cleanup and has no `python -m` replacement, so the reproduction command no
+# longer exists. The numbers below are the record of that run.
 ```
 
 ## First strategic result: rest at the touch or stay inside it?

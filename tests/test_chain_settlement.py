@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from polymarketbot.strategy.onchain.core import ChainClient
 from polymarketbot.risk.fast_signer import (
     _SECP256K1_G,
     _SECP256K1_N,
@@ -21,6 +20,7 @@ from polymarketbot.risk.fast_signer import (
     keccak256,
     private_key_to_address,
 )
+from polymarketbot.strategy.onchain.core import ChainClient
 from polymarketbot.strategy.onchain.ctf import (
     CTF_POSITION_BALANCE_SELECTOR,
     POLYGON_CHAIN_ID,
@@ -90,17 +90,17 @@ def test_eip155_canonical_transaction_vector():
 # EIP-1559 signing
 # ---------------------------------------------------------------------------
 
-TX_FIELDS = dict(
-    chain_id=POLYGON_CHAIN_ID,
-    nonce=7,
-    max_priority_fee_per_gas=30 * 10**9,
-    max_fee_per_gas=120 * 10**9,
-    gas_limit=97_500,
-    to=CTF_ADDRESS,
-    value=0,
-    data="0x9e7212ad",
-    access_list=[],
-)
+TX_FIELDS = {
+    "chain_id": POLYGON_CHAIN_ID,
+    "nonce": 7,
+    "max_priority_fee_per_gas": 30 * 10**9,
+    "max_fee_per_gas": 120 * 10**9,
+    "gas_limit": 97_500,
+    "to": CTF_ADDRESS,
+    "value": 0,
+    "data": "0x9e7212ad",
+    "access_list": [],
+}
 
 
 def _recover_address(digest: bytes, y_parity: int, r: int, s: int) -> str:
@@ -257,6 +257,13 @@ def test_dry_run_merge_and_redeem_unchanged(monkeypatch):
 
 
 def _enabled_ctf(chain: MagicMock) -> PolygonCtfClient:
+    # Every live signing path reads the latest block for baseFeePerGas and the
+    # EIP-1559 projection; a fake chain must answer that call realistically.
+    chain._rpc.return_value = {
+        "baseFeePerGas": hex(30 * 10**9),
+        "gasUsed": hex(15_000_000),
+        "gasLimit": hex(30_000_000),
+    }
     return PolygonCtfClient(
         private_key=TEST_KEY_HEX, dry_run=False, chain_client=chain
     )
@@ -311,6 +318,13 @@ def test_derive_position_token_id_matches_ctf_collection_math():
 def test_live_merge_uses_supplied_token_ids_for_balance_check():
     chain = MagicMock()
     chain.eth_call.return_value = hex(50 * 1_000_000)
+    # A real Polygon block publishes baseFeePerGas; the signed fee cap is now
+    # derived from it (no hard-coded Gwei clamps), so the fixture must carry it.
+    chain._rpc.return_value = {
+        "baseFeePerGas": hex(30 * 10**9),
+        "gasUsed": hex(15_000_000),
+        "gasLimit": hex(30_000_000),
+    }
     ctf = _enabled_ctf(chain)
     tokens = ("0x" + "11" * 32, "0x" + "22" * 32)
 

@@ -4,7 +4,56 @@ from __future__ import annotations
 
 import pytest
 
+from polymarketbot.fees import FeeSchedule, schedule_for_market
 from polymarketbot.live.base import BaseMarketMakingEngine, PositionView
+from polymarketbot.strategy.reward.deskew import (
+    DeSkewCalibration,
+    DynamicDeSkewOptimizer,
+)
+
+
+def _fee_schedule() -> FeeSchedule:
+    """The fixture market publishes no fees: an explicit zero schedule."""
+    return schedule_for_market({"conditionId": "0xTEST", "feesEnabled": False})
+
+
+# Test fixture coefficients (declared here, not production defaults).
+_CALIBRATION = DeSkewCalibration(
+    gamma=0.02,
+    skew_aggressiveness=0.40,
+    q_soft_bankroll_fraction=0.20,
+    q_hard_risk_fraction=0.60,
+    q_hard_absorption_quotes=3.5,
+    q_hard_floor_quotes=1.5,
+    reserve_usable_fraction=0.60,
+    holding_turnover_cycles=3.0,
+    holding_expiry_fraction=0.15,
+    holding_min_seconds=30.0,
+    holding_max_seconds=900.0,
+    merge_gas_fraction=0.30,
+    merge_quote_multiples=3.5,
+    merge_bankroll_fraction=0.30,
+    merge_min_shares=10.0,
+    ofi_toxicity_threshold=850.0,
+    drift_toxicity_cents=1.5,
+)
+
+
+def _deskew_optimizer(*, bankroll: float) -> DynamicDeSkewOptimizer:
+    """Optimizer over the fixture 0.49/0.51 book and the fixture calibration."""
+    return DynamicDeSkewOptimizer(
+        quote_size=20.0,
+        bankroll=bankroll,
+        cash_reserve=0.0,
+        taker_fee_bps=0.0,
+        calibration=_CALIBRATION,
+        mid_price=0.50,
+        time_to_resolution_days=7.0,
+        spread_cents=2.0,
+        gas_cost_usd=0.0016,
+        trades_per_min=0.5,
+        rewards_min_size=20.0,
+    )
 
 
 class _HarnessEngine(BaseMarketMakingEngine):
@@ -15,10 +64,19 @@ class _HarnessEngine(BaseMarketMakingEngine):
         self.position = PositionView(condition_id="0xTEST")
         self.placed: list[tuple[str, float, float, float]] = []
         self.canceled: list[str] = []
+        # The fixture's quote distance: the old provisional 0.50c was removed
+        # from MarketEconomics, so the test states the distance it prices with.
+        kwargs.setdefault("spread_offset_cents", 0.5)
+        # The harness has no calibration artifact, so the fixture states one
+        # explicitly. Its de-skew thresholds are derived from these numbers.
+        kwargs.setdefault("deskew_optimizer", _deskew_optimizer(bankroll=self.cash))
         super().__init__(
             condition_id="0xTEST",
             db_path=tmp_path / "engine.db",
             ledger_path=tmp_path / "ledger.json",
+            fee_schedule=_fee_schedule(),
+            bankroll_usd=self.cash,
+            cash_reserve_usd=0.0,  # the harness models no locked/reserved cash
             **kwargs,
         )
 
@@ -61,6 +119,10 @@ class _HarnessEngine(BaseMarketMakingEngine):
 
     def get_equity(self, prices=None) -> float:
         return self.cash
+
+    def _unrealized_pnl(self) -> float:
+        # The harness holds no inventory: get_equity() is cash, so nothing is unrealized.
+        return 0.0
 
 
 def _set_book(engine: _HarnessEngine, side: str, bid: float, ask: float) -> None:
@@ -266,7 +328,6 @@ def test_reward_epoch_risk_pnl_excludes_modelled_rewards(engine):
 
     def fake_update(**kwargs):
         captured.append(kwargs)
-        return None
 
     engine.risk_manager.update_portfolio_pnl = fake_update
 
@@ -286,7 +347,6 @@ def test_evaluate_quotes_risk_pnl_excludes_modelled_rewards(engine):
 
     def fake_update(**kwargs):
         captured.append(kwargs)
-        return None
 
     engine.risk_manager.update_portfolio_pnl = fake_update
 
@@ -314,11 +374,10 @@ def test_reward_epoch_index_aligns_to_wall_clock_and_does_not_extrapolate(engine
     result = engine.process_reward_epoch(timestamp=ts)
 
     assert result["epoch_index"] == int(ts // 60) % 1440
-    assert len(engine._epoch_samples) == 1
     # The displayed projection is the current run rate (one minute × 1440), while
     # the $1/day floor is judged on the accrued day, so one sample pays nothing.
     assert result["projected_daily_usd"] == pytest.approx(
-        round(engine._epoch_samples[0] * 1440.0, 2)
+        engine.daily_reward_rate * result["pool_share_pct"] / 100.0, abs=0.01
     )
     assert result["floor_met"] is False
     assert result["epoch_payout_usd"] == 0.0

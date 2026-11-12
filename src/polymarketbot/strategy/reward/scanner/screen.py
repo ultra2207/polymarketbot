@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
@@ -27,7 +27,7 @@ class OpportunityScanner:
     def __init__(
         self,
         rest_url: str = state.CLOB_REST_URL,
-        session: Optional[requests.Session] = None,
+        session: requests.Session | None = None,
     ) -> None:
         self.rest_url = rest_url
         self.session = session or requests.Session()
@@ -55,10 +55,10 @@ class OpportunityScanner:
         *,
         allocated_capital_usd: float,
         quote_horizon_s: float,
-        spread_cents: Optional[float] = None,
-        competing_score: Optional[float] = None,
-        regime: Optional[MarketRegime] = None,
-    ) -> Optional[MarketOpportunity]:
+        spread_cents: float | None = None,
+        competing_score: float | None = None,
+        regime: MarketRegime | None = None,
+    ) -> MarketOpportunity | None:
         """Parse a raw payload and score net yield from measured inputs.
 
         Every number this method prices comes from the payload, the venue's L2
@@ -140,9 +140,9 @@ class OpportunityScanner:
             logger.warning(f"no published tick for {cid!r}; not scoreable")
             return None
         tokens: list[TokenConfig] = []
-        mid: Optional[float] = None
-        yes_token: Optional[str] = None
-        no_token: Optional[str] = None
+        mid: float | None = None
+        yes_token: str | None = None
+        no_token: str | None = None
         for tok in raw_mkt.get("tokens", []):
             t_id = tok.get("token_id")
             outcome = tok.get("outcome", "unknown")
@@ -267,7 +267,7 @@ class OpportunityScanner:
         allocated_capital_usd: float,
         quote_horizon_s: float,
         limit: int = 50,
-        raw_markets: Optional[list[dict[str, Any]]] = None,
+        raw_markets: list[dict[str, Any]] | None = None,
     ) -> list[MarketOpportunity]:
         """Rank the rate universe by net yield per dollar on allocated capital.
 

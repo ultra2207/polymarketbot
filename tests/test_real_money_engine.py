@@ -21,14 +21,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from polymarketbot.fees import schedule_for_market
+from polymarketbot.live.engine import PreflightReport, RealMoneyTradingEngine
 from polymarketbot.risk.models import CircuitBreakerReason
-from polymarketbot.strategy.venue.feed import OrderBookLevel
-from polymarketbot.strategy.venue.clob import (
-    ClobAPIError,
-    ClobAuthCredentials,
-    LiveClobClient,
-    build_clob_hmac_signature,
-)
 from polymarketbot.strategy.onchain.ctf import (
     DEFAULT_COLLATERAL_USDC,
     MERGE_POSITIONS_SELECTOR,
@@ -41,7 +36,17 @@ from polymarketbot.strategy.onchain.ctf import (
     get_dynamic_gas_price_gwei,
     get_dynamic_pol_usd_price,
 )
-from polymarketbot.live.engine import PreflightReport, RealMoneyTradingEngine
+from polymarketbot.strategy.reward.deskew import (
+    DeSkewCalibration,
+    DynamicDeSkewOptimizer,
+)
+from polymarketbot.strategy.venue.clob import (
+    ClobAPIError,
+    ClobAuthCredentials,
+    LiveClobClient,
+    build_clob_hmac_signature,
+)
+from polymarketbot.strategy.venue.feed import OrderBookLevel
 
 SAMPLE_PRIVATE_KEY = "0x4c0883a69102937d6231471b5dbb6204db7e716b78ac5c7807e8b88f211d733b"
 EXPECTED_ADDRESS = "0x4a6d2fa1266d0e22ae77f79f6e16f3e5f6294e93"
@@ -58,6 +63,74 @@ LIVE_CREDENTIALS = ClobAuthCredentials(
     address=EXPECTED_ADDRESS,
     private_key=SAMPLE_PRIVATE_KEY,
 )
+
+
+def _live_engine(**kwargs) -> RealMoneyTradingEngine:
+    """A live engine over the fixture's synthetic, fee-free market.
+
+    ``fee_schedule`` is now a required constructor argument. These offline
+    fixtures do not model venue fees, so the schedule is derived from the
+    fixture market payload that declares ``feesEnabled: False`` - a measured
+    zero - rather than being left unmeasured or guessed.
+    """
+    market = {
+        "conditionId": str(kwargs.get("condition_id", "0xTEST")),
+        "feesEnabled": False,
+    }
+    return RealMoneyTradingEngine(fee_schedule=schedule_for_market(market), **kwargs)
+
+
+# Test fixture de-skew coefficients (declared here, not production defaults).
+_DESKEW_CALIBRATION = DeSkewCalibration(
+    gamma=0.02,
+    skew_aggressiveness=0.40,
+    q_soft_bankroll_fraction=0.20,
+    q_hard_risk_fraction=0.60,
+    q_hard_absorption_quotes=3.5,
+    q_hard_floor_quotes=1.5,
+    reserve_usable_fraction=0.60,
+    holding_turnover_cycles=3.0,
+    holding_expiry_fraction=0.15,
+    holding_min_seconds=30.0,
+    holding_max_seconds=900.0,
+    merge_gas_fraction=0.30,
+    merge_quote_multiples=3.5,
+    merge_bankroll_fraction=0.30,
+    merge_min_shares=10.0,
+    ofi_toxicity_threshold=850.0,
+    drift_toxicity_cents=1.5,
+)
+
+
+def _deskew_optimizer(*, bankroll: float) -> DynamicDeSkewOptimizer:
+    """Optimizer over the fixture's 0.49/0.51 book and stated calibration."""
+    return DynamicDeSkewOptimizer(
+        quote_size=20.0,
+        bankroll=bankroll,
+        cash_reserve=0.0,
+        taker_fee_bps=0.0,
+        calibration=_DESKEW_CALIBRATION,
+        mid_price=0.50,
+        time_to_resolution_days=7.0,
+        spread_cents=2.0,
+        gas_cost_usd=0.000287,
+        trades_per_min=0.5,
+        rewards_min_size=20.0,
+    )
+
+
+def _seed_no_book(engine: RealMoneyTradingEngine, timestamp: float | None = None) -> None:
+    """Make the complementary NO snapshot fresh for the quote gate.
+
+    Quoting now refuses when either YES or NO is older than the reprice
+    interval. These single-leg tests model the same 0.49/0.51 fixture book on
+    the NO side; the NO order it produces is cancelled by the caller so the
+    test keeps tracking exactly one YES quote.
+    """
+    ts = time.time() if timestamp is None else float(timestamp)
+    engine._book_ts["NO"] = ts
+    engine._best_bids["NO"] = 0.49
+    engine._best_asks["NO"] = 0.51
 
 
 @contextmanager
@@ -146,7 +219,7 @@ def test_clob_order_eip712_generation_and_signing():
     assert isinstance(sig, str)
     assert sig.startswith("0x")
     assert len(sig) == 132  # 65 bytes = 130 hex chars + '0x'
-    assert int(sig[2:], 16) != 0  # a zeroed signature is a signing failure
+    assert int(sig, 16) != 0  # a zeroed signature is a signing failure
 
     # The submitted body must agree with the signed struct field for field.
     assert order_payload["side"] == "BUY"
@@ -268,7 +341,7 @@ def test_polygon_ctf_dry_run_merge():
     with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
          patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
         res = ctf.merge_positions(
-            condition_id="0xTEST_CONDITION_ID",
+            condition_id="0x" + "ab" * 32,
             amount_shares=20.0,
         )
 
@@ -391,7 +464,8 @@ def test_dynamic_pol_usd_price_medians_listed_venues(tmp_path, monkeypatch):
 
 def test_dynamic_pol_usd_price_cache_ttl():
     """Verify cache hits within cache_ttl_seconds avoid outbound HTTP requests."""
-    from polymarketbot.strategy.onchain.ctf import PolReading, gas as _gas_mod
+    from polymarketbot.strategy.onchain.ctf import PolReading
+    from polymarketbot.strategy.onchain.ctf import gas as _gas_mod
 
     cached = PolReading(
         usd=0.105, source="test", samples={}, spread_pct=0.0, measured_at=time.time()
@@ -533,7 +607,7 @@ def test_real_money_engine_dynamic_merge_threshold_initialization():
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xDYNAMIC_TEST_CID",
                 clob_client=clob,
                 ctf_client=ctf,
@@ -580,11 +654,16 @@ def test_preflight_check_unconfigured_account():
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xDEMO_CID",
                 clob_client=clob,
                 ctf_client=ctf,
-                initial_cash=0.0,
+                # The engine now demands a measured positive bankroll seed.
+                # This fixture models an *unfunded* account: the wallet it
+                # reports is empty (total_wallet_balance=0), which is what the
+                # preflight's $0-collateral path must diagnose.
+                initial_cash=100.0,
+                total_wallet_balance=0.0,
                 db_path=db_path,
                 ledger_path=ledger_path,
                 dry_run=True,
@@ -651,7 +730,7 @@ class TestRealMoneyTradingEngine:
 
             with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
                  patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-                eng = RealMoneyTradingEngine(
+                eng = _live_engine(
                     condition_id="0xREAL_TEST_COND",
                     asset_id_yes="1000000000000000000000000000000000000000000000000000000000000001",
                     asset_id_no="1000000000000000000000000000000000000000000000000000000000000002",
@@ -662,6 +741,7 @@ class TestRealMoneyTradingEngine:
                     spread_offset_cents=0.50,
                     daily_reward_rate=28.80,
                     auto_merge_threshold=10.0,
+                    deskew_optimizer=_deskew_optimizer(bankroll=100.0),
                     db_path=db_path,
                     ledger_path=ledger_path,
                     dry_run=True,
@@ -677,6 +757,7 @@ class TestRealMoneyTradingEngine:
         asks = [{"price": 0.51, "size": 100.0}]
 
         engine.on_book_update("YES", bids=bids, asks=asks)
+        engine.on_book_update("NO", bids=bids, asks=asks)
 
         # Quotes should be placed for YES and NO
         assert len(engine.active_quotes) >= 1
@@ -707,10 +788,18 @@ class TestRealMoneyTradingEngine:
         """Verify mid-price jump > 2.0c within 60s trips circuit breaker and cancels CLOB orders."""
         # Initial book
         engine.on_book_update("YES", bids=[{"price": 0.50, "size": 100.0}], asks=[{"price": 0.50, "size": 100.0}])
+        engine.on_book_update("NO", bids=[{"price": 0.50, "size": 100.0}], asks=[{"price": 0.50, "size": 100.0}])
         assert len(engine.active_quotes) > 0
 
-        # Rapid jump by 3 cents (0.50 -> 0.53) within 60s
+        # Rapid jump by 3 cents (0.50 -> 0.53) within 60s. Both snapshots are
+        # refreshed at the jump tick, as the feed would send them.
         t_jump = time.time() + 10.0
+        engine.on_book_update(
+            "NO",
+            bids=[{"price": 0.50, "size": 100.0}],
+            asks=[{"price": 0.50, "size": 100.0}],
+            timestamp=t_jump,
+        )
         engine.on_book_update(
             "YES",
             bids=[{"price": 0.53, "size": 100.0}],
@@ -727,6 +816,7 @@ class TestRealMoneyTradingEngine:
     def test_daily_loss_circuit_breaker(self, engine):
         """Verify daily loss limit ($15.00) trips risk breaker and cancels orders."""
         engine.on_book_update("YES", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}])
+        engine.on_book_update("NO", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}])
         assert len(engine.active_quotes) > 0
 
         # Simulate heavy daily loss of $20.00
@@ -745,15 +835,21 @@ class TestRealMoneyTradingEngine:
 
     def test_quadratic_rewards_epoch_scoring(self, engine):
         """Verify reward epoch scoring, the maker-side $1/day floor, and compounding APR."""
-        ts = time.time()
+        # Quotes are placed at wall-clock time: ``_set_quote`` checks book
+        # freshness against the real clock, not only this tick's timestamp.
+        wall = time.time()
         # Both legs must be quoted against fresh books to earn a two-sided score.
         engine.on_book_update(
-            "YES", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}], timestamp=ts
+            "YES", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}], timestamp=wall
         )
         engine.on_book_update(
-            "NO", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}], timestamp=ts
+            "NO", bids=[{"price": 0.49, "size": 100.0}], asks=[{"price": 0.51, "size": 100.0}], timestamp=wall
         )
         assert {"BUY_YES", "BUY_NO"} <= set(engine.active_quotes)
+
+        # Rewards accrue per UTC day, so anchor the accumulator at the coming
+        # midnight: the interval exercised below is then exactly one UTC day.
+        ts = (int(wall // 86_400.0) + 1) * 86_400.0
 
         # One sampled minute projects the run rate across the day but is not a
         # day of income: the $1 floor is judged on the accrued day, so it pays 0.
@@ -767,14 +863,20 @@ class TestRealMoneyTradingEngine:
         assert res["epoch_payout_usd"] == 0.0
         assert engine.total_rewards_credited == 0.0
 
-        # With a full day of observed samples at that rate the projection clears
-        # the floor and the epoch is actually paid out.
-        engine._epoch_samples = [0.05] * 49
-        res_paid = engine.process_reward_epoch(timestamp=ts + 60.0)
+        # A second sampled minute accrues a minute of that rate - still far
+        # below a day's $1.00 floor, so nothing is paid yet.
+        minute = engine.process_reward_epoch(timestamp=ts + 60.0)
+        assert minute["floor_met"] is False
+        assert minute["epoch_payout_usd"] == 0.0
+
+        # A full UTC day of accrual at that rate clears the $1.00 floor. The
+        # epoch call at the next midnight settles and credits the completed
+        # day, while the new day is still accruing (so its own floor is unmet).
+        res_paid = engine.process_reward_epoch(timestamp=ts + 86_400.0)
         assert res_paid["projected_daily_usd"] >= 1.0
-        assert res_paid["floor_met"] is True
-        assert res_paid["epoch_payout_usd"] > 0.0
-        assert engine.total_rewards_credited > 0.0
+        assert res_paid["epoch_payout_usd"] >= 1.0
+        assert engine.total_rewards_credited >= 1.0
+        assert res_paid["floor_met"] is False
 
         telemetry = engine.get_telemetry()
         assert telemetry["total_rewards"] > 0.0
@@ -1048,7 +1150,7 @@ def test_preflight_allowance_enforcement():
              patch.object(clob, "get_total_rewards", return_value={}), \
              patch.object(clob, "get_daily_rewards", return_value={}), \
              patch.object(ctf.chain_client, "block_number", return_value=12345678):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_CID",
                 clob_client=clob,
                 ctf_client=ctf,
@@ -1078,7 +1180,7 @@ def test_initial_cash_calibration_no_premature_halt():
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_CID",
                 clob_client=clob,
                 ctf_client=ctf,
@@ -1089,7 +1191,7 @@ def test_initial_cash_calibration_no_premature_halt():
             )
 
             # Before fix, day_start_equity defaulted to 300.0 and process_reward_epoch tripped immediately
-            res = engine.process_reward_epoch(timestamp=time.time())
+            engine.process_reward_epoch(timestamp=time.time())
             assert engine.risk_manager.portfolio_state.is_halted is False
             assert len(engine.risk_manager.portfolio_state.circuit_breaker_events) == 0
             assert engine.risk_manager.portfolio_state.day_start_equity_usd == 100.0
@@ -1109,13 +1211,16 @@ def test_real_money_max_drawdown_circuit_breaker():
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_CID",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
                 clob_client=clob,
                 ctf_client=ctf,
                 initial_cash=100.0,
+                # The fixture's measured quote distance; without it quoting is
+                # disabled (MarketEconomics leaves it unmeasured by default).
+                spread_offset_cents=0.50,
                 db_path=db_path,
                 ledger_path=ledger_path,
                 dry_run=True,
@@ -1200,13 +1305,16 @@ def test_order_book_levels_dataclass_ingestion():
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_CID",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
                 clob_client=clob,
                 ctf_client=ctf,
                 initial_cash=100.0,
+                # The fixture's measured quote distance; without it quoting is
+                # disabled (MarketEconomics leaves it unmeasured by default).
+                spread_offset_cents=0.50,
                 db_path=db_path,
                 ledger_path=ledger_path,
                 dry_run=True,
@@ -1228,10 +1336,8 @@ def test_order_book_levels_dataclass_ingestion():
             )
 
             # Best bid = max bid price, best ask = min ask price, per side.
-            assert engine._best_bids["YES"] == 0.48
-            assert engine._best_asks["YES"] == 0.52
-            assert engine._best_bids["NO"] == 0.48
-            assert engine._best_asks["NO"] == 0.52
+            assert engine.get_best_bid_ask("YES") == (0.48, 0.52)
+            assert engine.get_best_bid_ask("NO") == (0.48, 0.52)
             assert engine.has_fresh_book("YES") and engine.has_fresh_book("NO")
 
             # Fresh two-sided books produce both maker legs.
@@ -1259,7 +1365,7 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
         ctf_dry = PolygonCtfClient(dry_run=True)
         with patch.object(ctf_dry, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine_dry = RealMoneyTradingEngine(
+            engine_dry = _live_engine(
                 condition_id="0xTEST_DRY",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1267,12 +1373,18 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
                 ctf_client=ctf_dry,
                 initial_cash=100.0,
                 quote_size=20.0,
+                # The fixture's measured quote distance; without it quoting is
+                # disabled (MarketEconomics leaves it unmeasured by default).
+                spread_offset_cents=0.50,
                 db_path=db_path,
                 ledger_path=ledger_path,
                 dry_run=True,
             )
 
         try:
+            # The quote gate needs both snapshots fresh; the NO order it
+            # produces is cancelled because this test tracks only the YES leg.
+            _seed_no_book(engine_dry)
             # Place resting quote against a fresh book
             engine_dry.on_book_update(
                 "YES",
@@ -1280,6 +1392,7 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
                 asks=[{"price": 0.51, "size": 100.0}],
                 timestamp=time.time(),
             )
+            engine_dry._cancel_quote("BUY_NO")
             assert "BUY_YES" in engine_dry.active_quotes
             quote = engine_dry.active_quotes["BUY_YES"]
             quote_size = float(quote["size"])
@@ -1330,7 +1443,7 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
                 is_dry_run=False,
             )
 
-            engine_live = RealMoneyTradingEngine(
+            engine_live = _live_engine(
                 condition_id="0xTEST_LIVE",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1338,6 +1451,9 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
                 ctf_client=ctf_live,
                 initial_cash=100.0,
                 quote_size=20.0,
+                # The fixture's measured quote distance; without it quoting is
+                # disabled (MarketEconomics leaves it unmeasured by default).
+                spread_offset_cents=0.50,
                 db_path=Path(tmpdir) / "live_trading.db",
                 ledger_path=Path(tmpdir) / "live_ledger.json",
                 dry_run=False,
@@ -1350,14 +1466,19 @@ def test_live_vs_dry_run_trade_update_fill_behavior():
                 assert engine_live.active_quotes == {}
 
                 # Place live quote; the signed token id must be the numeric asset id.
+                _seed_no_book(engine_live)
                 engine_live.on_book_update(
                     "YES",
                     bids=[{"price": 0.49, "size": 100.0}],
                     asks=[{"price": 0.51, "size": 100.0}],
                     timestamp=time.time(),
                 )
+                engine_live._cancel_quote("BUY_NO")
                 assert "BUY_YES" in engine_live.active_quotes
-                assert mock_place.call_args.kwargs["token_id"] == TOKEN_ID_YES
+                placed_token_ids = [
+                    call.kwargs.get("token_id") for call in mock_place.call_args_list
+                ]
+                assert TOKEN_ID_YES in placed_token_ids
                 live_order_id = engine_live.active_quotes["BUY_YES"]["order_id"]
 
                 # The venue still lists our order as LIVE with 0 matched.
@@ -1389,7 +1510,7 @@ def test_sync_live_orders_and_fills_partial_and_full():
 
         with patch.object(ctf, "get_dynamic_gas_price_gwei", return_value=40.0), \
              patch("polymarketbot.strategy.onchain.ctf.gas.get_dynamic_pol_usd_price", return_value=0.092):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_SYNC",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1397,12 +1518,18 @@ def test_sync_live_orders_and_fills_partial_and_full():
                 ctf_client=ctf,
                 initial_cash=100.0,
                 quote_size=20.0,
+                # The fixture's measured quote distance; without it quoting is
+                # disabled (MarketEconomics leaves it unmeasured by default).
+                spread_offset_cents=0.50,
                 db_path=Path(tmpdir) / "sync_trading.db",
                 ledger_path=Path(tmpdir) / "sync_ledger.json",
                 dry_run=True,
             )
 
         try:
+            # The quote gate needs both snapshots fresh; the NO order it
+            # produces is cancelled because this test tracks only the YES leg.
+            _seed_no_book(engine)
             # Place a resting quote against a fresh book.
             engine.on_book_update(
                 "YES",
@@ -1410,6 +1537,7 @@ def test_sync_live_orders_and_fills_partial_and_full():
                 asks=[{"price": 0.52, "size": 20.0}],
                 timestamp=time.time(),
             )
+            engine._cancel_quote("BUY_NO")
             qid = "BUY_YES"
             assert qid in engine.active_quotes
             order_id = engine.active_quotes[qid]["order_id"]
@@ -1482,7 +1610,14 @@ def test_sync_live_orders_and_fills_partial_and_full():
             assert qid in engine.active_quotes
             canceled_oid = engine.active_quotes[qid]["order_id"]
             engine._cancel_quote(qid)
-            assert canceled_oid in engine._canceled_order_ids
+            # The observable end state of a confirmed cancel: the venue no
+            # longer lists the order and no fill was booked (a cancel is not a
+            # trade), so the measured inventory is unchanged.
+            assert canceled_oid not in {
+                str(order.get("orderID")) for order in clob.get_open_orders()
+            }
+            assert len(engine.fills_history) == 2
+            assert engine.shares_yes == 20.0
             assert qid not in engine.active_quotes
 
             # Cancel any other remaining quotes
@@ -1520,7 +1655,7 @@ def test_safe_ctf_merge_complete_set_verification():
                 is_dry_run=True,
             )
 
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_MERGE",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1622,7 +1757,7 @@ def test_safe_ctf_merge_complete_set_verification():
             order_sink=[],
             position_side_effect=[10.0, 10.0, 10.0, 10.0, 0.0, 0.0],
         ):
-            engine_live = RealMoneyTradingEngine(
+            engine_live = _live_engine(
                 condition_id="0xTEST_MERGE_LIVE",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1667,7 +1802,7 @@ def test_sync_live_balances_and_alias():
         ctf = PolygonCtfClient(private_key=SAMPLE_PRIVATE_KEY, dry_run=False)
 
         with live_venue(clob, ctf, available=250.0, pol=1.85):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_BAL",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1746,7 +1881,7 @@ def test_dynamic_budget_percentage_allocation_and_isolation():
         ctf = PolygonCtfClient(private_key=SAMPLE_PRIVATE_KEY, dry_run=False)
 
         with live_venue(clob, ctf, available=1000.0):
-            engine = RealMoneyTradingEngine(
+            engine = _live_engine(
                 condition_id="0xTEST_BUDGET",
                 asset_id_yes=TOKEN_ID_YES,
                 asset_id_no=TOKEN_ID_NO,
@@ -1799,7 +1934,7 @@ def test_dynamic_budget_percentage_allocation_and_isolation():
                 clob2 = LiveClobClient(credentials=LIVE_CREDENTIALS, dry_run=False)
                 ctf2 = PolygonCtfClient(private_key=SAMPLE_PRIVATE_KEY, dry_run=False)
                 with live_venue(clob2, ctf2, available=400.0):
-                    engine2 = RealMoneyTradingEngine(
+                    engine2 = _live_engine(
                         condition_id="0xTEST_BUDGET2",
                         asset_id_yes=TOKEN_ID_YES,
                         asset_id_no=TOKEN_ID_NO,

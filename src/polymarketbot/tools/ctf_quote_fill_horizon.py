@@ -33,9 +33,9 @@ import argparse
 import glob
 import json
 import time
-from datetime import datetime, timezone
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional, Sequence
 
 import numpy as np
 import pyarrow as pa
@@ -43,6 +43,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from polymarketbot.logs import get_logger
+from polymarketbot.tools.tape_reader import read_tape
 
 log = get_logger("tools.ctf_quote_fill_horizon")
 
@@ -80,7 +81,7 @@ def _clopper_pearson(k: int, n: int, alpha: float = 0.05) -> tuple[float, float]
     return float(lo), float(hi)
 
 
-def _partitions(kind: str, hours: Optional[Sequence[str]] = None) -> list[str]:
+def _partitions(kind: str, hours: Sequence[str] | None = None) -> list[str]:
     """Hour partitions of one tape channel, oldest first."""
     pattern = str(TAPE_DIR / kind / "date=*" / "hour=*")
     parts = sorted(p for p in glob.glob(pattern) if Path(p).is_dir())
@@ -91,7 +92,7 @@ def _partitions(kind: str, hours: Optional[Sequence[str]] = None) -> list[str]:
 
 
 def _load_sell_prints(
-    hours: Optional[Sequence[str]],
+    hours: Sequence[str] | None,
 ) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Per-token (ts, price, size) of every SELL print on the tape."""
     out: dict[str, list[tuple[float, float, float]]] = {}
@@ -100,7 +101,9 @@ def _load_sell_prints(
         files = sorted(glob.glob(str(Path(part) / "*.parquet")))
         if not files:
             continue
-        table = pq.read_table(files, columns=["recv_ts_ns", "asset_id", "side", "price", "size"])
+        # Unified per part: the tape parts disagree on column types (int16/int64
+        # shard, null-typed fee_rate_bps), and `pq.read_table` refuses the merge.
+        table = read_tape(files, columns=["recv_ts_ns", "asset_id", "side", "price", "size"])
         table = table.filter(pc.equal(pc.utf8_upper(table["side"]), "SELL"))
         if table.num_rows == 0:
             continue
@@ -129,7 +132,7 @@ def _load_sell_prints(
 
 
 def _append_best_bid(
-    table: "pa.Table",
+    table: pa.Table,
     assets: list[np.ndarray],
     stamps: list[np.ndarray],
     bids: list[np.ndarray],
@@ -244,7 +247,7 @@ def _condition_legs(part: str) -> dict[str, tuple[str, str]]:
     files = sorted(glob.glob(str(Path(part) / "*.parquet")))
     if not files:
         return {}
-    table = pq.read_table(files, columns=["condition_id", "asset_id"]).combine_chunks()
+    table = read_tape(files, columns=["condition_id", "asset_id"])
     out: dict[str, list[str]] = {}
     seen: dict[str, set[str]] = {}
     for condition, asset in zip(
@@ -305,7 +308,7 @@ def _decay(
     }
     pairs = 0
     observations = 0
-    for condition, (asset_a, asset_b) in legs.items():
+    for asset_a, asset_b in legs.values():
         ser_a = series.get(asset_a)
         ser_b = series.get(asset_b)
         if ser_a is None or ser_b is None:
@@ -340,7 +343,7 @@ def _decay(
         pairs += 1
         observations += int(edge.size)
         for h in horizons:
-            shift = int(round(h / grid_s))
+            shift = round(h / grid_s)
             if shift <= 0 or edge.size <= shift:
                 continue
             # Only compare grid points that are exactly ``shift`` steps apart in
@@ -371,7 +374,7 @@ def _decay(
 
 
 def measure_decay(
-    hours: Optional[Sequence[str]] = None,
+    hours: Sequence[str] | None = None,
     grid_s: float = 5.0,
     horizons: Sequence[float] = DEFAULT_HORIZONS_S,
     tick: float = 0.01,
@@ -504,10 +507,13 @@ def _evaluate(
         for tick in ticks:
             quote = quote_bid + tick
             incidence[tick][0] += 1
-            if sell_ts.size and np.any(sell_price <= float(quote.max()) + 1e-12):
+            if (
+                sell_ts.size
+                and np.any(sell_price <= float(quote.max()) + 1e-12)
                 # The token printed at or below its best quote at some point.
-                if float(quote.max()) >= float(sell_price.min()):
-                    incidence[tick][1] += 1
+                and float(quote.max()) >= float(sell_price.min())
+            ):
+                incidence[tick][1] += 1
             # Placements sharing a quote price share one filtered print series,
             # so the crossing test is exact and the work is one cumsum per
             # distinct quote price instead of one pass per placement.
@@ -605,6 +611,7 @@ def _markout_evaluate(
     horizons: Sequence[float],
     ticks: Sequence[float],
     min_flow: float,
+    stale_after_s: float,
 ) -> dict[tuple[float, float], list[float]]:
     """Markout, entry slip and fill delay for every (horizon, tick) fill sample."""
     cells: dict[tuple[float, float], list[float]] = {
@@ -660,8 +667,8 @@ def _markout_evaluate(
                     completing = np.maximum(completing, lo[filled])
                     completing = np.minimum(completing, et.size - 1)
                     fill_ts = et[completing]
-                    entry = _as_of(ts, bid, fill_ts, horizon)
-                    exit_mark = _as_of(ts, bid, fill_ts + horizon, horizon)
+                    entry = _as_of(ts, bid, fill_ts, stale_after_s)
+                    exit_mark = _as_of(ts, bid, fill_ts + horizon, stale_after_s)
                     good = np.isfinite(entry) & np.isfinite(exit_mark)
                     if not np.any(good):
                         continue
@@ -678,13 +685,22 @@ def _markout_evaluate(
 
 
 def measure_markout(
-    hours: Optional[Sequence[str]] = None,
+    hours: Sequence[str] | None = None,
     grid_s: float = 5.0,
     horizons: Sequence[float] = DEFAULT_HORIZONS_S,
     ticks: Sequence[float] = DEFAULT_TICKS,
     min_flow: float = DEFAULT_MIN_FLOWS[0],
+    stale_after_s: float = DECAY_MAX_QUOTE_AGE_S,
 ) -> dict:
-    """Measure the adverse markout of a single filled leg on the recorded tape."""
+    """Measure the adverse markout of a single filled leg on the recorded tape.
+
+    ``stale_after_s`` bounds how old the newest book update may be for it to
+    count as the mark at the fill and at the exit. It used to be the horizon,
+    which accepted a 225 s-old best bid as the entry mark at a 225 s horizon;
+    the default is the interval this same module measured for a market that is
+    still quoting (``DECAY_MAX_QUOTE_AGE_S``), so a stale quote is dropped
+    instead of carried forward.
+    """
     started = time.time()
     prints = _load_sell_prints(hours)
     parts = _partitions("clob_events", hours)
@@ -698,7 +714,9 @@ def measure_markout(
         series = _best_bid_series(part)
         if not series:
             continue
-        hour_cells = _markout_evaluate(series, prints, grid_s, horizons, ticks, min_flow)
+        hour_cells = _markout_evaluate(
+            series, prints, grid_s, horizons, ticks, min_flow, stale_after_s
+        )
         for key, values in hour_cells.items():
             for i, value in enumerate(values):
                 totals[key][i] += value
@@ -729,11 +747,14 @@ def measure_markout(
                 "ci_high": (mean_drift + 1.96 * stderr) if stderr is not None else None,
                 "mean_entry_slip_usd_per_share": (slip_sum / count) if count else None,
                 "mean_fill_delay_s": (delay_sum / count) if count else None,
+                # Per-cell provenance: a merged artifact may hold cells measured
+                # under a different bound, so the bound travels with the number.
+                "stale_after_s": stale_after_s,
             }
         )
 
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "elapsed_s": round(time.time() - started, 1),
         "source": {
             "events_glob": str(TAPE_DIR / "clob_events" / "date=*" / "hour=*"),
@@ -753,7 +774,12 @@ def measure_markout(
                 "is the adverse drift the single-leg branch pays after it fills"
             ),
             "entry_slip": "quote - best_bid(at fill), USDC per share",
-            "stale_after_s": "a mark whose last book update is older than the horizon is dropped",
+            "stale_after_s": stale_after_s,
+            "stale_after_basis": (
+                "a mark whose newest book update is older than stale_after_s is dropped; "
+                "the value is the measured inter-update gap of a still-quoting market "
+                "(DECAY_MAX_QUOTE_AGE_S), not the horizon"
+            ),
             "grid_s": grid_s,
             "horizons_s": list(horizons),
             "ticks": list(ticks),
@@ -768,7 +794,7 @@ def measure_markout(
 
 
 def measure(
-    hours: Optional[Sequence[str]] = None,
+    hours: Sequence[str] | None = None,
     grid_s: float = 5.0,
     horizons: Sequence[float] = DEFAULT_HORIZONS_S,
     ticks: Sequence[float] = DEFAULT_TICKS,
@@ -838,7 +864,7 @@ def measure(
         )
 
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now(UTC).isoformat(),
         "elapsed_s": round(time.time() - started, 1),
         "source": {
             "events_glob": str(TAPE_DIR / "clob_events" / "date=*" / "hour=*"),
@@ -881,7 +907,7 @@ def measure(
     }
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--grid-s", type=float, default=5.0)
@@ -916,6 +942,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ),
     )
     parser.add_argument("--markout-out", default=str(DEFAULT_MARKOUT_OUT))
+    parser.add_argument(
+        "--stale-after",
+        type=float,
+        default=None,
+        help=(
+            "markout only: bound (s) on the age of the newest book update used as a mark. "
+            f"Default {DECAY_MAX_QUOTE_AGE_S:g}s, the measured inter-update gap of a "
+            "still-quoting market; the horizon is not a valid substitute"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.markout:
@@ -931,7 +967,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             horizons = DEFAULT_HORIZONS_S
         artifact = measure_markout(
-            hours=args.hours, grid_s=args.grid_s, horizons=horizons
+            hours=args.hours,
+            grid_s=args.grid_s,
+            horizons=horizons,
+            stale_after_s=(
+                args.stale_after if args.stale_after is not None else DECAY_MAX_QUOTE_AGE_S
+            ),
         )
         target = Path(args.markout_out)
         if args.merge and target.exists():
@@ -940,11 +981,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for cell in artifact["cells"]:
                 keyed[(cell["horizon_s"], cell["tick"])] = cell
             prior["cells"] = [keyed[key] for key in sorted(keyed)]
+            # The definition describes the cells that were just re-measured, and
+            # every cell carries its own stale_after_s for the ones that were not.
+            prior["definition"] = artifact["definition"]
             prior["last_merge"] = {
                 "generated_at": artifact["generated_at"],
                 "source": artifact["source"],
                 "coverage": artifact["coverage"],
                 "horizons": list(horizons),
+                "stale_after_s": artifact["definition"]["stale_after_s"],
             }
             artifact = prior
         target.parent.mkdir(parents=True, exist_ok=True)

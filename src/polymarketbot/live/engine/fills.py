@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.live.engine.markout import RealMoneyFillRecord
 from polymarketbot.logs import get_logger
@@ -22,7 +22,7 @@ class FillMixin:
         fill_sz: float,
         fill_px: float,
         fee_usd: float = 0.0,
-        ts: Optional[float] = None,
+        ts: float | None = None,
         is_taker: bool = False,
         maker_rebate_usd: float = 0.0,
     ) -> None:
@@ -117,6 +117,7 @@ class FillMixin:
 
             setattr(self, shares_attr, new_shares)
             setattr(self, avg_attr, round(float(avg), 10))
+            self._track_inventory_age(ts)
             self.realized_pnl += realized
             self.fees_paid_usd += fee
             self.total_volume_traded_usd += size * price
@@ -130,6 +131,7 @@ class FillMixin:
                 size=size,
                 timestamp=ts,
             )
+            self.micro_risk.on_fill(asset_id, side, price, size, ts)
 
             if (
                 self._cost_basis_unknown
@@ -145,7 +147,11 @@ class FillMixin:
                     float(getattr(cfg, "min_merge_notional_usd", 0.0) or 0.0),
                 )
                 if min(self.shares_yes, self.shares_no) >= min_sets:
-                    self.trigger_ctf_merge()
+                    # Deferred, not called here: this runs under ``self._lock``
+                    # (a fill is booked from the order/feed callback), and the
+                    # merge's broadcast + receipt wait must not hold the lock.
+                    # ``run_pending_ctf_merge`` executes it after release.
+                    self._merge_requested = True
 
     def _fill_mode(self) -> str:
         return "DRY_RUN" if self.dry_run else "LIVE"
@@ -168,8 +174,8 @@ class FillMixin:
     ) -> None:
         """Persist one fill plus its post-fill marks (measurement only)."""
         mid = self._fresh_mid(tok)
-        bid_at_fill: Optional[float] = None
-        ask_at_fill: Optional[float] = None
+        bid_at_fill: float | None = None
+        ask_at_fill: float | None = None
         if mid is not None:
             raw_bid, raw_ask = self.get_best_bid_ask(tok)
             bid_at_fill = float(raw_bid) if 0.0 < float(raw_bid) < 1.0 else None
@@ -252,6 +258,17 @@ class FillMixin:
         shares_after = float(getattr(self, shares_attr, 0.0) or 0.0)
 
         order_id = record.order_id
+        # The wash-trade guard indexes resting makers by their full size. A
+        # partial fill that is never reported leaves the guard believing the
+        # whole order still rests, which then blocks the engine's legitimate
+        # re-quote at that price. Report the remaining size.
+        guard = getattr(getattr(self, "clob_client", None), "self_trade_guard", None)
+        if guard is not None and order_id and not is_taker:
+            remaining = max(0.0, float(qdata.get("size", 0.0) or 0.0) - float(size))
+            try:
+                guard.update_maker_order(order_id, remaining)
+            except Exception as exc:  # noqa: BLE001 - guard bookkeeping must not lose a fill
+                logger.warning(f"STP guard size update failed for {order_id}: {exc}")
         key_prefix = order_id or record.fill_id
         fill_key = f"{key_prefix}:{float(ts):.3f}:{float(price):.6f}:{float(size):.6f}"
         self._record_fill_observation(

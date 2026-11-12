@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import requests
 
 from polymarketbot.logs import get_logger
-from polymarketbot.strategy.venue.clob.common import END_CURSOR, USER_AGENT, ClobAPIError
+from polymarketbot.strategy.venue.clob.common import (
+    END_CURSOR,
+    USER_AGENT,
+    ClobAPIError,
+)
 
 logger = get_logger("clob_client")
 
@@ -38,23 +42,13 @@ class HttpMixin:
 
     def close(self) -> None:
         """Close every session and connection pool created by this client (best effort)."""
-        if self.hft_pool is not None:
-            try:
-                self.hft_pool.close()
-            except Exception:
-                pass
-        if self._fast_cancel_pool is not None:
-            try:
-                self._fast_cancel_pool.close()
-            except Exception:
-                pass
         with self._sessions_lock:
             sessions = list(self._sessions)
             self._sessions.clear()
         for session in sessions:
             try:
                 session.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - best-effort teardown of pooled connections
                 pass
 
     def _request(
@@ -62,8 +56,8 @@ class HttpMixin:
         method: str,
         path: str,
         *,
-        params: Optional[dict[str, Any]] = None,
-        body: Optional[str] = None,
+        params: dict[str, Any] | None = None,
+        body: str | None = None,
         auth: bool = True,
     ) -> Any:
         """Execute one CLOB REST call and return its parsed JSON body.
@@ -128,7 +122,7 @@ class HttpMixin:
     def _paginate(
         self,
         path: str,
-        base_params: Optional[dict[str, Any]] = None,
+        base_params: dict[str, Any] | None = None,
         *,
         max_pages: int = 20,
     ) -> list[dict[str, Any]]:
@@ -138,6 +132,10 @@ class HttpMixin:
         https://docs.polymarket.com/api-reference/trade/get-user-orders and
         https://raw.githubusercontent.com/Polymarket/py-clob-client/main/py_clob_client/client.py
         (``get_orders`` / ``get_trades``; ``END_CURSOR = "LTE="``).
+
+        Raises:
+            ClobAPIError: on a failed call, an unexpected body, a repeated
+                cursor, or a list that is still truncated at ``max_pages``.
         """
         pages = max(1, int(max_pages))
         results: list[dict[str, Any]] = []
@@ -169,10 +167,14 @@ class HttpMixin:
                 )
             seen_cursors.add(next_cursor)
             if page == pages - 1:
-                logger.warning(
+                # A truncated list is indistinguishable from "the missing
+                # orders are gone" at every caller that reconciles against it,
+                # so refuse instead of returning a partial view.
+                raise ClobAPIError(
                     f"GET {path} stopped at max_pages={pages} with more pages available; "
-                    f"the list is truncated"
+                    f"refusing to return a truncated list",
+                    status_code=200,
+                    path=path,
                 )
-                return results
             cursor = next_cursor
         return results

@@ -1,5 +1,12 @@
 # Phase 2 — point-in-time universe
 
+> **Status (2026-11-11).** Design record only. The `polymarketbot.universe` module this file
+> imports (`universe_at`, `tradable_at`, `settle`) and every `polymarketbot.data.builders.*`
+> command in §8 were deleted with the 2026-11-10 cleanup; nothing in `src/` provides these
+> entry points today, so §1 and §8 raise `ModuleNotFoundError` and the "41 universe
+> invariants" test file is gone with them. The rules and measurements below are still the
+> reference for what a point-in-time universe has to mean.
+
 What "a market existed and was tradable at time *t*" means in this repo, why each rule is
 there, and what it deliberately ignores.
 

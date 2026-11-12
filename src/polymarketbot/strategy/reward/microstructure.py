@@ -11,26 +11,37 @@ Tracks real-time order book microstructure signals:
 from __future__ import annotations
 
 import math
+import statistics
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
 
 
 def compute_dynamic_ofi_threshold(
     bid_size: float,
     ask_size: float,
+    *,
+    c_depth: float,
+    z_score: float,
+    v_ref: float,
+    beta_vol: float,
     rolling_ofi_std: float = 0.0,
-    volume_24h: Optional[float] = None,
-    tick_size: float = 0.001,
-    c_depth: float = 1.5,
-    z_score: float = 3.0,
-    v_ref: float = 50_000.0,
-    beta_vol: float = 0.15,
+    volume_24h: float | None = None,
     min_threshold: float = 25.0,
     max_threshold: float = 25_000.0,
 ) -> float:
-    """Compute dynamic Cont-Kukanov-Stoikov Order Flow Imbalance (OFI) threshold."""
+    """Compute dynamic Cont-Kukanov-Stoikov Order Flow Imbalance (OFI) threshold.
+
+    ``c_depth``, ``z_score``, ``v_ref`` and ``beta_vol`` are the fitted
+    coefficients of the OFI model. They have no defaults: the caller must pass
+    values measured from the tape (or loaded from a fit artifact). A fabricated
+    coefficient would silently become the trading decision.
+
+    ``volume_24h`` is the measured 24-hour volume. When it is absent the volume
+    scaling is skipped entirely rather than substituting a reference multiplier;
+    ``v_ref``/``beta_vol`` are still required because the caller's fit is part
+    of the model, not an optional refinement.
+    """
     qb = max(0.0, float(bid_size))
     qa = max(0.0, float(ask_size))
     sum_q = qb + qa
@@ -42,28 +53,32 @@ def compute_dynamic_ofi_threshold(
 
     structural_capacity = c_depth * d_harm
     statistical_capacity = z_score * max(0.0, float(rolling_ofi_std))
-    base_thresh = max(structural_capacity, statistical_capacity)
+    dynamic_thresh = max(structural_capacity, statistical_capacity)
 
     if volume_24h is not None and volume_24h > 0.0:
         raw_psi = (float(volume_24h) / v_ref) ** beta_vol
         psi = max(0.50, min(2.50, raw_psi))
-    else:
-        psi = 1.0
+        dynamic_thresh *= psi
 
-    dynamic_thresh = base_thresh * psi
     return max(min_threshold, min(max_threshold, dynamic_thresh))
 
 
 def compute_dynamic_drift_threshold_cents(
     mid_price: float,
     spread_cents: float,
-    volatility: float = 0.02,
+    *,
+    volatility: float,
     critical_imbalance: float = 0.80,
     volatility_ref: float = 0.02,
     min_drift_cents: float = 0.10,
-    max_drift_cents: Optional[float] = None,
+    max_drift_cents: float | None = None,
 ) -> float:
-    """Compute dynamic Stoikov Micro-Price Drift Threshold in cents."""
+    """Compute dynamic Stoikov Micro-Price Drift Threshold in cents.
+
+    ``volatility`` is the engine's realised volatility, measured from the tape.
+    It has no default: an invented constant would silently pin ``vol_scale`` to
+    1.0 (its reference) and turn the volatility term into a no-op.
+    """
     p = max(0.005, min(0.995, float(mid_price)))
     s_cents = max(0.01, float(spread_cents))
     half_spread = s_cents / 2.0
@@ -143,19 +158,30 @@ def compute_dynamic_cooldown_duration(
 
 @dataclass(frozen=True)
 class MicrostructureState:
-    """Snapshot of current order book microstructure state."""
+    """Snapshot of current order book microstructure state.
+
+    ``ofi_threshold`` / ``drift_threshold_cents`` are the thresholds this
+    snapshot was actually judged against, and ``measured`` records whether they
+    came from a measurement (book + realised volatility, or an explicit
+    override) or were unavailable. An unmeasured snapshot carries ``nan``
+    thresholds: the engine never substitutes a provisional number, so callers
+    can tell "flow is calm" from "flow was not judged".
+    """
 
     mid_price: float
     micro_price: float
     ofi_10_events: float
     imbalance_ratio: float
     is_toxic: bool
+    ofi_threshold: float
+    drift_threshold_cents: float
+    measured: bool
     drift_cents: float = 0.0
     best_bid: float = 0.0
     best_ask: float = 0.0
     bid_size: float = 0.0
     ask_size: float = 0.0
-    toxicity_reason: str = ""  # "OFI", "DRIFT", "BOTH", or ""
+    toxicity_reason: str = ""  # "OFI", "DRIFT", "BOTH", "unmeasured", or ""
     timestamp: float = 0.0
 
     @property
@@ -191,29 +217,58 @@ class MicrostructureEngine:
 
     def __init__(
         self,
-        ofi_threshold: Optional[float] = None,
-        drift_threshold_cents: Optional[float] = None,
+        *,
+        c_depth: float,
+        z_score: float,
+        v_ref: float,
+        beta_vol: float,
+        pull_multiplier: float,
+        widen_offset_multiplier: float,
+        ofi_threshold: float | None = None,
+        drift_threshold_cents: float | None = None,
         window_size: int = 10,
-        pull_multiplier: float = 1.5,
-        widen_offset_multiplier: float = 1.5,
         dynamic_thresholds: bool = True,
     ) -> None:
+        """Create one flow engine.
+
+        All six keyword arguments are required and must be fitted/measured by
+        the caller. ``c_depth``/``z_score``/``v_ref``/``beta_vol`` are the OFI
+        fit coefficients; ``pull_multiplier``/``widen_offset_multiplier`` are
+        the measured multipliers applied to a threshold/drift once the gate is
+        toxic. ``widen_offset_multiplier == 0`` is the measured "do not widen"
+        policy: a toxic but non-extreme event MAINTAINS the quote. There are
+        deliberately no defaults: an invented number would silently become the
+        pull/widen decision.
+        """
+        if c_depth <= 0.0 or z_score <= 0.0 or v_ref <= 0.0 or beta_vol <= 0.0:
+            raise ValueError("OFI fit coefficients must be positive")
+        if pull_multiplier <= 0.0:
+            raise ValueError("pull multiplier must be positive")
+        if widen_offset_multiplier < 0.0:
+            # Zero is a measured policy, not a missing value: the fit found
+            # that widening the quote loses capture, so non-extreme toxicity
+            # MAINTAINS. Negative is not a spread.
+            raise ValueError("widen offset multiplier must be non-negative")
+        self.c_depth = float(c_depth)
+        self.z_score = float(z_score)
+        self.v_ref = float(v_ref)
+        self.beta_vol = float(beta_vol)
         self.ofi_threshold = ofi_threshold
         self.drift_threshold_cents = drift_threshold_cents
         self.window_size = window_size
-        self.pull_multiplier = pull_multiplier
-        self.widen_offset_multiplier = widen_offset_multiplier
+        self.pull_multiplier = float(pull_multiplier)
+        self.widen_offset_multiplier = float(widen_offset_multiplier)
         self.dynamic_thresholds = dynamic_thresholds
 
         self._ofi_window: deque[float] = deque(maxlen=window_size)
-        self._prev_bid_price: Optional[float] = None
-        self._prev_bid_size: Optional[float] = None
-        self._prev_ask_price: Optional[float] = None
-        self._prev_ask_size: Optional[float] = None
-        self._latest_state: Optional[MicrostructureState] = None
+        self._prev_bid_price: float | None = None
+        self._prev_bid_size: float | None = None
+        self._prev_ask_price: float | None = None
+        self._prev_ask_size: float | None = None
+        self._latest_state: MicrostructureState | None = None
 
     @property
-    def latest_state(self) -> Optional[MicrostructureState]:
+    def latest_state(self) -> MicrostructureState | None:
         """Return the most recent microstructure state computed."""
         return self._latest_state
 
@@ -232,7 +287,8 @@ class MicrostructureEngine:
         best_bid_size: float,
         best_ask_price: float,
         best_ask_size: float,
-        timestamp: Optional[float] = None,
+        timestamp: float | None = None,
+        realized_volatility: float | None = None,
     ) -> MicrostructureState:
         """Process a top-of-book update and compute the new MicrostructureState.
 
@@ -242,9 +298,15 @@ class MicrostructureEngine:
             best_ask_price: Current lowest ask price.
             best_ask_size: Quantity available at best ask.
             timestamp: Event timestamp (default time.time()).
+            realized_volatility: Realised volatility measured from the tape.
+                Required whenever a threshold is not supplied explicitly: the
+                dynamic thresholds are fitted from the book and this
+                measurement, never from a constant.
 
         Returns:
-            Updated MicrostructureState instance.
+            Updated MicrostructureState instance. ``measured`` is ``False``
+            (with ``nan`` thresholds and ``is_toxic`` ``False``) when the
+            thresholds could not be measured.
         """
         now = timestamp if timestamp is not None else time.time()
 
@@ -306,22 +368,67 @@ class MicrostructureEngine:
         scale = 100.0 if mid_price <= 1.0 else 1.0
         drift_cents = abs(micro_price - mid_price) * scale
 
-        # 3. Dynamic or Parameterized Toxicity Gate
+        # 3. Measured toxicity gate.
+        # Explicit constructor thresholds are measurements (the live path fits
+        # them from the tape), so they win verbatim. Otherwise thresholds are
+        # computed from this book and the realised volatility. With neither
+        # available the gate is unmeasured: no provisional number.
         spread_cents = abs(ask_price - bid_price) * 100.0
-        if self.dynamic_thresholds and (self.ofi_threshold is None or self.drift_threshold_cents is None):
-            dyn_ofi = compute_dynamic_ofi_threshold(bid_size, ask_size)
-            dyn_drift = compute_dynamic_drift_threshold_cents(mid_price, spread_cents)
-            eff_ofi = self.ofi_threshold if self.ofi_threshold is not None else dyn_ofi
-            eff_drift = self.drift_threshold_cents if self.drift_threshold_cents is not None else dyn_drift
-        else:
-            eff_ofi = self.ofi_threshold if self.ofi_threshold is not None else 850.0
-            eff_drift = self.drift_threshold_cents if self.drift_threshold_cents is not None else 0.45
 
-        ofi_triggered = abs(ofi_10_events) > eff_ofi
-        drift_triggered = drift_cents > eff_drift
+        if self.ofi_threshold is not None and self.drift_threshold_cents is not None:
+            eff_ofi = float(self.ofi_threshold)
+            eff_drift = float(self.drift_threshold_cents)
+            measured = True
+        elif self.dynamic_thresholds and realized_volatility is not None:
+            eff_ofi = (
+                float(self.ofi_threshold)
+                if self.ofi_threshold is not None
+                else compute_dynamic_ofi_threshold(
+                    bid_size,
+                    ask_size,
+                    # The observed dispersion of the engine's own OFI window.
+                    # Without it the statistical term is zero and the threshold
+                    # collapses to a fixed depth multiple.
+                    rolling_ofi_std=(
+                        statistics.pstdev(self._ofi_window)
+                        if len(self._ofi_window) >= 2
+                        else 0.0
+                    ),
+                    c_depth=self.c_depth,
+                    z_score=self.z_score,
+                    v_ref=self.v_ref,
+                    beta_vol=self.beta_vol,
+                )
+            )
+            eff_drift = (
+                float(self.drift_threshold_cents)
+                if self.drift_threshold_cents is not None
+                else compute_dynamic_drift_threshold_cents(
+                    mid_price,
+                    spread_cents,
+                    volatility=realized_volatility,
+                )
+            )
+            measured = True
+        else:
+            # No explicit threshold and no measured volatility: the gate is
+            # unmeasured. Substituting a provisional number would be an
+            # invented constant that silently becomes the decision.
+            eff_ofi = float("nan")
+            eff_drift = float("nan")
+            measured = False
+
+        if measured:
+            ofi_triggered = abs(ofi_10_events) > eff_ofi
+            drift_triggered = drift_cents > eff_drift
+        else:
+            ofi_triggered = False
+            drift_triggered = False
         is_toxic = ofi_triggered or drift_triggered
 
-        if ofi_triggered and drift_triggered:
+        if not measured:
+            toxicity_reason = "unmeasured"
+        elif ofi_triggered and drift_triggered:
             toxicity_reason = "BOTH"
         elif ofi_triggered:
             toxicity_reason = "OFI"
@@ -336,6 +443,9 @@ class MicrostructureEngine:
             ofi_10_events=ofi_10_events,
             imbalance_ratio=imbalance_ratio,
             is_toxic=is_toxic,
+            ofi_threshold=eff_ofi,
+            drift_threshold_cents=eff_drift,
+            measured=measured,
             drift_cents=drift_cents,
             best_bid=bid_price,
             best_ask=ask_price,
@@ -350,7 +460,7 @@ class MicrostructureEngine:
     def evaluate_quote_action(
         self,
         side: str,
-        state: Optional[MicrostructureState] = None,
+        state: MicrostructureState | None = None,
     ) -> QuoteAction:
         """Evaluate whether resting quotes on bid or ask should be pulled or widened.
 
@@ -368,6 +478,19 @@ class MicrostructureEngine:
 
         if not is_bid and not is_ask:
             raise ValueError(f"Unknown side '{side}'; must be BUY/BID or SELL/ASK.")
+
+        if current_state is not None and not current_state.measured:
+            return QuoteAction(
+                side=norm_side,
+                action="MAINTAIN",
+                should_pull=False,
+                should_widen=False,
+                spread_offset_cents=0.0,
+                reason=(
+                    "Microstructure thresholds unmeasured: no explicit threshold and no "
+                    "realised volatility; holding the resting quote rather than substituting a constant."
+                ),
+            )
 
         if current_state is None or not current_state.is_toxic:
             return QuoteAction(
@@ -388,8 +511,11 @@ class MicrostructureEngine:
             else (current_state.micro_price - current_state.mid_price)
         )
 
-        extreme_pull_threshold_ofi = self.ofi_threshold * self.pull_multiplier
-        extreme_pull_threshold_drift = self.drift_threshold_cents * self.pull_multiplier
+        # Judge extremity against the thresholds this snapshot was measured with.
+        extreme_pull_threshold_ofi = current_state.ofi_threshold * self.pull_multiplier
+        extreme_pull_threshold_drift = (
+            current_state.drift_threshold_cents * self.pull_multiplier
+        )
 
         is_extreme = (
             abs(current_state.ofi_10_events) >= extreme_pull_threshold_ofi
@@ -409,10 +535,21 @@ class MicrostructureEngine:
                         reason=f"Extreme toxic buying pressure ({current_state.toxicity_reason}); pull resting asks to prevent adverse selection.",
                     )
                 else:
-                    offset = max(
-                        current_state.drift_cents * self.widen_offset_multiplier,
-                        0.50,
-                    )
+                    if self.widen_offset_multiplier <= 0.0:
+                        return QuoteAction(
+                            side=norm_side,
+                            action="MAINTAIN",
+                            should_pull=False,
+                            should_widen=False,
+                            spread_offset_cents=0.0,
+                            reason=(
+                                "Measured widen offset is zero: maintain the "
+                                "resting ask on non-extreme toxicity rather than "
+                                "inventing a spread offset."
+                            ),
+                        )
+                    # The multiplier is measured; no floor may override it.
+                    offset = current_state.drift_cents * self.widen_offset_multiplier
                     return QuoteAction(
                         side=norm_side,
                         action="WIDEN",
@@ -444,10 +581,21 @@ class MicrostructureEngine:
                         reason=f"Extreme toxic selling pressure ({current_state.toxicity_reason}); pull resting bids to prevent adverse selection.",
                     )
                 else:
-                    offset = max(
-                        current_state.drift_cents * self.widen_offset_multiplier,
-                        0.50,
-                    )
+                    if self.widen_offset_multiplier <= 0.0:
+                        return QuoteAction(
+                            side=norm_side,
+                            action="MAINTAIN",
+                            should_pull=False,
+                            should_widen=False,
+                            spread_offset_cents=0.0,
+                            reason=(
+                                "Measured widen offset is zero: maintain the "
+                                "resting bid on non-extreme toxicity rather than "
+                                "inventing a spread offset."
+                            ),
+                        )
+                    # The multiplier is measured; no floor may override it.
+                    offset = current_state.drift_cents * self.widen_offset_multiplier
                     return QuoteAction(
                         side=norm_side,
                         action="WIDEN",
@@ -470,7 +618,7 @@ class MicrostructureEngine:
     def should_pull_quote(
         self,
         side: str,
-        state: Optional[MicrostructureState] = None,
+        state: MicrostructureState | None = None,
     ) -> bool:
         """Convenience boolean helper to check if resting quote should be pulled."""
         return self.evaluate_quote_action(side, state=state).should_pull
@@ -478,30 +626,54 @@ class MicrostructureEngine:
     def should_widen_quote(
         self,
         side: str,
-        state: Optional[MicrostructureState] = None,
+        state: MicrostructureState | None = None,
     ) -> bool:
         """Convenience boolean helper to check if resting quote should be widened."""
         return self.evaluate_quote_action(side, state=state).should_widen
 
 
 class MultiAssetMicrostructureSentinel:
-    """Manages independent MicrostructureEngine instances across multiple assets."""
+    """Manages independent MicrostructureEngine instances across multiple assets.
+
+    Every engine shares the caller's fitted coefficients and multipliers.
+    Thresholds are optional: when absent, each engine fits them from that
+    asset's own book and the realised volatility supplied per update.
+    """
 
     def __init__(
         self,
-        ofi_threshold: float = 850.0,
-        drift_threshold_cents: float = 0.45,
+        *,
+        c_depth: float,
+        z_score: float,
+        v_ref: float,
+        beta_vol: float,
+        pull_multiplier: float,
+        widen_offset_multiplier: float,
+        ofi_threshold: float | None = None,
+        drift_threshold_cents: float | None = None,
         window_size: int = 10,
     ) -> None:
+        self.c_depth = float(c_depth)
+        self.z_score = float(z_score)
+        self.v_ref = float(v_ref)
+        self.beta_vol = float(beta_vol)
+        self.pull_multiplier = float(pull_multiplier)
+        self.widen_offset_multiplier = float(widen_offset_multiplier)
         self.ofi_threshold = ofi_threshold
         self.drift_threshold_cents = drift_threshold_cents
         self.window_size = window_size
-        self._engines: Dict[str, MicrostructureEngine] = {}
+        self._engines: dict[str, MicrostructureEngine] = {}
 
     def get_engine(self, asset_id: str) -> MicrostructureEngine:
         """Retrieve or instantiate engine for a given asset."""
         if asset_id not in self._engines:
             self._engines[asset_id] = MicrostructureEngine(
+                c_depth=self.c_depth,
+                z_score=self.z_score,
+                v_ref=self.v_ref,
+                beta_vol=self.beta_vol,
+                pull_multiplier=self.pull_multiplier,
+                widen_offset_multiplier=self.widen_offset_multiplier,
                 ofi_threshold=self.ofi_threshold,
                 drift_threshold_cents=self.drift_threshold_cents,
                 window_size=self.window_size,
@@ -515,7 +687,8 @@ class MultiAssetMicrostructureSentinel:
         best_bid_size: float,
         best_ask_price: float,
         best_ask_size: float,
-        timestamp: Optional[float] = None,
+        timestamp: float | None = None,
+        realized_volatility: float | None = None,
     ) -> MicrostructureState:
         """Update top-of-book and return state for specified asset."""
         return self.get_engine(asset_id).update(
@@ -524,12 +697,14 @@ class MultiAssetMicrostructureSentinel:
             best_ask_price=best_ask_price,
             best_ask_size=best_ask_size,
             timestamp=timestamp,
+            realized_volatility=realized_volatility,
         )
 
     def evaluate_quote_action(
         self,
         asset_id: str,
         side: str,
+        state: MicrostructureState | None = None,
     ) -> QuoteAction:
         """Evaluate quote action for given asset and side."""
-        return self.get_engine(asset_id).evaluate_quote_action(side)
+        return self.get_engine(asset_id).evaluate_quote_action(side, state=state)

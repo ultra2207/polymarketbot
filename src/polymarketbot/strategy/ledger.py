@@ -9,14 +9,14 @@ No lot is ever valued at its own purchase price when a market mark exists.
 from __future__ import annotations
 
 import math
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
+from polymarketbot.storage import open_journal_connection, run_with_busy_retry
 
 log = get_logger(__name__)
 
@@ -73,7 +73,7 @@ class Lot:
     cost_usd: float
     # Protocol value per share when it is known (par 1.0 for an oracle winner,
     # 0.0 for a loser). ``None`` means the mark is the measured market price.
-    par_value: Optional[float] = None
+    par_value: float | None = None
     last_mark: float = 0.0
     tag: str = ""
     # True while ``last_mark`` is a live book measurement. ``False`` means the
@@ -111,7 +111,9 @@ class Ledger:
         self._books = {name: StrategyBook(cash=float(value)) for name, value in cash.items()}
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        # WAL + busy timeout: the dashboard reads this file while the engine
+        # writes it, and in rollback-journal mode a reader blocks the writer.
+        self._conn = open_journal_connection(self._db_path, check_same_thread=False)
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -120,7 +122,7 @@ class Ledger:
         #: instant. In memory only, so a resumed run starts checking from its
         #: second snapshot instead of guessing which journal rows the previous
         #: run had already counted.
-        self._prev_snapshot: Optional[dict[str, Any]] = None
+        self._prev_snapshot: dict[str, Any] | None = None
         if resume:
             self._resume()
 
@@ -177,12 +179,17 @@ class Ledger:
         cash_delta: float,
         detail: str,
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO trades (ts, strategy, kind, condition_id, token_id, shares,"
-            " price, fee, cash_delta, detail) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (time.time(), strategy, kind, condition_id, token_id, shares, price, fee, cash_delta, detail),
-        )
-        self._conn.commit()
+        def write() -> None:
+            self._conn.execute(
+                "INSERT INTO trades (ts, strategy, kind, condition_id, token_id, shares,"
+                " price, fee, cash_delta, detail) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), strategy, kind, condition_id, token_id, shares, price, fee, cash_delta, detail),
+            )
+            self._conn.commit()
+
+        # Safe to retry: the insert and its commit are one unit, and no in-memory
+        # state is mutated here, so a retry cannot double-apply.
+        run_with_busy_retry(write)
 
     # -- mutations -------------------------------------------------------
     def buy(
@@ -194,7 +201,7 @@ class Ledger:
         shares: float,
         price: float,
         fee: float = 0.0,
-        par_value: Optional[float] = None,
+        par_value: float | None = None,
         tag: str = "",
     ) -> bool:
         if shares <= 0.0 or not 0.0 <= price <= 1.0:
@@ -331,7 +338,7 @@ class Ledger:
         condition_id: str,
         accrued_usd: float,
         priced_markets: int,
-        ts: Optional[float] = None,
+        ts: float | None = None,
     ) -> None:
         """Journal one tick's per-market reward accrual.
 
@@ -399,7 +406,7 @@ class Ledger:
                       float(amount), detail)
 
     def mark(self, token_id: str, price: float,
-             strategy: Optional[str] = None) -> bool:
+             strategy: str | None = None) -> bool:
         """Record a live book measurement on every lot of ``token_id``.
 
         Returns True when at least one lot transitioned from unmeasured to
@@ -421,7 +428,7 @@ class Ledger:
             return transitioned
 
     def mark_unmeasured(self, token_id: str,
-                        strategy: Optional[str] = None) -> bool:
+                        strategy: str | None = None) -> bool:
         """Flag lots of ``token_id`` as unmeasured because their book is gone.
 
         ``last_mark`` is kept as the last real measurement (not a fabricated
@@ -634,7 +641,7 @@ class Ledger:
         token_id: str,
         shares: float,
         cost_usd: float,
-        par_value: Optional[float],
+        par_value: float | None,
         mark: float,
         tag: str,
     ) -> None:
@@ -653,7 +660,7 @@ class Ledger:
         )
 
     @staticmethod
-    def _remove_shares(book: StrategyBook, token_id: str, shares: float) -> Optional[float]:
+    def _remove_shares(book: StrategyBook, token_id: str, shares: float) -> float | None:
         # Pre-check before touching anything: this used to remove whatever it
         # could and *then* return None when the request was unsatisfiable,
         # which burned inventory with no journal row and no cash movement.

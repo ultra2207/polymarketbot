@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 
-from polymarketbot.data.universe_metadata import apply_to_manifest, load_rows, to_row, write_rows
+from polymarketbot.data.universe_metadata import (
+    apply_to_manifest,
+    load_rows,
+    to_row,
+    write_rows,
+)
 
 
 def test_to_row_extracts_event_and_fee_schedule() -> None:
@@ -90,5 +95,52 @@ def test_metadata_parquet_round_trip(tmp_path) -> None:
     loaded = load_rows(path)
     assert loaded["0xaaa"]["fee_type"] == "politics_fees"
     assert loaded["0xaaa"]["tags"] == ["Politics"]
+
+
+class _FakeGamma:
+    """Returns only the markets it is told Gamma still publishes."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.asked: list[str] = []
+
+    def markets(self, condition_ids):
+        self.asked = list(condition_ids)
+        return self.rows
+
+
+def test_refresh_keeps_rows_for_conditions_gamma_no_longer_returns(tmp_path) -> None:
+    """`write_rows` replaces the table, so a delisted market's fees were lost."""
+    from polymarketbot.data.universe_metadata import refresh
+
+    out = tmp_path / "meta.parquet"
+    write_rows(
+        [
+            {"condition_id": "0xAAA", "fee_type": "politics_fees", "fee_rate": 0.04},
+            {"condition_id": "0xGONE", "fee_type": "crypto_fees", "fee_rate": 0.07},
+        ],
+        out,
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps({"markets": [{"condition_id": "0xAAA"}]}), encoding="utf-8"
+    )
+
+    fake = _FakeGamma([
+        {
+            "conditionId": "0xAAA",
+            "feeType": "politics_fees",
+            "feesEnabled": True,
+            "feeSchedule": {"rate": 0.04, "exponent": 1, "rebateRate": 0.25},
+        }
+    ])
+    result = refresh(manifest, out, client=fake)
+
+    assert "0xgone" in [cid.lower() for cid in fake.asked]  # kept rows stay in the fetch set
+    assert len(fake.asked) == len({cid.lower() for cid in fake.asked})  # no double fetch
+    loaded = load_rows(out)
+    assert loaded["0xaaa"]["fee_rate"] == 0.04
+    assert loaded["0xgone"]["fee_rate"] == 0.07  # not silently dropped
+    assert result["written"] == 2
 
 

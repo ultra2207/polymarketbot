@@ -1,5 +1,9 @@
 # Kalshi mapping built from the active Polymarket universe
 
+> **Status (2026-11-11).** The artifact and the numbers below are a 2026-11-06 record. The
+> builder named here (`polymarketbot.data.kalshi_mapping`) no longer exists, so neither
+> command in this file can be re-run from this tree.
+
 `data/derived/kalshi_mapping_active_v2.parquet` — 13 Polymarket conditions that
 actually trade, each joined to the Kalshi market that states the same claim,
 with the six-hour book-event count and the measured freshness of the Polymarket

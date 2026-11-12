@@ -44,8 +44,9 @@ log joins to the adapter log without an off-chain lookup.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import pyarrow as pa
 from Crypto.Hash import keccak
@@ -98,7 +99,7 @@ def event_topic0(signature: str) -> str:
 
 def _strip_hex(value: str) -> str:
     text = str(value or "").strip().lower()
-    return text[2:] if text.startswith("0x") else text
+    return text.removeprefix("0x")
 
 
 def _to_bytes(value: str) -> bytes:
@@ -549,7 +550,7 @@ def _payouts(value: Any) -> str | None:
 # Polymarket's UMA ancillary data starts ``q: title: <question>, description:``.
 # The title itself may contain commas, so the terminator is the literal
 # ``description:`` key, not the first comma.
-_TITLE_RE = re.compile(r"^\s*q:\s*title:\s*(.*?),\s*description:", re.S)
+_TITLE_RE = re.compile(r"^\s*q:\s*title:\s*(.*?),\s*description:", re.DOTALL)
 
 
 def hex_int(value: Any, default: int | None = None) -> int | None:
@@ -571,7 +572,7 @@ def hex_int(value: Any, default: int | None = None) -> int | None:
             return default
         try:
             if text[:2].lower() == "0x":
-                return int(text[2:], 16) if len(text) > 2 else default
+                return int(text, 16) if len(text) > 2 else default
             return int(text, 10)
         except ValueError:
             return default

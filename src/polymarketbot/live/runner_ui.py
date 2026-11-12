@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any
 
 from polymarketbot.logs import IST
 
@@ -53,7 +53,7 @@ def build_dashboard_lines(
     market_info: dict[str, Any],
     elapsed: float,
     now_str: str,
-) -> List[str]:
+) -> list[str]:
     """Render telemetry into terminal lines. Missing keys render as ``n/a``."""
     t = telemetry or {}
     question = str(market_info.get("question", "n/a"))
@@ -112,7 +112,6 @@ def build_dashboard_lines(
     urgency_color = C_GREEN if urgency == "LOW" else (C_YELLOW if urgency == "MEDIUM" else C_RED)
     savings = _num(deskew, "synthetic_savings_cents", ".2f")
 
-    epoch_index = t.get("epoch_index")
     modelled_rewards = t.get("modelled_rewards", t.get("total_rewards"))
     modelled_value = _fmt_value(modelled_rewards, ".4f")
     run_rate = t.get("projected_daily_usd")
@@ -137,7 +136,7 @@ def build_dashboard_lines(
             if isinstance(score, (int, float)):
                 user_score += score
 
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append(f"{C_BOLD}{C_CYAN}========================================================================================{C_RESET}")
     lines.append(f"{C_BOLD}{C_WHITE}[MM] POLYMARKET REAL-MONEY TRADING ENGINE | CLOB & ON-CHAIN CTF {mode_str}{C_RESET}")
     lines.append(f"{C_BOLD}{C_CYAN}========================================================================================{C_RESET}")
@@ -241,7 +240,7 @@ def build_dashboard_lines(
             order_id = str(quote.get("order_id", "N/A"))[:18]
             lines.append(
                 f"  {side_color}{side:<6s}{C_RESET} "
-                f"{str(quote.get('token_side', 'n/a')):<8s} "
+                f"{quote.get('token_side', 'n/a')!s:<8s} "
                 f"${_num(quote, 'price', '.3f'):<7s} "
                 f"{_num(quote, 'size', '.1f'):<8s} "
                 f"{order_id:<20s} "
@@ -273,14 +272,14 @@ def render_dashboard(
 def write_banner(
     *,
     dry_run: bool,
-    order_version: Optional[int],
+    order_version: int | None,
     signature_type: int,
     settlement_available: bool,
     neg_risk: bool,
     total_wallet: float,
     trading_bankroll: float,
     budget_pct: float,
-    max_budget: Optional[float],
+    max_budget: float | None,
     condition_id: str,
 ) -> None:
     mode = (
@@ -293,7 +292,7 @@ def write_banner(
         f"{C_BOLD}MODE:{C_RESET} {mode}",
         f"  Condition: {condition_id} | neg_risk: {neg_risk}",
         f"  CLOB order version: {order_version if order_version is not None else 'n/a'}",
-        f"  Settlement path: "
+        "  Settlement path: "
         + (
             f"{C_GREEN}EOA-only CTF merge/redeem ENABLED{C_RESET}"
             if settlement_available
@@ -332,7 +331,7 @@ def write_banner(
     sys.stdout.flush()
 
 
-def write_final_summary(telemetry: Optional[dict[str, Any]]) -> None:
+def write_final_summary(telemetry: dict[str, Any] | None) -> None:
     lines = [
         f"{C_BOLD}{C_CYAN}================================================================================{C_RESET}",
         f"{C_BOLD}SHUTDOWN SUMMARY{C_RESET}",

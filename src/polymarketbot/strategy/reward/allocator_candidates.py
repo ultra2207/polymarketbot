@@ -11,7 +11,7 @@ dropped with the bound logged.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.reward.marginal import (
@@ -23,6 +23,38 @@ from polymarketbot.strategy.reward.marginal import (
 )
 
 log = get_logger("rewards_allocator")
+
+
+def activation_lot_capital(cand: dict[str, Any]) -> float | None:
+    """USD for one matched pair at the venue's binding minimum order.
+
+    The venue publishes ``orderMinSize`` as a USDC notional per order; the
+    rewards campaign publishes ``min_size`` as a share count. The binding
+    count is the larger of the two at the cheap leg's rest price:
+
+    ``q = max(min_size, ceil(order_min_usd / min(p, 1 - p)))``
+
+    A matched binary pair redeems for exactly $1.00 and its two bids sum to at
+    most $1.00, so the pair's capital is ``q`` dollars. Funding only
+    ``min_size * price`` under-budgets the second leg. A candidate that cannot
+    state its minimum or price returns ``None`` (missing is not zero).
+    """
+    try:
+        min_sz = float(cand.get("min_size", 0.0))
+        mid = float(cand.get("real_mid", cand.get("mid_yes", 0.0)))
+        lot_price = float(cand.get("lot_price", mid))
+        order_min = float(cand.get("order_min_usd") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if min_sz <= 0.0 or not 0.0 < mid < 1.0 or not 0.0 < lot_price < 1.0:
+        return None
+    shares = min_sz
+    if order_min > 0.0:
+        cheap = min(lot_price, 1.0 - lot_price)
+        if cheap <= 0.0:
+            return None
+        shares = max(shares, float(math.ceil(order_min / cheap)))
+    return round(shares, 2)
 
 
 def parse_candidates(
@@ -85,15 +117,18 @@ def parse_candidates(
 
         c_floor = calculate_min_floor_capital(p, d, eff_alpha, floor_target=floor_target)
 
-        # The venue's minimum is a *share* count; the optimizer's unit is
-        # USD, so the activation lot is min_size shares at the price the
-        # order will rest at. Funding it at the mid leaves the floored
-        # share count one short of the minimum whenever the quote sits
-        # above the mid, and the quote is then silently dropped.
+        # The binding minimum is the larger of the rewards share count and
+        # the venue's per-order notional, and BOTH legs carry it. The
+        # activation lot is the matched pair's capital, not one leg's.
         lot_price = float(cand.get("lot_price", mid))
         if not 0.0 < lot_price < 1.0:
             continue
-        c_min = max(min_sz * lot_price, c_floor)
+        lot_capital = activation_lot_capital(
+            {**cand, "min_size": min_sz, "real_mid": mid, "lot_price": lot_price}
+        )
+        if lot_capital is None:
+            continue
+        c_min = max(lot_capital, c_floor)
         if not math.isfinite(c_min) or c_min > usable_capital:
             continue
 
@@ -139,12 +174,19 @@ def parse_candidates(
             "daily pool or competing score was unmeasured (a missing denominator "
             "is never read as zero)"
         )
+    dropped = len(candidates) - len(parsed_candidates) - unmeasured
+    if dropped:
+        log.info(
+            f"allocator: dropped {dropped}/{len(candidates)} candidates that could "
+            "not be scored or funded at this capital (quote distance, alpha, "
+            "activation lot, or the $1.00/day floor)"
+        )
     return parsed_candidates, unmeasured
 
 
 def prune_dominated(
     parsed_candidates: list[dict[str, Any]], usable_capital: float
-) -> tuple[list[dict[str, Any]], Optional[float]]:
+) -> tuple[list[dict[str, Any]], float | None]:
     """Drop candidates that cannot be active, with the shadow-price bound logged.
 
     Returns the surviving candidates ranked by marginal yield, and the shadow
@@ -161,7 +203,7 @@ def prune_dominated(
         m["marginal_at_floor"] = marginal_total_yield(
             m["c_min"], m["P"], m["D"], m["alpha"], stay, fill
         )
-    shadow_floor: Optional[float] = None
+    shadow_floor: float | None = None
     k_max = 0
     spent = 0.0
     for m in sorted(parsed_candidates, key=lambda item: item["c_min"]):

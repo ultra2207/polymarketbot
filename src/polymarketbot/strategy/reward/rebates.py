@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.fees import FeeSchedule, maker_fee_rebate
 from polymarketbot.logs import get_logger
@@ -80,7 +80,7 @@ class RebateAccountant:
     ) -> None:
         self._client = client
         self._refresh_s = float(refresh_s)
-        self._day: Optional[str] = None
+        self._day: str | None = None
         self._venue_total: dict[str, float] = {}
         self._credited: dict[str, float] = {}
         self._last_poll = -math.inf
@@ -185,7 +185,7 @@ class RebateAccountant:
         condition_id: str,
         price: float,
         shares: float,
-        schedule: Optional[FeeSchedule],
+        schedule: FeeSchedule | None,
     ) -> RebateCredit:
         """Modelled fallback for one fill; zero whenever the venue source is live.
 

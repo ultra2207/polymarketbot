@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from typing import Any, Optional
+from typing import Any
 
+from polymarketbot.storage import BUSY_TIMEOUT_MS
 from polymarketbot.strategy.onchain.pending import (
     PENDING_SETTLEMENTS_DDL,
     PENDING_SETTLEMENTS_INDEX,
@@ -26,6 +27,9 @@ class StoreMixin:
         cur = self._conn.cursor()
         cur.execute("PRAGMA journal_mode = WAL;")
         cur.execute("PRAGMA synchronous = NORMAL;")
+        # Matches the journal helper: a concurrent reader (dashboard) must not
+        # turn a writer into an immediate "database is locked" failure.
+        cur.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS portfolio_snapshots (
@@ -327,15 +331,15 @@ class StoreMixin:
         self,
         *,
         pathway: str,
-        ts: Optional[float] = None,
+        ts: float | None = None,
         crossed_cents: float = 0.0,
         taker_fee_usd: float = 0.0,
         gas_usd: float = 0.0,
         reward_score_lost: float = 0.0,
-        inventory_before: Optional[float] = None,
-        inventory_after: Optional[float] = None,
+        inventory_before: float | None = None,
+        inventory_after: float | None = None,
         note: str = "",
-        condition_id: Optional[str] = None,
+        condition_id: str | None = None,
     ) -> None:
         """Record one inventory-rebalancing cost observation (append-only)."""
         cur = self._conn.cursor()
@@ -368,7 +372,7 @@ class StoreMixin:
         condition_id: str,
         usd: float,
         source: str,
-        observed_ts: Optional[float] = None,
+        observed_ts: float | None = None,
     ) -> None:
         """Idempotently upsert one venue-reported daily reward payout."""
         if not date or not condition_id or not source:

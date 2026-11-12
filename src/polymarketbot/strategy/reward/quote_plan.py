@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.reward.allocator import PortfolioAllocationResult
@@ -46,7 +47,7 @@ class RewardQuote:
     max_spread_cents: float
     min_size: float
     strategy: str = "RewardHarvester"
-    p_fill: Optional[float] = None
+    p_fill: float | None = None
     """Measured P(this bid is filled within one quote horizon). ``None`` = the
     fill side was not priced for this quote (accrual-only study)."""
     fill_yield_usd_per_usd_per_day: float = 0.0

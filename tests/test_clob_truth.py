@@ -7,7 +7,7 @@ All tests are offline and deterministic: a fake session stands in for
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 import requests
@@ -18,6 +18,7 @@ from polymarketbot.strategy.venue.clob import (
     USDC_ASSET_ADDRESSES,
     ClobAPIError,
     ClobAuthCredentials,
+    ClobMarketParamsUnreadable,
     LiveClobClient,
     OrderPlacementResult,
     build_clob_hmac_signature,
@@ -146,14 +147,21 @@ def test_open_orders_order_id_returns_order_regardless_of_status():
     assert len(fake.calls) == 1
 
 
-def test_open_orders_stops_at_max_pages():
+def test_open_orders_refuses_a_truncated_list():
+    """Truncation is a refusal, not a short list.
+
+    A partial open-order list is indistinguishable from "the missing orders are
+    gone" at the caller, which would book phantom cancellations and re-place
+    duplicates.
+    """
     fake = FakeSession(
         FakeResponse({"next_cursor": "a", "data": [{"id": "1"}]}),
         FakeResponse({"next_cursor": "b", "data": [{"id": "2"}]}),
         FakeResponse({"next_cursor": "c", "data": [{"id": "3"}]}),
     )
     client = make_client(fake)
-    assert [o["id"] for o in client.get_open_orders(max_pages=2)] == ["1", "2"]
+    with pytest.raises(ClobAPIError, match="truncated"):
+        client.get_open_orders(max_pages=2)
     assert len(fake.calls) == 2
 
 
@@ -310,20 +318,28 @@ def test_get_market_normalisation():
     assert market["raw"]["condition_id"] == "0x" + "ef" * 32
 
 
-def test_get_market_defaults_missing_fields():
+def test_get_market_refuses_missing_parameters():
+    """A payload without a tick or a fee is a refusal, not 0.01 / 0 bps.
+
+    Both values are committed by the signed order: a defaulted 0.01 tick
+    mis-rounds every price on a finer market, and a defaulted 0 fee prices the
+    taker side free.
+    """
     fake = FakeSession(FakeResponse({"condition_id": "0xabc"}))
     client = make_client(fake)
-    market = client.get_market("0xabc")
-    assert market["tick_size"] == pytest.approx(0.01)
-    assert market["fee_rate_bps"] == 0
-    assert market["neg_risk"] is False
-    assert market["end_date_iso"] is None
+    with pytest.raises(ClobMarketParamsUnreadable):
+        client.get_market("0xabc")
+
+    fake = FakeSession(FakeResponse({"condition_id": "0xabc", "minimum_tick_size": 0.01}))
+    client = make_client(fake)
+    with pytest.raises(ClobMarketParamsUnreadable):
+        client.get_market("0xabc")
 
 
 # --------------------------------------------------------------------------
 # Reward telemetry parsing
 # --------------------------------------------------------------------------
-USDC_ADDRESS = sorted(USDC_ASSET_ADDRESSES)[0]
+USDC_ADDRESS = min(USDC_ASSET_ADDRESSES)
 POL_ASSET_ADDRESS = "0x9c4E1703476E875070EE25b56A58B008CFb8FA78"
 
 
@@ -521,7 +537,7 @@ def test_total_rewards_uses_per_day_clob_array():
     assert total["reward_income_usd"] == pytest.approx(expected)
     assert total["payout_count"] == 2
     assert total["unknown_earnings"] == []
-    assert total["date"] == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert total["date"] == datetime.now(UTC).strftime("%Y-%m-%d")
 
     params = params_of(fake.calls[0])
     assert fake.calls[0]["url"].endswith("/rewards/user/total")
@@ -679,6 +695,8 @@ def test_neg_risk_uses_separate_cached_signer():
     _, neg = client.build_signed_order("42", "BUY", 0.5, 10.0, salt=7, neg_risk=True)
 
     assert plain["order"]["signature"] != neg["order"]["signature"]
+    # Cache identity is the only observable of signer reuse: the two public
+    # signatures already differ, and the domain itself is not in the order body.
     negative_key = f"v2:{NEG_RISK_CTF_EXCHANGE_V2.lower()}"
     negative_signer = client._signers[negative_key]
     assert negative_signer.verifying_contract == NEG_RISK_CTF_EXCHANGE_V2

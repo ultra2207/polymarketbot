@@ -24,7 +24,7 @@ import json
 import sqlite3
 import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -74,7 +74,7 @@ def _dict_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
 class PendingSettlementStore:
     """Idempotent, hash-keyed record of signed settlement transactions."""
 
-    def __init__(self, conn: Optional[sqlite3.Connection] = None) -> None:
+    def __init__(self, conn: sqlite3.Connection | None = None) -> None:
         self._lock = threading.Lock()
         self._owns_conn = conn is None
         self._conn = conn or sqlite3.connect(":memory:", check_same_thread=False)
@@ -144,7 +144,7 @@ class PendingSettlementStore:
         self,
         tx_hash: str,
         status: str,
-        receipt: Optional[dict[str, Any]] = None,
+        receipt: dict[str, Any] | None = None,
     ) -> bool:
         """Move a row to a terminal status from chain evidence."""
         if status not in TERMINAL_STATUSES:
@@ -160,7 +160,7 @@ class PendingSettlementStore:
             return cur.rowcount > 0
 
     # -- reads -------------------------------------------------------------
-    def get(self, tx_hash: str) -> Optional[dict[str, Any]]:
+    def get(self, tx_hash: str) -> dict[str, Any] | None:
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM pending_settlements WHERE tx_hash = ?",
@@ -205,8 +205,8 @@ __all__ = [
     "PENDING_SETTLEMENTS_DDL",
     "PENDING_SETTLEMENTS_INDEX",
     "PENDING_SETTLEMENTS_UNIQUE",
-    "PendingSettlementStore",
     "REVERTED",
     "SUCCESS",
     "TERMINAL_STATUSES",
+    "PendingSettlementStore",
 ]

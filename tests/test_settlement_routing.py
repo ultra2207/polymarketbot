@@ -16,22 +16,29 @@ from decimal import Decimal
 
 import pytest
 
-from polymarketbot.strategy.onchain.core import ChainClient
 from polymarketbot.gamma import GammaClient
+from polymarketbot.strategy.onchain.core import (
+    RATE_LIMIT,
+    SERVER_ERROR,
+    TRANSPORT,
+    ChainClient,
+    RpcError,
+    classify_rpc_error,
+)
 from polymarketbot.strategy.onchain.settlement import (
     CTF,
+    CTF_PAYOUT_DENOMINATOR_SELECTOR,
+    CTF_PAYOUT_NUMERATOR_SELECTOR,
+    CTF_REDEEM_SELECTOR,
+    IS_APPROVED_FOR_ALL_SELECTOR,
     NEGRISK_ADAPTER,
     NEGRISK_CONVERT_SELECTOR,
     NEGRISK_MERGE_SELECTOR,
+    ROUTER,
     ROUTER_MERGE_SELECTOR,
     ROUTER_REDEEM_SELECTOR,
-    CTF_REDEEM_SELECTOR,
-    CTF_PAYOUT_DENOMINATOR_SELECTOR,
-    CTF_PAYOUT_NUMERATOR_SELECTOR,
-    ROUTER,
-    IS_APPROVED_FOR_ALL_SELECTOR,
-    SettlementRoute,
     USDC_E,
+    SettlementRoute,
     amount_to_6dp,
     build_ctf_merge,
     build_ctf_redeem,
@@ -482,7 +489,7 @@ class _StubGamma(GammaClient):
         super().__init__(min_interval_s=0.0)
         self._rows = rows
 
-    def get(self, path: str, params=None):  # noqa: ANN001 - test stub
+    def get(self, path: str, params=None):
         assert path == "/markets/keyset"
         return {"markets": list(self._rows)}
 
@@ -515,6 +522,29 @@ def test_market_meta_returns_none_when_gamma_has_no_row():
 # ---------------------------------------------------------------------------
 # Read-only on-chain smoke (skipped when the RPC is unavailable)
 # ---------------------------------------------------------------------------
+# The smoke call proves routing only when the endpoint answers. A transport or
+# provider failure leaves the result unknown; anything else (a malformed call,
+# a decoder bug, an address with no code) is a defect and must fail the test.
+_TRANSIENT_RPC_KINDS = (RATE_LIMIT, SERVER_ERROR, TRANSPORT)
+
+
+def _network_reason(exc: BaseException) -> str | None:
+    """Why ``exc`` is a transport/provider failure, or ``None`` when it is not."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError):  # includes requests.RequestException
+            return str(current) or type(current).__name__
+        if isinstance(current, RpcError) and current.kind in _TRANSIENT_RPC_KINDS:
+            return str(current)
+        current = current.__cause__ or current.__context__
+    # `ChainClient._rpc` wraps a retried provider failure in a RuntimeError, and
+    # that wrapper carries the provider's message but not the provider's type.
+    return str(exc) if classify_rpc_error(exc) in _TRANSIENT_RPC_KINDS else None
+
+
+@pytest.mark.network
 def test_readonly_eth_call_smoke():
     chain = ChainClient(url=None, timeout_s=4.0, max_retries=1, min_interval_s=0.0)
     data = (
@@ -525,10 +555,15 @@ def test_readonly_eth_call_smoke():
     )
     try:
         raw = chain.eth_call(to=CTF, data=data)
-    except Exception as exc:  # noqa: BLE001 - offline CI must skip, not fail
-        pytest.skip(f"Polygon RPC unavailable: {exc}")
-    if not raw or raw == "0x":
-        pytest.skip("Polygon RPC returned no data for CTF.isApprovedForAll")
+    except Exception as exc:  # only the cause decides skip vs fail
+        reason = _network_reason(exc)
+        if reason is None:
+            raise
+        pytest.skip(f"Polygon RPC unavailable: {reason}")
+    assert raw and raw != "0x", (
+        f"Polygon RPC answered no data for CTF.isApprovedForAll (to={CTF}); "
+        "an empty eth_call result means the address has no code"
+    )
     assert int(raw, 16) in (0, 1)
 
 

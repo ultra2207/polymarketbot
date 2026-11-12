@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
-from polymarketbot.logs import get_logger
 from polymarketbot.live.runner_market import MARKET_STATUS_INTERVAL, _coerce_float
 from polymarketbot.live.supervisor.helpers import _thread_optional
+from polymarketbot.logs import get_logger
 
 if TYPE_CHECKING:  # the run record only appears in annotations
     from polymarketbot.live.supervisor.context import RunContext
@@ -17,7 +17,7 @@ log = get_logger("real_money_trader")
 REDEEM_RETRY_INTERVAL = 60.0
 
 
-async def market_lifecycle(ctx: "RunContext", now: float) -> None:
+async def market_lifecycle(ctx: RunContext, now: float) -> None:
     """Halt on a dead market, then redeem once it closes."""
     # -- Market lifecycle (every 60 s) ----------------------------------
     if now - ctx.last_market_check >= MARKET_STATUS_INTERVAL:
@@ -28,7 +28,7 @@ async def market_lifecycle(ctx: "RunContext", now: float) -> None:
         end_passed = now >= float(ctx.market["end_timestamp"])
         closed = bool((status or {}).get("closed"))
         accepting = (status or {}).get("accepting_orders")
-        reason: Optional[str] = None
+        reason: str | None = None
         if closed:
             reason = "market closed"
         elif accepting is False:

@@ -1,4 +1,9 @@
-"""Tests for FIFO queue priority valuation, CTF gas model, and switching hurdle."""
+"""Economic-property tests for FIFO queue priority, CTF gas and switching frictions.
+
+The queue model has no default parameters, so every test supplies the fitted
+inputs explicitly. Assertions are economic properties (monotonicity, refusal),
+not a re-derivation of the model's formula.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,33 @@ from polymarketbot.strategy.reward.queue import (
 )
 
 
+def _fitted_model() -> QueuePriorityValuationModel:
+    """A model built from an explicit fit (no constructor defaults exist)."""
+    return QueuePriorityValuationModel(
+        trade_arrival_rate_shares_sec=25.0,
+        cancellation_rate_intensity=0.05,
+        kyle_lambda=0.00015,
+        volatility_annualized=0.45,
+        annual_capital_hurdle_rate=0.12,
+    )
+
+
+def _measured_gas_env() -> PolygonPoSEnvironment:
+    """A priced environment supplied by the test instead of a network read."""
+    return PolygonPoSEnvironment(
+        base_fee_gwei=100.0,
+        priority_fee_gwei=0.0,
+        pol_usd_rate=0.09,
+    )
+
+
+def _engine() -> CapitalMigrationEngine:
+    return CapitalMigrationEngine(
+        gas_env=_measured_gas_env(),
+        queue_model=_fitted_model(),
+    )
+
+
 def test_polygon_gas_calculations() -> None:
     env = PolygonPoSEnvironment(base_fee_gwei=35.0, priority_fee_gwei=45.0, pol_usd_rate=0.35)
     assert env.total_gas_price_gwei == 80.0
@@ -24,38 +56,51 @@ def test_polygon_gas_calculations() -> None:
     assert 0.0020 <= cost_usd <= 0.0025
 
 
-def test_queue_priority_valuation() -> None:
-    model = QueuePriorityValuationModel()
+def test_queue_model_refuses_unmeasured_parameters() -> None:
+    with pytest.raises(TypeError):
+        QueuePriorityValuationModel()  # type: ignore[call-arg]
+    with pytest.raises(ValueError):
+        QueuePriorityValuationModel(
+            trade_arrival_rate_shares_sec=0.0,
+            cancellation_rate_intensity=0.05,
+            kyle_lambda=0.00015,
+            volatility_annualized=0.45,
+            annual_capital_hurdle_rate=0.12,
+        )
+    with pytest.raises(ValueError):
+        QueuePriorityValuationModel(
+            trade_arrival_rate_shares_sec=25.0,
+            cancellation_rate_intensity=-1.0,
+            kyle_lambda=0.00015,
+            volatility_annualized=0.45,
+            annual_capital_hurdle_rate=0.12,
+        )
 
-    # Front of queue vs back of queue
-    val_front = model.evaluate_queue_value(
-        quote_size=100.0,
-        queue_ahead=0.0,
-        half_spread_cents=1.5,
-        token_mid_price=0.50,
-    )
-    val_back = model.evaluate_queue_value(
-        quote_size=100.0,
-        queue_ahead=2500.0,
-        half_spread_cents=1.5,
-        token_mid_price=0.50,
-    )
 
-    # Front of queue must have strictly higher fill probability and value than back
-    assert val_front.fill_probability > val_back.fill_probability
-    assert val_front.net_queue_value_usd > val_back.net_queue_value_usd
-    # Front-of-queue value is re-derived from the measured isotonic P(fill) for a
-    # zero-ratio queue (data/derived/fill_model.json), not a hand-set threshold.
-    p_front = model.calculate_fill_probability(0.0, 100.0)
-    assert p_front < 1.0
-    # Kyle's lambda is price change per 1000 shares, so a 100-share fill pays
-    # lambda * 100 / 1000 dollars per share of adverse selection.
-    expected_front = (
-        100.0
-        * (0.015 - model.kyle_lambda * 100.0 / 1000.0)
-        * p_front
-    )
-    assert val_front.net_queue_value_usd == pytest.approx(expected_front, abs=1e-4)
+def test_deeper_queue_strictly_lowers_projection() -> None:
+    model = _fitted_model()
+    level_size = 10_000.0
+    ahead = (0.0, 1_000.0, 5_000.0)
+
+    valuations = [
+        model.evaluate_queue_value(
+            quote_size=100.0,
+            queue_ahead=queue_ahead,
+            half_spread_cents=1.5,
+            token_mid_price=0.50,
+            level_size_shares=level_size,
+        )
+        for queue_ahead in ahead
+    ]
+
+    # FIFO depth strictly lowers fill probability and the projected net value,
+    # and strictly lengthens the wait for the shares ahead to clear.
+    probabilities = [v.fill_probability for v in valuations]
+    values = [v.net_queue_value_usd for v in valuations]
+    waits = [v.expected_wait_time_seconds for v in valuations]
+    assert probabilities[0] > probabilities[1] > probabilities[2]
+    assert values[0] > values[1] > values[2]
+    assert waits[0] < waits[1] < waits[2]
 
 
 def test_synthetic_liquidation_dominance() -> None:
@@ -67,6 +112,7 @@ def test_synthetic_liquidation_dominance() -> None:
         p_bid=0.45,
         p_ask_opp=0.51,
         gas_merge_usd=0.015,
+        taker_fee_rate=0.0,
     )
     assert res_synth.route == LiquidationRoute.SYNTHETIC_MERGE
     assert res_synth.synthetic_savings_usd > 0.0
@@ -80,13 +126,105 @@ def test_synthetic_liquidation_dominance() -> None:
         p_bid=0.495,
         p_ask_opp=0.53,
         gas_merge_usd=0.015,
+        taker_fee_rate=0.0,
     )
     assert res_direct.route == LiquidationRoute.DIRECT_CROSS
     assert res_direct.optimal_friction_usd == pytest.approx(150.0 * (0.50 - 0.495))
 
 
+def test_missing_taker_fee_is_refused() -> None:
+    with pytest.raises(TypeError):
+        solve_inventory_liquidation_friction(  # type: ignore[call-arg]
+            q=150.0,
+            p_mid=0.50,
+            p_bid=0.45,
+            p_ask_opp=0.51,
+            gas_merge_usd=0.015,
+        )
+    with pytest.raises(ValueError):
+        solve_inventory_liquidation_friction(
+            q=150.0,
+            p_mid=0.50,
+            p_bid=0.45,
+            p_ask_opp=0.51,
+            gas_merge_usd=0.015,
+            taker_fee_rate=None,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError):
+        solve_inventory_liquidation_friction(
+            q=150.0,
+            p_mid=0.50,
+            p_bid=0.45,
+            p_ask_opp=0.51,
+            gas_merge_usd=0.015,
+            taker_fee_rate=-0.01,
+        )
+
+
+def test_higher_taker_fee_strictly_raises_switching_cost() -> None:
+    engine = _engine()
+    kwargs = {
+        "q_a": 100.0,
+        "p_mid_a": 0.50,
+        "p_bid_a": 0.48,
+        "p_ask_opp_a": 0.51,
+        "resting_bid_size": 100.0,
+        "resting_ask_size": 100.0,
+        "queue_ahead_bid": 50.0,
+        "queue_ahead_ask": 50.0,
+        "half_spread_cents_a": 1.5,
+        "daily_yield_a": 15.0,
+        # One measured CLOB round trip; the former 4.5 s placeholder is gone.
+        "transit_latency_seconds": 0.57,
+    }
+    free = engine.compute_switching_cost(taker_fee_rate=0.0, **kwargs)
+    charged = engine.compute_switching_cost(taker_fee_rate=0.05, **kwargs)
+
+    # A measured taker fee can only add friction: it is never free.
+    assert charged.liquidation_friction_usd > free.liquidation_friction_usd
+    assert charged.total_switching_cost_usd > free.total_switching_cost_usd
+
+
+def test_switching_cost_refuses_a_missing_fee() -> None:
+    engine = _engine()
+    with pytest.raises(TypeError):
+        engine.compute_switching_cost(  # type: ignore[call-arg]
+            q_a=100.0,
+            p_mid_a=0.50,
+            p_bid_a=0.48,
+            p_ask_opp_a=0.51,
+            resting_bid_size=100.0,
+            resting_ask_size=100.0,
+            queue_ahead_bid=50.0,
+            queue_ahead_ask=50.0,
+            half_spread_cents_a=1.5,
+            daily_yield_a=15.0,
+            transit_latency_seconds=0.57,
+        )
+    with pytest.raises(ValueError):
+        engine.compute_switching_cost(
+            q_a=100.0,
+            p_mid_a=0.50,
+            p_bid_a=0.48,
+            p_ask_opp_a=0.51,
+            resting_bid_size=100.0,
+            resting_ask_size=100.0,
+            queue_ahead_bid=50.0,
+            queue_ahead_ask=50.0,
+            half_spread_cents_a=1.5,
+            daily_yield_a=15.0,
+            transit_latency_seconds=0.57,
+            taker_fee_rate=None,  # type: ignore[arg-type]
+        )
+
+
+def test_capital_migration_engine_requires_a_fitted_queue_model() -> None:
+    with pytest.raises(TypeError):
+        CapitalMigrationEngine()  # type: ignore[call-arg]
+
+
 def test_capital_migration_hurdle_evaluation() -> None:
-    engine = CapitalMigrationEngine()
+    engine = _engine()
 
     cost = engine.compute_switching_cost(
         q_a=100.0,
@@ -99,6 +237,8 @@ def test_capital_migration_hurdle_evaluation() -> None:
         queue_ahead_ask=50.0,
         half_spread_cents_a=1.5,
         daily_yield_a=15.0,
+        transit_latency_seconds=0.57,
+        taker_fee_rate=0.0,
     )
 
     assert cost.total_switching_cost_usd > 0.0

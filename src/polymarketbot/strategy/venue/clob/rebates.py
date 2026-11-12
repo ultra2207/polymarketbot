@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.clob.common import ClobAPIError
@@ -19,7 +19,7 @@ class RebateMixin:
     """Rebate entitlement reads."""
 
 
-    def get_current_rebates(self, date: Optional[str] = None) -> dict[str, Any]:
+    def get_current_rebates(self, date: str | None = None) -> dict[str, Any]:
         """Read a maker's own rebated fees for one UTC day.
 
         ``GET /rebates/current`` (no authentication; ``date`` and a nonzero
@@ -35,7 +35,7 @@ class RebateMixin:
         an unreachable endpoint is ``source="unavailable"`` with an ``error``
         and no number - never a fabricated zero marked valid.
         """
-        target_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target_date = date or datetime.now(UTC).strftime("%Y-%m-%d")
         empty = {
             "date": target_date,
             "rows": [],
@@ -58,7 +58,7 @@ class RebateMixin:
                 params={"date": target_date, "maker_address": self.maker_address},
                 auth=False,
             )
-        except Exception as e:
+        except ClobAPIError as e:
             logger.warning(f"CLOB /rebates/current query failed: {e}")
             return {**empty, "source": "unavailable", "error": str(e)}
         if payload is None:
@@ -96,7 +96,7 @@ class RebateMixin:
             "source": "clob_api",
         }
 
-    def get_daily_rewards(self, date: Optional[str] = None) -> dict[str, Any]:
+    def get_daily_rewards(self, date: str | None = None) -> dict[str, Any]:
         """Query one day's reward earnings from ``GET /rewards/user``.
 
         The endpoint is paginated (``{limit, count, next_cursor, data}`` with
@@ -115,7 +115,7 @@ class RebateMixin:
         Raises nothing: on failure it returns zeros with ``source="unavailable"``
         and an ``error`` string (C2-style: never a fabricated zero marked valid).
         """
-        target_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target_date = date or datetime.now(UTC).strftime("%Y-%m-%d")
 
         if self.dry_run or not self.maker_address:
             return {
@@ -151,7 +151,20 @@ class RebateMixin:
             }
 
         total_usd, breakdown, unknown = _summarise_earnings(rows)
-        rebates = self.get_current_rebates(target_date)
+        # The rewards read must survive a rebate read failure: the two are
+        # separate programs, and a broken entitlement endpoint must not turn a
+        # measured reward day into an exception. The degradation is explicit
+        # here rather than relying on a broad catch inside the transport.
+        try:
+            rebates = self.get_current_rebates(target_date)
+        except Exception as e:  # noqa: BLE001 - a rebate read must never break the rewards read
+            logger.warning(f"CLOB rebates read failed while reading rewards: {e}")
+            rebates = {
+                "total_usd": 0.0,
+                "by_condition": {},
+                "source": "unavailable",
+                "error": str(e),
+            }
         rebate_usd = float(rebates.get("total_usd") or 0.0)
         return {
             "date": target_date,

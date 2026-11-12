@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -23,7 +23,7 @@ def _is_numeric_token_id(value: Any) -> bool:
     return isinstance(value, str) and _NUMERIC_TOKEN_ID_PATTERN.fullmatch(value.strip()) is not None
 
 
-def _coerce_float(value: Any) -> Optional[float]:
+def _coerce_float(value: Any) -> float | None:
     """Parse a finite float, or return None instead of guessing a value."""
     if value is None or isinstance(value, bool):
         return None
@@ -36,7 +36,7 @@ def _coerce_float(value: Any) -> Optional[float]:
     return parsed
 
 
-def _coerce_bool(value: Any) -> Optional[bool]:
+def _coerce_bool(value: Any) -> bool | None:
     """Parse a payload boolean flag, or return None when it cannot be interpreted."""
     if isinstance(value, bool):
         return value
@@ -72,7 +72,7 @@ def _extract_market_metadata(raw_market: dict[str, Any]) -> dict[str, Any]:
     if tick_size is not None and tick_size <= 0.0:
         tick_size = None
     fee_rate = _coerce_float(_first_present(raw_market, "fee_rate_bps", "feeRateBps"))
-    fee_rate_bps = int(round(fee_rate)) if fee_rate is not None and fee_rate >= 0.0 else 0
+    fee_rate_bps = round(fee_rate) if fee_rate is not None and fee_rate >= 0.0 else 0
     return {
         "neg_risk": bool(_coerce_bool(_first_present(raw_market, "neg_risk", "negRisk"))),
         "tick_size": tick_size,
@@ -86,15 +86,15 @@ def _extract_market_metadata(raw_market: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_market_tokens(
     raw_market: dict[str, Any],
-) -> tuple[Optional[str], Optional[str], Optional[float]]:
+) -> tuple[str | None, str | None, float | None]:
     """Return (YES token id, NO token id, YES mid price) without inventing values.
 
     ``mid_yes`` is ``None`` when no YES token publishes a price in (0, 1): the
     old ``0.50`` stand-in priced every unreadable market at 50c.
     """
-    yes_token: Optional[str] = None
-    no_token: Optional[str] = None
-    mid_yes: Optional[float] = None
+    yes_token: str | None = None
+    no_token: str | None = None
+    mid_yes: float | None = None
     tokens = raw_market.get("tokens")
     if not isinstance(tokens, (list, tuple)):
         return yes_token, no_token, mid_yes
@@ -112,7 +112,7 @@ def _extract_market_tokens(
     return yes_token, no_token, mid_yes
 
 
-def _extract_daily_pool(raw_market: dict[str, Any]) -> Optional[float]:
+def _extract_daily_pool(raw_market: dict[str, Any]) -> float | None:
     """The market's published daily reward pool, summed over its campaigns.
 
     Returns ``None`` when the payload publishes no rate at all. The old
@@ -122,7 +122,7 @@ def _extract_daily_pool(raw_market: dict[str, Any]) -> Optional[float]:
     """
     rewards_cfg = raw_market.get("rewards_config")
     campaigns = list(rewards_cfg) if isinstance(rewards_cfg, (list, tuple)) else []
-    total: Optional[float] = None
+    total: float | None = None
     for campaign in campaigns:
         if not isinstance(campaign, dict):
             continue
@@ -135,20 +135,20 @@ def _extract_daily_pool(raw_market: dict[str, Any]) -> Optional[float]:
     return _coerce_float(raw_market.get("rewards_daily_rate"))
 
 
-def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+def _parse_iso_datetime(value: Any) -> datetime | None:
     """Parse an ISO-8601 timestamp into an aware UTC datetime, or None."""
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.strip())
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
-def _market_state_rejection(raw_market: dict[str, Any]) -> Optional[str]:
+def _market_state_rejection(raw_market: dict[str, Any]) -> str | None:
     """Return a reason when the payload says the market cannot accept orders."""
     for field_name in _STATE_BOOLEAN_FIELDS:
         raw_value = raw_market.get(field_name)
@@ -172,7 +172,7 @@ def _market_state_rejection(raw_market: dict[str, Any]) -> Optional[str]:
 def validate_market_for_live(
     raw_market: dict[str, Any],
     *,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> tuple[bool, str]:
     """Validate a raw reward-market payload is safe to quote live.
 
@@ -208,9 +208,9 @@ def validate_market_for_live(
     ):
         return (
             False,
-            "rewards_max_spread: must be within "
+            ("rewards_max_spread: must be within "
             f"[{_MIN_REWARD_SPREAD_CENTS}, {_MAX_REWARD_SPREAD_CENTS}] cents, "
-            f"got {raw_market.get('rewards_max_spread')!r}",
+            f"got {raw_market.get('rewards_max_spread')!r}"),
         )
 
     state_reason = _market_state_rejection(raw_market)
@@ -221,7 +221,7 @@ def validate_market_for_live(
     end_date = _parse_iso_datetime(end_date_raw)
     if end_date is None:
         return False, f"end_date_iso: missing or unparseable ({end_date_raw!r})"
-    now_utc = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    now_utc = now.astimezone(UTC) if now is not None else datetime.now(UTC)
     if end_date <= now_utc:
         return False, f"end_date_iso: market already ended at {end_date_raw}"
 

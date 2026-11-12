@@ -9,10 +9,14 @@ import asyncio
 import re
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
-import polymarketbot.live.runner as runner
+from polymarketbot.live import runner
+
+if TYPE_CHECKING:
+    import argparse
 
 END_DATE = "2030-01-01T00:00:00Z"
 
@@ -107,6 +111,8 @@ def _rewards_market(tokens: list[dict]) -> dict:
         "end_date_iso": END_DATE,
         "neg_risk": False,
         "tick_size": 0.01,
+        # The venue's own minimum-order notional (Gamma ``orderMinSize``).
+        "orderMinSize": 5.0,
     }
 
 
@@ -157,6 +163,7 @@ def test_resolve_market_details_returns_numeric_tokens_and_metadata():
     assert resolved["tick_size_cents"] == pytest.approx(1.0)
     assert resolved["neg_risk"] is False
     assert resolved["fee_rate_bps"] == 0
+    assert resolved["order_min_usd"] == pytest.approx(5.0)
     assert resolved["end_date_iso"] == END_DATE
     assert resolved["days_to_resolution"] >= 1.0 / 24.0
     assert resolved["daily_reward"] == pytest.approx(25.0)
@@ -174,6 +181,7 @@ def test_resolve_market_details_uses_cli_reward_config_for_manual_market():
                 "neg_risk": True,
                 "tick_size": 0.001,
                 "fee_rate_bps": 25,
+                "order_min_size": 5.0,
                 "closed": False,
                 "accepting_orders": True,
                 "end_date_iso": END_DATE,
@@ -223,6 +231,7 @@ def _market_info() -> dict:
         "tick_size_cents": 1.0,
         "neg_risk": False,
         "fee_rate_bps": 0,
+        "order_min_usd": 5.0,
         "end_date_iso": END_DATE,
         "end_timestamp": 1893456000.0,
         "days_to_resolution": 30.0,
@@ -282,7 +291,7 @@ class FakeCtf:
 
 
 class FakeLiveFeed:
-    instances: list["FakeLiveFeed"] = []
+    instances: ClassVar[list[FakeLiveFeed]] = []
     book = None
     ws_connected = True
 
@@ -322,7 +331,7 @@ class FakeLiveFeed:
 
 
 class NotReadyEngine:
-    created: list["NotReadyEngine"] = []
+    created: ClassVar[list[NotReadyEngine]] = []
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
@@ -374,6 +383,10 @@ class LoopEngine(NotReadyEngine):
 
     def process_reward_epoch(self, timestamp=None, competing_score=0.0) -> None:
         pass
+
+    def settle_completed_reward_days(self) -> float:
+        # The real engine settles rolled-over UTC days; the fake has no accrual.
+        return 0.0
 
     def cancel_all_quotes(self) -> bool:
         self.cancel_attempts += 1
@@ -427,7 +440,7 @@ def _install_live_fakes(
     monkeypatch.setattr(runner, "optimize_spread_offset", lambda **kwargs: (1.0, {}))
 
 
-def _live_args(tmp_path, *extra: str) -> "argparse.Namespace":
+def _live_args(tmp_path, *extra: str) -> argparse.Namespace:
     return runner.parse_args(
         [
             "--live",
@@ -436,6 +449,11 @@ def _live_args(tmp_path, *extra: str) -> "argparse.Namespace":
             str(tmp_path / "runner.db"),
             "--ledger-path",
             str(tmp_path / "runner_ledger.json"),
+            # These tests exercise the runner gates, not the sizing measurement. An
+            # operator-stated distance is the documented path for an unmeasurable or
+            # offline market; without it `apply_quote_sizing` correctly refuses.
+            "--spread-offset",
+            "1.0",
             *extra,
         ]
     )

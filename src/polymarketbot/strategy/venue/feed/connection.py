@@ -8,6 +8,7 @@ import random
 import time
 
 import websockets
+from websockets.exceptions import WebSocketException
 
 from polymarketbot.logs import get_logger
 
@@ -32,7 +33,7 @@ class _ConnectionMixin:
         try:
             await self._active_ws.send(json.dumps(payload))
             logger.info(f"Sent WebSocket subscription for {len(token_ids)} token(s).")
-        except Exception as exc:
+        except (OSError, WebSocketException) as exc:
             logger.warning(f"Failed to send WS subscription payload: {exc}")
 
     # -------------------------------------------------------------------------
@@ -54,6 +55,9 @@ class _ConnectionMixin:
                     self._active_ws = ws
                     self._ws_connected = True
                     self._last_ws_message_time = time.time()
+                    # No data has arrived on this connection yet: keep the REST
+                    # fallback engaged until the first parsed frame re-seeds it.
+                    self._last_ws_data_time = 0.0
                     reconnect_delay = self.initial_reconnect_delay
                     # Deltas received after a gap cannot be applied to depth that
                     # accumulated before it. Drop the books and let the exchange's
@@ -71,7 +75,7 @@ class _ConnectionMixin:
                             await asyncio.sleep(8.0)
                             try:
                                 await ws.send("PING")
-                            except Exception:
+                            except (OSError, WebSocketException):
                                 break
 
                     hb_task = asyncio.create_task(_heartbeat_worker(), name="CLOB-WS-Heartbeat")
@@ -81,18 +85,18 @@ class _ConnectionMixin:
                             try:
                                 msg = await asyncio.wait_for(ws.recv(), timeout=20.0)
                                 await self._process_ws_payload(msg)
-                            except asyncio.TimeoutError:
+                            except TimeoutError:
                                 # Re-verify connection with explicit ping
                                 try:
                                     await ws.send("PING")
-                                except Exception:
+                                except (OSError, WebSocketException):
                                     break
                     finally:
                         hb_task.cancel()
 
             except asyncio.CancelledError:
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - reconnect loop: any failure must not stop the feed
                 self._ws_connected = False
                 self._active_ws = None
                 jitter = random.uniform(0.1, 0.5)
@@ -120,23 +124,32 @@ class _ConnectionMixin:
                 if not self._running:
                     break
 
-                # If WebSocket is connected and healthy, fallback remains idle
-                ws_healthy = self._ws_connected and (time.time() - self._last_ws_message_time < 30.0)
-                if ws_healthy or not self._subscribed_tokens:
+                # A socket that only answers PONGs is not delivering books, so
+                # liveness is measured from the last parsed data frame.
+                ws_healthy = self._ws_connected and (
+                    time.time() - self._last_ws_data_time < 30.0
+                )
+                desynced = list(getattr(self, "_desync_assets", ()))
+                if ws_healthy and not desynced:
                     continue
 
-                # WebSocket is down: fetch snapshots via REST
-                tokens_to_poll = list(self._subscribed_tokens)
+                # Re-seed the books a dropped delta left incomplete, and poll
+                # everything when the socket is not delivering data at all.
+                tokens_to_poll = desynced if ws_healthy else list(self._subscribed_tokens)
+                if not tokens_to_poll:
+                    continue
                 for tok in tokens_to_poll:
                     if not self._running:
                         break
                     snapshot = await self.fetch_book(tok)
                     if snapshot:
                         await self._dispatch_book(snapshot)
+                        if ws_healthy:
+                            self._desync_assets.discard(tok)
                     await asyncio.sleep(0.1)  # Courteous pacing
 
             except asyncio.CancelledError:
                 break
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - fallback poller: any failure must not stop the feed
                 logger.error(f"Error in REST fallback polling loop: {exc}")
                 await asyncio.sleep(self.fallback_poll_interval)

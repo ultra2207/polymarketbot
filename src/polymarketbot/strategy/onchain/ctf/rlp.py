@@ -7,10 +7,12 @@ broadcast bytes of every settlement transaction.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.risk.fast_signer import (
     _SECP256K1_N as SECP256K1_N,
+)
+from polymarketbot.risk.fast_signer import (
     ecdsa_sign_digest,
     keccak256,
 )
@@ -179,7 +181,7 @@ def sign_eip1559_transaction(
     )
 
 
-def _parse_private_key(raw: str | None) -> Optional[bytes]:
+def _parse_private_key(raw: str | None) -> bytes | None:
     """Return validated 32-byte key material, or None when absent."""
     if not raw:
         return None

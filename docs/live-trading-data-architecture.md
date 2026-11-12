@@ -4,6 +4,17 @@ How data collection runs while real money is trading, and what the real-money
 trader records that the public collector cannot. Companion to
 `docs/tape-initial-analysis.md` and `docs/live-data-gap-analysis.md`.
 
+> **Tools (2026-11-11).** The `scripts/*.py` helpers named below
+> (`replay_live_journal.py`, `analyze_live_session_join.py`) were deleted in the
+> 2026-11-10 scripts cleanup and have no `python -m` replacement.
+> `scripts/run_paper_trading.py` became `uv run python -m polymarketbot.paper.main`.
+>
+> **The public collector and the monitor in §1 no longer exist.**
+> `python -m polymarketbot.data.collector` and `polymarketbot.ops.monitor` were deleted in
+> commit `999ec0a`; `data/tape/clob_trades` stopped at 2026-11-10 19:50 IST and is resumed
+> only by `uv run python -m polymarketbot.tools.reward_tape`. Read the collector row and the
+> monitor row of the table below as the 2026-11-05 design, not the current process list.
+
 **Status 2026-11-05 (v2):** implemented in
 `src/polymarketbot/live/recorder.py` and wired into
 `polymarketbot.live.runner` via `--record-live-data`
@@ -226,7 +237,7 @@ Paper-vs-live parity on the same columns (`PaperSessionRecorder`) is wired.
 3. **Paper trader parity (done).** `PaperSessionRecorder` writes the paper
    engine's positions/fills/virtual quotes/epoch snapshots and portfolio
    summary with the live recorder's columns, under `data/live_tape/paper-*`
-   with `mode="paper"`. `scripts/run_paper_trading.py` starts/stops it around
+   with `mode="paper"`. `python -m polymarketbot.paper.main` starts/stops it around
    the paper run. Paper-vs-live comparisons can now use the same columns.
 4. **Live single-market limitation.** The live engine is one condition per
    process; the event cap is enforced within that market. If the runner later

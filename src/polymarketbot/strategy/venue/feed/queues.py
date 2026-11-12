@@ -68,10 +68,9 @@ class _DispatchQueue(_BoundedEventQueue):
         """Enqueue an event, coalescing books and enforcing the bound."""
         if kind == "book":
             self._drop_queued_books(payload.asset_id)
-        if self.full():
-            if not self._evict_oldest_book():
-                self.dropped += 1
-                return False
+        if self.full() and not self._evict_oldest_book():
+            self.dropped += 1
+            return False
         self.put_nowait((kind, payload))
         return True
 

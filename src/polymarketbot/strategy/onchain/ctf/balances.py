@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 from polymarketbot.logs import get_logger
 from polymarketbot.risk.fast_signer import keccak256
 
@@ -21,37 +19,50 @@ logger = get_logger("ctf_client")
 class CtfBalanceMixin:
     """Wallet and position balances the merge preflight depends on."""
 
-    def get_pol_balance(self, address: str) -> float:
-        """Query native POL (MATIC) gas balance for wallet address."""
+    def get_pol_balance(self, address: str) -> float | None:
+        """Native POL (gas) balance for ``address``, or ``None`` when unmeasured.
+
+        A failed RPC read or a wallet this client does not know is *not* a zero
+        balance: returning ``0.0`` here (at ``debug`` level) recorded a
+        fabricated 0 POL in the tape and made a gas-starved wallet look funded.
+        """
         if not address or address.startswith("0x00000"):
-            return 0.50 if self.dry_run else 0.0
+            return None
 
         try:
             raw_bal = self.chain_client._rpc("eth_getBalance", [address, "latest"])
-            if raw_bal:
-                wei = int(str(raw_bal), 16)
-                return round(wei / 1e18, 4)
-        except Exception as e:
-            logger.debug(f"Failed to query POL balance: {e}")
+        except (RuntimeError, ValueError, OSError) as e:
+            logger.warning(f"Failed to query POL balance for {address}: {e}")
+            return None
+        if not raw_bal:
+            return None
+        try:
+            wei = int(str(raw_bal), 16)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"POL balance for {address} was not a hex quantity: {e}")
+            return None
+        return round(wei / 1e18, 4)
 
-        return 0.50 if self.dry_run else 0.0
-
-    def get_usdc_balance(self, address: str) -> float:
-        """Query on-chain ERC-20 USDC balance for wallet address."""
+    def get_usdc_balance(self, address: str) -> float | None:
+        """On-chain ERC-20 USDC balance for ``address``, or ``None`` when unmeasured."""
         if not address or address.startswith("0x00000"):
-            return 100.0 if self.dry_run else 0.0
+            return None
 
         try:
             clean_addr = address.lower().removeprefix("0x").rjust(64, "0")
             data = f"0x{ERC20_BALANCE_OF_SELECTOR}{clean_addr}"
             res = self.chain_client.eth_call(to=self.collateral_address, data=data)
-            if res and res != "0x":
-                raw_units = int(res, 16)
-                return round(raw_units / 1_000_000.0, 2)
-        except Exception as e:
-            logger.debug(f"Failed to query on-chain USDC balance: {e}")
-
-        return 100.0 if self.dry_run else 0.0
+        except (RuntimeError, ValueError, OSError) as e:
+            logger.warning(f"Failed to query on-chain USDC balance for {address}: {e}")
+            return None
+        if not res or res == "0x":
+            return None
+        try:
+            raw_units = int(res, 16)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"On-chain USDC balance for {address} was not a hex quantity: {e}")
+            return None
+        return round(raw_units / 1_000_000.0, 2)
 
     # ------------------------------------------------------------------
     # CTF position balances
@@ -103,9 +114,9 @@ class CtfBalanceMixin:
         self,
         condition_id: str,
         amount_shares: float,
-        index_sets: List[int],
-        token_ids: Optional[Tuple[str, ...]],
-    ) -> Optional[str]:
+        index_sets: list[int],
+        token_ids: tuple[str, ...] | None,
+    ) -> str | None:
         """Return an error string when the merge cannot be proven to be backed.
 
         tokenIds are not part of mergePositions calldata, so they are supplied
@@ -127,8 +138,8 @@ class CtfBalanceMixin:
         if not ids:
             return "no CTF token ids available to verify merge balances"
 
-        required_raw = int(round(float(amount_shares) * CTF_SHARE_DECIMALS))
-        problems: List[str] = []
+        required_raw = round(float(amount_shares) * CTF_SHARE_DECIMALS)
+        problems: list[str] = []
         for token_id in ids:
             try:
                 held_raw = self._position_balance_raw(token_id, self.signer_address)

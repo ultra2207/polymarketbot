@@ -10,9 +10,8 @@ cache, which lives here and nowhere else.
 from __future__ import annotations
 
 import threading
-
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -76,7 +75,9 @@ def _fill_table() -> Any:
     with _TABLE_LOCK:
         if not _QUOTE_FILL_HORIZON_TRIED:
             try:
-                from polymarketbot.strategy.reward.measurement import load_quote_fill_horizon
+                from polymarketbot.strategy.reward.measurement import (
+                    load_quote_fill_horizon,
+                )
 
                 _QUOTE_FILL_HORIZON = load_quote_fill_horizon()
             except Exception as exc:  # noqa: BLE001 - a missing measurement is data, not a crash
@@ -115,7 +116,7 @@ def expected_fill_yield(
     horizon_s: float,
     quote_price: float,
     leg_mid: float,
-) -> Optional[MarketFillYield]:
+) -> MarketFillYield | None:
     """Expected fill yield of one reward bid, from the two measured tape tables.
 
     ``min_flow_shares`` is the size our own bid must be met with - the venue's
@@ -156,8 +157,8 @@ def expected_fill_yield(
 
 
 def markout_cost_usd(
-    shares: float, markout_cents_per_share: Optional[float]
-) -> float:
+    shares: float, markout_cents_per_share: float | None
+) -> float | None:
     """Adverse-move cost of ``shares`` filled at the quote, in USDC.
 
     The paper engine already books the *realised* adverse move: a fill enters
@@ -183,15 +184,21 @@ def markout_cost_usd(
     The missing input is therefore not prints but a persisted best-bid/mid
     series at a fixed offset from the fill: this soak writes equity snapshots
     only, so a fixed-Delta markout cannot be computed from it. The parameter
-    stays ``None`` until that series exists; ``None`` -> 0.0 with no invented
-    default, and the caller is expected to log that the fill is priced without
-    one.
+    stays ``None`` until that series exists.
+
+    An unmeasured markout returns ``None``, never ``0.0``: zero is the measured
+    value of *no adverse move*, so a numeric fallback would state that a
+    missing measurement is a benign one. A caller that needs a number must
+    refuse the quote (or price it without the term and say so) rather than add
+    a fabricated zero.
 
     Units: ``shares`` is shares, ``markout_cents_per_share`` is USDC cents per
     share (negative for an adverse move the pillar pays), result is USDC.
     """
-    if markout_cents_per_share is None or shares <= 0.0:
+    if shares <= 0.0:
         return 0.0
+    if markout_cents_per_share is None:
+        return None
     return float(shares) * float(markout_cents_per_share) / 100.0
 
 

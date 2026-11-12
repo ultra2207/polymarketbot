@@ -4,12 +4,111 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 from polymarketbot.strategy.books import mid, qualifying_score
 from polymarketbot.strategy.reward.competition import CompetingEstimate
 from polymarketbot.strategy.reward.marginal import PROTOCOL_MIN_DAILY_PAYOUT_USD
 from polymarketbot.strategy.reward.scoring import single_sided_score_fraction
+
+REWARD_ELIGIBILITY_SECONDS = 3.5
+"""How long an order must rest before the venue counts it at all.
+
+"The minimum amount of time that an order needs to be active to be eligible
+for rewards is 3.5 seconds" (``data/raw/docs/llms-full.txt:53855``). Time
+before that is not accruable, whatever the order's quoted rate says.
+"""
+
+_SECONDS_PER_DAY = 86_400.0
+
+
+class RewardDayAccrual:
+    """Reward accrual for one market, banked per UTC day behind the $1 floor.
+
+    The venue pays liquidity rewards per market per UTC day and refuses a
+    payout below $1.00 ("The minimum reward payout is $1; amounts below this
+    will not be paid", ``site/programs/liquidity-rewards.md:21``). That floor is
+    a property of a *day's total*, never of an instantaneous rate: applying it
+    to the rate would book a zero for every reading under $1/day and, worse,
+    let a rate just above $1/day be credited as if it were paid continuously.
+    This accumulator integrates the rate over real elapsed time instead, and
+    the caller settles each UTC day against the floor at rollover.
+
+    ``record`` integrates over ``[previous record, ts]``, so the first call
+    only anchors the clock (there is no measured interval yet). Intervals that
+    cross UTC midnight are split, because the payout period is the UTC day.
+    The caller is responsible for passing only the intervals in which the
+    order was actually reward-eligible: time before the 3.5 s minimum, or after
+    a cancel, is not a measurable rate at all.
+    """
+
+    def __init__(self, condition_id: str = "") -> None:
+        self.condition_id = condition_id
+        self._last_ts: float | None = None
+        self._pending: dict[date, float] = {}
+        self._settled: set[date] = set()
+
+    @property
+    def last_ts(self) -> float | None:
+        """The last timestamp the clock was advanced to (``None`` = never)."""
+        return self._last_ts
+
+    def record(self, ts: float, usd_per_day: float) -> None:
+        """Accrue ``usd_per_day`` over the interval ending at ``ts``.
+
+        ``ts`` is epoch seconds. A non-positive rate accrues nothing but still
+        advances the clock, so an interval with no eligible resting order can
+        never be charged to the next rate. A clock that does not advance is
+        ignored: the interval is not measured twice.
+        """
+        ts = float(ts)
+        last = self._last_ts
+        if last is None:
+            self._last_ts = ts
+            return
+        if ts <= last:
+            return
+        rate = float(usd_per_day)
+        if rate > 0.0:
+            start = last
+            while start < ts:
+                day = datetime.fromtimestamp(start, UTC).date()
+                stop = min(ts, _utc_day_start(day + timedelta(days=1)))
+                self._pending[day] = (
+                    self._pending.get(day, 0.0)
+                    + rate * (stop - start) / _SECONDS_PER_DAY
+                )
+                start = stop
+        self._last_ts = ts
+
+    def pending_utc_day(self, day: date) -> float:
+        """USD accrued for ``day`` that has not been settled yet."""
+        return self._pending.get(day, 0.0)
+
+    def pending_days(self) -> tuple[date, ...]:
+        """Every UTC day with unsettled accrual, oldest first."""
+        return tuple(sorted(day for day, usd in self._pending.items() if usd != 0.0))
+
+    def settle_utc_day(self, day: date) -> float:
+        """Settle ``day`` against the venue's minimum payout.
+
+        Returns the day's total when it clears $1.00 and ``0.0`` when it does
+        not; either way the day is marked settled and its pending accrual is
+        cleared, so a day can never pay twice. Call it only after the tick that
+        closes the day has been recorded, or the pre-midnight tail lands after
+        the settle.
+        """
+        if day in self._settled:
+            return 0.0
+        self._settled.add(day)
+        total = self._pending.pop(day, 0.0)
+        return total if total >= PROTOCOL_MIN_DAILY_PAYOUT_USD else 0.0
+
+
+def _utc_day_start(day: date) -> float:
+    """Epoch seconds of 00:00:00 UTC on ``day``."""
+    return datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp()
 
 
 @dataclass(frozen=True)
@@ -41,9 +140,9 @@ class AccrualShare:
     pool_usd_per_day: float
     qualifies: bool
     competing_samples: int = 1
-    competing_variance: Optional[float] = None
+    competing_variance: float | None = None
     low_confidence: bool = True
-    competing_snapshot: Optional[float] = None
+    competing_snapshot: float | None = None
 
     @property
     def provenance(self) -> str:
@@ -55,18 +154,19 @@ class AccrualShare:
 
 def measured_accrual(
     *,
-    pool_usd_per_day: Optional[float],
+    pool_usd_per_day: float | None,
     price: float,
     shares: float,
-    min_size: Optional[float],
-    max_spread_cents: Optional[float],
-    leg_book: Optional[dict[str, Any]],
-    other_book: Optional[dict[str, Any]],
-    competing: Optional[CompetingEstimate] = None,
-) -> Optional[AccrualShare]:
-    """The payout a resting bid earns per day, from its own measured books.
+    min_size: float | None,
+    max_spread_cents: float | None,
+    leg_book: dict[str, Any] | None,
+    other_book: dict[str, Any] | None,
+    competing: CompetingEstimate | None = None,
+    books_include_our_order: bool = False,
+) -> AccrualShare | None:
+    """The payout rate a resting bid earns per day, from its own measured books.
 
-    This is the accrual the engine credits as cash, so every input is a
+    This is the rate the engine banks per UTC day, so every input is a
     measurement and nothing has a fallback: the pool is the venue's published
     daily rate for the market, the band and the minimum size are the venue's
     published campaign parameters, ``price``/``shares`` are what is actually
@@ -75,6 +175,12 @@ def measured_accrual(
     nothing - when any of those is missing or when the measured competing score
     is zero (a singular denominator), because a payout without a measured
     denominator is a guess.
+
+    The returned ``usd_per_day`` is **not** floored: the venue's $1.00 minimum
+    applies to a market's daily total at UTC-day rollover, so the caller must
+    bank this rate with :class:`RewardDayAccrual` and settle the day, and must
+    only bank intervals in which the order was reward-eligible (rested at least
+    ``REWARD_ELIGIBILITY_SECONDS``).
 
     ``competing`` is the epoch-average estimate for this market's pair. The
     venue divides by the average of up to 1,440 samples, so pricing an epoch
@@ -87,6 +193,14 @@ def measured_accrual(
     a *plan* from the optimizer, whose payout was computed once for the planned
     capital; this one prices what is on the book **now**, so a partially filled,
     stale or over-sized resting bid accrues what it actually earns.
+
+    ``books_include_our_order`` states whether the supplied L2 snapshots
+    contain this order. The paper engine quotes into a simulated book, so the
+    venue snapshot it reads never contains the order and the default (``False``)
+    adds our score to a clean competitor total. An engine reading the venue's
+    own book while its order rests there must pass ``True``: the snapshot then
+    already carries our raw score, and adding it again would divide our claim
+    by itself twice.
     """
     if pool_usd_per_day is None or pool_usd_per_day <= 0.0:
         return None
@@ -144,15 +258,27 @@ def measured_accrual(
     fraction = single_sided_score_fraction(leg_mid)
     if fraction <= 0.0:
         return _share(0.0, 0.0, 0.0, False)
-    our_score = ((band - distance) / band) ** 2 * float(shares) * fraction
-    denom = denominator + our_score
+    our_raw = ((band - distance) / band) ** 2 * float(shares)
+    our_score = our_raw * fraction
+    # The venue's denominator is ``sum_makers Q_min``. A book snapshot that
+    # includes our own resting order already carries our raw score, so adding
+    # ``our_score`` on top of it counts us twice and understates the share
+    # (by up to 2x when we are the only maker). Trim our raw contribution from
+    # the measured total first, then add back the ``1/c``-penalised score the
+    # venue actually counts; when the caller's books do not contain our order
+    # (the paper engine quotes into a simulated book, not the venue's), the
+    # competitor total is already clean and only the add-back applies.
+    competitor_total = denominator
+    if books_include_our_order:
+        competitor_total = max(0.0, competitor_total - our_raw)
+    denom = competitor_total + our_score
     share = our_score / denom if denom > 0.0 else 0.0
     usd_per_day = pool_usd_per_day * share
-    # Documented venue floor: a market whose daily payout is below $1.00 pays
-    # nothing, so the quote's share of it is a measured zero, not a small cash
-    # amount the engine would otherwise bank.
-    if usd_per_day < PROTOCOL_MIN_DAILY_PAYOUT_USD:
-        return _share(0.0, share, our_score, False)
+    # The rate is not floored here. The $1.00 minimum is a property of a
+    # market's *daily total* and is applied at UTC-day rollover by
+    # :class:`RewardDayAccrual`; flooring the instantaneous rate would discard
+    # a real accrual on every sub-$1/day reading and can never reproduce the
+    # venue's per-day payout.
     return _share(usd_per_day, share, our_score, True)
 
 

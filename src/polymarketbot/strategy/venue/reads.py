@@ -9,14 +9,19 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
 
-from polymarketbot.fees import FeeSchedule
+from polymarketbot.fees import (
+    FeeSchedule,
+    FeeScheduleUnreadable,
+    schedule_for_market,
+)
 from polymarketbot.gamma import GammaClient
 from polymarketbot.logs import get_logger
 
@@ -37,7 +42,7 @@ class Market:
     daily_reward: float
     reward_max_spread_cents: float
     reward_min_size: float
-    fee_schedule: Optional[FeeSchedule]
+    fee_schedule: FeeSchedule | None
     neg_risk: bool
     closed: bool
     uma_status: str
@@ -70,7 +75,7 @@ def _json_list(value: Any) -> list[Any]:
     return []
 
 
-def parse_market(row: dict[str, Any]) -> Optional[Market]:
+def parse_market(row: dict[str, Any]) -> Market | None:
     condition_id = str(row.get("conditionId") or row.get("condition_id") or "")
     outcomes = tuple(str(o) for o in _json_list(row.get("outcomes")))
     token_ids = tuple(str(t) for t in _json_list(row.get("clobTokenIds")))
@@ -95,18 +100,10 @@ def parse_market(row: dict[str, Any]) -> Optional[Market]:
             prices.append(float(raw))
         except (TypeError, ValueError):
             prices.append(float("nan"))
-    schedule = None
-    try:
-        schedule = GammaClient.fee_schedule(row)
-    except Exception:  # noqa: BLE001 - a market without a schedule is unpriced
-        schedule = None
-    if schedule is None:
-        from polymarketbot.fees import FeeSchedule
-
-        if row.get("feesEnabled") is False:
-            # Measured: 4 of 27 proposed/disputed markets are fee-free with no
-            # schedule; treating that as "unknown" refuses 15 % of the universe.
-            schedule = FeeSchedule.zero()
+    # Gamma's per-market schedule is authoritative (docs/fees.md). A payload
+    # that cannot be parsed raises FeeScheduleUnreadable; it is never turned
+    # into a free market here.
+    schedule = schedule_for_market(row)
     if row.get("acceptingOrders") is False or row.get("archived") is True:
         return None
     tags = row.get("tags") or []
@@ -130,9 +127,23 @@ def parse_market(row: dict[str, Any]) -> Optional[Market]:
     )
 
 
-def universe(gamma: GammaClient, max_pages: Optional[int] = None) -> Iterator[Market]:
+def _parse_row(row: dict[str, Any]) -> Market | None:
+    """``parse_market`` that refuses (logs and skips) an unreadable fee schedule.
+
+    Refusing one market must not abort a universe pass: a single malformed
+    payload would otherwise pin the keyset cursor, or stop a full scan, while
+    the rest of the universe is tradable.
+    """
+    try:
+        return parse_market(row)
+    except FeeScheduleUnreadable as exc:
+        log.warning(f"market refused: {exc}")
+        return None
+
+
+def universe(gamma: GammaClient, max_pages: int | None = None) -> Iterator[Market]:
     """Bounded walk over the venue keyset; ``max_pages=None`` runs to the end."""
-    cursor: Optional[str] = None
+    cursor: str | None = None
     seen: set[str] = set()
     pages = 0
     while True:
@@ -140,7 +151,7 @@ def universe(gamma: GammaClient, max_pages: Optional[int] = None) -> Iterator[Ma
                                        extra={"active": "true"})
         rows = (payload or {}).get("markets") or []
         for row in rows:
-            market = parse_market(row)
+            market = _parse_row(row)
             if market is not None:
                 yield market
         pages += 1
@@ -167,7 +178,7 @@ class UniverseWalker:
     def __init__(self, gamma: GammaClient, pages_per_tick: int = 20) -> None:
         self._gamma = gamma
         self._pages_per_tick = max(1, int(pages_per_tick))
-        self._cursor: Optional[str] = None
+        self._cursor: str | None = None
         self._known: dict[str, Market] = {}
         self._pass_seen: set[str] = set()
         self._pages = 0
@@ -193,12 +204,15 @@ class UniverseWalker:
                 closed="false", after_cursor=self._cursor, extra={"active": "true"}
             )
             rows = (payload or {}).get("markets") or []
+            parsed: list[Market] = []
+            for row in rows:
+                market = _parse_row(row)
+                if market is not None:
+                    parsed.append(market)
             with self._lock:
-                for row in rows:
-                    market = parse_market(row)
-                    if market is not None:
-                        self._known[market.condition_id] = market
-                        self._pass_seen.add(market.condition_id)
+                for market in parsed:
+                    self._known[market.condition_id] = market
+                    self._pass_seen.add(market.condition_id)
             pages += 1
             self._pages += 1
             next_cursor = (payload or {}).get("next_cursor")
@@ -228,7 +242,7 @@ class UniverseWalker:
         while not stop.is_set():
             try:
                 self.step()
-            except Exception:  # noqa: BLE001 - a failed page is retried next loop
+            except Exception:
                 log.warning("universe walk page failed; retrying", exc_info=True)
                 stop.wait(1.0)
 
@@ -300,7 +314,7 @@ class BookFeed:
         with self._lock:
             return {token: self._book[token] for token in ids if token in self._book}
 
-    def snapshot(self, max_age: Optional[float] = None) -> dict[str, dict[str, Any]]:
+    def snapshot(self, max_age: float | None = None) -> dict[str, dict[str, Any]]:
         limit = self._max_age if max_age is None else float(max_age)
         cutoff = time.time() - limit
         with self._lock:
@@ -418,7 +432,13 @@ def condition_tape(
             if cid in _TAPE_CACHE and _TAPE_CACHE[cid][0] >= now - _TAPE_TTL
         }
 
-    def one(condition_id: str) -> list[Print]:
+    def one(condition_id: str) -> list[Print] | None:
+        """Prints for one condition, or ``None`` when the read failed.
+
+        ``None`` and ``[]`` are different answers: an empty list is a measured
+        "no prints in the window", while a 429 / non-200 / transport failure is
+        *missing data* and must not be cached as a fresh zero.
+        """
         try:
             response = http.get(
                 f"{DATA_API}/v2/trades",
@@ -429,14 +449,14 @@ def condition_tape(
                 with _TAPE_LOCK:
                     _TAPE_COOLDOWN[condition_id] = time.time() + 30.0
                     _TAPE_STATS["limited"] += 1
-                return []
+                return None
             if response.status_code != 200:
                 log.warning(f"condition tape HTTP {response.status_code}")
-                return []
+                return None
             rows = (response.json() or {}).get("data") or []
         except Exception as exc:  # noqa: BLE001 - a failed market is missing data
             log.warning(f"condition tape failed: {exc}")
-            return []
+            return None
         # A page whose newest row is already older than the window is not
         # evidence of "no flow": the per-condition index can lag the websocket
         # tape. Measured 2026-11-10 14:11 for the venue's most active condition
@@ -448,7 +468,7 @@ def condition_tape(
         newest = max((_row_ts(row) for row in rows), default=0.0)
         if rows and newest < cutoff:
             _log_stale_condition_index(condition_id, newest, cutoff)
-            return []
+            return None
         out: list[Print] = []
         for row in rows:
             ts = _row_ts(row)
@@ -470,6 +490,10 @@ def condition_tape(
     if stale:
         with ThreadPoolExecutor(max_workers=max(1, min(workers, len(stale)))) as pool:
             for condition_id, rows in zip(stale, pool.map(one, stale)):
+                if rows is None:
+                    # Leave the cache entry (and its timestamp) untouched so the
+                    # next tick retries instead of serving a fabricated zero.
+                    continue
                 fetched[condition_id] = rows
     with _TAPE_LOCK:
         for condition_id, rows in fetched.items():
@@ -490,7 +514,7 @@ def tape(http: requests.Session, window_s: float = 300.0, max_pages: int = 20,
     """Newest-first tape walk until the window is covered. Partial tape is measured."""
     cutoff = time.time() - max(1.0, window_s)
     prints: list[Print] = []
-    cursor: Optional[str] = None
+    cursor: str | None = None
     for _ in range(max_pages):
         params: dict[str, Any] = {"limit": page_size}
         if cursor:
@@ -534,6 +558,6 @@ def tape(http: requests.Session, window_s: float = 300.0, max_pages: int = 20,
 
 def ctf_contracts() -> dict[str, str]:
     """Protocol addresses read from config; paper uses them only for labels."""
-    from polymarketbot.config import CONTRACTS  # noqa: PLC0415 - optional dependency
+    from polymarketbot.config import CONTRACTS
 
     return dict(CONTRACTS)

@@ -22,7 +22,6 @@ import math
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Tuple
 
 from polymarketbot.logs import get_logger
 
@@ -62,7 +61,7 @@ def _parse_size_bound(label: str) -> float:
     raise ValueError(f"unrecognised fill-model size bucket label: {label!r}")
 
 
-def _parse_ratio_bounds(label: str) -> Tuple[float, float]:
+def _parse_ratio_bounds(label: str) -> tuple[float, float]:
     """Inclusive bounds of a measured ratio-bucket label (``0.85-1``, ``1.0``)."""
     text = label.strip()
     if "-" in text:
@@ -87,9 +86,9 @@ class FillModel:
     p_floor: float
     p_ceiling: float
     # (upper size bound in shares, measured P(fill)) from the by_size table.
-    by_size: Tuple[Tuple[float, float], ...]
+    by_size: tuple[tuple[float, float], ...]
     # (ratio lo, ratio hi, measured P(fill)) from the isotonic by_ratio table.
-    by_ratio: Tuple[Tuple[float, float, float], ...]
+    by_ratio: tuple[tuple[float, float, float], ...]
 
     def p_fill(self, queue_ratio: float, size_at_level: float) -> float:
         """Measured P(fill | queue ratio, displayed size at the level)."""
@@ -122,7 +121,7 @@ class FillModel:
         return self.by_ratio[-1][2]
 
 
-def load_fill_model(path: Optional[Path] = None) -> FillModel:
+def load_fill_model(path: Path | None = None) -> FillModel:
     """Load and validate ``data/derived/fill_model.json``; raise if unusable."""
     candidates = []
     if path is not None:

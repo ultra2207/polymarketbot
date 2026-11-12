@@ -1,5 +1,10 @@
 # H2: Does Kalshi taker flow initiate Polymarket trading?
 
+> **Tools (2026-11-11).** `scripts/report_kalshi_trade_lead.py` (and every
+> other `scripts/*.py` named here) was deleted in the 2026-11-10 scripts
+> cleanup; it has no `python -m` replacement. The measurements are kept as the
+> record of that run and cannot be reproduced from this tree.
+
 **Method.** Event pairing on the two trade tapes, both of which carry venue
 timestamps at millisecond resolution. For every Kalshi print on a mapped ticker:
 how long until the next Polymarket print on the paired condition, and does it

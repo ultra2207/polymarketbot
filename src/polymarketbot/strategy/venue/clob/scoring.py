@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.clob.common import ClobAPIError
@@ -59,7 +59,7 @@ class ScoringMixin:
                 "raw_response": {"status_code": e.status_code},
             }
 
-    def get_market_reward_config(self, condition_id_or_market_id: str) -> Optional[dict[str, Any]]:
+    def get_market_reward_config(self, condition_id_or_market_id: str) -> dict[str, Any] | None:
         """Query live official reward parameters from CLOB ``/rewards/user/markets``.
 
         Returns the config dict, or None when the market is absent from the
@@ -91,7 +91,7 @@ class ScoringMixin:
                         "earning_percentage": float(m.get("earning_percentage", 0.0) or 0.0),
                         "earnings": m.get("earnings", []),
                     }
-        except Exception as e:
+        except (ClobAPIError, ValueError, KeyError, TypeError) as e:
             logger.warning(f"Failed to fetch market reward config: {e}")
 
         return None

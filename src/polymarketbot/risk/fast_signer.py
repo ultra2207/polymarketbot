@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import time
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any
 
 from Crypto.Hash import keccak
 
@@ -125,9 +124,9 @@ class FastOrder:
 
 
 def _point_add(
-    p1: Optional[Tuple[int, int]],
-    p2: Optional[Tuple[int, int]],
-) -> Optional[Tuple[int, int]]:
+    p1: tuple[int, int] | None,
+    p2: tuple[int, int] | None,
+) -> tuple[int, int] | None:
     if p1 is None:
         return p2
     if p2 is None:
@@ -145,9 +144,9 @@ def _point_add(
     return (x3, y3)
 
 
-def _point_mul(k: int, p: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+def _point_mul(k: int, p: tuple[int, int]) -> tuple[int, int] | None:
     res = None
-    cur: Optional[Tuple[int, int]] = p
+    cur: tuple[int, int] | None = p
     while k > 0:
         if k & 1:
             res = _point_add(res, cur)
@@ -173,7 +172,7 @@ def private_key_to_address(private_key_bytes: bytes) -> str:
 def ecdsa_sign_digest(
     digest: bytes,
     private_key_bytes: bytes,
-) -> Tuple[int, int, int]:
+) -> tuple[int, int, int]:
     """Sign a 32-byte message digest using RFC 6979 deterministic nonce generation.
 
     Returns:
@@ -196,7 +195,7 @@ def ecdsa_sign_digest(
                 s = _SECP256K1_N - s
                 recid ^= 1
             return (r, s, 27 + recid)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - fall back to the next signer path
             pass
 
     # Fast path 2: eth_keys (optimized C/native backend) ~3.2 milliseconds
@@ -209,7 +208,7 @@ def ecdsa_sign_digest(
                 s = _SECP256K1_N - s
                 v = 28 if v == 27 else 27
             return (r, s, v)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - fall back to the next signer path
             pass
 
     # Fallback path 3: Pure Python RFC 6979 implementation
@@ -258,7 +257,7 @@ class FastEIP712Signer:
 
     def __init__(
         self,
-        private_key: Optional[str] = None,
+        private_key: str | None = None,
         verifying_contract: str = DEFAULT_CTF_EXCHANGE,
         chain_id: int = DEFAULT_CHAIN_ID,
         domain_name: str = DEFAULT_DOMAIN_NAME,
@@ -284,8 +283,8 @@ class FastEIP712Signer:
         self._buffer[0:32] = self.order_typehash
 
         # Initialize private key & address if provided
-        self._private_key_bytes: Optional[bytes] = None
-        self.address: Optional[str] = None
+        self._private_key_bytes: bytes | None = None
+        self.address: str | None = None
         if private_key:
             clean_key = private_key.removeprefix("0x").removeprefix("0X")
             self._private_key_bytes = bytes.fromhex(clean_key)
@@ -340,7 +339,7 @@ class FastEIP712Signer:
         digest = self.hash_typed_data(order)
         return self.sign_digest(digest)
 
-    def build_signed_order_payload(self, order: FastOrder) -> Dict[str, Any]:
+    def build_signed_order_payload(self, order: FastOrder) -> dict[str, Any]:
         """Produce the complete dictionary payload ready to be sent to CLOB POST /order."""
         sig = self.sign_order(order)
         return {
@@ -473,7 +472,7 @@ class FastEIP712SignerV2:
 
     def __init__(
         self,
-        private_key: Optional[str] = None,
+        private_key: str | None = None,
         verifying_contract: str = V2_CTF_EXCHANGE,
         chain_id: int = DEFAULT_CHAIN_ID,
         domain_name: str = DEFAULT_DOMAIN_NAME,
@@ -496,8 +495,8 @@ class FastEIP712SignerV2:
         self._buffer = bytearray(384)
         self._buffer[0:32] = self.order_typehash
 
-        self._private_key_bytes: Optional[bytes] = None
-        self.address: Optional[str] = None
+        self._private_key_bytes: bytes | None = None
+        self.address: str | None = None
         if private_key:
             clean_key = private_key.removeprefix("0x").removeprefix("0X")
             self._private_key_bytes = bytes.fromhex(clean_key)
@@ -598,7 +597,7 @@ class FastEIP712SignerV2:
         expiration: int = 0,
         order_type: str = "GTC",
         post_only: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Produce the POST /order body for a V2 order.
 
         Numeric order fields are strings except ``salt`` and ``signatureType``;

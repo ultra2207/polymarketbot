@@ -27,7 +27,7 @@ from __future__ import annotations
 import enum
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 from polymarketbot.logs import get_logger
 
@@ -52,7 +52,7 @@ class MakerOrderRecord:
     side: str  # "BUY" or "SELL"
     price: float
     size: float
-    condition_id: Optional[str] = None
+    condition_id: str | None = None
     registered_at: float = field(default_factory=float)
 
 
@@ -63,9 +63,9 @@ class STPCheckResult:
     allowed: bool
     action: STPAction
     reason: str
-    crossing_orders: List[MakerOrderRecord] = field(default_factory=list)
-    crossing_token_id: Optional[str] = None
-    crossing_price: Optional[float] = None
+    crossing_orders: list[MakerOrderRecord] = field(default_factory=list)
+    crossing_token_id: str | None = None
+    crossing_price: float | None = None
 
 
 _STATIC_ALLOWED_RESULT = STPCheckResult(
@@ -87,20 +87,20 @@ class SelfTradeGuard:
         self.check_complementary_binary = check_complementary_binary
 
         # Primary order storage: order_id -> MakerOrderRecord
-        self._orders: Dict[str, MakerOrderRecord] = {}
+        self._orders: dict[str, MakerOrderRecord] = {}
 
         # Token index: token_id -> { "BUY": {order_id: order}, "SELL": {order_id: order} }
-        self._buy_by_token: Dict[str, Dict[str, MakerOrderRecord]] = {}
-        self._sell_by_token: Dict[str, Dict[str, MakerOrderRecord]] = {}
+        self._buy_by_token: dict[str, dict[str, MakerOrderRecord]] = {}
+        self._sell_by_token: dict[str, dict[str, MakerOrderRecord]] = {}
 
         # Cached price bounds per token: token_id -> float
         # max_buy_price: highest resting maker BUY on this token
         # min_sell_price: lowest resting maker SELL on this token
-        self._max_buy_price: Dict[str, float] = {}
-        self._min_sell_price: Dict[str, float] = {}
+        self._max_buy_price: dict[str, float] = {}
+        self._min_sell_price: dict[str, float] = {}
 
         # Complementary token pairs for binary markets: token_id -> complementary_token_id
-        self._complementary_tokens: Dict[str, str] = {}
+        self._complementary_tokens: dict[str, str] = {}
 
         self._lock = threading.Lock()
 
@@ -123,7 +123,7 @@ class SelfTradeGuard:
         side_norm: str,
         p: float,
         s: float,
-        condition_id: Optional[str] = None,
+        condition_id: str | None = None,
     ) -> None:
         if oid in self._orders:
             self._unregister_locked(oid)
@@ -153,7 +153,7 @@ class SelfTradeGuard:
             if p < current_min:
                 self._min_sell_price[tid] = p
 
-    def _unregister_locked(self, oid: str) -> Optional[MakerOrderRecord]:
+    def _unregister_locked(self, oid: str) -> MakerOrderRecord | None:
         record = self._orders.pop(oid, None)
         if not record:
             return None
@@ -187,7 +187,7 @@ class SelfTradeGuard:
         side: str,
         price: float,
         size: float,
-        condition_id: Optional[str] = None,
+        condition_id: str | None = None,
     ) -> None:
         """Register an active resting maker order into the STP index."""
         if not order_id:
@@ -202,7 +202,7 @@ class SelfTradeGuard:
         with self._lock:
             self._register_locked(oid, tid, side_norm, p, s, condition_id)
 
-    def unregister_maker_order(self, order_id: str) -> Optional[MakerOrderRecord]:
+    def unregister_maker_order(self, order_id: str) -> MakerOrderRecord | None:
         """Remove a cancelled or filled maker order from the STP index."""
         oid = str(order_id)
         with self._lock:
@@ -212,7 +212,7 @@ class SelfTradeGuard:
         self,
         order_id: str,
         new_size: float,
-        new_price: Optional[float] = None,
+        new_price: float | None = None,
     ) -> bool:
         """Update price or size of an existing maker order."""
         oid = str(order_id)
@@ -241,7 +241,7 @@ class SelfTradeGuard:
         price: float,
         size: float,
         is_taker: bool = True,
-        action: Optional[STPAction] = None,
+        action: STPAction | None = None,
     ) -> STPCheckResult:
         """Deterministic, sub-microsecond evaluation of incoming order against maker book.
 
@@ -341,6 +341,34 @@ class SelfTradeGuard:
                             reason = (
                                 f"Complementary self-trade violation: Taker BUY {tid} @ ${p:.4f} + "
                                 f"resting BUY {comp_tid} @ ${comp_crossing[0].price:.4f} > $1.00 "
+                                f"({p + comp_crossing[0].price:.4f})"
+                            )
+                            logger.warning(f"[STP GUARD] {reason}")
+                            return STPCheckResult(
+                                allowed=False,
+                                action=chosen_action,
+                                reason=reason,
+                                crossing_orders=comp_crossing,
+                                crossing_token_id=comp_tid,
+                                crossing_price=comp_crossing[0].price,
+                            )
+                else:
+                    # Symmetric case: taker SELL on YES @ P1 + resting SELL on
+                    # NO @ P2 < 1.00 self-merges exactly like buying both legs
+                    # above $1.00 self-mints (the pair redeems for $1.00 while
+                    # the position was opened for less), so it is the same wash.
+                    min_comp_sell = self._min_sell_price.get(comp_tid)
+                    if min_comp_sell is not None and (p + min_comp_sell) < 0.999999:
+                        comp_crossing = [
+                            o for o in self._sell_by_token.get(comp_tid, {}).values()
+                            if (p + o.price) < 0.999999
+                        ]
+                        if comp_crossing:
+                            self._prevented_trades += 1
+                            comp_crossing.sort(key=lambda o: o.price)
+                            reason = (
+                                f"Complementary self-trade violation: Taker SELL {tid} @ ${p:.4f} + "
+                                f"resting SELL {comp_tid} @ ${comp_crossing[0].price:.4f} < $1.00 "
                                 f"({p + comp_crossing[0].price:.4f})"
                             )
                             logger.warning(f"[STP GUARD] {reason}")

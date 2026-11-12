@@ -6,7 +6,6 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 
 from polymarketbot.strategy.venue.clob.common import COLLATERAL_DECIMALS, ClobAPIError
 
-
 """Per-tick rounding (price dp, size dp, amount dp) from py-clob-client's ROUNDING_CONFIG.
 
 Size is always 2 dp; the collateral/share amount is carried to price_dp + size_dp,

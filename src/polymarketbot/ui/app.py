@@ -19,9 +19,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from polymarketbot.logs import IST
+from polymarketbot.logs import IST, get_logger
 
-DB_PATH = Path(os.environ.get("POLYMARKETBOT_PAPER_DB", "data/paper_engine.db"))
+log = get_logger("ui.app")
+
+_ROOT = Path(__file__).resolve().parents[3]
+# A relative default resolved against the streamlit launcher's cwd, so a run
+# started from anywhere but the repo root showed an empty journal.
+DB_PATH = Path(
+    os.environ.get("POLYMARKETBOT_PAPER_DB", str(_ROOT / "data" / "paper_engine.db"))
+)
 
 SNAPSHOT_COLUMNS = ("ts", "strategy", "cash", "positions_value", "equity")
 TRADE_COLUMNS = (
@@ -49,32 +56,109 @@ LOT_COLUMNS = (
 )
 
 
-def read_table(db_path: Path | str, table: str, columns: tuple[str, ...],
-               order_by: str = "", limit: int | None = None) -> list[dict[str, Any]]:
-    """Read one journal table, returning ``[]`` when the soak has not run yet."""
+def _read(db_path: Path | str, query: str) -> list[dict[str, Any]]:
+    """Run one read-only query; ``[]`` for an absent journal, a warning on failure."""
     path = Path(db_path)
     if not path.exists() or path.stat().st_size == 0:
         return []
-    query = f"SELECT {', '.join(columns)} FROM {table}"
-    if order_by:
-        query += f" ORDER BY {order_by}"
-    if limit is not None:
-        query += f" LIMIT {int(limit)}"
     try:
         conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        log.warning("journal {} not readable: {}", path, exc)  # noqa: PLE1205 - loguru str.format
         return []
     try:
         conn.row_factory = sqlite3.Row
         return [dict(row) for row in conn.execute(query)]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        # A missing table is the empty-journal case; a locked or corrupt file is
+        # not, and it used to render as "no trades yet" with nothing said.
+        log.warning("journal {}: query failed: {}", path.name, exc)  # noqa: PLE1205
         return []
     finally:
         conn.close()
 
 
-def read_snapshots(db_path: Path | str = DB_PATH) -> list[dict[str, Any]]:
-    return read_table(db_path, "snapshots", SNAPSHOT_COLUMNS, order_by="ts")
+def read_table(db_path: Path | str, table: str, columns: tuple[str, ...],
+               order_by: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+    """Read one journal table, returning ``[]`` when the soak has not run yet."""
+    query = f"SELECT {', '.join(columns)} FROM {table}"
+    if order_by:
+        query += f" ORDER BY {order_by}"
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+    return _read(db_path, query)
+
+
+def table_columns(db_path: Path | str, table: str) -> set[str]:
+    """Column names of ``table``; empty when the table or file does not exist."""
+    return {row["name"] for row in _read(db_path, f"PRAGMA table_info({table})")}
+
+
+def read_totals(db_path: Path | str = DB_PATH) -> dict[str, float]:
+    """Journal-wide trade count and fees, not just the rows a panel displays."""
+    rows = _read(
+        db_path,
+        "SELECT COUNT(*) AS trade_count, COALESCE(SUM(fee), 0.0) AS fees FROM trades",
+    )
+    if not rows:
+        return {"trade_count": 0.0, "fees": 0.0}
+    return {
+        "trade_count": float(rows[0]["trade_count"] or 0),
+        "fees": float(rows[0]["fees"] or 0.0),
+    }
+
+
+#: Points drawn per strategy. A 320-px line chart cannot resolve more than one
+#: point per pixel column, so this is the most the chart can show; the snapshot
+#: table itself is unbounded (one row per strategy per tick).
+CHART_MAX_POINTS = 320
+
+
+def read_snapshots(
+    db_path: Path | str = DB_PATH, max_points: int | None = CHART_MAX_POINTS
+) -> list[dict[str, Any]]:
+    """The most recent snapshot series a chart can draw, oldest first.
+
+    Reading the whole table on every rerun (every 2-20 s) made the dashboard's
+    cost grow with the soak: a multi-day journal is millions of rows to load and
+    pivot for a 320-px line. The bound is *per strategy*, so adding a pillar does
+    not shorten the history each line shows. ``max_points=None`` reads
+    everything, which a caller that needs the full series must ask for.
+    """
+    if max_points is None:
+        return read_table(db_path, "snapshots", SNAPSHOT_COLUMNS, order_by="ts")
+    return _read(
+        db_path,
+        "SELECT ts, strategy, cash, positions_value, equity FROM ("
+        " SELECT ts, strategy, cash, positions_value, equity,"
+        " ROW_NUMBER() OVER (PARTITION BY strategy ORDER BY ts DESC) AS rn"
+        " FROM snapshots"
+        f") WHERE rn <= {int(max_points)} ORDER BY ts",
+    )
+
+
+def read_snapshot_edges(
+    db_path: Path | str = DB_PATH,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """First and last snapshot per strategy, without loading the series.
+
+    The headline PnL must start at each strategy's *first* snapshot; if it were
+    derived from the chart window the initial equity would creep forward with
+    every rerun and the PnL would silently shrink.
+    """
+    first = _read(
+        db_path,
+        "SELECT s.ts, s.strategy, s.cash, s.positions_value, s.equity FROM snapshots s"
+        " JOIN (SELECT strategy, MIN(ts) AS ts FROM snapshots GROUP BY strategy) e"
+        " ON s.strategy = e.strategy AND s.ts = e.ts ORDER BY s.strategy",
+    )
+    last = _read(
+        db_path,
+        "SELECT s.ts, s.strategy, s.cash, s.positions_value, s.equity FROM snapshots s"
+        " JOIN (SELECT strategy, MAX(ts) AS ts FROM snapshots GROUP BY strategy) e"
+        " ON s.strategy = e.strategy AND s.ts = e.ts ORDER BY s.strategy",
+    )
+    return first, last
 
 
 def read_trades(db_path: Path | str = DB_PATH, limit: int = 500) -> list[dict[str, Any]]:
@@ -85,10 +169,12 @@ def read_lots(db_path: Path | str = DB_PATH) -> list[dict[str, Any]]:
     rows = read_table(db_path, "lots", LOT_COLUMNS, order_by="strategy, condition_id")
     if rows:
         return rows
-    # A journal written before mark_live existed has no such column, so the
-    # first query fails inside read_table and returns []. Re-read the legacy
-    # columns and mark every lot unmeasured, the same honest default the
-    # ledger applies when it migrates the table.
+    # A journal written before mark_live existed has no such column. Ask the
+    # schema rather than inferring it from a failed query: a locked database
+    # used to take this branch too, which relabelled every live mark unmeasured.
+    columns = table_columns(db_path, "lots")
+    if not columns or "mark_live" in columns:
+        return []
     legacy = read_table(
         db_path, "lots",
         tuple(column for column in LOT_COLUMNS if column != "mark_live"),
@@ -110,9 +196,25 @@ def _first_and_last(snapshots: list[dict[str, Any]]) -> tuple[dict[str, dict], d
     return first, last
 
 
-def summarise(snapshots: list[dict[str, Any]], trades: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate the journal into the headline numbers the panels show."""
-    first, last = _first_and_last(snapshots)
+def summarise(
+    snapshots: list[dict[str, Any]],
+    trades: list[dict[str, Any]],
+    totals: dict[str, float] | None = None,
+    edges: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Aggregate the journal into the headline numbers the panels show.
+
+    ``trades`` is the recent window a panel displays (``read_trades`` caps it),
+    so the headline count and fee total come from ``totals`` when the caller
+    supplies journal-wide sums; otherwise they describe that window only.
+    ``edges`` carries the journal-wide first/last snapshot per strategy when
+    ``snapshots`` is only the chart window.
+    """
+    if edges is not None:
+        first = {row["strategy"]: row for row in edges[0]}
+        last = {row["strategy"]: row for row in edges[1]}
+    else:
+        first, last = _first_and_last(snapshots)
     strategies = sorted(last)
     total_equity = sum(float(last[name]["equity"]) for name in strategies)
     initial_equity = sum(float(first[name]["equity"]) for name in strategies)
@@ -138,8 +240,10 @@ def summarise(snapshots: list[dict[str, Any]], trades: list[dict[str, Any]]) -> 
         "pnl": total_equity - initial_equity,
         "cash": cash,
         "positions_value": positions_value,
-        "trade_count": len(trades),
-        "fees": sum(float(t["fee"]) for t in trades),
+        "trade_count": int(totals["trade_count"]) if totals else len(trades),
+        "fees": float(totals["fees"]) if totals else sum(float(t["fee"]) for t in trades),
+        "window_trade_count": len(trades),
+        "window_fees": sum(float(t["fee"]) for t in trades),
         "last_snapshot": max((float(last[name]["ts"]) for name in strategies), default=None),
         "rows": rows,
     }
@@ -212,10 +316,15 @@ def main() -> None:
     if st.sidebar.button("🔄 Refresh now", use_container_width=True):
         st.rerun()
 
+    # The chart gets a bounded series; the headline comes from the journal-wide
+    # first/last rows, so a long soak is not loaded and pivoted every rerun and
+    # the initial equity does not creep forward with the window.
     snapshots = read_snapshots(db_path)
+    edges = read_snapshot_edges(db_path)
     trades = read_trades(db_path)
     lots = read_lots(db_path)
-    state = summarise(snapshots, trades)
+    totals = read_totals(db_path)
+    state = summarise(snapshots, trades, totals, edges=edges)
 
     col_title, col_status = st.columns([4, 1])
     with col_title:
@@ -269,6 +378,12 @@ def main() -> None:
             equity["total"] = equity.sum(axis=1)
             st.markdown("#### Equity per strategy")
             st.line_chart(equity, height=320)
+            if len(snapshots) >= CHART_MAX_POINTS:
+                st.caption(
+                    f"Showing the most recent {CHART_MAX_POINTS} snapshot rows "
+                    f"({len(state['strategies'])} strategies); the headline totals cover "
+                    "the whole journal."
+                )
             cash = frame.pivot_table(
                 index="time", columns="strategy", values="cash", aggfunc="last"
             ).sort_index().ffill()
@@ -364,6 +479,11 @@ def main() -> None:
             table = pd.DataFrame(state["rows"])
             table["Last snapshot"] = [format_ts(row["Last snapshot"]) for row in state["rows"]]
             st.dataframe(table, hide_index=True, use_container_width=True)
+            if state["window_trade_count"] != state["trade_count"]:
+                st.caption(
+                    f"Trades and Fees above count the {state['window_trade_count']} most "
+                    f"recent journal rows; the journal holds {state['trade_count']}."
+                )
         else:
             st.info("No strategies have written a snapshot yet.")
         if trades:

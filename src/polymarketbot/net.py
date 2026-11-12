@@ -20,7 +20,6 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from urllib.parse import urlparse
 
 import requests
 
@@ -125,7 +124,7 @@ def install_doh_fallback(hosts: set[str] | None = None) -> None:
     if _INSTALLED:
         return
 
-    def patched(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
+    def patched(host, port, family=0, type=0, proto=0, flags=0):
         name = host.decode() if isinstance(host, bytes) else host
         if name in watched:
             try:
@@ -133,7 +132,7 @@ def install_doh_fallback(hosts: set[str] | None = None) -> None:
                 # AF_INET only: avoids the broken IPv6 path entirely.
                 return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
                          "", (ip, port))]
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110
                 pass  # fall through to the system resolver
         return _ORIG(host, port, family, type, proto, flags)
 

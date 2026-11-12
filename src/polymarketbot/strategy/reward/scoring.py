@@ -8,19 +8,21 @@ Implements the official quadratic scoring function and epoch aggregation:
 5. 1,440-minute daily epoch accumulation
 6. Reward payout calculation with $1.00 minimum daily floor per market
 
-There is **no minimum rest time** in the published rules. The venue samples the
-book once per minute at a random offset and scores whatever rests at that
-instant (``docs.polymarket.com/programs/liquidity-rewards``, equation 6); an
-order that is on the book when the sample lands counts, and one that is not
-does not. An earlier revision of this module gated scoring on a 3.5 s
-"qualification timer" that appears nowhere in the documentation; it was
-removed on 2026-11-10 because it silently zeroed orders that the venue pays.
+The venue samples the book once per minute at a random offset and scores
+whatever rests at that instant (``docs.polymarket.com/programs/liquidity-rewards``,
+equation 6), so the *score* has no resting-time term. Eligibility is a separate,
+documented rule: "Orders must be active on the book for a minimum of 3.5 seconds
+to be eligible" (``data/raw/docs/llms-full.txt:53855``, venue changelog). That
+rule is applied to accrual time, not here: ``reward.accrual`` starts an order's
+clock at ``placed + REWARD_ELIGIBILITY_SECONDS`` so the pre-3.5 s interval can
+never be banked. Applying it here instead would silently zero the score of an
+order the venue pays for the rest of its life.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -249,36 +251,3 @@ def calculate_epoch_payout(
     gross_payout = share * rate_per_day
     net_payout = gross_payout if gross_payout >= payout_floor_usd else 0.0
     return share, gross_payout, net_payout
-
-
-DEFAULT_COMPETITOR_LADDER = (
-    (0.35, 0.5),  # 35% of qualifying depth at s = 0.5c
-    (0.30, 1.0),  # 30% of qualifying depth at s = 1.0c
-    (0.20, 2.0),  # 20% of qualifying depth at s = 2.0c
-    (0.15, 3.5),  # 15% of qualifying depth at s = 3.5c
-)
-
-
-def compute_competitor_ladder_score(
-    max_spread_cents: float,
-    qualifying_depth: float,
-    ladder: Sequence[tuple[float, float]] = DEFAULT_COMPETITOR_LADDER,
-) -> float:
-    """Compute quadratic score for competing liquidity distributed across a multi-tier ladder.
-
-    Eliminates Jensen's Inequality distortion from lumping all competitor depth at one spread.
-    Default distribution:
-      - 35% of qualifying depth at s = 0.5c
-      - 30% of qualifying depth at s = 1.0c
-      - 20% of qualifying depth at s = 2.0c
-      - 15% of qualifying depth at s = 3.5c
-    """
-    total_score = 0.0
-    for weight, spread_cents in ladder:
-        size = qualifying_depth * weight
-        total_score += quadratic_order_score(
-            max_spread_cents=max_spread_cents,
-            spread_cents=spread_cents,
-            size=size,
-        )
-    return total_score

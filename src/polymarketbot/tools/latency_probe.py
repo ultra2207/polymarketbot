@@ -24,13 +24,15 @@ unfiltered path instead; that is the run in which failures are DNS, not wire.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import os
 import socket
 import ssl
 import statistics
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
 
@@ -44,23 +46,30 @@ DEFAULT_GAMMA = "https://gamma-api.polymarket.com"
 DEFAULT_BINANCE = "https://fapi.binance.com"
 
 
-def _percentile(values: List[float], pct: float) -> float:
+def _percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * (len(ordered) - 1)))))
+    idx = min(len(ordered) - 1, max(0, round((pct / 100.0) * (len(ordered) - 1))))
     return ordered[idx]
 
 
-def _jitter(values: List[float]) -> float:
+def _jitter(values: list[float]) -> float:
     if len(values) < 2:
         return 0.0
-    return statistics.fmean(abs(b - a) for a, b in zip(values, values[1:]))
+    return statistics.fmean(abs(b - a) for a, b in itertools.pairwise(values))
 
 
-def _socket_timings(host: str, port: int = 443, timeout: float = 8.0) -> Dict[str, float]:
-    """DNS -> TCP -> TLS, in milliseconds; failures return NaN-like 0.0."""
-    result = {"dns_ms": 0.0, "tcp_ms": 0.0, "tls_ms": 0.0}
+def _socket_timings(host: str, port: int = 443, timeout: float = 8.0) -> dict[str, float | None]:
+    """DNS -> TCP -> TLS, in milliseconds; an unfinished stage is ``None``.
+
+    A failed lookup used to report ``0.0``, which then entered the sample and
+    pulled the reported DNS/TCP/TLS medians toward zero exactly in the runs with
+    the most loss - the opposite of what the probe exists to show.
+    """
+    result: dict[str, float | None] = {"dns_ms": None, "tcp_ms": None, "tls_ms": None}
+    raw: socket.socket | None = None
+    tls: Any = None
     t0 = time.perf_counter()
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
@@ -74,10 +83,17 @@ def _socket_timings(host: str, port: int = 443, timeout: float = 8.0) -> Dict[st
         t2 = time.perf_counter()
         ctx = ssl.create_default_context()
         tls = ctx.wrap_socket(raw, server_hostname=host)
+        raw = None
         result["tls_ms"] = (time.perf_counter() - t2) * 1000.0
-        tls.close()
     except Exception as exc:  # noqa: BLE001 - report the failed sample
-        log.debug("socket probe {} failed: {}", host, exc)
+        log.debug("socket probe {}:{} failed: {}", host, port, exc)  # noqa: PLE1205 - loguru str.format
+    finally:
+        for sock in (tls, raw):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
     return result
 
 
@@ -85,8 +101,8 @@ def _http_probe(
     session: requests.Session,
     method: str,
     url: str,
-    body: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """HTTP TTFB and total time; stream so the body is not downloaded."""
     t0 = time.perf_counter()
     try:
@@ -106,7 +122,7 @@ def _http_probe(
         }
 
 
-def _pick_token(session: requests.Session) -> Optional[str]:
+def _pick_token(session: requests.Session) -> str | None:
     """One live CLOB token for the /books probe; no hardcoded market id."""
     try:
         r = session.get(
@@ -115,7 +131,10 @@ def _pick_token(session: requests.Session) -> Optional[str]:
             timeout=10.0,
         )
         if r.status_code != 200:
-            log.warning("Gamma token discovery HTTP {}; /books probe skipped", r.status_code)
+            log.warning(  # noqa: PLE1205 - loguru str.format
+                "Gamma token discovery HTTP {}; /books probe skipped",
+                r.status_code,
+            )
             return None
         markets = r.json()
         if not isinstance(markets, list) or not markets:
@@ -124,16 +143,22 @@ def _pick_token(session: requests.Session) -> Optional[str]:
         tokens = json.loads(raw_tokens) if isinstance(raw_tokens, str) else (raw_tokens or [])
         return str(tokens[0]) if tokens else None
     except Exception as exc:  # noqa: BLE001
-        log.warning("Gamma token discovery failed: {}", exc)
+        log.warning("Gamma token discovery failed: {}", exc)  # noqa: PLE1205 - loguru str.format
         return None
 
 
-def _summarize(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
     ok = [s for s in samples if s.get("ok")]
     ttfb = [float(s["ttfb_ms"]) for s in ok]
-    dns = [float(s.get("dns_ms", 0.0)) for s in samples]
-    tcp = [float(s.get("tcp_ms", 0.0)) for s in samples]
-    tls = [float(s.get("tls_ms", 0.0)) for s in samples]
+
+    def stage(key: str) -> list[float]:
+        """Only completed stages: an unmeasured one is absent, never zero."""
+        return [float(s[key]) for s in samples if s.get(key) is not None]
+
+    def p50(key: str) -> float | None:
+        values = stage(key)
+        return round(_percentile(values, 50), 2) if values else None
+
     return {
         "samples": len(samples),
         "ok": len(ok),
@@ -142,9 +167,12 @@ def _summarize(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         "ttfb_p95_ms": round(_percentile(ttfb, 95), 2),
         "ttfb_p99_ms": round(_percentile(ttfb, 99), 2),
         "ttfb_jitter_ms": round(_jitter(ttfb), 2),
-        "dns_p50_ms": round(_percentile(dns, 50), 2),
-        "tcp_p50_ms": round(_percentile(tcp, 50), 2),
-        "tls_p50_ms": round(_percentile(tls, 50), 2),
+        "dns_p50_ms": p50("dns_ms"),
+        "tcp_p50_ms": p50("tcp_ms"),
+        "tls_p50_ms": p50("tls_ms"),
+        "dns_samples": len(stage("dns_ms")),
+        "tcp_samples": len(stage("tcp_ms")),
+        "tls_samples": len(stage("tls_ms")),
     }
 
 
@@ -162,21 +190,25 @@ def main() -> int:
 
     if not args.raw_dns:
         install_doh_fallback()
-    log.info("name resolution: {}", "system resolver (--raw-dns)" if args.raw_dns else "DoH 1.1.1.1, IPv4 pinned")
+    log.info(  # noqa: PLE1205 - loguru str.format
+        "name resolution: {}",
+        "system resolver (--raw-dns)" if args.raw_dns else "DoH 1.1.1.1, IPv4 pinned",
+    )
 
     session = requests.Session()
     session.headers.update({"User-Agent": "polymarketbot-latency-probe/1.0"})
     token = _pick_token(session)
     endpoints = [
-        {"name": "clob_time", "host": "clob.polymarket.com", "method": "GET", "url": f"{DEFAULT_CLOB}/time"},
-        {"name": "gamma_markets", "host": "gamma-api.polymarket.com", "method": "GET", "url": f"{DEFAULT_GAMMA}/markets?limit=1"},
-        {"name": "binance_time", "host": "fapi.binance.com", "method": "GET", "url": f"{DEFAULT_BINANCE}/fapi/v1/time"},
+        {"name": "clob_time", "host": "clob.polymarket.com", "port": 443, "method": "GET", "url": f"{DEFAULT_CLOB}/time"},
+        {"name": "gamma_markets", "host": "gamma-api.polymarket.com", "port": 443, "method": "GET", "url": f"{DEFAULT_GAMMA}/markets?limit=1"},
+        {"name": "binance_time", "host": "fapi.binance.com", "port": 443, "method": "GET", "url": f"{DEFAULT_BINANCE}/fapi/v1/time"},
     ]
     if token:
         endpoints.append(
             {
                 "name": "clob_books",
                 "host": "clob.polymarket.com",
+                "port": 443,
                 "method": "POST",
                 "url": f"{DEFAULT_CLOB}/books",
                 "body": [{"token_id": token}],
@@ -193,10 +225,14 @@ def main() -> int:
         from polymarketbot.strategy.onchain.core import rpc_url
 
         _rpc_endpoint, _ = rpc_url()
+        parsed = urlsplit(_rpc_endpoint)
         endpoints.append(
             {
                 "name": "polygon_rpc",
-                "host": urlsplit(_rpc_endpoint).netloc,
+                # ``netloc`` can carry ``:port``, and getaddrinfo("host:8545")
+                # fails, which silently zeroed this endpoint's socket stages.
+                "host": parsed.hostname or parsed.netloc,
+                "port": parsed.port or 443,
                 "method": "POST",
                 "url": _rpc_endpoint,
                 "body": {
@@ -208,37 +244,52 @@ def main() -> int:
             }
         )
     except Exception as exc:  # noqa: BLE001 - probe is additive, never fatal
-        log.warning("Polygon RPC endpoint unresolved, RPC latency not measured: {}", exc)
+        log.warning(  # noqa: PLE1205 - loguru str.format
+            "Polygon RPC endpoint unresolved, RPC latency not measured: {}",
+            exc,
+        )
 
-    report: Dict[str, Any] = {"ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "endpoints": {}}
-    log.info("Latency probe: {} samples/endpoint, token={}...", args.samples, token or "none")
+    report: dict[str, Any] = {"ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "endpoints": {}}
+    log.info(  # noqa: PLE1205 - loguru str.format
+        "Latency probe: {} samples/endpoint, token={}...",
+        args.samples,
+        token or "none",
+    )
     for ep in endpoints:
-        samples: List[Dict[str, Any]] = []
+        samples: list[dict[str, Any]] = []
         for _ in range(max(1, args.samples)):
-            timing = _socket_timings(ep["host"])
+            timing = _socket_timings(ep["host"], ep.get("port", 443))
             http = _http_probe(session, ep["method"], ep["url"], ep.get("body"))
             http.update(timing)
             samples.append(http)
             time.sleep(max(0.0, args.sleep))
         summary = _summarize(samples)
         report["endpoints"][ep["name"]] = summary
-        log.info(
-            "{:<14} p50={:>7.2f}ms p95={:>7.2f}ms p99={:>7.2f}ms "
-            "jitter={:>6.2f}ms loss={:>5.2f}% dns={:>5.2f} tcp={:>5.2f} tls={:>5.2f}",
+
+        def _ms(value: float | None) -> str:
+            return "   n/a" if value is None else f"{value:>7.2f}"
+
+        log.info(  # noqa: PLE1205 - loguru str.format
+            "{:<14} p50={}ms p95={}ms p99={}ms "
+            "jitter={:>6.2f}ms loss={:>5.2f}% dns={} tcp={} tls={}",
             ep["name"],
-            summary["ttfb_p50_ms"],
-            summary["ttfb_p95_ms"],
-            summary["ttfb_p99_ms"],
+            _ms(summary["ttfb_p50_ms"]),
+            _ms(summary["ttfb_p95_ms"]),
+            _ms(summary["ttfb_p99_ms"]),
             summary["ttfb_jitter_ms"],
             summary["loss_pct"],
-            summary["dns_p50_ms"],
-            summary["tcp_p50_ms"],
-            summary["tls_p50_ms"],
+            _ms(summary["dns_p50_ms"]),
+            _ms(summary["tcp_p50_ms"]),
+            _ms(summary["tls_p50_ms"]),
         )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    log.info("Wrote {}", args.out)
+    # Atomic: a kill mid-write must not leave the report truncated, because
+    # `load_persisted_rpc_rtt_s` reads it for the on-chain flight time.
+    tmp = args.out.with_name(f".{args.out.name}.tmp")
+    tmp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    os.replace(tmp, args.out)
+    log.info("Wrote {}", args.out)  # noqa: PLE1205 - loguru str.format
     return 0 if all(v["ok"] > 0 for v in report["endpoints"].values()) else 1
 
 

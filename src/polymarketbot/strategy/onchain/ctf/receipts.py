@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.onchain.core import ALREADY_KNOWN, classify_rpc_error
 from polymarketbot.strategy.onchain.pending import (
     FAILED as SETTLEMENT_FAILED,
+)
+from polymarketbot.strategy.onchain.pending import (
     REVERTED as SETTLEMENT_REVERTED,
+)
+from polymarketbot.strategy.onchain.pending import (
     SUCCESS as SETTLEMENT_SUCCESS,
 )
 
@@ -26,9 +29,9 @@ class CtfReceiptMixin:
     def _wait_for_receipt(
         self,
         tx_hash: str,
-        timeout_s: Optional[float] = None,
-        interval_s: Optional[float] = None,
-    ) -> Optional[dict]:
+        timeout_s: float | None = None,
+        interval_s: float | None = None,
+    ) -> dict | None:
         """Bounded receipt poll. Returns None on timeout."""
         timeout = self.receipt_timeout_s if timeout_s is None else float(timeout_s)
         interval = (
@@ -48,7 +51,7 @@ class CtfReceiptMixin:
             if interval > 0:
                 time.sleep(interval)
 
-    def _receipt_once(self, tx_hash: str) -> Optional[dict]:
+    def _receipt_once(self, tx_hash: str) -> dict | None:
         """One receipt lookup, tolerant of a transport failure."""
         try:
             receipt = self.chain_client.get_transaction_receipt(tx_hash)
@@ -74,7 +77,7 @@ class CtfReceiptMixin:
             return False
 
     def _resolve_settlement(
-        self, tx_hash: str, status: str, receipt: Optional[dict] = None
+        self, tx_hash: str, status: str, receipt: dict | None = None
     ) -> None:
         try:
             self.settlement_store.resolve(tx_hash, status, receipt)
@@ -85,7 +88,7 @@ class CtfReceiptMixin:
         self,
         tx_hash: str,
         receipt: dict,
-        pol_usd_price: Optional[float],
+        pol_usd_price: float | None,
         max_fee_wei: int,
     ) -> SettlementOutcome:
         """Turn a mined receipt into a terminal outcome and resolve the row."""
@@ -105,7 +108,7 @@ class CtfReceiptMixin:
             logger.error(
                 "receipt read but POL/USD is unmeasured; gas_fee_usd left unknown"
             )
-            gas_fee_usd: Optional[float] = None
+            gas_fee_usd: float | None = None
         else:
             gas_fee_usd = round(gas_used * effective_price / 1e18 * float(pol_price), 6)
 

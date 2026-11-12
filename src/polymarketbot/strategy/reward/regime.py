@@ -57,9 +57,10 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any
 
 import duckdb
 
@@ -98,7 +99,7 @@ class MarketRegime:
     trades_per_min: float
     mean_trade_size_shares: float
     size_cv: float
-    realised_vol_bps_per_min: Optional[float]
+    realised_vol_bps_per_min: float | None
     jump_freq: float
     span_minutes: float
     required_sample: int
@@ -136,8 +137,8 @@ class RegimeMeasurement:
 
     window_start_ns: int
     window_end_ns: int
-    regimes: Dict[str, MarketRegime] = field(default_factory=dict)
-    refusals: Dict[str, str] = field(default_factory=dict)
+    regimes: dict[str, MarketRegime] = field(default_factory=dict)
+    refusals: dict[str, str] = field(default_factory=dict)
 
     def reason_for(self, condition_id: str) -> str:
         return self.refusals.get(
@@ -151,7 +152,7 @@ def _trades_glob(tape: Path) -> str:
 
 def latest_tape_ns(
     con: duckdb.DuckDBPyConnection, tape: Path = DEFAULT_TAPE_DIR
-) -> Optional[int]:
+) -> int | None:
     """Newest ``recv_ts_ns`` in the tape, or ``None`` when the tape is empty."""
     row = con.execute(
         f"SELECT MAX(recv_ts_ns) FROM read_parquet('{_trades_glob(tape)}')"
@@ -161,12 +162,12 @@ def latest_tape_ns(
     return int(row[0])
 
 
-def required_sample_for(size_cv: Optional[float]) -> int:
+def required_sample_for(size_cv: float | None) -> int:
     """Prints needed for the mean size to reach the stated relative precision."""
     if size_cv is None or not math.isfinite(size_cv):
         return MIN_PRINTS_FOR_DISPERSION
     needed = (SIZE_PRECISION_Z * float(size_cv) / SIZE_REL_HALF_WIDTH) ** 2
-    return max(MIN_PRINTS_FOR_DISPERSION, int(math.ceil(needed)))
+    return max(MIN_PRINTS_FOR_DISPERSION, math.ceil(needed))
 
 
 _MEASURE_SQL = """
@@ -235,7 +236,7 @@ def measure_regimes(
     *,
     tape: Path = DEFAULT_TAPE_DIR,
     window_hours: float = TAPE_WINDOW_HOURS,
-    con: Optional[duckdb.DuckDBPyConnection] = None,
+    con: duckdb.DuckDBPyConnection | None = None,
 ) -> RegimeMeasurement:
     """Measure each requested market's regime from one pass over the tape.
 
@@ -244,8 +245,8 @@ def measure_regimes(
     no published band is not measurable (the jump statistic needs it) and is
     refused with that reason.
     """
-    empties: Dict[str, str] = {}
-    wanted: Dict[str, float] = {}
+    empties: dict[str, str] = {}
+    wanted: dict[str, float] = {}
     for cid, band in bands_cents.items():
         key = str(cid or "")
         if not key:
@@ -290,7 +291,7 @@ def measure_regimes(
             con.close()
 
     window_minutes = max(1e-9, window_hours * 60.0)
-    regimes: Dict[str, MarketRegime] = {}
+    regimes: dict[str, MarketRegime] = {}
     for (
         cid,
         n,
@@ -325,7 +326,7 @@ def measure_regimes(
                 f"(measured size CV {size_cv:.3f})"
             )
             continue
-        vol_bps: Optional[float] = None
+        vol_bps: float | None = None
         if sumsq is not None and sum_minutes is not None and float(sum_minutes) > 0.0:
             vol_bps = (
                 math.sqrt(max(0.0, float(sumsq)) / float(sum_minutes)) * 1e4
@@ -360,7 +361,7 @@ def measure_regimes(
             "shares)"
         )
     if missing:
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for reason in missing.values():
             counts[reason] = counts.get(reason, 0) + 1
         logger.info(
@@ -377,8 +378,8 @@ def measure_regimes(
 
 # --- cached batch measurement -------------------------------------------------
 
-_REGIME_CACHE: Dict[str, RegimeMeasurement] = {}
-_REGIME_CACHE_AT: Dict[str, float] = {}
+_REGIME_CACHE: dict[str, RegimeMeasurement] = {}
+_REGIME_CACHE_AT: dict[str, float] = {}
 _REGIME_LOCK = threading.Lock()
 
 

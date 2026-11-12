@@ -22,32 +22,35 @@ option is on the table.
 
 ## Step 1 — download (you, on a drive with ≥ 1.2 TB free)
 
-Run from the repo root. `--dest` must be the external drive.
+> **Status (2026-11-11).** `polymarketbot.data.builders.download` was deleted with the
+> `data/builders` tree, so the two commands that used to drive this step no longer resolve.
+> What remains is the URL pattern and the measured sizes. A manual pull has to redo the
+> parts that command did for you: hour enumeration (absent hours 404 — skip and log them,
+> do not count them), ETag-based resume, and the manifest/byte-count probe. Files must still
+> land at `<dest>/pmxt/polymarket_orderbook_<stamp>.parquet` for the reducer's glob.
+
+The windows to pull, forward-test first — this is the part that gates the go/no-go:
+
+| Window | Start | End (inclusive) | Files |
+|---|---|---|---|
+| Forward test | `2026-06-01T00` | `2026-08-10T23` | 1,703 |
+| Validation | `2026-04-13T19` | `2026-05-31T23` | 1,158 |
+
+One hour, as the equivalent of the old command's unit of work:
 
 ```bash
-# forward-test window first - this is the part that gates the go/no-go
-uv run python -m polymarketbot.data.builders.download --only pmxt \
-  --pmxt-start 2026-06-01T00 --pmxt-end 2026-08-10T23 \
-  --dest E:/polymarket_pmxt --yes
-```
-
-Then the earlier validation window:
-
-```bash
-uv run python -m polymarketbot.data.builders.download --only pmxt \
-  --pmxt-start 2026-04-13T19 --pmxt-end 2026-05-31T23 \
-  --dest E:/polymarket_pmxt --yes
+mkdir -p E:/polymarket_pmxt/pmxt
+curl -fL --retry 3 --retry-delay 5 \
+  -o E:/polymarket_pmxt/pmxt/polymarket_orderbook_2026-06-01T00.parquet \
+  https://r2v2.pmxt.dev/polymarket_orderbook_2026-06-01T00.parquet
 ```
 
 Notes:
 
-- Resumable and ETag-pinned. Ctrl-C is safe; re-run the same command.
-- It probes every hour first and writes a manifest, so you see the true byte count before
-  committing. Absent hours are logged, not counted.
+- Resumable by construction: re-run an hour whose file is shorter than 371 MB.
 - Measured throughput here: **~15 MB/s**, so the forward-test window is ~12 h and the full
   archive ~20 h. Run it overnight.
-- Files land at `<dest>/pmxt/polymarket_orderbook_<stamp>.parquet`. Keep that layout — the
-  reducer globs for it.
+- Keep the layout — the reducer globs for it.
 
 Expected result: **1,703 files** for the forward-test window, **1,158** for validation.
 
@@ -58,7 +61,9 @@ never deletes the raw archive in `--dir` mode, and skips hours already reduced, 
 safe to stop and resume.
 
 ```bash
-uv run scripts/reduce_pmxt.py --dir E:/polymarket_pmxt --bucket-seconds 900
+# retired: scripts/reduce_pmxt.py was deleted in the 2026-11-10 scripts cleanup
+# and has no `python -m` replacement, so Step 2 can no longer be run from this
+# tree. The raw archive is untouched; only the reduced table is unavailable.
 ```
 
 Output: `data/processed/pmxt_reduced/dt=YYYY-MM-DD/hour=HH/books.parquet`, one row per

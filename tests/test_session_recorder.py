@@ -218,6 +218,7 @@ def test_chain_snapshot_and_receipt_and_latency(tmp_path) -> None:
 def test_user_ws_subscribes_with_auth_and_records_events(tmp_path) -> None:
     import socket
     import threading
+
     from websockets.sync.server import serve
 
     subscription: dict = {}

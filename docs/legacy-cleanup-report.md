@@ -287,6 +287,9 @@ rest — do not keep the file.
 - **Precondition:** move `parse_log` from `data/streams/polygon.py` into
   `data/uma.py`; the only paper uses are `paper/uma_poll.py:437-438`. Keep
   `data/uma.py`.
+  *Superseded 2026-11-11:* with the collector gone, `data/uma.py` has no
+  `src/` importer and was archived to `archive/data/uma.py`
+  (`docs/quality-fix-plan.md` #33).
 - **Tests to delete:** stream/universe/writer/l3/kalshi/tape/uma_replay/
   validate_tape/wallets/categories plus three universe-metadata tests.
 - Note: this deletes `data/kalshi_mapping.py` (2,134 code lines) and the Kalshi

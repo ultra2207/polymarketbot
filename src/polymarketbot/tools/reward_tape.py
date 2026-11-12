@@ -23,7 +23,11 @@ with the fields we cannot observe (``transaction_hash``, ``fee_rate_bps``,
 
 Discovery is a Gamma keyset walk on the venue's own ``rewardsDailyRate`` - the
 field the reward economics are denominated in, and the filter the old collector
-used (``> 15``). Markets are re-walked every ``--rediscover`` seconds.
+used (``> 15``). The walk is bounded per cycle (``--max-pages``) and resumable:
+the keyset cursor and the markets found so far are persisted to
+``data/derived/reward_tape_cursor.json``, so a restart continues where the last
+cycle stopped instead of re-scanning 6,000 markets. The discovered set is
+replaced only when a cycle reaches the end of the walk.
 
 Expected cost, measured rather than assumed: a few hundred subscribed tokens,
 ~4 prints per second, so roughly 15k rows and 2-3 MB per hour, flushed once a
@@ -35,21 +39,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import time
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path
-from contextlib import AsyncExitStack
 from typing import Any
 
 from polymarketbot.gamma import GammaClient
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.venue.feed import LivePolymarketFeed
+from polymarketbot.tools.expiry import parse_expiry_ms
 from polymarketbot.tools.tape_buffer import MinuteParquetBuffer
 
 log = get_logger("reward_tape")
 
 ROOT = Path(__file__).resolve().parents[3]
 TAPE = ROOT / "data" / "tape" / "clob_trades"
+#: Resumable discovery state: the keyset cursor plus the markets found so far.
+CURSOR_PATH = ROOT / "data" / "derived" / "reward_tape_cursor.json"
 
 # Exactly the columns the existing parts carry; see the module docstring.
 COLUMNS = [
@@ -77,59 +85,138 @@ def _json_list(value: Any) -> list[str]:
 
 
 def _end_ms(market: dict[str, Any]) -> int | None:
-    raw = market.get("endDateIso") or market.get("endDate")
-    if not raw or "T" not in str(raw):
-        return None
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return int(dt.timestamp() * 1000)
+    return parse_expiry_ms(market.get("endDateIso"), market.get("endDate"))
 
 
 class RewardUniverse:
-    """Active markets with a live reward campaign, ranked by daily rate."""
+    """Active markets with a live reward campaign, ranked by daily rate.
+
+    ``max_pages`` bounds one *cycle*, not the universe: a full keyset walk is
+    ~6,000 markets and cost ~18 s of network per rediscovery at the recorder's
+    own request budget. With ``cursor_path`` set, a cycle resumes from the page
+    the previous one stopped at and the discovered markets accumulate until one
+    cycle reaches the end of the walk; that final cycle replaces the set (so a
+    market that lost its campaign is dropped). Without a cursor path every cycle
+    is a full walk from the first page.
+    """
 
     def __init__(self, client: GammaClient, min_rate: float, max_markets: int,
-                 max_pages: int) -> None:
+                 max_pages: int, *, cursor_path: Path | None = None) -> None:
         self.client = client
         self.min_rate = min_rate
         self.max_markets = max_markets
         self.max_pages = max_pages
+        self.cursor_path = Path(cursor_path) if cursor_path else None
 
-    def discover(self, now: float) -> list[dict[str, Any]]:
-        found: list[dict[str, Any]] = []
-        for m in self.client.iter_markets(closed="false", max_pages=self.max_pages):
-            # the rate is not a top-level field: it lives in the campaign list
-            rate = 0.0
-            for camp in m.get("clobRewards") or []:
-                try:
-                    rate += float(camp.get("rewardsDailyRate") or 0.0)
-                except (TypeError, ValueError):
-                    continue
-            if rate < self.min_rate:
+    # -- persisted discovery state ---------------------------------------
+    def _load_state(self, now: float) -> dict[str, Any]:
+        if self.cursor_path is None or not self.cursor_path.exists():
+            return {"cursor": None, "markets": [], "cycles": 0}
+        try:
+            state = json.loads(self.cursor_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning(f"cursor {self.cursor_path} unreadable ({exc}); starting a fresh walk")
+            return {"cursor": None, "markets": [], "cycles": 0}
+        if not isinstance(state, dict):
+            return {"cursor": None, "markets": [], "cycles": 0}
+        markets = []
+        for row in state.get("markets") or []:
+            end = row.get("window_end_ms")
+            if end is not None and end < (now - 120) * 1000:
+                continue  # expired between cycles; nothing left to subscribe to
+            markets.append(row)
+        return {
+            "cursor": state.get("cursor"),
+            "markets": markets,
+            "cycles": int(state.get("cycles") or 0),
+        }
+
+    def _save_state(self, cursor: str | None, markets: list[dict[str, Any]]) -> None:
+        if self.cursor_path is None:
+            return
+        payload = {
+            "updated_at": time.time(),
+            "cursor": cursor,
+            "cycles": self._cycles,
+            "markets": markets,
+        }
+        try:
+            self.cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.cursor_path.with_name(f".{self.cursor_path.name}.tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, self.cursor_path)
+        except OSError as exc:
+            # Losing the cursor costs a re-scan, never a subscription.
+            log.warning(f"could not persist cursor {self.cursor_path}: {exc}")
+
+    def _row(self, m: dict[str, Any]) -> dict[str, Any] | None:
+        # the rate is not a top-level field: it lives in the campaign list
+        rate = 0.0
+        for camp in m.get("clobRewards") or []:
+            try:
+                rate += float(camp.get("rewardsDailyRate") or 0.0)
+            except (TypeError, ValueError):
                 continue
-            if m.get("closed") or m.get("active") is False:
-                continue
-            tokens = _json_list(m.get("clobTokenIds"))
-            if len(tokens) != 2:
-                continue
-            labels = _json_list(m.get("outcomes"))
-            found.append({
-                "condition_id": m.get("conditionId"),
-                "slug": m.get("slug") or m.get("conditionId"),
-                "min_size": m.get("rewardsMinSize"),
-                "max_spread": m.get("rewardsMaxSpread"),
-                "tokens": tokens,
-                "sides": {t: (labels[i] if i < len(labels) else f"leg{i}")
-                          for i, t in enumerate(tokens)},
-                "window_end_ms": _end_ms(m),
-                "reward_rate": rate,
-            })
-        found.sort(key=lambda r: r["reward_rate"], reverse=True)
-        return found[: self.max_markets]
+        if rate < self.min_rate:
+            return None
+        if m.get("closed") or m.get("active") is False:
+            return None
+        tokens = _json_list(m.get("clobTokenIds"))
+        if len(tokens) != 2:
+            return None
+        labels = _json_list(m.get("outcomes"))
+        condition_id = m.get("conditionId")
+        if not condition_id:
+            return None
+        return {
+            "condition_id": condition_id,
+            "slug": m.get("slug") or condition_id,
+            "min_size": m.get("rewardsMinSize"),
+            "max_spread": m.get("rewardsMaxSpread"),
+            "tokens": tokens,
+            "sides": {t: (labels[i] if i < len(labels) else f"leg{i}")
+                      for i, t in enumerate(tokens)},
+            "window_end_ms": _end_ms(m),
+            "reward_rate": rate,
+        }
+
+    def discover(self, now: float, *, resume: bool = True) -> list[dict[str, Any]]:
+        state = self._load_state(now) if resume else {
+            "cursor": None, "markets": [], "cycles": 0
+        }
+        self._cycles = state["cycles"] + 1
+        cursor = state["cursor"]
+        found: dict[str, dict[str, Any]] = {}
+        complete = False
+        pages = 0
+        for _ in range(max(1, self.max_pages)):
+            payload = self.client.markets_keyset(closed="false", after_cursor=cursor)
+            pages += 1
+            for m in payload.get("markets") or []:
+                row = self._row(m)
+                if row is not None:
+                    found[row["condition_id"]] = row
+            cursor = payload.get("next_cursor")
+            if not cursor:
+                complete = True
+                break
+
+        if complete:
+            # One full pass: the set is exactly what the venue lists now.
+            merged = found
+            next_cursor = None
+        else:
+            merged = {row["condition_id"]: row for row in state["markets"]}
+            merged.update(found)
+            next_cursor = cursor
+        markets = sorted(merged.values(), key=lambda r: r["reward_rate"], reverse=True)
+        self._save_state(next_cursor, markets)
+        log.info(
+            f"discover: {pages} page(s), {len(found)} market(s) this cycle, "
+            f"{len(markets)} in the set, "
+            + ("walk complete" if complete else f"cursor {str(next_cursor)[:12]}...")
+        )
+        return markets[: self.max_markets]
 
 
 def _meta(markets: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -152,19 +239,24 @@ async def run(args: argparse.Namespace) -> int:
     """
     TAPE.mkdir(parents=True, exist_ok=True)
     buf = MinuteParquetBuffer(TAPE, COLUMNS, DTYPES)
-    universe = RewardUniverse(GammaClient(), args.min_rate, args.max_markets,
-                              args.max_pages)
+    universe = RewardUniverse(
+        GammaClient(), args.min_rate, args.max_markets, args.max_pages,
+        cursor_path=None if args.no_cursor else args.cursor,
+    )
 
     shards: list[dict[str, Any]] = []
 
-    def on_trade(trade: Any) -> None:
+    def on_trade(trade: Any, shard: int = 0) -> None:
         recv_ns = time.time_ns()
         stamp = datetime.fromtimestamp(recv_ns / 1e9, UTC)
         buf.add(trade.asset_id, {
             "recv_ts_ns": recv_ns,
             "recv_mono_ns": time.perf_counter_ns(),
             "venue_ts_ms": int(trade.timestamp * 1000) if trade.timestamp else None,
-            "shard": 0,
+            # The shard that observed the print, not a constant: with the old
+            # literal 0 every row claimed shard 0, so a per-shard loss (the
+            # measured WS-silence failure) could not be located in the tape.
+            "shard": int(shard),
             "price": float(trade.price),
             "size": float(trade.size),
             "side": str(trade.side).upper(),
@@ -182,24 +274,25 @@ async def run(args: argparse.Namespace) -> int:
             "hour": stamp.hour,
         })
 
-    async def consumer(feed: LivePolymarketFeed) -> None:
+    async def consumer(feed: LivePolymarketFeed, index: int) -> None:
         while True:
             event = await feed.get_next_event(timeout=0.5)
             if event is None:
                 continue
             kind, payload = event
             if kind == "trade":
-                on_trade(payload)
+                on_trade(payload, index)
 
-    async def add_shard(stack: AsyncExitStack) -> dict[str, Any]:
+    async def add_shard(stack: AsyncExitStack) -> dict[str, Any] | None:
         if len(shards) >= args.max_shards:
-            return shards[-1]
+            return None
         if shards:
             await asyncio.sleep(args.shard_stagger)
         feed = LivePolymarketFeed(fallback_poll_interval=args.poll_interval)
         await stack.enter_async_context(feed)
-        shard = {"feed": feed, "tokens": set(),
-                 "task": asyncio.create_task(consumer(feed), name=f"tape-consumer-{len(shards)}")}
+        index = len(shards)
+        shard = {"feed": feed, "index": index, "tokens": set(),
+                 "task": asyncio.create_task(consumer(feed, index), name=f"tape-consumer-{index}")}
         shards.append(shard)
         log.info(f"shard {len(shards)} connected (tokens per shard <= {args.tokens_per_shard})")
         return shard
@@ -221,6 +314,17 @@ async def run(args: argparse.Namespace) -> int:
                 want = sorted(meta)
                 per = max(1, args.tokens_per_shard)
                 chunks = [want[i:i + per] for i in range(0, len(want), per)]
+                if len(chunks) > args.max_shards:
+                    # `add_shard` refuses past the cap, so the old
+                    # `while len(shards) < len(chunks)` never terminated once
+                    # the universe needed more chunks than shards allowed.
+                    unrecorded = sum(len(chunk) for chunk in chunks[args.max_shards:])
+                    log.warning(
+                        f"{len(chunks)} token chunks for {args.max_shards} shard(s): "
+                        f"{unrecorded} tokens will not be recorded (raise --max-shards "
+                        "or --tokens-per-shard)"
+                    )
+                    chunks = chunks[: args.max_shards]
                 while len(shards) < len(chunks):
                     await add_shard(stack)
                 assigned = set()
@@ -273,8 +377,10 @@ async def run(args: argparse.Namespace) -> int:
 
 def probe(args: argparse.Namespace) -> int:
     now = time.time()
+    # A probe is a one-shot full walk: it must not advance or consume the
+    # recorder's cursor, or the next recording cycle would skip a page range.
     markets = RewardUniverse(GammaClient(), args.min_rate, args.max_markets,
-                             args.max_pages).discover(now)
+                             args.max_pages).discover(now, resume=False)
     log.info(f"probe: {len(markets)} markets with rewardsDailyRate >= "
              f"${args.min_rate}/day")
     for m in markets[:10]:
@@ -294,7 +400,13 @@ def main() -> int:
     ap.add_argument("--min-rate", type=float, default=15.0,
                     help="rewardsDailyRate floor; the old collector cut on >15")
     ap.add_argument("--max-markets", type=int, default=250)
-    ap.add_argument("--max-pages", type=int, default=60)
+    ap.add_argument("--max-pages", type=int, default=60,
+                    help="keyset pages per rediscovery cycle; the walk resumes at the "
+                         "saved cursor on the next cycle")
+    ap.add_argument("--cursor", type=Path, default=CURSOR_PATH,
+                    help="persisted discovery cursor so a re-run does not re-scan")
+    ap.add_argument("--no-cursor", action="store_true",
+                    help="walk from the first page every cycle (ignores --cursor)")
     ap.add_argument("--tokens-per-shard", type=int, default=60,
                     help="one WS connection cannot hold the universe; 336 tokens "
                          "silently fall back to REST and deliver no trades")
@@ -304,11 +416,14 @@ def main() -> int:
     ap.add_argument("--poll-interval", type=float, default=2.0)
     ap.add_argument("--probe", action="store_true", help="discovery only, then exit")
     a = ap.parse_args()
+    if a.max_shards < 1 or a.tokens_per_shard < 1:
+        ap.error("--max-shards and --tokens-per-shard must be >= 1")
     if a.probe:
         return probe(a)
     log.info(f"reward tape: duration={a.duration}s flush={a.flush}s "
              f"rediscover={a.rediscover}s min_rate=${a.min_rate}/day "
-             f"max_markets={a.max_markets} out={TAPE}")
+             f"max_markets={a.max_markets} pages/cycle={a.max_pages} "
+             f"cursor={'-' if a.no_cursor else a.cursor} out={TAPE}")
     return asyncio.run(run(a))
 
 

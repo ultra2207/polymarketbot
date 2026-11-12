@@ -1,5 +1,10 @@
 # Kalshi high-frequency basis (E1): harness on one hour of book tape
 
+> **Tools (2026-11-11).** `scripts/report_kalshi_hf_basis.py` (and every other
+> `scripts/*.py` named here) was deleted in the 2026-11-10 scripts cleanup; it
+> has no `python -m` replacement. The measurements are kept as the record of
+> that run and cannot be reproduced from this tree.
+
 Status: harness built and run 2026-11-06 01:37 IST on the live `kalshi_books`
 tape, over the one **sealed** hour partition
 (`date=2026-11-05/hour=19`; the hour=20 partition was still being appended and

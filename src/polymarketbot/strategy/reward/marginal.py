@@ -10,7 +10,7 @@ per-market statement (:func:`allocation_for_capital`) is built one way.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.strategy.reward.models import MarketAllocation
@@ -23,7 +23,7 @@ log = get_logger("rewards_allocator")
 PROTOCOL_MIN_DAILY_PAYOUT_USD = 1.00
 
 
-def _fill_side_of(candidate: dict[str, Any]) -> Tuple[float, float]:
+def _fill_side_of(candidate: dict[str, Any]) -> tuple[float, float]:
     """``(stay_fraction, fill_yield_per_usd_per_day)`` for a parsed candidate.
 
     ``(1.0, 0.0)`` means the caller priced no fill side at all - the
@@ -82,10 +82,10 @@ def calculate_min_floor_capital(
 
 def evaluate_market_payout(
     capital: float,
-    daily_pool: Optional[float],
-    competing_score: Optional[float],
+    daily_pool: float | None,
+    competing_score: float | None,
     alpha: float,
-) -> Optional[float]:
+) -> float | None:
     """Evaluate non-linear daily cash payout function R_i(c_i).
 
     ``alpha`` here is the venue score earned per USDC of capital (see
@@ -138,12 +138,12 @@ def marginal_payout(
 
 def evaluate_market_total_yield(
     capital: float,
-    daily_pool: Optional[float],
-    competing_score: Optional[float],
+    daily_pool: float | None,
+    competing_score: float | None,
     alpha: float,
     stay_fraction: float,
     fill_yield_usd_per_usd_per_day: float,
-) -> Optional[float]:
+) -> float | None:
     """Expected **total** yield of ``capital`` in one market, USD per day.
 
         E[yield] = R(c) * stay_fraction + fill_yield * c
@@ -190,7 +190,7 @@ def marginal_total_yield(
     )
 
 
-def fill_side(cand: dict[str, Any]) -> Optional[tuple[float, float]]:
+def fill_side(cand: dict[str, Any]) -> tuple[float, float] | None:
     """``(stay_fraction, fill_yield)`` for a candidate, or ``None`` when unpriced.
 
     ``None`` means the caller did not price the fill side at all (an
@@ -209,7 +209,7 @@ def fill_side(cand: dict[str, Any]) -> Optional[tuple[float, float]]:
 
 def allocation_for_capital(
     m: dict[str, Any], cap: float
-) -> Optional[tuple[MarketAllocation, float]]:
+) -> tuple[MarketAllocation, float] | None:
     """The per-market statement for ``cap``, and the unrounded payout behind it.
 
     ``None`` - with the reason logged - when the denominator stopped being

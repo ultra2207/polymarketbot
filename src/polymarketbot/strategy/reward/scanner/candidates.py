@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from polymarketbot.logs import get_logger
 from polymarketbot.market import MarketConfig, TokenConfig
@@ -38,20 +38,20 @@ class MarketOpportunity:
     rate_per_day: float
     rewards_min_size: float
     rewards_max_spread: float  # in cents (v)
-    mid_price: Optional[float] = None
+    mid_price: float | None = None
     """Measured YES mid; ``None`` = unmeasured (never a 0.50 stand-in)."""
     category: str = "default"
-    competing_depth: Optional[float] = None
+    competing_depth: float | None = None
     """Measured in-band competing score of both token books; ``None`` = unmeasured."""
-    competing_score: Optional[float] = None
+    competing_score: float | None = None
     """Same measurement, kept for callers that price the payout share."""
     tokens: list[TokenConfig] = field(default_factory=list)
-    event_id: Optional[str] = None
+    event_id: str | None = None
 
     # Scored yield components
     maker_score: float = 0.0
     gross_reward_payout: float = 0.0
-    daily_reward_payout: Optional[float] = None  # None = unmeasured, never a stand-in
+    daily_reward_payout: float | None = None  # None = unmeasured, never a stand-in
     expected_spread_capture: float = 0.0
     expected_adverse_selection: float = 0.0
     expected_gas_fees: float = 0.0
@@ -65,9 +65,9 @@ class MarketOpportunity:
     # Capital the **caller** allocated to this market (allocator.py sizes it),
     # the quote lifetime the fill table was read at, and the market's published
     # tick. All three are inputs, never defaults.
-    allocated_capital_usd: Optional[float] = None
-    quote_horizon_s: Optional[float] = None
-    tick_size: Optional[float] = None
+    allocated_capital_usd: float | None = None
+    quote_horizon_s: float | None = None
+    tick_size: float | None = None
     # The measured quantities this score was built from: horizon fill
     # probability, required flow, signed markout, quote size, fills per day and
     # the market's tape regime (with its window and print count).
@@ -143,7 +143,7 @@ def _screen_lp_candidate(
     min_mid_price: float,
     max_mid_price: float,
     bankroll_usd: float,
-) -> tuple[Optional[dict[str, Any]], str]:
+) -> tuple[dict[str, Any] | None, str]:
     """Filter one raw reward pool. Returns (candidate, "") or (None, "code: reason")."""
     condition_id = raw_market.get("condition_id")
     if not isinstance(condition_id, str) or not condition_id.strip():
@@ -193,24 +193,28 @@ def _screen_lp_candidate(
         )
 
     # Expiry / resolution filter (avoid markets ending soon with settlement jump risk).
-    # A missing end_date_iso keeps the historical "distant expiry" ranking behaviour;
+    # The CLOB rewards payload publishes ``end_date`` ("2028-11-08 04:59:00+00") and
+    # never ``end_date_iso``; reading only the latter marked every reward market
+    # "distant expiry" and let already-ended ones through to the live validator.
+    # A missing end_date keeps the historical "distant expiry" ranking behaviour;
     # validate_market_for_live() is the stricter live-trading gate.
-    end_date_raw = raw_market.get("end_date_iso")
+    end_date_raw = raw_market.get("end_date_iso") or raw_market.get("end_date")
     end_date = _parse_iso_datetime(end_date_raw)
     if end_date is not None:
         days_left = (end_date - now_utc).total_seconds() / 86400.0
+        if days_left <= 0.0:
+            return None, f"expired: already ended ({days_left:.1f} days)"
         if days_left < min_days_to_expiry:
             return None, (
-                f"end_date_iso: expires in {days_left:.1f} days "
+                f"near_expiry: expires in {days_left:.1f} days "
                 f"(< {min_days_to_expiry:.1f})"
             )
     elif end_date_raw:
         return None, f"end_date_iso: unparseable ({end_date_raw!r})"
     else:
-        days_left = 999.0
-        logger.debug(
-            f"[SCANNER] {condition_id!r} has no end_date_iso; ranking with distant expiry"
-        )
+        # A missing expiry is unknown, not "furthest away": excluding it keeps an
+        # ended market that omits the field out of the ranking.
+        return None, "end_date_iso: missing (expiry unmeasured)"
 
     # Capital sizing: the screen quotes both legs, and a complete pair costs
     # exactly its two leg prices. The pair's mids sum to the $1.00 it redeems
@@ -241,6 +245,13 @@ def _screen_lp_candidate(
         "days_left": days_left,
         "quote_size": quote_size,
         "capital_required": capital_required,
+        # USD -> shares per side: the optimizer's score per USD is
+        # alpha * (quote_size / capital_required) = alpha / pair_cost. The
+        # allocator's 1.0 default is only right when a pair costs $1.00; a
+        # 0.99 pair buys 1.01 shares per dollar.
+        "score_per_usd": (
+            quote_size / capital_required if capital_required > 0.0 else 1.0
+        ),
         # Our quote rests at ``best_bid + tick``, which on a tick grid is at
         # least half a tick from the mid; ``alpha(tick/2)`` is therefore the
         # upper bound on the score this plan can earn, and the tick is the one
@@ -253,6 +264,16 @@ def _screen_lp_candidate(
             quadratic_order_score(max_spread, tick_size * 100.0 / 2.0, quote_size)
             if tick_size is not None
             else None
+        ),
+        # The same distance ``our_score`` was scored at. The allocator refuses
+        # a candidate that cannot state its quote distance, so the scanner
+        # must publish the input it used, not just the resulting score.
+        "spread_offset_cents": (
+            tick_size * 100.0 / 2.0 if tick_size is not None else None
+        ),
+        "order_min_usd": (
+            _coerce_float(raw_market.get("orderMinSize"))
+            or _coerce_float(raw_market.get("order_min_size"))
         ),
         "quote_sides": 2,
         "yes_token": yes_token,

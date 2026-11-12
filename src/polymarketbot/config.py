@@ -9,7 +9,6 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
 
 from polymarketbot.logs import get_logger
 
@@ -104,7 +103,7 @@ class BotConfig:
             and self.POLYMARKET_PASSPHRASE.strip()
         )
 
-    def to_dict(self, mask_secrets: bool = False) -> Dict[str, str]:
+    def to_dict(self, mask_secrets: bool = False) -> dict[str, str]:
         """Convert configuration to dictionary, optionally masking sensitive secrets."""
         d = asdict(self)
         if mask_secrets:
@@ -117,14 +116,25 @@ class BotConfig:
             }
             for k in secret_keys:
                 v = d.get(k, "")
+                if not v:
+                    continue
+                # The trailing characters of a signing key identify nothing an
+                # operator needs and narrow the search space for everyone else.
+                d[k] = "***" if k == "PRIVATE_KEY" else f"***{v[-4:]}"
+            # A hosted RPC URL carries the provider key as its last path
+            # segment (``.../v2/<key>``), so an unmasked dump published the key
+            # that the private-key masking was there to protect.
+            for k in ("POLYGON_RPC_URL",):
+                v = d.get(k, "")
                 if v:
-                    d[k] = f"***{v[-4:]}" if len(v) >= 4 else "***"
+                    head, sep, tail = v.rpartition("/")
+                    d[k] = f"{head}{sep}***" if sep and len(tail) >= 8 else v
         return d
 
 
-def _parse_env_file_direct(file_path: Path) -> Dict[str, str]:
+def _parse_env_file_direct(file_path: Path) -> dict[str, str]:
     """Parse a simple KEY=VALUE formatted .env file directly without external dependencies."""
-    parsed: Dict[str, str] = {}
+    parsed: dict[str, str] = {}
     if not file_path.is_file():
         return parsed
 
@@ -146,13 +156,13 @@ def _parse_env_file_direct(file_path: Path) -> Dict[str, str]:
                     ):
                         val = val[1:-1]
                     parsed[key] = val
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - a malformed .env must not block startup
         log.warning(f"Error directly parsing env file {file_path}: {e}")
 
     return parsed
 
 
-def load_config(env_path: Union[str, Path] = ".env") -> BotConfig:
+def load_config(env_path: str | Path = ".env") -> BotConfig:
     """Load configuration from .env file and environment variables.
 
     Loading order and precedence:
@@ -167,7 +177,7 @@ def load_config(env_path: Union[str, Path] = ".env") -> BotConfig:
         BotConfig instance with resolved values.
     """
     path = Path(env_path)
-    file_vars: Dict[str, str] = {}
+    file_vars: dict[str, str] = {}
 
     if path.is_file():
         # Read the file without mutating os.environ. `load_dotenv` writes new
@@ -188,6 +198,10 @@ def load_config(env_path: Union[str, Path] = ".env") -> BotConfig:
         for k, v in direct_parsed.items():
             if k not in file_vars:
                 file_vars[k] = v
+    else:
+        # Say so rather than resolve every field from defaults: a live run
+        # started from the wrong directory looked configured and was not.
+        log.debug(f"no env file at {path.resolve()}; using the process environment only")
 
     def _get_val(key: str, default: str) -> str:
         # Check os.environ first (exact match, uppercase, lowercase)

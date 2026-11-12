@@ -9,10 +9,9 @@ import time
 
 import pytest
 
-from polymarketbot.strategy.reward.deskew import DeSkewDecision, DeSkewPathway
-from polymarketbot.strategy.venue.clob import ClobAPIError, OrderPlacementResult
-from polymarketbot.strategy.onchain.ctf import MergeExecutionResult
+from polymarketbot.fees import schedule_for_market
 from polymarketbot.live.engine import RealMoneyTradingEngine
+from polymarketbot.strategy.onchain.ctf import MergeExecutionResult
 from polymarketbot.strategy.onchain.settlement import (
     NEGRISK_ADAPTER,
     NEGRISK_MERGE_SELECTOR,
@@ -20,6 +19,8 @@ from polymarketbot.strategy.onchain.settlement import (
     ROUTER_MERGE_SELECTOR,
     SettlementRoute,
 )
+from polymarketbot.strategy.reward.deskew import DeSkewDecision, DeSkewPathway
+from polymarketbot.strategy.venue.clob import ClobAPIError, OrderPlacementResult
 
 
 class FakeCredentials:
@@ -206,6 +207,11 @@ def make_engine(tmp_path, *, cash: float = 100.0, clob=None, ctf=None,
         dry_run=True,
         gas_fee_merge=0.01,
         auto_merge_threshold=1.0,
+        # The fixture market declares fees disabled; its schedule is derived
+        # from that payload (a measured zero), never assumed.
+        fee_schedule=schedule_for_market(
+            {"conditionId": condition_id, "feesEnabled": False}
+        ),
     )
     return engine, clob, ctf
 
@@ -366,7 +372,7 @@ def test_locked_cash_is_counted_once_both_calibrations(tmp_path):
     engine.shares_no = 0.0
     engine.active_quotes["BUY_YES"] = quote(price=0.5, size=10.0, matched=2.0)
 
-    assert engine._compute_locked_cash() == pytest.approx(4.0)
+    assert engine.get_locked_cash() == pytest.approx(4.0)
 
     engine._locked_already_in_balance = False
     assert engine.get_locked_cash() == pytest.approx(4.0)
@@ -388,7 +394,7 @@ def prime_yes_book(engine: RealMoneyTradingEngine) -> None:
 
 @pytest.mark.parametrize("includes_locked", [False, True])
 def test_cash_ledger_place_and_fill_equity_invariant(tmp_path, includes_locked):
-    engine, clob, _ = make_engine(tmp_path)
+    engine, _clob, _ = make_engine(tmp_path)
     go_live(engine)
     engine._locked_already_in_balance = includes_locked
     engine.cash = 100.0
@@ -421,7 +427,7 @@ def test_cash_ledger_place_and_fill_equity_invariant(tmp_path, includes_locked):
 
 @pytest.mark.parametrize("includes_locked", [False, True])
 def test_cash_ledger_cancel_restores_reservation(tmp_path, includes_locked):
-    engine, clob, _ = make_engine(tmp_path)
+    engine, _clob, _ = make_engine(tmp_path)
     go_live(engine)
     engine._locked_already_in_balance = includes_locked
     engine.cash = 100.0
@@ -574,6 +580,8 @@ def test_tier2_places_order_but_books_no_fill(tmp_path):
     assert engine.get_locked_cash() == pytest.approx(5.0 * 0.50)
     assert engine.get_equity() == pytest.approx(100.0)
     assert engine.shares_yes == 0.0
+    # The in-flight taker has no public accessor; the DESKEW_* quote below is
+    # the public observable of the placement.
     assert engine._deskew_order is not None
     assert any(qid.startswith("DESKEW_YES_") for qid in engine.active_quotes)
 
@@ -796,7 +804,7 @@ def test_cancel_all_quotes_returns_true_when_venue_confirms_empty(tmp_path):
 
 
 def test_dry_run_quote_fills_only_remaining_size_once(tmp_path):
-    engine, clob, _ = make_engine(tmp_path)
+    engine, _clob, _ = make_engine(tmp_path)
     engine.cash = 100.0
     engine.shares_yes = 0.0
     engine.active_quotes["BUY_YES"] = quote(size=10.0, price=0.50, matched=0.0)
