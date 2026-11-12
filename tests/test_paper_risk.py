@@ -471,6 +471,33 @@ def test_order_cap_clamps_the_planned_size(tmp_path, stable_books, monkeypatch):
     engine.ledger.close()
 
 
+def test_in_flight_and_cancelling_orders_reserve_cash(tmp_path, stable_books):
+    """Resting, in-flight and cancel-in-flight bids all hold their cash.
+
+    A pending quote has not landed but its dollars are already committed at
+    the venue; a cancel in flight leaves the bid live and fillable. Only the
+    landing that removes the record releases the reservation.
+    """
+    engine = _engine(tmp_path, stable_books, [_market()], capital=1000.0)
+    resting = Resting(
+        STRATEGY, "c1", "yes", 0.50, 100.0, 20.0, time.time(),
+        tick=0.01, daily_payout=0.0, seen_ts=time.time(),
+    )
+    engine.actions.submit("reward_quote", STRATEGY, {"token_id": "yes", "resting": resting})
+    assert paper_risk.reserved_cash(engine) == pytest.approx(50.0)
+
+    engine.reward_quotes["no"] = Resting(
+        STRATEGY, "c1", "no", 0.40, 100.0, 20.0, time.time(),
+        tick=0.01, daily_payout=0.0, seen_ts=time.time(),
+    )
+    assert paper_risk.reserved_cash(engine) == pytest.approx(90.0)
+    engine.reward_quotes["no"].cancel_at = time.time()
+    assert paper_risk.reserved_cash(engine) == pytest.approx(90.0)
+    engine.reward_quotes.pop("no")
+    assert paper_risk.reserved_cash(engine) == pytest.approx(50.0)
+    engine.ledger.close()
+
+
 def test_position_cost_cap_refuses_a_quote_below_the_venue_minimum(
     tmp_path, stable_books, monkeypatch,
 ):

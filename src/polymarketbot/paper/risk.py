@@ -186,14 +186,34 @@ def reserved_cash(engine, *, exclude_token: str | None = None) -> float:
     counting its own reserve would refuse every reprice of a fully deployed
     book.
     """
-    total = 0.0
-    for token_id, quote in engine.reward_quotes.items():
-        if exclude_token is not None and token_id == exclude_token:
-            continue
-        if quote.cancel_at is not None or quote.shares <= 0.0:
-            continue
-        total += quote.shares * quote.price
-    return total
+    by_token: dict[str, float] = {}
+    # Resting bids reserve their notional even while a cancel is in flight:
+    # the order remains live and fillable until the cancel lands. ``land``
+    # removes the record at landing, which is when the reservation ends.
+    for token_id, quote in getattr(engine, "reward_quotes", {}).items():
+        if quote.shares > 0.0:
+            by_token[token_id] = by_token.get(token_id, 0.0) + quote.shares * quote.price
+    # An order still in ``ActionBook`` has not landed, so its cash is already
+    # committed at the venue. Reserve it here or a second planner tick can
+    # place another bid against the same dollars.
+    for action in engine.actions.pending():
+        payload = getattr(action, "payload", None) or {}
+        if action.kind == "reward_quote":
+            resting = payload.get("resting")
+            shares = float(getattr(resting, "shares", 0.0) or 0.0)
+            price = float(getattr(resting, "price", 0.0) or 0.0)
+            token_id = str(getattr(resting, "token_id", ""))
+            if shares > 0.0 and token_id:
+                by_token[token_id] = by_token.get(token_id, 0.0) + shares * price
+        elif action.kind == "taker" and str(payload.get("side", "")).upper() == "BUY":
+            shares = float(payload.get("shares", 0.0) or 0.0)
+            price = float(payload.get("decision_price", 0.0) or 0.0)
+            token_id = str(payload.get("token_id", ""))
+            if shares > 0.0 and price > 0.0 and token_id:
+                by_token[token_id] = by_token.get(token_id, 0.0) + shares * price
+    return sum(
+        value for token_id, value in by_token.items() if token_id != exclude_token
+    )
 
 
 def blocks_actions(engine) -> bool:
