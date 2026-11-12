@@ -273,9 +273,9 @@ one 34 h window with one collector configuration.
 
 ## 8. Live verdict feed: provider caps, not the chain (2026-11-09)
 
-The soak prices settlement candidates only from an oracle verdict (a final payout
+The paper trader prices settlement candidates only from an oracle verdict (a final payout
 vector or an undisputed UMA proposal), so the verdict feed *is* the pillar. On the
-2026-11-09 21:20 IST soak it had been dead for 83 h: `_poll_uma_proposals_live`
+2026-11-09 21:20 IST paper trading run it had been dead for 83 h: `_poll_uma_proposals_live`
 issued one `eth_getLogs` of 2,048 blocks, dRPC's free plan rejected it
 (`ranges over 10000 blocks are not supported on free plan`, code 35), and the
 cursor was held forever — `5,724` markets had no fair value.

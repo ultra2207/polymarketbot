@@ -1,6 +1,6 @@
 """Measure the latency profile that the paper/live strategies actually see.
 
-Run this on the India PC before trusting a local soak:
+Run this on the India PC before trusting a local paper trader:
 
     uv run python -m polymarketbot.tools.latency_probe --samples 100
 

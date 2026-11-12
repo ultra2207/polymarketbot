@@ -62,14 +62,18 @@ def quotes_from_allocation(
     candidates: list[dict[str, Any]],
     books: dict[str, dict[str, Any]],
 ) -> list[RewardQuote]:
-    """Convert allocated capital into tick-valid resting bids.
+    """Convert allocated pair capital into tick-valid resting bids.
 
-    ``shares = allocated_capital / quote_price`` floored to whole shares, the
-    venue's minimum-order unit; a quote is dropped when it carries no capital,
-    prices outside (0, 1), or floors below the market's ``min_size`` shares.
+    One candidate is one matched pair, so ``shares = allocated_capital /
+    pair_cost`` floored to whole shares is the size of **each** leg, and every
+    candidate emits one quote per leg at that one share count. A candidate
+    without ``legs`` is a legacy single-leg plan and emits one quote at
+    ``quote_price``. A pair is dropped as a whole when it carries no capital,
+    when either leg prices outside (0, 1), or when the pair size floors below
+    the market's ``min_size`` shares - never only one of its legs.
     ``books`` is the snapshot the candidates were built from and is accepted so
     callers pass one book set through the pipeline; sizing needs only the
-    candidate's quote price.
+    candidate's prices.
 
     Units: capital is USDC, ``price`` is USDC per share, ``shares`` is shares,
     ``daily_payout`` is USDC per day, ``max_spread_cents`` is cents,
@@ -83,36 +87,63 @@ def quotes_from_allocation(
             continue
         if allocation.allocated_capital <= 0.0:
             continue
-        price = float(candidate["quote_price"])
-        if not 0.0 < price < 1.0:
+        pair_cost = float(
+            candidate.get("pair_cost")
+            or candidate.get("capital_per_share")
+            or candidate["quote_price"]
+        )
+        if not 0.0 < pair_cost <= 1.0:
             continue
         tick = float(candidate["tick"])
         if tick <= 0.0:
             continue
-        raw_shares = allocation.allocated_capital / price
+        raw_shares = allocation.allocated_capital / pair_cost
         # The price tick quantises *prices*, not sizes; shares are whole units
         # because the venue's minimum order is published as a share count.
         shares = float(math.floor(raw_shares + 1e-9))
         min_size = float(candidate["min_size"])
         if min_size <= 0.0 or shares < min_size:
             continue
-        quotes.append(
-            RewardQuote(
-                condition_id=str(candidate["condition_id"]),
-                question=str(candidate["question"]),
-                token_id=str(candidate["quote_token"]),
-                price=price,
-                shares=shares,
-                daily_payout=float(allocation.daily_reward_payout),
-                competing_score=float(candidate["competing_score"]),
-                max_spread_cents=float(candidate["max_spread"]),
-                min_size=min_size,
-                p_fill=candidate.get("p_fill"),
-                fill_yield_usd_per_usd_per_day=_as_float(
-                    candidate.get("fill_yield_usd_per_usd_per_day"), 0.0
-                ),
+        legs = candidate.get("legs") or [
+            {
+                "token_id": candidate["quote_token"],
+                "price": candidate["quote_price"],
+            }
+        ]
+        planned: list[RewardQuote] = []
+        valid = True
+        for leg in legs:
+            price = float(leg["price"])
+            if not 0.0 < price < 1.0:
+                valid = False
+                break
+            planned.append(
+                RewardQuote(
+                    condition_id=str(candidate["condition_id"]),
+                    question=str(candidate["question"]),
+                    token_id=str(leg["token_id"]),
+                    price=price,
+                    shares=shares,
+                    # The optimizer's payout is for the pair; each leg carries
+                    # the share of capital it commits so the total is unchanged.
+                    daily_payout=float(allocation.daily_reward_payout)
+                    * price
+                    / pair_cost,
+                    competing_score=float(candidate["competing_score"]),
+                    max_spread_cents=float(candidate["max_spread"]),
+                    min_size=min_size,
+                    p_fill=leg.get("p_fill", candidate.get("p_fill")),
+                    fill_yield_usd_per_usd_per_day=_as_float(
+                        leg.get(
+                            "fill_yield_usd_per_usd_per_day",
+                            candidate.get("fill_yield_usd_per_usd_per_day"),
+                        ),
+                        0.0,
+                    ),
+                )
             )
-        )
+        if valid:
+            quotes.extend(planned)
     return quotes
 
 
@@ -136,16 +167,19 @@ def commit_quotes(
     tape filled that book, ``Ledger.buy`` would have refused the overflow and
     silently dropped fills the pillar had already decided to take.
 
-    This function is the reserve ledger. Quotes are accepted in descending
-    marginal yield (``daily_payout`` per dollar of notional) until the cash is
-    spent, and a quote whose notional does not fit is **not** returned: the
-    engine cancels any resting bid it is not asked to keep, so an unaffordable
-    stale bid is retired instead of being allowed to over-commit.
+    This function is the reserve ledger. A **matched pair** (both legs of one
+    condition) is the unit of commitment: pairs are accepted in descending
+    marginal yield (``daily_payout`` per dollar of pair notional) until the cash
+    is spent, and a pair whose notional does not fit is **not** returned in
+    part. The engine cancels any resting bid it is not asked to keep, so an
+    unaffordable stale pair is retired whole instead of leaving one directional
+    leg. A legacy single-leg plan is a one-quote group and behaves as before.
 
-    A resting bid is accepted at the size it is already resting at, not at the
-    freshly optimised size, because the engine keeps the existing order when
-    the price is unchanged; counting the new size while the old one rests is
-    exactly the double-spend this function exists to prevent. The residual
+    A resting pair is accepted at the sizes it is already resting at, not at
+    the freshly optimised size, because the engine keeps the existing orders
+    when the price is unchanged; counting the new size while the old one rests
+    is exactly the double-spend this function exists to prevent. If either leg
+    moved, both legs are cancelled and re-placed at the fresh size. The residual
     (which can only be smaller than the fresh plan) is deliberately not
     redistributed: re-sizing a kept order needs a cancel/replace, and holding
     a smaller quote for one more tick costs a fraction of one tick's accrual.
@@ -163,45 +197,62 @@ def commit_quotes(
     # Rank by expected *total* yield per dollar, the same objective the
     # optimizer maximised: the accrual alone would rank the emptiest book first,
     # and an empty book is exactly where a fill - the other half of the yield -
-    # never happens.
-    ordered = sorted(
-        ideal,
-        key=lambda quote: (
+    # never happens. Legs are grouped by condition so a pair is never split.
+    pairs: dict[str, list[RewardQuote]] = {}
+    for quote in ideal:
+        pairs.setdefault(quote.condition_id, []).append(quote)
+
+    def _yield_per_dollar(legs: list[RewardQuote]) -> float:
+        total = sum(
             quote.daily_payout * (1.0 - _as_float(quote.p_fill, 0.0))
             + quote.fill_yield_usd_per_usd_per_day * quote.price * quote.shares
-        ) / max(quote.price * quote.shares, 1e-9),
-        reverse=True,
-    )
+            for quote in legs
+        )
+        notional = sum(quote.price * quote.shares for quote in legs)
+        return total / max(notional, 1e-9)
+
+    ordered = sorted(pairs.values(), key=_yield_per_dollar, reverse=True)
     committed: list[RewardQuote] = []
     remaining = cash
-    already = 0
-    for quote in ordered:
-        entry = resting.get(quote.token_id)
-        # A resting bid only counts as kept when it prices where this tick's
-        # plan does; a moved price is a cancel, and a cancelled order releases
-        # its cash, so it must not be charged against this budget.
-        kept = None
-        if entry is not None:
+    kept_pairs = new_pairs = unaffordable = 0
+    for legs in ordered:
+        # A resting pair only counts as kept when every leg prices where this
+        # tick's plan does; a moved leg is a cancel, and a cancelled order
+        # releases its cash, so it must not be charged against this budget.
+        kept: list[float] | None = []
+        for quote in legs:
+            entry = resting.get(quote.token_id)
+            if entry is None:
+                kept = None
+                break
             price, shares = float(entry[0]), float(entry[1])
-            if shares >= quote.min_size and abs(price - quote.price) <= 1e-9:
-                kept = shares
-        notional = (kept if kept is not None else quote.shares) * quote.price
+            if shares < quote.min_size or abs(price - quote.price) > 1e-9:
+                kept = None
+                break
+            kept.append(shares)
+        sizes = kept if kept is not None else [quote.shares for quote in legs]
+        notional = sum(size * quote.price for size, quote in zip(sizes, legs))
         if notional > remaining:
+            unaffordable += 1
             continue
         remaining -= notional
-        already += kept is not None
-        committed.append(quote if kept is None else dataclasses.replace(quote, shares=kept))
+        if kept is not None:
+            kept_pairs += 1
+        else:
+            new_pairs += 1
+        for quote, size in zip(legs, sizes):
+            committed.append(
+                quote if size == quote.shares else dataclasses.replace(quote, shares=size)
+            )
     # Logged every tick, not only on a shortfall: ``already resting`` versus
     # ``new`` is the plan's own stability, and the engine cancels every resting
-    # bid this plan omits. The 11:48-12:19 window issued >=156 cancels and >=191
-    # placements over 110 ticks on a 32.7-quote book (3.15 quotes of churn per
-    # tick); it cost 0.09-0.13 % of the window's $9.09 accrual, so churn was not
-    # what kept the book at zero fills.
+    # bid this plan omits.
     log.info(
-        f"reward reserve: kept {len(committed)}/{len(ordered)} quotes, "
+        f"reward reserve: kept {len(committed)}/{len(ideal)} quotes over "
+        f"{len(ordered)} pair(s), "
         f"${cash - remaining:,.2f} committed of ${cash:,.2f} cash "
-        f"({len(ordered) - len(committed)} unaffordable; "
-        f"{already} already resting, {len(committed) - already} new)"
+        f"({unaffordable} unaffordable; {kept_pairs} already resting, "
+        f"{new_pairs} new)"
     )
     return committed
 

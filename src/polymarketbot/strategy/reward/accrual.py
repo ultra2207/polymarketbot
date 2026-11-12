@@ -10,7 +10,14 @@ from typing import Any
 from polymarketbot.strategy.books import mid, qualifying_score
 from polymarketbot.strategy.reward.competition import CompetingEstimate
 from polymarketbot.strategy.reward.marginal import PROTOCOL_MIN_DAILY_PAYOUT_USD
-from polymarketbot.strategy.reward.scoring import single_sided_score_fraction
+from polymarketbot.strategy.reward.scoring import (
+    OrderQuote,
+    compute_book_side_scores,
+    compute_minimum_score,
+    order_spread_cents,
+    quadratic_order_score,
+    single_sided_score_fraction,
+)
 
 REWARD_ELIGIBILITY_SECONDS = 3.5
 """How long an order must rest before the venue counts it at all.
@@ -282,3 +289,143 @@ def measured_accrual(
     return _share(usd_per_day, share, our_score, True)
 
 
+@dataclass(frozen=True)
+class PairLeg:
+    """One resting bid of a matched pair: its outcome, price and size.
+
+    The pair is two legs at one share count - a YES bid and a NO bid - which is
+    the neutral quote the live engine places. Prices are USDC per share and
+    ``shares`` is that leg's still-resting size, so a partially filled pair
+    scores exactly what is on the book.
+    """
+
+    outcome: str  # "YES" or "NO"
+    price: float
+    shares: float
+
+
+def measured_pair_accrual(
+    *,
+    pool_usd_per_day: float | None,
+    max_spread_cents: float | None,
+    min_size: float | None,
+    yes_book: dict[str, Any] | None,
+    no_book: dict[str, Any] | None,
+    resting: tuple[PairLeg, ...] = (),
+    competing: CompetingEstimate | None = None,
+    books_include_our_order: bool = False,
+) -> AccrualShare | None:
+    """The payout rate a matched pair earns per day, from its measured books.
+
+    This is :func:`measured_accrual` for the two-sided quote. The venue scores
+    the pair once: the YES bid contributes to ``Q_one``, the NO bid to
+    ``Q_two``, and ``Q_min`` applies the documented two-sided rule. A full pair
+    that rests both legs inside the band is therefore paid its raw score;
+    pricing each leg as an independent one-sided quote would instead claim two
+    ``Q_one / c`` payouts and divide the pool twice. A half-filled pair falls
+    back to the venue's own one-sided rule (``Q_min = Q_one / c`` inside the
+    band, zero outside it) because that is what the venue pays for what is
+    actually resting.
+
+    Everything else matches :func:`measured_accrual`: every input is a
+    measurement with no fallback, a missing book, mid or zero measured
+    competing score returns ``None`` (the caller must then credit nothing), and
+    the returned rate is **not** floored - the venue's $1.00 minimum applies to
+    a market's UTC-day total at rollover.
+
+    ``books_include_our_order`` states whether the supplied snapshots already
+    contain the legs; the paper trader quotes into a simulated book, so the
+    default (``False``) adds only the pair's ``Q_min`` to a clean competitor
+    total. Callers reading the venue's own book pass ``True`` and the legs' raw
+    scores are trimmed from the measured total first.
+    """
+    if pool_usd_per_day is None or pool_usd_per_day <= 0.0:
+        return None
+    if min_size is None or min_size <= 0.0:
+        return None
+    if max_spread_cents is None or max_spread_cents <= 0.0:
+        return None
+    if not isinstance(yes_book, dict) or not isinstance(no_book, dict):
+        return None
+    mid_yes = mid(yes_book)
+    mid_no = mid(no_book)
+    if mid_yes is None or mid_no is None:
+        return None
+    snapshot = qualifying_score(
+        yes_book, max_spread_cents=max_spread_cents, mid_price=mid_yes
+    ) + qualifying_score(
+        no_book, max_spread_cents=max_spread_cents, mid_price=mid_no
+    )
+    if competing is not None:
+        denominator = float(competing.mean)
+        samples = competing.samples
+        variance = competing.variance
+        low = competing.low_confidence
+        latest = competing.snapshot
+    else:
+        denominator = snapshot
+        samples = 1
+        variance = None
+        low = True
+        latest = snapshot
+    if denominator <= 0.0:
+        return None
+
+    # The venue's own pair score, computed once: YES bids are Q_one, NO bids are
+    # Q_two, and the two-sided rule combines them. This is exactly the live
+    # engine's ``compute_quote_scores``, so paper and live cannot drift.
+    q_one = q_two = 0.0
+    our_raw = 0.0
+    for leg in resting:
+        outcome = leg.outcome.upper()
+        if outcome not in ("YES", "NO"):
+            return None
+        leg_mid = mid_yes if outcome == "YES" else mid_no
+        price = float(leg.price)
+        size = float(leg.shares)
+        if not 0.0 < price < 1.0 or size <= 0.0:
+            continue
+        # ``compute_book_side_scores`` scores a NO bid around ``1 - mid_no``;
+        # passing the complement keeps its Q_one/Q_two mapping while using this
+        # book's own mid.
+        leg_mid_yes = leg_mid if outcome == "YES" else 1.0 - leg_mid
+        one, two = compute_book_side_scores(
+            [OrderQuote(side="BUY", outcome=outcome, price=price, size=size)],
+            mid_price_yes=leg_mid_yes,
+            max_spread_cents=float(max_spread_cents),
+            min_size=float(min_size),
+        )
+        q_one += one
+        q_two += two
+        our_raw += quadratic_order_score(
+            max_spread_cents=float(max_spread_cents),
+            spread_cents=order_spread_cents(price, leg_mid, "BUY"),
+            size=size,
+            min_size=float(min_size),
+        )
+    our_score = compute_minimum_score(q_one=q_one, q_two=q_two, midpoint=mid_yes)
+
+    def _share(usd: float, share: float, qualifies: bool) -> AccrualShare:
+        return AccrualShare(
+            usd_per_day=usd,
+            share=share,
+            our_score=our_score,
+            competing_score=denominator,
+            pool_usd_per_day=pool_usd_per_day,
+            qualifies=qualifies,
+            competing_samples=samples,
+            competing_variance=variance,
+            low_confidence=low,
+            competing_snapshot=latest,
+        )
+
+    if our_score <= 0.0:
+        return _share(0.0, 0.0, False)
+    competitor_total = denominator
+    if books_include_our_order:
+        competitor_total = max(0.0, competitor_total - our_raw)
+    denom = competitor_total + our_score
+    share = our_score / denom if denom > 0.0 else 0.0
+    usd_per_day = pool_usd_per_day * share
+    # The rate is not floored here; see :func:`measured_accrual`.
+    return _share(usd_per_day, share, True)

@@ -409,7 +409,7 @@ were split because their seams were already visible in the method list.
    baseline in the commit message so a later regression is visible.
 3. A 60 s `paper.main --duration 60` smoke that writes at least one snapshot row
    per pillar. Deleting a module that a pillar silently imported must fail here,
-   not in the 30-minute soak.
+   not in the 30-minute paper trading run.
 4. `grep -rn "import polymarketbot" src/ | wc -l` before and after, and the
    reachability BFS re-run: the "neither" set must shrink, never grow.
 
@@ -421,7 +421,7 @@ were split because their seams were already visible in the method list.
   cadence fix (profitability report §2.4, §7.2) touches
   `paper/pillars/settlement_runner.py` and the radar; land it before moving
   those files in §4, or the move will conflict.
-- **The 30-minute audit loop is suspended during waves 2-4.** The soak cannot run
+- **The 30-minute audit loop is suspended during waves 2-4.** The paper trader cannot run
   while the tree is mid-deletion; use the 60 s smoke as the gate.
 - **Do not delete on the strength of "no test imports it".** 34 test files
   currently import only dead modules; they will be deleted with their subjects,

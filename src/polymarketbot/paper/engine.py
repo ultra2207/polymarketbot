@@ -184,7 +184,7 @@ class PaperEngine:
     def _stage(self, name: str, started: float) -> None:
         """Accumulate per-stage tick cost and log the profile once a minute.
 
-        The soak must hold its interval; a stage that silently grows with the
+        The paper trader must hold its interval; a stage that silently grows with the
         universe is the difference between 180 snapshots and 71.
         """
         elapsed = time.monotonic() - started

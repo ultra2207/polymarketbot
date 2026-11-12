@@ -127,7 +127,7 @@ class Ledger:
             self._resume()
 
     def _migrate(self) -> None:
-        """Add columns that older soak databases do not have.
+        """Add columns that older paper-trader databases do not have.
 
         A resumed lot from before ``mark_live`` existed cannot say whether its
         persisted mark was measured or just its purchase price, so the column

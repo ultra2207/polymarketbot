@@ -392,7 +392,7 @@ def get_logger(
                     level=effective_level,
                     format=_FORMAT,
                     # One enqueue thread per source file is dozens of threads in
-                    # the soak. The per-file sinks are low-volume; write
+                    # the paper trader. The per-file sinks are low-volume; write
                     # synchronously and keep the aggregate app.log asynchronous.
                     # The sink itself is locked, so synchronous writes from
                     # several threads are still safe.

@@ -373,14 +373,3 @@ def test_rtt_probe_seeds_from_a_legacy_sample_when_its_own_file_is_absent(tmp_pa
         legacy=legacy,
     )
     assert probe.p50() == pytest.approx(0.300)
-
-
-def test_paper_main_refuses_the_retired_one_sided_pillar():
-    """The one-sided reward pillar must not run by default.
-
-    It quoted one leg per market; the live engine quotes both. The retired path
-    is reachable only with `--legacy-one-sided`.
-    """
-    from polymarketbot.paper.main import main
-
-    assert main(["--capital", "40", "--duration", "1"]) == 2

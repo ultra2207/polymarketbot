@@ -131,7 +131,7 @@ not the venue this bot trades. Verified from primary sources:
 
 Tests: `tests/test_fees.py` 104 passed (7 new), fee/rebate/pillar suites 162 passed.
 
-## Cycle-3 soak (window 6) — first-hour defects
+## Cycle-3 paper trading run (window 6) — first-hour defects
 
 Window `11:14:55 → 11:44:55 IST`, integrated tree (all three auditor diffs + the
 shared fixes). Verified working from the log within the first ten minutes:

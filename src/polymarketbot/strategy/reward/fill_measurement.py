@@ -182,7 +182,7 @@ def markout_cost_usd(
     1,710 s against a nominal 60 s, and the estimate it produces is +0.311 c
     +/- 0.133 c (t = +2.33), the opposite sign to the earlier 2-fill reading.
     The missing input is therefore not prints but a persisted best-bid/mid
-    series at a fixed offset from the fill: this soak writes equity snapshots
+    series at a fixed offset from the fill: the paper trader writes equity snapshots
     only, so a fixed-Delta markout cannot be computed from it. The parameter
     stays ``None`` until that series exists.
 

@@ -104,11 +104,11 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         # Resting liquidity earns the pool's daily payout pro rata. The
         # payout is NOT read from the optimizer's plan: it is recomputed
         # every tick from what is actually resting and from the measured
-        # books - our in-band score on the leg against the pair-wide
-        # measured competing score of both outcome tokens, averaged over the
-        # window of venue-cadence samples. A quote whose denominator cannot be
-        # measured earns nothing and is counted, so a window can never book a
-        # share of a pool it never measured.
+        # books - the pair's venue Q_min across the YES and NO bids against
+        # the pair-wide measured competing score of both outcome tokens,
+        # averaged over the window of venue-cadence samples. A market whose
+        # denominator cannot be measured earns nothing and is counted, so a
+        # window can never book a share of a pool it never measured.
         accrued = 0.0
         settled = 0.0
         priced = refused = unqualified = 0
@@ -129,20 +129,24 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         anchors: dict[str, float] = {}
         resting_conditions: set[str] = set()
         window_scores = competitor_window(engine)
-        # One quote per market: the pillar quotes the cheaper leg only, so
-        # this set must have the same size as ``priced``. Logged so a market
-        # paying its pool twice would be visible in a single line.
+        # One candidate per market is one matched pair: both legs rest at one
+        # share count, so the venue pays one pair-level Q_min and this set must
+        # have the same size as ``priced``. Grouping by condition is what stops
+        # the two legs being summed into two one-sided claims against one pool.
         priced_markets: set[str] = set()
+        resting_by_condition: dict[str, list[Resting]] = {}
         for quote in engine.reward_quotes.values():
             if quote.cancel_at is not None or quote.shares <= 0.0:
                 continue
             resting_conditions.add(quote.condition_id)
-            market = engine.by_condition.get(quote.condition_id)
-            if market is None or not market.binary:
+            resting_by_condition.setdefault(quote.condition_id, []).append(quote)
+        for condition_id, pair_quotes in resting_by_condition.items():
+            market = engine.by_condition.get(condition_id)
+            if market is None or not market.binary or len(market.token_ids) != 2:
                 refused += 1
                 continue
-            others = [t for t in market.token_ids if t != quote.token_id]
-            if len(others) != 1:
+            by_token = {quote.token_id: quote for quote in pair_quotes}
+            if not set(by_token) <= set(market.token_ids):
                 refused += 1
                 continue
             # Observe the pair-wide snapshot into the window first: the venue's
@@ -151,19 +155,26 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
             estimate: reward.CompetingEstimate | None = None
             detail = reward.market_competing_detail(market, books)
             if detail is not None:
-                estimate = window_scores.observe(
-                    quote.condition_id, detail.total, now
-                )
-            share = reward.measured_accrual(
+                estimate = window_scores.observe(condition_id, detail.total, now)
+            share = reward.measured_pair_accrual(
                 pool_usd_per_day=market.daily_reward,
-                price=quote.price,
-                shares=quote.shares,
-                min_size=quote.min_order,
                 max_spread_cents=market.reward_max_spread_cents,
-                leg_book=books.get(quote.token_id),
-                other_book=books.get(others[0]),
+                min_size=min(quote.min_order for quote in pair_quotes),
+                yes_book=books.get(market.token_ids[0]),
+                no_book=books.get(market.token_ids[1]),
+                # The venue scores the pair once: YES bid in Q_one, NO bid in
+                # Q_two, combined by the two-sided rule. A half-filled pair
+                # falls back to the venue's own one-sided Q_one / c.
+                resting=tuple(
+                    reward.PairLeg(
+                        outcome="YES" if token_id == market.token_ids[0] else "NO",
+                        price=quote.price,
+                        shares=quote.shares,
+                    )
+                    for token_id, quote in by_token.items()
+                ),
                 competing=estimate,
-                # The paper pillar quotes into a simulated book: the venue L2
+                # The paper trader quotes into a simulated book: the venue L2
                 # snapshot it reads never contains the order, so the measured
                 # competitor total is clean and our score is added once. A
                 # caller reading the venue's own book with its order resting
@@ -174,9 +185,9 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                 refused += 1
                 continue
             priced += 1
-            priced_markets.add(quote.condition_id)
+            priced_markets.add(condition_id)
             pools += share.pool_usd_per_day
-            notional += quote.shares * quote.price
+            notional += sum(quote.shares * quote.price for quote in pair_quotes)
             competing.append(share.competing_score)
             sample_counts.append(share.competing_samples)
             if share.competing_variance:
@@ -186,19 +197,19 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
             if not share.qualifies:
                 unqualified += 1
                 continue
-            # The venue only counts an order that has rested at least 3.5 s,
-            # and `placed` is this quote's first rest: the accrual anchor is
-            # that boundary, so the pre-eligibility interval is never charged
-            # to the rate this order earns.
-            eligible_from = float(quote.placed) + REWARD_ELIGIBILITY_SECONDS
+            # The venue only counts an order that has rested at least 3.5 s.
+            # The pair accrues only once *both* legs are eligible, so the
+            # anchor is the later landing: charging the pair rate while one leg
+            # is still inside the pre-eligibility interval would claim a
+            # two-sided score for a one-sided book.
+            eligible_from = max(
+                float(quote.placed) + REWARD_ELIGIBILITY_SECONDS
+                for quote in pair_quotes
+            )
             if now > eligible_from:
-                rates[quote.condition_id] = (
-                    rates.get(quote.condition_id, 0.0) + share.usd_per_day
-                )
-                anchors[quote.condition_id] = min(
-                    anchors.get(quote.condition_id, eligible_from), eligible_from
-                )
-            top.append((share.usd_per_day, quote.condition_id,
+                rates[condition_id] = share.usd_per_day
+                anchors[condition_id] = eligible_from
+            top.append((share.usd_per_day, condition_id,
                         share.competing_score, share.share))
         # Record every resting condition, including the measured zeros: an
         # interval with no eligible rate must still advance the accumulator's
@@ -299,14 +310,16 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                 for usd, cid, d, share in biggest
             ) or "none"
             # Two known biases, stated every window rather than buried:
-            # the denominator is Q_one+Q_two (the venue sums Q_min, so ours
-            # overstates by at most 1+c and understates our share), and the
-            # spread is measured from the raw L2 mid because the venue's
-            # "size-cutoff-adjusted midpoint" is named but never defined.
+            # the competitor total is Q_one+Q_two (the venue sums Q_min, so it
+            # overstates competition by at most 1+c and understates our share),
+            # and the spread is measured from the raw L2 mid because the
+            # venue's "size-cutoff-adjusted midpoint" is named but never
+            # defined. Our own claim is now the pair's Q_min, the venue's own
+            # number, so only the competitor side carries the bound.
             bias_high = 1.0 + reward.SINGLE_SIDED_PENALTY
             log.info(
-                f"reward accrual: {priced} quotes over {len(priced_markets)} "
-                f"markets priced, {unqualified} "
+                f"reward accrual: {priced} matched pairs over "
+                f"{len(priced_markets)} markets priced, {unqualified} "
                 f"not qualifying, {refused} refused (unmeasured books or "
                 f"denominator) | pending ${window_accrued:,.4f} over "
                 f"{elapsed:.0f}s = ${window_implied:,.2f}/day on a time-average "
@@ -325,10 +338,11 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                 f"median n={median_n} sample(s), "
                 f"median sd={'n/a' if median_sd is None else f'{median_sd:,.1f}'}, "
                 f"{low_confidence}/{priced} "
-                f"low-confidence | denominator bias: ours=Q_one+Q_two overstates "
-                f"venue sum(Q_min) by 1.0-{bias_high:.1f}x -> our share understated "
-                f"the same factor (conservative) | spread bias: measured from the "
-                f"raw L2 mid, venue uses the size-cutoff-adjusted mid (adjustment "
+                f"low-confidence | denominator bias: competitor total "
+                f"(Q_one+Q_two) overstates venue sum(Q_min) by 1.0-{bias_high:.1f}x "
+                f"-> our pair share understated the same factor (conservative) | "
+                f"spread bias: measured from the raw L2 mid, venue uses the "
+                f"size-cutoff-adjusted mid (adjustment "
                 f"not published; direction unknown) | rebates: {rebates(engine).describe()} "
                 f"| top claims: {top_txt}"
             )

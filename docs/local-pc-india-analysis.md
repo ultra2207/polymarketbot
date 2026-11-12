@@ -8,7 +8,7 @@ CtfMinter?
 **Answer in one line:** the local PC solves the *memory and CPU* failure
 completely, but the high-RTT path is not neutral: it is acceptable for
 SettlementHarvester, marginal for RewardHarvester, and dangerous for CtfMinter
-live. The current paper soak also **does not price most of that latency**, so a
+live. The current paper trader also **does not price most of that latency**, so a
 local paper PnL will look better than a local live deployment would achieve.
 
 **Measured on the local PC, 2026-11-09 (§2a):** the quote path measured **174–260 ms p50** (p95 205–397 ms) and the order endpoints track it — `POST /order` 260/368 ms, `DELETE /order` 264/305 ms (unauthenticated lower bound) — against 37 ms for the same `/books` call from London. Gamma is
@@ -16,7 +16,7 @@ local paper PnL will look better than a local live deployment would achieve.
 **DNS resolution failure**, not packet loss: the raw resolver failed **8–27 %**
 of samples, and it zeroed the CTF universe on the very first Gamma page.
 `install_doh_fallback()` removed both failure modes (0/60 requests failed,
-Gamma halved to 444 ms). **Do not run the soak on this machine without it.**
+Gamma halved to 444 ms). **Do not run the paper trader on this machine without it.**
 
 ## 1. Why the t3.micro failed
 
@@ -27,7 +27,7 @@ Measured on the current host:
 | Instance | `t3.micro`, 2 vCPU |
 | RAM | `MemTotal: 930,428 kB` (~908 MiB) |
 | Swap | 2 GiB, already 372–713 MiB used |
-| Soak RSS (1 GB profile) | 441–558 MB |
+| Paper trader RSS (1 GB profile) | 441–558 MB |
 | Agent harness RSS | ~320 MB idle, ~570 MB while reasoning |
 | Kernel | repeated `systemd-journald: Under memory pressure, flushing caches` |
 | Cycle 6 | stopped at 8m45 with reward page 15 in flight; a later 30-minute run restarted the instance |
@@ -35,7 +35,7 @@ Measured on the current host:
 The full-universe scans are not huge by themselves; the host was simply
 oversubscribed: 908 MB total − 320–570 MB harness leaves ~340–590 MB for a
 process whose measured peak is 558 MB. The 16 GB local PC removes this entire
-failure mode; the soak used <0.6 GB in the 1 GB profile and needs no memory
+failure mode; the paper trader used <0.6 GB in the 1 GB profile and needs no memory
 guard.
 
 The 24-thread CPU also matters: the t3.micro has one physical CPU budget, and
@@ -205,7 +205,7 @@ Code facts:
 Impact: at 200 ms RTT the quote is ~175 ms behind a 25 ms competitor. At a 1¢
 tick, that is the difference between resting first and resting behind a queue.
 The reward share itself depends on `Q_min`, not time, but fills, markouts and
-queue priority do. A local paper soak will therefore show roughly the same
+queue priority do. A local paper trading run will therefore show roughly the same
 reward accrual as London; a local live harvester would not.
 
 ### SettlementHarvester — low sensitivity
@@ -256,23 +256,23 @@ Code facts:
   has a 120 ms relayer latency with a latency-decay model. Measured from this
   PC, a single `DELETE /order` is **264 ms p50** (305 ms p95, unauthenticated
   lower bound), so a cancel+replace round trip is ~2× the paper assumption
-  before any server-side matching delay. The soak's CTF path applies neither
+  before any server-side matching delay. The paper trader's CTF path applies neither
   model.
 
 Impact: for a 1–3¢ parity edge, 200 ms of stale quoting is enough to turn a
 positive EV into a one-leg fill followed by an adverse exit. The local paper
-soak will overstate CTF PnL because it fixes markout and ignores the
+trading run will overstate CTF PnL because it fixes markout and ignores the
 cancel/leg-risk race. **Do not use local India paper results as evidence that
 CtfMinter is live-profitable.**
 
 ## 4. Strategy verdict
 
-| Strategy | Local PC paper soak | Local PC live | Main latency channel | Verdict |
+| Strategy | Local PC paper trading run | Local PC live | Main latency channel | Verdict |
 |---|---|---|---|---|
 | RewardHarvester | Works; 16 GB removes OOM; scans 10–30% slower | Conditionally viable; markout/queue must be re-measured at local RTT | Queue priority, cancel/replace, adverse selection | **Paper yes; live only with a latency-adjusted fill model** |
 | SettlementHarvester | Works; ideal local workload | Plausibly viable; use limit orders and verify fills | Entry slippage on a multi-hour opportunity | **Best fit for local India** |
 | CtfMinter | Runs, but PnL is optimistic | Not recommended from India | Two-leg race, broken-leg markout, cancel latency | **Paper only with latency stress; live in London** |
-| LatencySniper | Benched; not in the soak | Requires London/Binance colocation | Direct signal race | **Not relevant** |
+| LatencySniper | Benched; not in the paper trading run | Requires London/Binance colocation | Direct signal race | **Not relevant** |
 
 ## 5. Scan-time impact: batch requests soften the high ping
 
@@ -282,7 +282,7 @@ has 22 Gamma pages plus ~34 book chunks. A 150 ms RTT penalty per request is
 seconds, not the 8× one would naively apply to every market.
 
 Expected local wall-clock, using the §2a per-request costs ("derived" = my
-arithmetic on those costs, not observed end-to-end; the soak's own dashboard
+arithmetic on those costs, not observed end-to-end; the paper trader's own dashboard
 reports the observed sweep):
 
 | Scan | London observed | Local, derived | Basis |
@@ -300,7 +300,7 @@ even when the economic latency (order ack) is acceptable.
 
 **Positive:**
 
-- 16 GB RAM vs <0.6 GB soak: no memory guard, no swap, no instance restart.
+- 16 GB RAM vs <0.6 GB paper trading run: no memory guard, no swap, no instance restart.
 - 24 threads vs the t3.micro's 2 vCPU: HTTP pools and the three engines have
   headroom; the 49–52 s watchdog stalls should disappear.
 - 4080 Mobile is unused: this code is CPU/network/JSON-bound; no CUDA path.
@@ -331,7 +331,7 @@ even when the economic latency (order ack) is acceptable.
 
 ## 7. Recommended operating modes
 
-### A. Research / paper soak locally — recommended
+### A. Research / paper trading run locally — recommended
 
 Run the full 30-minute loop on the local PC, no memory guard needed:
 
@@ -346,7 +346,7 @@ paper results are usable; settlement is the strongest local result.
 
 ### B. Live execution — hybrid, not all-local
 
-Use the local PC for research, backtests and the paper soak, but keep order
+Use the local PC for research, backtests and the paper trading run, but keep order
 placement close to the CLOB:
 
 - London VPS (eu-west-2) for CtfMinter live.
@@ -386,7 +386,7 @@ Before any local CTF conclusion:
       (default; `--raw-dns` measures the unfiltered resolver). Verified: probe
       with DoH reports 0 % loss and now reaches the `/books` endpoint it
       previously skipped when token discovery failed.
-- [ ] Run the 30-minute soak locally; compare scan durations and fill counts
+- [ ] Run the 30-minute paper trading run locally; compare scan durations and fill counts
       against the last London window.
 - [ ] If CTF is to be trusted, add the measured local markout and latency
       stress; do not rely on the current fixed 0.0063 markout.
@@ -407,12 +407,12 @@ The report's own gate, applied to what was measured on 2026-11-09:
 |---|---|---|---|
 | CLOB order-path p95 (`/order`, `/cancel-all`) | ≤ 250 ms | 305–397 ms | **fail** |
 | CLOB `/books` p95 | ≤ 250 ms | 205–397 ms (two windows) | **fail at high end** |
-| CLOB `/time` p95 (soak ping) | ≤ 250 ms | 304–363 ms | **fail** |
+| CLOB `/time` p95 (paper trader ping) | ≤ 250 ms | 304–363 ms | **fail** |
 | Failed requests | ≤ 1 % | 8–27 % raw; **0 % with DoH** | **fail until DoH is installed** |
 
 So: **run paper, research and Settlement locally; keep CtfMinter live in
-London.** Before the first local soak, install
-`polymarketbot.net.install_doh_fallback()` — without it the soak's Gamma
+London.** Before the first local paper trading run, install
+`polymarketbot.net.install_doh_fallback()` — without it the paper trader's Gamma
 pagination failed on page one in a live test and returns an empty CTF
 universe, which would look like "no opportunities" rather than a network bug.
 With DoH, the full 2 100-market universe paginates in 2.0 s and nothing in the

@@ -1,6 +1,6 @@
 # Audit cycle 7 — measured findings and fixes (2026-11-10, local PC)
 
-Three 30-minute paper soaks on the canonical command, then three pillar auditors
+Three 30-minute paper trading runs on the canonical command, then three pillar auditors
 on the window, each implementing its own fix. All numbers below are measured on
 this host unless labelled otherwise.
 
@@ -73,7 +73,7 @@ new `Ledger.write_off`.
 
 - The keyset universe walk is sequential by construction; it now runs in a
   background thread (`UniverseWalker.run_forever`) and completed the full
-  189,076-market universe inside one soak for the first time.
+  189,076-market universe inside one paper trading run for the first time.
 - Settlements no longer call the hazard model on ~72 k priced markets; the
   verdict index is the radar.
 - CTF's EV gate runs on a rotating 1,500-market slice of 12,862 priced markets

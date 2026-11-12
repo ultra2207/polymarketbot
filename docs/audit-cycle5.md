@@ -1,8 +1,8 @@
-# Paper-soak audit — cycle 5
+# Paper trader audit — cycle 5
 
 Window: **2026-11-09 08:21:03 → 08:51:06 UTC** (13:51:03 → 14:21:06 IST).
 Duration: 1,802.97 s. 180 snapshots, 165 trades. 0 WARNING / ERROR / CRITICAL in the
-soak log. This is the first run with the cycle-4 remediation, before the cycle-6 dynamic
+paper trader log. This is the first run with the cycle-4 remediation, before the cycle-6 dynamic
 optimizer rewrite.
 
 ## Result

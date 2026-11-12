@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Live paper soak entry point: RewardHarvester.
+"""Live paper trader entry point: the dual-sided reward pair.
 
-The engine charges the measured venue round trip for every state change, writes
-every trade to ``data/paper_engine.db``, and logs a dashboard line per interval.
-This file is deliberately thin: decisions live in ``polymarketbot.paper``.
+The trader rests one bid on each outcome token of a binary market at the same
+share count, prices the pair's venue ``Q_min`` once, and replays the measured
+tape into fills on both legs. The engine charges the measured venue round trip
+for every state change, writes every trade to ``data/paper_engine.db``, and
+logs a dashboard line per interval. This file is deliberately thin: decisions
+live in ``polymarketbot.paper``.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ CLOB = "https://clob.polymarket.com"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Live paper soak (reward)")
+    parser = argparse.ArgumentParser(description="Live paper trader (reward pair)")
     parser.add_argument("--capital", type=float, default=3000.0,
                         help="Total virtual bankroll split evenly across the pillars")
     parser.add_argument("--duration", type=float, default=None,
@@ -34,30 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite journal path")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore the last durable snapshot and start from --capital")
-    parser.add_argument(
-        "--legacy-one-sided",
-        action="store_true",
-        help=(
-            "Retired research path: run the one-sided RewardHarvester paper pillar. "
-            "The live engine quotes both legs; without this flag the paper entry "
-            "point refuses to run a one-sided book."
-        ),
-    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if not args.legacy_one_sided:
-        log.critical(
-            "The one-sided RewardHarvester paper pillar is retired: it quoted one "
-            "leg per market, which is a directional bet, not a hedged pair. The "
-            "live engine quotes both legs at one share count. For a two-sided "
-            "quote/risk soak use: python -m polymarketbot.live.runner --dry-run "
-            "--initial-cash 3000 --duration 1800 --db-path data/paper_engine.db. "
-            "The legacy one-sided research path requires --legacy-one-sided."
-        )
-        return 2
     if args.capital <= 0.0:
         log.error("--capital must be positive")
         return 2
@@ -85,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     def _stop(signum: int, _frame: object) -> None:
-        log.info(f"Signal {signum}: stopping the paper soak")
+        log.info(f"Signal {signum}: stopping the paper trader")
         engine.stop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):

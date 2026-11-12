@@ -356,7 +356,7 @@ class QueuePriorityValuationModel:
         support of the same file rather than hand-set 0.01/0.99 caps.
 
         Deliberate deviation: the numerator includes better-price depth (the
-        soak's ``queue_ahead_shares`` is strict ``spread < quote``), so the
+        paper trader's ``queue_ahead_shares`` is strict ``spread < quote``), so the
         ratio can exceed the level-local calibration; it is clamped at 1.0 and
         the measured floor P=0.2339 is a conservative bound on time-to-fill,
         not the calibrated level-local probability.
@@ -418,7 +418,7 @@ class QueuePriorityValuationModel:
         # `quote_size` shares is lambda * Q / 1000 dollars per share. The
         # previous `lambda * sqrt(Q) * volatility` mixed units -- annualised
         # volatility has no place in a per-fill impact -- and with the measured
-        # inputs of the 2026-11-09 soak (lambda ~ 1e-3, vol 8.5-14) it exceeded
+        # inputs of the 2026-11-09 paper trading run (lambda ~ 1e-3, vol 8.5-14) it exceeded
         # the half spread on every reward quote, flooring net_edge_per_share at
         # zero. Queue priority was therefore valued at exactly $0, cancels
         # looked free, and the harvester re-quoted on every radar snapshot.

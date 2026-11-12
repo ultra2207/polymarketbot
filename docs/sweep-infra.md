@@ -178,7 +178,7 @@ the directory union, exactly one warning) and retention/gzip.
 
 `read_snapshots` is bounded to `CHART_MAX_POINTS` (320) **per strategy** with a
 `ROW_NUMBER() OVER (PARTITION BY strategy ...)` query, so the cost of a rerun is
-constant in soak length and adding a pillar does not shorten the history of the
+constant in paper trading run length and adding a pillar does not shorten the history of the
 others. The headline comes from `read_snapshot_edges`, two indexed
 MIN/MAX-per-strategy joins, so PnL still starts at each strategy's first
 snapshot; `summarise(..., edges=...)` uses them. The chart captions the truncation.

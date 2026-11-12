@@ -1,4 +1,4 @@
-# Paper-soak audit — cycle 1
+# Paper trader audit — cycle 1
 
 - Window: 2026-11-09 06:31:35 → 07:01:35 UTC (12:01:35 → 12:31:35 IST)
 - Command: `uv run python scripts/run_live_paper_soak.py --capital 3000 --duration 1800 --interval 10 --fresh`
@@ -11,7 +11,7 @@ before cycle 2. The audits were run in parallel, read-only, with SQLite/log evid
 
 ## 1. RewardHarvester — critical
 
-**Measured:** `pnl_domain2` grew $5.81 in 30 min with **zero orders and zero `soak_trades`
+**Measured:** `pnl_domain2` grew $5.81 in 30 min with **zero orders and zero `soak_trades` (telemetry table)
 rows**. The script contains no order-placement call; the pillar is an accrual formula.
 
 | # | Finding | Evidence |
@@ -45,7 +45,7 @@ or report `pnl_domain2` as a model output and exclude it from portfolio PnL.
 | S1 | **`clean_ladder` was discarded; the raw ladder was passed to the allocator.** A stale 0.05 ask could absorb the whole budget. Prior history contains a $0.2304 entry → `PAR_REFUND` at $0.0005, **−$350.64**. | `:1399`, `:1306`; `settlement_allocator.py:57-67`; DB id 24196/24197 |
 | S2 | **Resolution used live indicative `outcomePrices >= 0.99`, not `closed`/UMA state.** All six held markets were `closed=False`, `uma=None`; a 0.975 print can force-settle an open position. | `:1563-1579` |
 | S3 | **Horizons were hardcoded** (`900+7200+180` = 2.30 h) for every market. 15-minute crypto candles were ranked at 11,424-23,884 % ARR. `robust_hazard.calculate_physical_cycle_time` existed and was unused. | `:1198-1219`; `robust_hazard.py:56-115` |
-| S4 | `pnl_settlement` includes unrealized par edge while `soak_trades` records only entry fees; the two disagree by the whole edge. Reserve/caps were computed from marked-up equity. | `:322-332`, `:1436-1446`, `:1397`, `:1751` |
+| S4 | `pnl_settlement` includes unrealized par edge while `soak_trades` (telemetry table) records only entry fees; the two disagree by the whole edge. Reserve/caps were computed from marked-up equity. | `:322-332`, `:1436-1446`, `:1397`, `:1751` |
 | S5 | Allocator `net_profit`/`annualized_arr` omitted taker fees; the fee was hardcoded `0.04`/exponent 1.0 instead of Gamma `feeSchedule`. | `:377-378`, `:550-551`, `:1401`, `:1433`, `:1530` |
 | S6 | A position whose market vanished from the Gamma batch was locked forever; batch-poll failures were DEBUG. | `:1504-1508`, `:1499` |
 | S7 | `--settle-hold-sec` is stored and never read; slots/caps/reserve/ticket are literals. | `:664-671`, `:704-707` |
@@ -98,11 +98,11 @@ next-cycle model work.
 
 - Every source file now logs through `polymarketbot.logs`: `data/logs/app.log` plus a
   rotating per-source-file log (`10 MB`, 3 rotations, compressed). Per-file sinks are
-  synchronous, removing ~70 enqueue threads from the soak.
+  synchronous, removing ~70 enqueue threads from the paper trading run.
 - `print()` is gone from `src/` and `scripts/`; the remaining CLI/table output goes through
   `log.info`/`log.error`.
-- Telemetry `soak_trades` entry rows still record only fees for settlement buys; use
-  `soak_snapshots` for equity and the `details` field for par edge.
+- Telemetry `soak_trades` (table) entry rows still record only fees for settlement buys; use
+  `soak_snapshots` (table) for equity and the `details` field for par edge.
 
 ## Post-remediation verification (cycle 4)
 

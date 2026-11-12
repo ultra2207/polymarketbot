@@ -569,19 +569,19 @@ def _stub_plan(monkeypatch, now: float, wanted: list[RewardQuote]) -> None:
 
 
 def _stub_rate(monkeypatch, usd_per_day: float) -> None:
-    monkeypatch.setattr(
-        reward,
-        "measured_accrual",
-        lambda **kwargs: reward.AccrualShare(
-            usd_per_day=usd_per_day,
-            share=0.1,
-            our_score=1.0,
-            competing_score=9.0,
-            pool_usd_per_day=usd_per_day,
-            qualifies=True,
-            competing_samples=3,
-        ),
+    share = reward.AccrualShare(
+        usd_per_day=usd_per_day,
+        share=0.1,
+        our_score=1.0,
+        competing_score=9.0,
+        pool_usd_per_day=usd_per_day,
+        qualifies=True,
+        competing_samples=3,
     )
+    # The runner prices a matched pair now; the legacy one-sided entry point
+    # remains for callers that still ask for it.
+    monkeypatch.setattr(reward, "measured_accrual", lambda **kwargs: share)
+    monkeypatch.setattr(reward, "measured_pair_accrual", lambda **kwargs: share)
 
 
 def test_day_accrual_below_floor_settles_to_zero() -> None:

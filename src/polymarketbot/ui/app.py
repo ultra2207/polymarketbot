@@ -1,9 +1,9 @@
-"""Executive telemetry for the live paper soak.
+"""Executive telemetry for the live paper trader.
 
 Run with ``streamlit run src/polymarketbot/ui/app.py``. Every panel reads the
 SQLite journal written by ``python -m polymarketbot.paper.main``
 (``data/paper_engine.db``: ``trades``, ``snapshots``, ``lots``). The dashboard
-never imports the trading engine and never starts or stops it: the soak is its
+never imports the trading engine and never starts or stops it: the paper trader is its
 own process, so the UI is read-only by construction.
 
 The UI is imported in tests without a Streamlit runtime; ``streamlit`` and
@@ -80,7 +80,7 @@ def _read(db_path: Path | str, query: str) -> list[dict[str, Any]]:
 
 def read_table(db_path: Path | str, table: str, columns: tuple[str, ...],
                order_by: str = "", limit: int | None = None) -> list[dict[str, Any]]:
-    """Read one journal table, returning ``[]`` when the soak has not run yet."""
+    """Read one journal table, returning ``[]`` when the paper trader has not run yet."""
     query = f"SELECT {', '.join(columns)} FROM {table}"
     if order_by:
         query += f" ORDER BY {order_by}"
@@ -120,7 +120,7 @@ def read_snapshots(
     """The most recent snapshot series a chart can draw, oldest first.
 
     Reading the whole table on every rerun (every 2-20 s) made the dashboard's
-    cost grow with the soak: a multi-day journal is millions of rows to load and
+    cost grow with the paper trader: a multi-day journal is millions of rows to load and
     pivot for a 320-px line. The bound is *per strategy*, so adding a pillar does
     not shorten the history each line shows. ``max_points=None`` reads
     everything, which a caller that needs the full series must ask for.
@@ -272,7 +272,7 @@ def main() -> None:
     db_path = Path(os.environ.get("POLYMARKETBOT_PAPER_DB", str(DB_PATH)))
 
     st.set_page_config(
-        page_title="Paper Soak Telemetry",
+        page_title="Paper Trader Telemetry",
         page_icon="⚡",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -305,10 +305,10 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.sidebar.title("⚡ Paper Soak")
+    st.sidebar.title("⚡ Paper Trader")
     st.sidebar.caption(f"Journal: `{db_path}`")
     st.sidebar.markdown(
-        "Read-only telemetry. Start the soak in its own terminal:\n\n"
+        "Read-only telemetry. Start the paper trader in its own terminal:\n\n"
         "`python -m polymarketbot.paper.main`"
     )
     auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
@@ -317,7 +317,7 @@ def main() -> None:
         st.rerun()
 
     # The chart gets a bounded series; the headline comes from the journal-wide
-    # first/last rows, so a long soak is not loaded and pivoted every rerun and
+    # first/last rows, so a long paper trading run is not loaded and pivoted every rerun and
     # the initial equity does not creep forward with the window.
     snapshots = read_snapshots(db_path)
     edges = read_snapshot_edges(db_path)

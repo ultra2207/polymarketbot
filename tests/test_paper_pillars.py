@@ -60,10 +60,53 @@ def test_reward_candidate_stays_inside_venue_band():
     candidate = candidates[0]
     assert candidate["daily_pool"] == 500.0
     assert candidate["competing_score"] > 0.0
-    assert abs(candidate["quote_price"] - 0.49) < 1e-9
+    # One candidate is one matched pair: both legs at 0.49, 0.98 combined.
+    assert candidate["quote_price"] == pytest.approx(0.98)
+    assert [leg["price"] for leg in candidate["legs"]] == pytest.approx([0.49, 0.49])
     # Outside the band: bid 0.42 leaves the quote 2.5c from the 0.455 mid.
     far = {"yes": _book(0.42, 0.49), "no": _book(0.42, 0.49)}
     assert reward.reward_candidates([market], far, []) == []
+
+
+def test_half_filled_pair_is_scored_one_sided_by_the_venue_rule():
+    """A pair that lost one leg is valued as one-sided, not as a full pair."""
+    market = _market(reward_rate=500.0, max_spread=3.0)
+    books = {"yes": _book(0.48, 0.52), "no": _book(0.48, 0.52)}
+    common = {
+        "pool_usd_per_day": market.daily_reward,
+        "max_spread_cents": market.reward_max_spread_cents,
+        "min_size": market.reward_min_size,
+        "yes_book": books["yes"],
+        "no_book": books["no"],
+        "competing": None,
+    }
+    full = reward.measured_pair_accrual(
+        **common,
+        resting=(reward.PairLeg("YES", 0.49, 200.0), reward.PairLeg("NO", 0.51, 200.0)),
+    )
+    half = reward.measured_pair_accrual(
+        **common, resting=(reward.PairLeg("YES", 0.49, 200.0),)
+    )
+    assert full is not None and half is not None
+    assert half.our_score == pytest.approx(full.our_score / 3.0)
+    assert 0.0 < half.usd_per_day < full.usd_per_day
+
+
+def test_reward_pair_emits_two_equal_legs_and_one_payout():
+    """The paper trader is one matched pair, not two one-sided claims."""
+    market = _market(reward_rate=500.0, max_spread=3.0)
+    books = {"yes": _book(0.48, 0.52), "no": _book(0.48, 0.52)}
+    candidates = reward.reward_candidates([market], books, [])
+    result = reward.allocate(candidates, bankroll_usd=1000.0)
+    quotes = reward.quotes_from_allocation(result, candidates, books)
+
+    assert {quote.token_id for quote in quotes} == {"yes", "no"}
+    assert len({quote.shares for quote in quotes}) == 1
+    assert all(quote.shares >= quote.min_size for quote in quotes)
+    # The pair's payout is split across the two legs, never paid twice.
+    assert sum(quote.daily_payout for quote in quotes) == pytest.approx(
+        result.allocations[0].daily_reward_payout
+    )
 
 
 def test_reward_candidate_requires_a_published_minimum():
@@ -110,7 +153,8 @@ def test_reward_candidate_carries_its_measured_resting_distance():
     books = {"yes": _book(0.48, 0.52), "no": _book(0.48, 0.52)}
     candidate = reward.reward_candidates([market], books, [])[0]
     # quote = bid + tick = 0.49 against a 0.50 mid -> exactly 1c of the band.
-    assert candidate["quote_price"] == pytest.approx(0.49)
+    assert [leg["price"] for leg in candidate["legs"]] == pytest.approx([0.49, 0.49])
+    assert candidate["quote_price"] == pytest.approx(0.98)
     assert candidate["spread_offset_cents"] == pytest.approx(1.0)
 
 
@@ -129,13 +173,14 @@ def test_reward_quote_never_crosses_the_ask():
     market = _market(reward_rate=500.0, max_spread=3.0, tick=0.01)
     one_tick = {"yes": _book(0.33, 0.34), "no": _book(0.33, 0.34)}
     candidate = reward.reward_candidates([market], one_tick, [])[0]
-    assert candidate["quote_price"] == pytest.approx(0.33)
-    assert candidate["quote_price"] < 0.34
+    assert [leg["price"] for leg in candidate["legs"]] == pytest.approx([0.33, 0.33])
+    assert candidate["quote_price"] == pytest.approx(0.66)
+    assert all(leg["price"] < 0.34 for leg in candidate["legs"])
     assert candidate["spread_offset_cents"] == pytest.approx(0.5)
 
     # Two ticks wide: one tick of price improvement still rests below the ask.
     two_ticks = {"yes": _book(0.32, 0.34), "no": _book(0.32, 0.34)}
-    assert reward.reward_candidates([market], two_ticks, [])[0]["quote_price"] == pytest.approx(0.33)
+    assert reward.reward_candidates([market], two_ticks, [])[0]["quote_price"] == pytest.approx(0.66)
 
     # A locked book has no resting price between the touch and the ask, on
     # either leg of the binary market.
@@ -158,7 +203,7 @@ def test_reward_touch_quote_fills_from_a_print_at_the_touch():
     market = _market(reward_rate=500.0, max_spread=3.0, tick=0.01, reward_min=50.0)
     books = {"yes": _book(0.33, 0.34, size=300.0), "no": _book(0.33, 0.34, size=300.0)}
     candidate = reward.reward_candidates([market], books, [])[0]
-    quote_price = candidate["quote_price"]
+    quote_price = float(candidate["legs"][0]["price"])
     level = shares_at(books[candidate["quote_token"]], bid=True, price=quote_price)
     assert level == pytest.approx(300.0)
     prints = [
@@ -337,7 +382,7 @@ def test_reward_reserve_trims_resting_bids_that_no_longer_fit():
     ideal = reward.quotes_from_allocation(
         reward.allocate(candidates, bankroll_usd=cash), candidates, books
     )
-    assert len(ideal) == 2
+    assert len(ideal) == 4  # two matched pairs, two legs each
     # Both bids are already resting above what this tick's cash covers, so the
     # cheaper half of the book has to go rather than over-commit. Scale the
     # stale sizes to the calibrated quote size instead of a fixed 20 %: the
@@ -347,7 +392,7 @@ def test_reward_reserve_trims_resting_bids_that_no_longer_fit():
     bloated = {q.token_id: (q.price, q.shares * factor) for q in ideal}
     assert sum(price * shares for price, shares in bloated.values()) > cash
     kept = reward.commit_quotes(ideal, cash, bloated)
-    assert len(kept) == 1
+    assert len(kept) == 2  # one whole pair, never one directional leg
     assert sum(q.shares * q.price for q in kept) <= cash + 1e-6
     # A moved price is a cancel, so its cash must not be charged again: the
     # fresh plan is funded in full even though the stale sizes would not fit.

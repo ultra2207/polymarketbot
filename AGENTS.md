@@ -55,10 +55,9 @@ runs have already wasted hours here.
   unreviewable after the fact, cannot be re-run or amended without rewriting it, and
   buries the result in a wall of echoed source. `tmp_python/` is gitignored.
 - **Anything run repeatedly lives in `src/polymarketbot/` and is invoked with
-  `python -m`.** The two-sided soak is `polymarketbot.live.runner --dry-run`:
-  `uv run python -m polymarketbot.live.runner --dry-run --initial-cash 3000 --duration 1800 --spread-offset 0.5 --db-path data/paper_engine.db`.
-  The one-sided `polymarketbot.paper.main` pillar is retired and refuses to run
-  without `--legacy-one-sided` (it quoted one leg per market, a directional bet).
+  `python -m`.** The paper trader is `polymarketbot.paper.main`; it quotes a
+  matched YES/NO pair at one share count and prices the pair's venue `Q_min` once:
+  `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --db data/paper_engine.db`.
 - A long-lived entry point that grows past a few hundred lines is a design error: split
   it into modules under its package, where each decision rule is testable without I/O.
 
@@ -156,7 +155,7 @@ executing, not after it times out.**
   - **First-Principles Solvers:** Zero greedy heuristics or arbitrary caps. LP rewards must use KKT
     water-filling convex optimization over the full active universe.
 
-- **Production Soak & 30-Minute Continuous Audit Cycle:**
+- **Production Paper Trader & 30-Minute Continuous Audit Cycle:**
   1. The live paper trader daemon runs continuously with the single live pillar (RewardHarvester).
   2. Every 30 minutes, perform a rigorous system audit by dispatching **1 dedicated subagent**:
      - **Reward Harvester Auditor:** Inspects liquidity reward allocations, queue
@@ -233,17 +232,16 @@ round trip before it takes effect. This is not optional:
 
 ### The loop
 
-1. **Soak.** Run the live paper trader for exactly 30 minutes. The canonical command,
+1. **Paper trader run.** Run the live paper trader for exactly 30 minutes. The canonical command,
    used verbatim every cycle (the operator watches its output live):
 
    ```
-   uv run python -m polymarketbot.live.runner --dry-run --initial-cash 3000 --duration 1800 --spread-offset 0.5 --db-path data/paper_engine.db
+   uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --fresh --db data/paper_engine.db
    ```
 
-   The one-sided paper pillar is retired; `paper.main` refuses unless
-   `--legacy-one-sided` is passed. This dry-run quotes **both legs** and records
-   quote/risk telemetry; it does not replay tape fills (a two-sided replay
-   harness is not yet implemented), so use live canary fills for fill economics.
+   The paper trader rests one bid on each outcome leg at the same share count,
+   prices the pair's venue `Q_min` once, and replays the measured tape into
+   fills on both legs. The retired one-sided path is no longer selectable.
 
    Run this as a **normal foreground command** with a **2000-second timeout** — not as a
    background job, not as a named service, and **not through a PTY**. Use plain
@@ -255,7 +253,7 @@ round trip before it takes effect. This is not optional:
    the 600-second invocation cap: it is a daemon with 10-second SQLite snapshots, per-file
    logs, and graceful SIGINT/SIGTERM, so a kill still leaves inspectable progress. Never
    launch it silently; the dashboard is logged every interval and
-   `data/paper_soak_telemetry.db` grows every interval.
+   `data/paper_engine.db` grows every interval.
    - Gas is **measured at startup** from the live Polygon gas oracle (`fast.maxFee`) and
      the live POL/USD ticker; both must resolve or the reward harvester's merge economics
      refuse to price an inventory merge. `--gas-usd` is an override, never a substitute for
@@ -284,7 +282,7 @@ round trip before it takes effect. This is not optional:
    dump findings on the orchestrator. It implements every fix it finds in the reward
    strategy files, runs the narrowest verifying test or bounded smoke, and reports the
    diff plus evidence. There is no rush: every found issue is to be fixed, not deferred.
-   The orchestrator verifies the integrated result and restarts the soak.
+   The orchestrator verifies the integrated result and restarts the paper trader.
 
    **Hard 30-minute limit per auditor.** An auditor that has not returned a complete,
    compiling fix within 30 minutes is treated as irrecoverably stuck (observed: one
@@ -302,17 +300,17 @@ round trip before it takes effect. This is not optional:
 ### Operating constraints for the loop
 
 - **Host memory.** A `t3.micro` (930 MB) is **not sufficient** for the full-universe
-  soak. Even with chunked book loading, spread trimming, compact reward rows and
-  allocator trimming, the soak peaks at 441–558 MB while the agent harness holds another
+  paper trading run. Even with chunked book loading, spread trimming, compact reward rows and
+  allocator trimming, the paper trader peaks at 441–558 MB while the agent harness holds another
   320–570 MB; a 30-minute run restarted the instance despite the memory guard. Use a
   **>= 2 GB instance** (or the 16 GB local PC) and run the local-India assessment in
   `docs/local-pc-india-analysis.md` before using a high-RTT host for live trading.
-- Keep one compute process at a time; the soak is that process. Auditors read files and the
-  SQLite/log outputs, they do not launch duplicate soak runs.
-- Never kill the soak blind: check `data/logs/polymarketbot.paper.main.log` and the row
+- Keep one compute process at a time; the paper trader is that process. Auditors read files and the
+  SQLite/log outputs, they do not launch duplicate paper trading runs.
+- Never kill the paper trader blind: check `data/logs/polymarketbot.paper.main.log` and the row
   growth in `data/paper_engine.db` first. If it produced nothing after 300 seconds, stop and
   fix the code.
-- State the expected cost of the soak up front: one process, one incremental universe walk
+- State the expected cost of the paper trading run up front: one process, one incremental universe walk
   (20 keyset pages per tick), one rotating 12k-token book window per tick, one trade-tape
   walk, UMA log windows per settlement pass, and one SQLite snapshot per interval. A
   30-minute run at `--interval 10` writes ~180 snapshot rows per pillar.

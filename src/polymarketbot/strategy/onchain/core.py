@@ -262,7 +262,7 @@ def mask_url(url: str) -> str:
 # `eth-mainnet.g.alchemy.com/v2/<key>` and `polygon-mainnet.g.alchemy.com/v2/<key>`.
 # Resting only the URL that answered rotates to its sibling on the same
 # throttled key, which re-earns the 429 and climbs a second, independent
-# backoff ladder. Measured 2026-11-10 in one 30-minute soak: cooldown
+# backoff ladder. Measured 2026-11-10 in one 30-minute paper trading run: cooldown
 # 56 s -> 142 s -> 921 s on a single configured key. Cooldown is therefore
 # applied to every endpoint sharing a credential.
 MIN_COOLDOWN_S = 60.0

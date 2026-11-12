@@ -6,11 +6,11 @@ carries a `path:line` anchor; anything unanchored is labelled a judgement.
 
 ## 0. What changed already (this pass)
 
-The 9,300-line soak monolith is gone. The live system is now:
+The 9,300-line paper trader monolith is gone. The live system is now:
 
 | Item | Before | After |
 |---|---|---|
-| Soak entry | `scripts/run_live_paper_soak.py`, 9,300 lines | `src/polymarketbot/paper/main.py`, **98 lines** |
+| Paper trader entry | `scripts/run_live_paper_soak.py`, 9,300 lines | `src/polymarketbot/paper/main.py`, **98 lines** |
 | Engine | one class, ~7,000 lines | `paper/engine.py` (~500), one clock, three pillars |
 | Decisions | inline in the daemon | `paper/pillars/{reward,settlement,ctf}.py`, pure functions |
 | Accounting | ad-hoc counters + SQLite | `paper/ledger.py`, cash + lots + mark-to-par, resumable |
@@ -22,7 +22,7 @@ The 9,300-line soak monolith is gone. The live system is now:
 | Deploy unit | launched the deleted script (P0, broken) | `python -m polymarketbot.paper.main` |
 
 Measured shape today: `src/` 145 files / 73,640 lines, `tests/` 128 / 42,491,
-`scripts/` **149 / 41,643**. The soak was ~1.5 % of `src/`; the real problem is
+`scripts/` **149 / 41,643**. The paper trader script was ~1.5 % of `src/`; the real problem is
 the rest of the tree, which contains three parallel paper engines and 120
 disposable scripts.
 
@@ -79,7 +79,7 @@ Wave 3/4 (same day, after greenlight feedback):
   migrates only when the gain exceeds cost; `--condition-id` stays pinned.
   Tests: better-market switch, sub-cost hold, empty universe hold (29 tests).
 - **Replay rebuild declined deliberately** (not a silent loss): the live paper
-  soak already scans the full universe every tick and journals every trade; a
+  trader already scans the full universe every tick and journals every trade; a
   historical replay harness is rebuilt only when a concrete question needs it.
 
 Known capability gaps (deliberate, must be rebuilt rather than silently lost):
@@ -157,7 +157,7 @@ They duplicate `evaluate_quotes`, `_execute_tier1/2`, `process_reward_epoch`,
 | Recurring operational tool | **17** | promote to `src/`, then delete |
 
 - **P0 fixed now:** `deploy/polymarketbot.service:28` and
-  `deploy/cloud_deployment_guide.md:217,236` launched the deleted soak script.
+  `deploy/cloud_deployment_guide.md:217,236` launched the deleted paper trader script (`run_live_paper_soak.py`).
   They now run `python -m polymarketbot.paper.main`.
 - 8 tests import implementation from `scripts/` (`test_multi_tier_paper_trader.py:15`,
   `test_native_paper_trader.py:19`, `test_realistic_three_domains_apy.py:13`,
@@ -218,7 +218,7 @@ a 60-second paper smoke is the gate after every phase.
 3. Delete the alias exports `trading/__init__.py:206-215`
    (`LatencySniperEngine`, `RewardHarvesterEngine`).
 4. Update stale references: `logs.py:93`, `trading/domain2/gamma_universe.py:28`,
-   `fill_model.py:3,138`, and the soak anchors in `docs/audit-cycle1.md`,
+   `fill_model.py:3,138`, and the historical paper-trader anchors in `docs/audit-cycle1.md`,
    `docs/audit-cycle4.md`, `docs/cycle6-status.md`,
    `docs/local-pc-india-analysis.md`.
 

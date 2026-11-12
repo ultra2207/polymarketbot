@@ -30,7 +30,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from polymarketbot.strategy.reward.accrual import AccrualShare, measured_accrual
+from polymarketbot.strategy.reward.accrual import (
+    AccrualShare,
+    PairLeg,
+    measured_accrual,
+    measured_pair_accrual,
+)
 from polymarketbot.strategy.reward.allocator import (
     PROTOCOL_MIN_DAILY_PAYOUT_USD,
     LiquidityRewardsAllocator,
@@ -83,6 +88,7 @@ __all__ = [
     "FillDecision",
     "FillTape",
     "MarketFillYield",
+    "PairLeg",
     "PortfolioAllocationResult",
     "RewardQuote",
     "allocate",
@@ -95,6 +101,7 @@ __all__ = [
     "markout_cost_usd",
     "measured_accrual",
     "measured_fill_shares",
+    "measured_pair_accrual",
     "plan_quotes",
     "quotes_from_allocation",
     "reset_fill_tape",

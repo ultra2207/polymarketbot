@@ -7,7 +7,7 @@ Run in order. Nothing here places an order until step 4.
 | 1 | Create Polymarket API creds + signing key; set `POLY_API_KEY`, `POLY_SECRET`, `POLY_PASSPHRASE`, `PRIVATE_KEY` (aliases: `POLYMARKET_SECRET`, `POLY_PRIVATE_KEY`). The signer address is `POLY_ADDRESS` or `PROXY_WALLET_ADDRESS` | — |
 | 2 | **Fund nothing yet.** Run `--live --yes` on the unfunded wallet | It must abort at preflight with a summary naming missing credentials / $0 collateral / POL / UNAPPROVED allowances. It refuses **before** quoting and does not downgrade to dry-run. Do this *before* depositing — once funded the same command trades. |
 | 3 | Fund **$40 USDC.e** to the Polymarket proxy wallet + **1–2 POL** for merge gas; approve CTF exchange allowances | Re-run step 2; `PreflightReport.summary()` all green |
-| 3b | Run the 30-minute paper soak on the same tree | `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --fresh --db data/paper_soak_telemetry.db` returns; the dashboard quoted both legs and the fill tape recorded activity |
+| 3b | Run the 30-minute paper trading run on the same tree | `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --fresh --db data/paper_engine.db` returns; the dashboard quoted both legs and the fill tape recorded activity |
 | 4 | Run the canary, 1 hour, on an explicitly chosen **non-neg-risk** rewards market | Command below |
 
 ```bash
@@ -77,10 +77,9 @@ rows[rows.kind == "micro_risk_decision"].sort_values("recv_ts_ns")
 
 ## Limits to carry into the run
 
-- **The one-sided paper pillar is retired.** `python -m polymarketbot.paper.main`
-  refuses without `--legacy-one-sided`; it quoted one leg per market. The live engine
-  quotes both legs at one share count, and the service default is the two-sided
-  `live.runner --dry-run`. There is no two-sided tape-replay harness yet.
+- **The paper trader is dual-sided.** `python -m polymarketbot.paper.main` rests one
+  bid on each outcome leg at the same share count, prices the pair's venue `Q_min`
+  once, and replays tape fills on both legs. The service default runs it.
 
 - **Startup refuses live without a fitted microstructure calibration.** If
   `data/derived/risk_calibration.json` is absent the engine reports

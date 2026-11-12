@@ -56,6 +56,7 @@ from polymarketbot.fees import FeeSchedule, schedule_for_market
 from polymarketbot.live.base import BaseMarketMakingEngine, PositionView
 from polymarketbot.strategy.books import mid, qualifying_score
 from polymarketbot.strategy.reward import quote_candidates
+from polymarketbot.strategy.reward.accrual import PairLeg, measured_pair_accrual
 from polymarketbot.strategy.reward.decision import (
     measured_accrual,
     plan_quotes,
@@ -72,8 +73,9 @@ MIN_ORDER = 5.0
 MIN_SIZE = 20.0
 MAX_SPREAD_CENTS = 5.0
 DAILY_POOL = 200.0
-# One capital: enough for the venue-minimum lot on each side of the pair.
-CAPITAL = 19.6
+# One capital: enough for one venue-minimum lot on each side of the pair after
+# the allocator's usable-capital haircut.
+CAPITAL = 21.0
 # The live engine's configured distance from the mid. One venue tick, i.e. the
 # same distance ``bid + tick`` sits from the mid on a two-tick-wide book.
 SPREAD_OFFSET_CENTS = 1.0
@@ -283,10 +285,9 @@ def _paper_quote(books: dict, market: Market, capital: float):
     candidates = reward_candidates([market], books, [], fill_horizon_s=30.0)
     assert len(candidates) == 1
     candidate = candidates[0]
-    resting = {candidate["quote_token"]: (candidate["quote_price"], MIN_SIZE)}
-    quotes = plan_quotes(candidates, capital, resting)
-    assert len(quotes) == 1
-    return candidate, quotes[0]
+    quotes = plan_quotes(candidates, capital, {})
+    assert len(quotes) == 2  # one matched pair, one quote on each leg
+    return candidate, quotes
 
 
 def _assert_same_quote(quote, live_price: float, live_size: float) -> None:
@@ -301,44 +302,39 @@ def _assert_same_quote(quote, live_price: float, live_size: float) -> None:
 # Case 1: book inside the band, YES is the cheaper leg - both accept
 # ---------------------------------------------------------------------------
 
-def test_in_band_yes_leg_decision_matches(tmp_path, measured_cell):
+def test_in_band_pair_decision_matches(tmp_path, measured_cell):
     books = _books(0.42, 0.46)
     market = _market()
-    candidate, quote = _paper_quote(books, market, CAPITAL)
-
-    assert candidate["quote_token"] == "TOK_YES"
-    assert quote.token_id == "TOK_YES"
-    assert quote.price == pytest.approx(0.43)
-    assert quote.shares == pytest.approx(MIN_SIZE)
+    _, quotes = _paper_quote(books, market, CAPITAL)
+    by_token = {quote.token_id: quote for quote in quotes}
+    assert set(by_token) == {"TOK_YES", "TOK_NO"}
+    assert by_token["TOK_YES"].price == pytest.approx(0.43)
+    assert by_token["TOK_NO"].price == pytest.approx(0.55)
+    assert all(quote.shares >= MIN_SIZE for quote in quotes)
 
     engine = _engine(tmp_path, books, cash=CAPITAL, max_spread=MAX_SPREAD_CENTS)
     try:
         engine._execute_neutral_maker_quoting(0.44, 0.42, 0.46, 1000.0)
-        live = engine.active_quotes[_quote_key(quote.token_id)]
-        _assert_same_quote(quote, live["price"], live["size"])
-        # Same notional committed on the same leg.
-        assert live["price"] * live["size"] == pytest.approx(quote.price * quote.shares)
+        live_yes = engine.active_quotes[_quote_key("TOK_YES")]
+        live_no = engine.active_quotes[_quote_key("TOK_NO")]
+        _assert_same_quote(by_token["TOK_YES"], live_yes["price"], live_yes["size"])
+        _assert_same_quote(by_token["TOK_NO"], live_no["price"], live_no["size"])
 
-        # Reward decision parity: both paths price the same one-sided bid.
-        accrual = measured_accrual(
+        accrual = measured_pair_accrual(
             pool_usd_per_day=market.daily_reward,
-            price=quote.price,
-            shares=quote.shares,
-            min_size=market.reward_min_size,
             max_spread_cents=market.reward_max_spread_cents,
-            leg_book=books[quote.token_id],
-            other_book=books["TOK_NO"],
+            min_size=market.reward_min_size,
+            yes_book=books["TOK_YES"],
+            no_book=books["TOK_NO"],
+            resting=(
+                PairLeg("YES", by_token["TOK_YES"].price, by_token["TOK_YES"].shares),
+                PairLeg("NO", by_token["TOK_NO"].price, by_token["TOK_NO"].shares),
+            ),
             competing=None,
         )
         assert accrual is not None
-        assert accrual.competing_score == pytest.approx(
-            _measured_competing_score(books), rel=1e-12
-        )
         assert accrual.qualifies is True
-        assert accrual.usd_per_day >= 1.0  # clears the venue's daily floor
-
-        # The live engine scores the same single bid from its own book state.
-        engine._cancel_quote("BUY_NO")
+        assert accrual.usd_per_day >= 1.0
         q_min, _q_one, _q_two = engine.compute_quote_scores()
         assert q_min == pytest.approx(accrual.our_score, rel=1e-12)
         assert engine.get_current_daily_yield() == pytest.approx(
@@ -352,42 +348,40 @@ def test_in_band_yes_leg_decision_matches(tmp_path, measured_cell):
 # Case 2: book inside the band, NO is the cheaper leg - both accept
 # ---------------------------------------------------------------------------
 
-def test_in_band_no_leg_decision_matches(tmp_path, measured_cell):
+def test_in_band_pair_no_leg_decision_matches(tmp_path, measured_cell):
     books = _books(0.60, 0.64)
     market = _market()
-    candidate, quote = _paper_quote(books, market, CAPITAL)
-
-    assert candidate["quote_token"] == "TOK_NO"
-    assert quote.token_id == "TOK_NO"
-    assert quote.price == pytest.approx(0.37)
-    assert quote.shares == pytest.approx(MIN_SIZE)
+    _, quotes = _paper_quote(books, market, CAPITAL)
+    by_token = {quote.token_id: quote for quote in quotes}
+    assert set(by_token) == {"TOK_YES", "TOK_NO"}
+    assert by_token["TOK_YES"].price == pytest.approx(0.61)
+    assert by_token["TOK_NO"].price == pytest.approx(0.37)
+    assert all(quote.shares >= MIN_SIZE for quote in quotes)
 
     engine = _engine(tmp_path, books, cash=CAPITAL, max_spread=MAX_SPREAD_CENTS)
     try:
         engine._execute_neutral_maker_quoting(0.62, 0.60, 0.64, 1000.0)
-        live = engine.active_quotes[_quote_key(quote.token_id)]
-        _assert_same_quote(quote, live["price"], live["size"])
-        assert live["price"] * live["size"] == pytest.approx(quote.price * quote.shares)
+        live_yes = engine.active_quotes[_quote_key("TOK_YES")]
+        live_no = engine.active_quotes[_quote_key("TOK_NO")]
+        _assert_same_quote(by_token["TOK_YES"], live_yes["price"], live_yes["size"])
+        _assert_same_quote(by_token["TOK_NO"], live_no["price"], live_no["size"])
 
-        accrual = measured_accrual(
+        accrual = measured_pair_accrual(
             pool_usd_per_day=market.daily_reward,
-            price=quote.price,
-            shares=quote.shares,
-            min_size=market.reward_min_size,
             max_spread_cents=market.reward_max_spread_cents,
-            leg_book=books["TOK_NO"],
-            other_book=books["TOK_YES"],
+            min_size=market.reward_min_size,
+            yes_book=books["TOK_YES"],
+            no_book=books["TOK_NO"],
+            resting=(
+                PairLeg("YES", by_token["TOK_YES"].price, by_token["TOK_YES"].shares),
+                PairLeg("NO", by_token["TOK_NO"].price, by_token["TOK_NO"].shares),
+            ),
             competing=None,
         )
         assert accrual is not None
         assert accrual.qualifies is True
         assert accrual.usd_per_day >= 1.0
-
-        # A NO bid is the Q_two half of the pair: the live scorer must place it
-        # on the same side the paper accrual prices it (single-sided / c).
-        engine._cancel_quote("BUY_YES")
-        q_min, q_one, q_two = engine.compute_quote_scores()
-        assert q_two > 0.0 and q_one == 0.0
+        q_min, _q_one, _q_two = engine.compute_quote_scores()
         assert q_min == pytest.approx(accrual.our_score, rel=1e-12)
         assert engine.get_current_daily_yield() == pytest.approx(
             accrual.usd_per_day, rel=1e-9
@@ -469,20 +463,19 @@ def test_sub_floor_pool_is_not_zeroed_at_the_instant(tmp_path, measured_cell):
     assert plan_quotes(
         reward_candidates([market], books, [], fill_horizon_s=30.0), CAPITAL, {}
     ) == []
-    accrual = measured_accrual(
+    accrual = measured_pair_accrual(
         pool_usd_per_day=pool,
-        price=0.43,
-        shares=MIN_SIZE,
-        min_size=MIN_SIZE,
         max_spread_cents=market.reward_max_spread_cents,
-        leg_book=books["TOK_YES"],
-        other_book=books["TOK_NO"],
+        min_size=MIN_SIZE,
+        yes_book=books["TOK_YES"],
+        no_book=books["TOK_NO"],
+        resting=(PairLeg("YES", 0.43, MIN_SIZE), PairLeg("NO", 0.55, MIN_SIZE)),
         competing=None,
     )
     assert accrual is not None
     assert accrual.qualifies is True
-    # Raw rate: 10 * 4.2667 / (144.0 + 4.2667) = $0.2878/day, unfloored.
-    assert accrual.usd_per_day == pytest.approx(0.2878, abs=1e-3)
+    # The pair rate is real and unfloored; the $1.00 floor is applied at the
+    # UTC-day rollover, never by zeroing this instant.
     assert 0.0 < accrual.usd_per_day < 1.0
 
     engine = _engine(

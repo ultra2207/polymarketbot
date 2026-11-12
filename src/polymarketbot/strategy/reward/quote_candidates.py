@@ -1,4 +1,14 @@
-"""Allocator candidates for every reward market quoting inside the band."""
+"""Allocator candidates for the paper trader's matched reward pairs.
+
+The paper trader quotes a **pair**: one bid on each outcome token of a binary
+market, at the same share count and the same measured distance from each mid.
+That is the neutral quoting the live engine places (``live/quoting.py``,
+``_execute_neutral_maker_quoting``) and exactly how it sizes the pair
+(``live/supervisor/sizing.py``, ``matched_pair_quote_size``): one share count
+funded by the pair's combined cost. This module prices the pair - both leg
+prices, the venue's pair-level ``Q_min``, the measured fill side - so the
+allocator funds matched pairs rather than a directional one-leg book.
+"""
 
 from __future__ import annotations
 
@@ -15,43 +25,87 @@ from polymarketbot.strategy.reward.fill_measurement import (
     MarketFillYield,
     expected_fill_yield,
 )
-from polymarketbot.strategy.reward.scoring import single_sided_score_fraction
+from polymarketbot.strategy.reward.scoring import (
+    OrderQuote,
+    compute_book_side_scores,
+    compute_minimum_score,
+)
 from polymarketbot.strategy.venue.reads import Market, Print
 
 log = get_logger("polymarketbot.strategy.reward.decision")
 
 
-def _cheaper_leg(
+def _pair_legs(
     market: Market, books: dict[str, dict[str, Any]]
-) -> tuple[float, str, dict[str, Any]] | None:
-    """(leg mid, token_id, book) for the lower-priced leg of a binary market.
+) -> list[dict[str, Any]] | None:
+    """Both legs of the matched pair, priced to rest inside the venue band.
 
-    The leg price is ``mid`` of a token below 0.5, otherwise ``1 - mid`` of the
-    complementary token.  When both books price, the cheaper leg wins; when
-    neither does, returns ``None``.  Units: the mid is a fraction of 1.00 USDC
-    per share; the token id is the leg's CLOB token.
+    Each leg's bid is ``min(best_bid + tick, best_ask - tick)``: the highest
+    price that still *rests* below the ask, so it can neither cross on landing
+    nor be filled by a print at its own price. A locked or crossed book
+    publishes no mid, so it has no measurable distance and the market is
+    refused. Units: prices are USDC per share, distances are cents.
     """
-    best: tuple[float, str, dict[str, Any]] | None = None
-    for index, token_id in enumerate(market.token_ids):
+    legs: list[dict[str, Any]] = []
+    for index, token_id in enumerate(market.token_ids[:2]):
         book = books.get(token_id)
         if not isinstance(book, dict):
-            continue
-        token_mid = mid(book)
-        if token_mid is None:
-            continue
-        if token_mid <= 0.5:
-            leg_price, leg_token, leg_book = token_mid, token_id, book
-        else:
-            leg_token = market.token_ids[1 - index]
-            leg_book = books.get(leg_token)
-            leg_price = 1.0 - token_mid
-        if not isinstance(leg_book, dict):
-            continue
-        if best is None or leg_price < best[0]:
-            best = (leg_price, leg_token, leg_book)
-    return best
+            return None
+        bid, ask = best_bid(book), best_ask(book)
+        if bid is None or ask is None:
+            return None
+        leg_mid = mid(book)
+        if leg_mid is None:
+            # Locked/crossed: no resting price between the touch and the ask.
+            return None
+        price = min(bid + market.tick, ask - market.tick)
+        if price < bid - 1e-12 or not 0.0 < price < 1.0:
+            return None
+        distance_cents = abs(price - leg_mid) * 100.0
+        band_cents = market.reward_max_spread_cents - market.tick * 100.0
+        if distance_cents > band_cents:
+            return None
+        legs.append(
+            {
+                "outcome": "YES" if index == 0 else "NO",
+                "token_id": token_id,
+                "book": book,
+                "mid": leg_mid,
+                "price": price,
+                "distance_cents": distance_cents,
+            }
+        )
+    return legs if len(legs) == 2 else None
 
 
+def _pair_min_score(
+    legs: list[dict[str, Any]], mid_yes: float, band_cents: float, shares: float
+) -> float:
+    """The venue's ``Q_min`` for this pair at ``shares`` per leg.
+
+    This is the live engine's own scoring path (``compute_quote_scores``): the
+    YES bid contributes to ``Q_one``, the NO bid to ``Q_two``, and the
+    two-sided rule pays ``min`` when both legs are scored. A lone leg falls
+    back to ``Q_one / c`` inside the band, exactly as the venue does.
+    """
+    q_one = q_two = 0.0
+    for leg in legs:
+        quote = OrderQuote(
+            side="BUY",
+            outcome=leg["outcome"],
+            price=float(leg["price"]),
+            size=float(shares),
+        )
+        leg_mid_yes = mid_yes if leg["outcome"] == "YES" else 1.0 - float(leg["mid"])
+        one, two = compute_book_side_scores(
+            [quote],
+            mid_price_yes=leg_mid_yes,
+            max_spread_cents=band_cents,
+            min_size=0.0,
+        )
+        q_one += one
+        q_two += two
+    return compute_minimum_score(q_one=q_one, q_two=q_two, midpoint=mid_yes)
 
 
 def reward_candidates(
@@ -62,56 +116,46 @@ def reward_candidates(
     competitor: CompetingScoreWindow | None = None,
     now: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Allocator candidate dicts for every market quoting inside the band.
+    """Allocator candidates for every market the trader can quote as a pair.
 
     A market qualifies when it pays a daily pool, publishes a positive maximum
-    spread and tick, is binary, and at least one token book has a measured mid.
-    The cheaper leg is quoted at ``min(best_bid + tick, best_ask - tick)``, the
-    highest price at which the bid still *rests*: on a book one tick wide those
-    are the same price as the ask, and a bid at the ask is marketable. The
-    candidate is dropped when the leg book lacks a bid or ask, when the book is
-    locked or crossed (no resting price exists), when that quote leaves the
-    price domain, when ``|quote - leg mid|`` exceeds ``max_spread - tick`` in
-    cents, or when the venue would pay a one-sided quote nothing at all (leg
-    mid below the documented two-sided band, see
-    :func:`polymarketbot.strategy.reward.scoring.single_sided_score_fraction`).
+    spread, minimum size and tick, is binary, and **both** outcome books have a
+    measured bid, ask and mid. Both legs are quoted at a single share count,
+    each at the highest price that still rests inside the band. The candidate
+    is dropped when either leg leaves the price domain, when a leg's book is
+    locked or crossed, or when either leg's distance exceeds
+    ``max_spread - tick``.
 
-    This pillar rests a **single** bid, so the venue scores it one-sided:
-    ``Q_min = alpha * shares / c`` inside the band and ``0`` outside it. The
-    candidate therefore carries the measured score it will actually be paid,
-    ``score_per_usd = score_fraction / quote_price`` (venue score units per
-    USDC of resting capital), rather than the raw ``alpha`` the allocator would
-    otherwise read as a dollar-denominated score.
+    **One candidate is one matched pair.** ``capital_per_share`` /
+    ``quote_price`` are the pair's combined bid cost, so the allocator's
+    capital buys that many shares *per leg*; ``score_per_usd`` converts
+    dollars of pair capital into the venue's pair-level ``Q_min``, computed
+    once with :func:`_pair_min_score` - never the sum of two independent
+    one-sided claims. ``legs`` carries each leg's token, price, mid, measured
+    fill side and distance.
 
-    ``competing_score`` is the market's **measured** in-band competing score,
-    summed over both outcome-token books (see :func:`market_competing_score`) -
-    an upper bound on the competitors' ``Q_min``, because every competitor's own
-    two-sided penalty can only shrink it (``sum Q_min <= sum raw``). Using the
-    upper bound understates our share, which is the safe direction; the
-    candidate carries ``venue_denominator_low`` and ``denominator_bias_high``
-    so a caller can state the bracket instead of hiding it. A market whose
-    books or mids are missing, or whose measured total is zero, is refused here
-    rather than priced at a floor: the denominator is the claim's only evidence.
+    ``competing_score`` is the market's measured in-band competing score, summed
+    over both outcome-token books (an upper bound on the competitors' ``Q_min``,
+    because every competitor's own two-sided penalty can only shrink it). A
+    market whose books or mids are missing, or whose measured total is zero, is
+    refused rather than priced at a floor: the denominator is the claim's only
+    evidence.
 
     ``competitor`` (with the sample clock ``now``) turns that single snapshot
     into the venue's epoch-average estimate: every candidate is observed into
-    the rolling window, and ``competing_score`` is the window **mean**, with
+    the rolling window, and ``competing_score`` is the window mean, with
     ``competing_samples``, ``competing_variance`` and
-    ``competing_low_confidence`` stating how much evidence stands behind it. A
-    one-sample window is reported as low-confidence, never as the epoch rate.
-    Without a window the candidate carries one snapshot and is likewise marked
-    low-confidence.
+    ``competing_low_confidence`` stating how much evidence stands behind it.
 
-    ``lot_price`` is the price our own order rests at, so the optimizer funds
-    the venue's minimum *share* lot at the quote rather than at the mid.
-
-    ``tape_prints`` is the measured tape snapshot accompanying the books; the
-    quote itself is a pure function of the book and market fields.
+    The fill side is measured for both legs. The pair's ``stay_fraction`` is the
+    probability neither leg fills (the accrual only survives while both rest);
+    ``fill_yield_usd_per_usd_per_day`` is the legs' measured fill yield weighted
+    by the capital each commits, per dollar of pair capital.
 
     Units: ``daily_pool`` is USDC per day, ``competing_score`` is the venue's
     share-weighted score, ``max_spread`` is cents, ``min_size`` is shares,
-    ``real_mid``, ``quote_price``, ``lot_price`` and ``tick`` are USDC per
-    share, ``score_per_usd`` is score units per USDC.
+    ``real_mid``, ``quote_price``, ``pair_cost`` and ``tick`` are USDC per share,
+    ``score_per_usd`` is the pair ``Q_min`` per USDC of pair capital.
     """
     candidates: list[dict[str, Any]] = []
     unpriced = 0
@@ -121,41 +165,23 @@ def reward_candidates(
         if market.tick <= 0.0 or not market.binary:
             continue
         # A rewarded market always publishes the share size that qualifies for
-        # rewards. When the venue omits it, the quote cannot be scored, so the
+        # rewards. When the venue omits it, the pair cannot be scored, so the
         # market is not tradable here; a null is not a zero-size qualification.
         if market.reward_min_size <= 0.0:
             continue
-        leg = _cheaper_leg(market, books)
-        if leg is None:
+        legs = _pair_legs(market, books)
+        if legs is None:
             continue
-        leg_mid, token_id, book = leg
-        bid, ask = best_bid(book), best_ask(book)
-        if bid is None or ask is None:
+        mid_yes = float(legs[0]["mid"])
+        pair_cost = float(legs[0]["price"]) + float(legs[1]["price"])
+        # One share of the pair redeems for $1.00, so a pair that costs more
+        # cannot be funded as a matched lot.
+        if not 0.0 < pair_cost <= 1.0:
             continue
-        # A bid priced at or above the ask is marketable: it would cross on
-        # landing, so it can neither rest for the pool nor be filled by a later
-        # SELL print. `best_bid + tick` equals the ask whenever the book is one
-        # tick wide, and those are exactly the highest-scoring markets, so the
-        # allocator funds them first. Measured on 40 live reward candidates,
-        # 16 (40 %) priced at the ask; over 4,229 tape prints those quotes saw
-        # 0.22 crossing prints per 30-minute window, and the highest price that
-        # still rests (`ask - tick`) saw 0.81 - 4x the flow, on a book where
-        # the level actually has depth (16/40) so the queue share is not 1.0.
-        quote_price = min(bid + market.tick, ask - market.tick)
-        # A locked or crossed book publishes no price a bid can rest at.
-        if quote_price < bid - 1e-12:
-            continue
-        if not 0.0 < quote_price < 1.0:
-            continue
-        band_cents = market.reward_max_spread_cents - market.tick * 100.0
-        if abs(quote_price - leg_mid) * 100.0 > band_cents:
-            continue
-        # One bid is one-sided liquidity: outside the documented two-sided
-        # midpoint band the venue pays it nothing, so quoting there is pure
-        # inventory risk. Measured on 2,921 live candidates, 51 % price below
-        # the band and the allocator was funding them.
-        score_fraction = single_sided_score_fraction(leg_mid)
-        if score_fraction <= 0.0:
+        band_cents = float(market.reward_max_spread_cents)
+        binding_distance = max(leg["distance_cents"] for leg in legs)
+        q_min_per_share = _pair_min_score(legs, mid_yes, band_cents, 1.0)
+        if q_min_per_share <= 0.0:
             continue
         detail = market_competing_detail(market, books)
         if detail is None:
@@ -173,22 +199,52 @@ def reward_candidates(
         samples = 1 if estimate is None else estimate.samples
         low_confidence = True if estimate is None else estimate.low_confidence
         min_size = max(market.reward_min_size, market.min_order)
-        fill_yield: MarketFillYield | None = None
+        fill_yields: list[MarketFillYield] = []
         if fill_horizon_s is not None:
-            # With a stated quote horizon the fill side is mandatory: a bid
-            # whose chance of filling is unmeasured cannot be priced against
-            # the accrual it gives up when it fills, so the market is refused
-            # rather than valued on half a measurement.
-            fill_yield = expected_fill_yield(
-                tick=market.tick,
-                min_flow_shares=min_size,
-                horizon_s=float(fill_horizon_s),
-                quote_price=quote_price,
-                leg_mid=leg_mid,
-            )
-            if fill_yield is None:
-                unpriced += 1
+            # With a stated quote horizon the fill side is mandatory for both
+            # legs: a pair priced on one leg's fill probability claims half a
+            # measurement, so the market is refused instead.
+            for leg in legs:
+                fill_yield = expected_fill_yield(
+                    tick=market.tick,
+                    min_flow_shares=min_size,
+                    horizon_s=float(fill_horizon_s),
+                    quote_price=float(leg["price"]),
+                    leg_mid=float(leg["mid"]),
+                )
+                if fill_yield is None:
+                    unpriced += 1
+                    fill_yields = []
+                    break
+                fill_yields.append(fill_yield)
+            if not fill_yields:
                 continue
+            for leg, fill_yield in zip(legs, fill_yields):
+                leg["p_fill"] = fill_yield.p_fill
+                leg["stay_fraction"] = fill_yield.stay_fraction
+                leg["fill_yield_usd_per_usd_per_day"] = (
+                    fill_yield.fill_yield_usd_per_usd_per_day
+                )
+        # The pair's raw alpha is the leg the optimizer sees: the worse leg's
+        # quadratic multiplier. ``score_per_usd`` then scales that alpha to the
+        # pair Q_min per dollar of pair capital, so
+        # ``alpha * score_per_usd * capital`` is exactly ``Q_min(shares)``.
+        alpha = ((band_cents - binding_distance) / band_cents) ** 2
+        if alpha <= 0.0:
+            continue
+        score_per_usd = (q_min_per_share / pair_cost) / alpha
+        stay_fraction = 1.0
+        fill_yield_usd = 0.0
+        for leg in legs:
+            fill_yield_usd += (
+                float(leg.get("fill_yield_usd_per_usd_per_day", 0.0))
+                * float(leg["price"])
+                / pair_cost
+            )
+        if fill_yields:
+            for fill_yield in fill_yields:
+                stay_fraction *= fill_yield.stay_fraction
+        cheap_leg = min(legs, key=lambda leg: float(leg["price"]))
         candidates.append(
             {
                 "condition_id": market.condition_id,
@@ -208,44 +264,56 @@ def reward_candidates(
                 "denominator_bias_high": detail.bias_factor_high,
                 "max_spread": market.reward_max_spread_cents,
                 "min_size": min_size,
-                "real_mid": leg_mid,
-                # The score multiplier belongs to the distance *this* quote will
-                # actually rest at, so it is measured here, per candidate, and
-                # never defaulted by the allocator.
-                "spread_offset_cents": abs(quote_price - leg_mid) * 100.0,
-                # Venue score earned per USDC of resting capital: shares per
-                # dollar (1 / price) times the one-sided payout fraction.
-                "score_per_usd": score_fraction / quote_price,
+                "real_mid": mid_yes,
+                # The pair's binding (worse) leg distance: the distance the
+                # optimizer's alpha is measured at.
+                "spread_offset_cents": binding_distance,
+                # Pair Q_min per USDC of pair capital. The allocator multiplies
+                # this by ``calculate_alpha(spread_offset_cents)``.
+                "score_per_usd": score_per_usd,
                 "tokens": [
                     {"outcome": outcome, "token_id": token}
                     for outcome, token in zip(market.outcomes, market.token_ids)
                 ],
-                "quote_price": quote_price,
-                # One-sided pillar: one share commits its own quote price.
-                "capital_per_share": quote_price,
-                "quote_token": token_id,
+                # One candidate is one matched pair: this is the combined cost
+                # of one share on each leg, and the capital one pair-share
+                # commits.
+                "quote_price": pair_cost,
+                "pair_cost": pair_cost,
+                "capital_per_share": pair_cost,
+                "quote_token": cheap_leg["token_id"],
                 "quote_side": "bid",
                 "tick": market.tick,
-                "lot_price": quote_price,
-                # Expected fill side, both halves measured on the L2 tape. The
-                # optimiser maximises accrual + fill yield, so a book that never
-                # trades can no longer win on its thin competing score alone:
-                # the share it claims is only earned while the bid rests
-                # in-band and unfilled.
-                "p_fill": None if fill_yield is None else fill_yield.p_fill,
-                "stay_fraction": 1.0 if fill_yield is None else fill_yield.stay_fraction,
-                "fill_yield_usd_per_usd_per_day": (
-                    0.0 if fill_yield is None else fill_yield.fill_yield_usd_per_usd_per_day
-                ),
+                "lot_price": float(cheap_leg["price"]),
+                "legs": [
+                    {
+                        key: leg[key]
+                        for key in (
+                            "outcome",
+                            "token_id",
+                            "price",
+                            "mid",
+                            "distance_cents",
+                            "p_fill",
+                            "stay_fraction",
+                            "fill_yield_usd_per_usd_per_day",
+                        )
+                        if key in leg
+                    }
+                    for leg in legs
+                ],
+                # Expected fill side of the pair, both legs measured on the L2
+                # tape: the accrual only survives while both bids rest.
+                "p_fill": None if not fill_yields else 1.0 - stay_fraction,
+                "stay_fraction": stay_fraction,
+                "fill_yield_usd_per_usd_per_day": fill_yield_usd,
             }
         )
     if unpriced:
         log.info(
             f"reward candidates: refused {unpriced} market(s) whose fill probability "
             f"is unmeasured at a {fill_horizon_s:.0f}s horizon for their tick and "
-            f"required flow (a resting bid priced without it claims an accrual it "
+            f"required flow (a matched pair priced without it claims an accrual it "
             f"may not keep)"
         )
     return candidates
-
-

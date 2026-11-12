@@ -22,10 +22,10 @@ Environment=DUCKDB_MEMORY_LIMIT=1GB
 Environment=DUCKDB_THREADS=2
 
 # Execution Command
-# Default: two-sided dry-run of the live engine (quotes both legs; never places a
-# real order). The old one-sided paper pillar is retired in `paper.main`.
+# Default: the dual-sided paper trader (one bid on each outcome leg, one share
+# count, pair-level Q_min). It places no real orders.
 # Requires the canonical >=2 GB host profile from AGENTS.md.
-ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.live.runner --dry-run --initial-cash 3000 --duration 1800 --spread-offset 0.5 --db-path data/paper_engine.db
+ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --db data/paper_engine.db
 
 # Alternate modes (override via systemctl edit polymarketbot):
 #   Real Money Quoting (Blocked until Dec 1st - Requires --live, --yes, and populated credentials):
@@ -40,7 +40,7 @@ TimeoutStopSec=30s
 KillMode=mixed
 FinalKillSignal=SIGKILL
 
-# Host memory guard. The measured soak peaks at 441-558 MB plus the agent harness;
+# Host memory guard. The measured paper trading run peaks at 441-558 MB plus the agent harness;
 # run this unit only on the >=2 GB host profile (AGENTS.md).
 MemoryHigh=1.5G
 MemoryMax=2.0G

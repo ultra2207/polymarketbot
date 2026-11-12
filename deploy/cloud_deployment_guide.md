@@ -102,7 +102,7 @@ sudo netfilter-persistent save 2>/dev/null || true
 4. **Name**: `polymarketbot-aws`
 5. **Application and OS Images (AMI)**: Choose **Ubuntu Server 24.04 LTS (HVM), SSD Volume Type** (64-bit x86).
 6. **Instance Type**:
-   - Choose **`t3.small`** (2 vCPU, 2 GiB RAM). The 1 GiB free-tier `t2/t3.micro` is **not sufficient** for the full-universe soak (AGENTS.md host-memory rule); do not use it for the live canary.
+   - Choose **`t3.small`** (2 vCPU, 2 GiB RAM). The 1 GiB free-tier `t2/t3.micro` is **not sufficient** for the full-universe paper trading run (AGENTS.md host-memory rule); do not use it for the live canary.
 7. **Key Pair**:
    - Select an existing key pair or click **Create new key pair** (Type: `ED25519` or `RSA`, Name: `polymarket-aws-key`). Save the downloaded `.pem` file to `~/.ssh/polymarket-aws-key.pem`.
 8. **Network Settings**:
@@ -212,7 +212,7 @@ sudo journalctl -u polymarketbot -f -o cat
 
 ### Selecting Execution Modes
 
-By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Soak Daemon** across the 3 active production pillars ($1,000 each = $3,000 total):
+By default (leading to December 1st live launch), `polymarketbot.service` executes the **24/7 Live Paper Trader Daemon** across the 3 active production pillars ($1,000 each = $3,000 total):
 ```ini
 ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 ```
@@ -232,7 +232,7 @@ Paste your override in the opened editor:
 ```ini
 [Service]
 ExecStart=
-# --- Option 1: 3-Strategy Live Paper Soak Daemon ($3,000 virtual capital) ---
+# --- Option 1: 3-Strategy Live Paper Trader Daemon ($3,000 virtual capital) ---
 ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
 
 # --- Option 2: Live Real Money Quoter (BLOCKED until Dec 1st - requires real capital) ---

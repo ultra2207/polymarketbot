@@ -1,4 +1,4 @@
-# Paper-soak audit — cycle 4 (post-remediation)
+# Paper trader audit — cycle 4 (post-remediation)
 
 - Window: 2026-11-09 07:37:39 → 08:07:39 UTC (13:07:39 → 13:37:39 IST)
 - Command: `uv run python scripts/run_live_paper_soak.py --capital 3000 --duration 1800 --interval 10 --fresh`
@@ -37,7 +37,7 @@ intended effect of removing the fake fill/accounting paths, not a performance re
   `umaResolutionStatus=None` at 0.915/0.985 and were **not** force-settled on the
   indicative 0.99 print. Two honest `CLOB_EXIT` early harvests occurred at $0.999.
 - **Reward universe:** radar logs 2,390–2,401 primed pools (cycle 1: ~330 from one page).
-- **Logging:** 0 `print()` in `src/` and `scripts/`; per-source logs + `app.log`; the soak
+- **Logging:** 0 `print()` in `src/` and `scripts/`; per-source logs + `app.log`; the paper trading run
   process ran with 8 threads (cycle 1 pre-fix: 82).
 
 ## 3. Remaining findings and fixes applied for cycle 5
@@ -45,7 +45,7 @@ intended effect of removing the fake fill/accounting paths, not a performance re
 The three cycle-4 audits found, in addition to the verified fixes:
 
 - **Reward:** no order is ever placed (F1); three incompatible score conventions
-  (`compute_minimum_score` vs `normalise_two_sided` vs the soak's 2S/3 numerator and
+  (`compute_minimum_score` vs `normalise_two_sided` vs the paper trading run's 2S/3 numerator and
   Q1+Q2 denominator, F2); `mu(0)` ≈ 1 $/$/day with no plausibility ceiling (F3); 0.5 c
   sub-tick offset (F4); continuous `dt` instead of 1-minute epochs (F5); 68–97 s stale
   depth and fall-through on refresh failure (F6); `dt` catch-up after idle (F7);

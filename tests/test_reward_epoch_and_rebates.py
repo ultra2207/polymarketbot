@@ -290,19 +290,17 @@ def _run_reward_tick(
     )
     engine = _Engine(ledger, market, quote, now)
     monkeypatch.setattr(reward_runner.time, "time", lambda: now)
-    monkeypatch.setattr(
-        reward,
-        "measured_accrual",
-        lambda **kwargs: reward.AccrualShare(
-            usd_per_day=usd_per_day,
-            share=0.1,
-            our_score=1.0,
-            competing_score=9.0,
-            pool_usd_per_day=usd_per_day,
-            qualifies=True,
-            competing_samples=3,
-        ),
+    share = reward.AccrualShare(
+        usd_per_day=usd_per_day,
+        share=0.1,
+        our_score=1.0,
+        competing_score=9.0,
+        pool_usd_per_day=usd_per_day,
+        qualifies=True,
+        competing_samples=3,
     )
+    monkeypatch.setattr(reward, "measured_accrual", lambda **kwargs: share)
+    monkeypatch.setattr(reward, "measured_pair_accrual", lambda **kwargs: share)
     monkeypatch.setattr(reward, "reward_candidates", lambda *a, **kw: [])
     monkeypatch.setattr(reward, "plan_quotes", lambda *a, **kw: [])
     reward_runner.run_reward(

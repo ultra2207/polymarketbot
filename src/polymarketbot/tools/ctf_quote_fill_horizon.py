@@ -5,7 +5,7 @@ question: given that a trade printed at a level, did it clear the queue ahead of
 us?  That is not the question a resting quote asks.  A quote earns its edge only
 if a print arrives at all, and the print-conditional model carries no arrival
 rate - applied to a quote that rests for one engine tick it overstates the
-per-leg fill probability by an order of magnitude (the paper soak quoted 1,262
+per-leg fill probability by an order of magnitude (the paper trader quoted 1,262
 legs per tick for 30 minutes and filled none).
 
 This tool measures the horizon-matched quantity directly on the recorded L2
@@ -18,7 +18,7 @@ tape:
                   ``paper.pillars.reward.measured_fill_shares``)
 
 Placements are sampled on the engine's own tick grid (``--grid-s``, default the
-measured 5 s soak tick), so the sample is the population of quotes the engine
+measured 5 s paper-trading tick), so the sample is the population of quotes the engine
 would actually have rested, not a hand-picked subset.  The best bid is read
 as-of from the L2 event tape, not assumed from the print.
 
@@ -52,7 +52,7 @@ TAPE_DIR = _REPO_ROOT / "data" / "tape"
 DEFAULT_OUT = _REPO_ROOT / "data" / "derived" / "ctf_quote_fill_horizon.json"
 DEFAULT_MARKOUT_OUT = _REPO_ROOT / "data" / "derived" / "ctf_maker_markout.json"
 
-# Horizons are the requote lifetimes the engine can actually produce: one soak
+# Horizons are the requote lifetimes the engine can actually produce: one paper-trading run
 # tick, a handful of ticks, and a full rotating-slice revisit.  They are
 # measured durations (log: tick 4.4-5.1 s, full sweep every 48-52 ticks), not
 # tuning knobs.
