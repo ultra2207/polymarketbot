@@ -77,6 +77,11 @@ rows[rows.kind == "micro_risk_decision"].sort_values("recv_ts_ns")
 
 ## Limits to carry into the run
 
+- **The one-sided paper pillar is retired.** `python -m polymarketbot.paper.main`
+  refuses without `--legacy-one-sided`; it quoted one leg per market. The live engine
+  quotes both legs at one share count, and the service default is the two-sided
+  `live.runner --dry-run`. There is no two-sided tape-replay harness yet.
+
 - **Startup refuses live without a fitted microstructure calibration.** If
   `data/derived/risk_calibration.json` is absent the engine reports
   `micro_gate_active=False` and the runner aborts (exit 1) rather than trading with

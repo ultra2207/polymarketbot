@@ -34,11 +34,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite journal path")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore the last durable snapshot and start from --capital")
+    parser.add_argument(
+        "--legacy-one-sided",
+        action="store_true",
+        help=(
+            "Retired research path: run the one-sided RewardHarvester paper pillar. "
+            "The live engine quotes both legs; without this flag the paper entry "
+            "point refuses to run a one-sided book."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not args.legacy_one_sided:
+        log.critical(
+            "The one-sided RewardHarvester paper pillar is retired: it quoted one "
+            "leg per market, which is a directional bet, not a hedged pair. The "
+            "live engine quotes both legs at one share count. For a two-sided "
+            "quote/risk soak use: python -m polymarketbot.live.runner --dry-run "
+            "--initial-cash 3000 --duration 1800 --db-path data/paper_engine.db. "
+            "The legacy one-sided research path requires --legacy-one-sided."
+        )
+        return 2
     if args.capital <= 0.0:
         log.error("--capital must be positive")
         return 2

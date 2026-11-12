@@ -55,8 +55,10 @@ runs have already wasted hours here.
   unreviewable after the fact, cannot be re-run or amended without rewriting it, and
   buries the result in a wall of echoed source. `tmp_python/` is gitignored.
 - **Anything run repeatedly lives in `src/polymarketbot/` and is invoked with
-  `python -m`.** The live paper soak is `polymarketbot.paper.main`, not a script:
-  `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10`.
+  `python -m`.** The two-sided soak is `polymarketbot.live.runner --dry-run`:
+  `uv run python -m polymarketbot.live.runner --dry-run --initial-cash 3000 --duration 1800 --spread-offset 0.5 --db-path data/paper_engine.db`.
+  The one-sided `polymarketbot.paper.main` pillar is retired and refuses to run
+  without `--legacy-one-sided` (it quoted one leg per market, a directional bet).
 - A long-lived entry point that grows past a few hundred lines is a design error: split
   it into modules under its package, where each decision rule is testable without I/O.
 
@@ -235,8 +237,13 @@ round trip before it takes effect. This is not optional:
    used verbatim every cycle (the operator watches its output live):
 
    ```
-   uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --fresh --db data/paper_soak_telemetry.db
+   uv run python -m polymarketbot.live.runner --dry-run --initial-cash 3000 --duration 1800 --spread-offset 0.5 --db-path data/paper_engine.db
    ```
+
+   The one-sided paper pillar is retired; `paper.main` refuses unless
+   `--legacy-one-sided` is passed. This dry-run quotes **both legs** and records
+   quote/risk telemetry; it does not replay tape fills (a two-sided replay
+   harness is not yet implemented), so use live canary fills for fill economics.
 
    Run this as a **normal foreground command** with a **2000-second timeout** — not as a
    background job, not as a named service, and **not through a PTY**. Use plain

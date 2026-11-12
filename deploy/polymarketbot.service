@@ -22,10 +22,10 @@ Environment=DUCKDB_MEMORY_LIMIT=1GB
 Environment=DUCKDB_THREADS=2
 
 # Execution Command
-# Default: 24/7 zero-capital paper soak of the single live pillar (RewardHarvester).
-# Requires the canonical >=2 GB host profile from AGENTS.md; the 1 GB t3.micro was
-# measured to restart under the full-universe walk.
-ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10
+# Default: two-sided dry-run of the live engine (quotes both legs; never places a
+# real order). The old one-sided paper pillar is retired in `paper.main`.
+# Requires the canonical >=2 GB host profile from AGENTS.md.
+ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.live.runner --dry-run --initial-cash 3000 --duration 1800 --spread-offset 0.5 --db-path data/paper_engine.db
 
 # Alternate modes (override via systemctl edit polymarketbot):
 #   Real Money Quoting (Blocked until Dec 1st - Requires --live, --yes, and populated credentials):
