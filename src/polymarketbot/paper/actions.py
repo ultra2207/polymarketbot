@@ -128,6 +128,11 @@ def land_taker(engine, strategy: str, payload: dict, books: dict[str, dict]) -> 
     requested = float(payload["shares"])
     pathway = str(payload.get("pathway") or "deskew")
     condition_id = str(payload.get("condition_id") or "")
+    # The decision price is the limit the cross was submitted at. A landing
+    # book that has moved through it must not be swept level by level at any
+    # price: that would book a fill the live taker order could not have got.
+    limit_price = payload.get("decision_price")
+    limit = float(limit_price) if limit_price is not None else None
     if side not in ("BUY", "SELL") or requested <= 0.0:
         return
     schedule = payload.get("fee_schedule")
@@ -159,6 +164,14 @@ def land_taker(engine, strategy: str, payload: dict, books: dict[str, dict]) -> 
 
     remaining, filled, cost, fee = requested, 0.0, 0.0, 0.0
     for price, size in levels:
+        # BUY crosses asks in ascending price order; SELL crosses bids in
+        # descending order. Once the book is worse than the submitted limit,
+        # every later level is worse too.
+        if limit is not None and (
+            (side == "BUY" and price > limit + 1e-12)
+            or (side == "SELL" and price < limit - 1e-12)
+        ):
+            break
         take = min(size, remaining)
         if take <= 0.0:
             continue
@@ -169,7 +182,11 @@ def land_taker(engine, strategy: str, payload: dict, books: dict[str, dict]) -> 
         if remaining <= 1e-9:
             break
     if filled <= 0.0:
-        log.warning(f"taker landing refused for {token_id[:12]}: empty book side")
+        log.warning(
+            f"taker landing refused for {token_id[:12]}: no "
+            f"{'ask' if side == 'BUY' else 'bid'} at or better than the "
+            f"decision price {limit!r}"
+        )
         return
     price = cost / filled
 

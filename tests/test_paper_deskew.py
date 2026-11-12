@@ -20,7 +20,7 @@ from loguru import logger
 from polymarketbot.fees import FeeSchedule, taker_fee
 from polymarketbot.paper import deskew as deskew_mod
 from polymarketbot.paper import engine as engine_mod
-from polymarketbot.paper.actions import TAKER_KIND
+from polymarketbot.paper.actions import TAKER_KIND, land_taker
 from polymarketbot.paper.deskew import DeskewState
 from polymarketbot.strategy.reward.deskew import (
     DeSkewCalibration,
@@ -266,12 +266,12 @@ def test_long_yes_synthetic_merge_buys_the_missing_leg_then_merges(tmp_path):
     assert [lot.token_id for lot in engine.ledger.positions(STRATEGY)] == ["yes"]
 
     _wait_for_landing()
-    landing = {"yes": _book(0.43, 0.45), "no": _book(0.53, 0.55)}
+    landing = {"yes": _book(0.43, 0.45), "no": _book(0.52, 0.54)}
     engine._land(landing, [])
     tokens = {lot.token_id: lot.shares for lot in engine.ledger.positions(STRATEGY)}
     assert tokens["no"] == pytest.approx(40.0)
-    fee = taker_fee(40.0, 0.55, schedule)
-    assert engine.ledger.cash(STRATEGY) == pytest.approx(cash_before - 40.0 * 0.55 - fee)
+    fee = taker_fee(40.0, 0.54, schedule)
+    assert engine.ledger.cash(STRATEGY) == pytest.approx(cash_before - 40.0 * 0.54 - fee)
 
     engine._merge(landing)
     assert engine.deskew.merges == 1
@@ -279,7 +279,7 @@ def test_long_yes_synthetic_merge_buys_the_missing_leg_then_merges(tmp_path):
     assert tokens == {"yes": 260.0}
     gas = engine.deskew.gas_cost_usd
     assert engine.ledger.cash(STRATEGY) == pytest.approx(
-        cash_before - 40.0 * 0.55 - fee + 40.0 - gas
+        cash_before - 40.0 * 0.54 - fee + 40.0 - gas
     )
     engine.ledger.close()
 
@@ -332,17 +332,17 @@ def test_long_yes_direct_cross_sells_the_excess_leg_at_the_landing_bid(tmp_path)
     assert decision.target_token == "YES" and decision.action_side == "SELL"
 
     _wait_for_landing()
-    landing = {"yes": _book(0.40, 0.42), "no": _book(0.58, 0.60)}
+    landing = {"yes": _book(0.44, 0.46), "no": _book(0.58, 0.60)}
     engine._land(landing, [])
     tokens = {lot.token_id: lot.shares for lot in engine.ledger.positions(STRATEGY)}
     assert tokens == {"yes": 260.0}
-    fee = taker_fee(40.0, 0.40, schedule)
+    fee = taker_fee(40.0, 0.44, schedule)
     assert engine.ledger.cash(STRATEGY) == pytest.approx(
-        cash_before + 40.0 * 0.40 - fee
+        cash_before + 40.0 * 0.44 - fee
     )
     rows = _journal(str(tmp_path / "deskew.db"))
     assert rows[-1][0] == "sell"
-    assert rows[-1][6] == pytest.approx(40.0 * 0.40 - fee)
+    assert rows[-1][6] == pytest.approx(40.0 * 0.44 - fee)
     engine.ledger.close()
 
 
@@ -384,6 +384,30 @@ def test_passive_fade_reprices_the_missing_leg_in_bid_space(tmp_path):
     engine.ledger.close()
 
 
+def test_taker_does_not_sweep_through_the_decision_limit(tmp_path):
+    """A worse landing book is a miss, not a fill at an arbitrary price."""
+    schedule = FeeSchedule(rate=0.05, exponent=1.0, taker_only=True,
+                           rebate_rate=0.0, source="test")
+    engine = _engine(tmp_path, {"no": _book(0.54, 0.56)})
+    cash_before = engine.ledger.cash(STRATEGY)
+    payload = {
+        "condition_id": "c1",
+        "token_id": "no",
+        "side": "BUY",
+        "shares": 40.0,
+        "pathway": "SYNTHETIC_MERGE",
+        "decision_price": 0.55,
+        "fee_schedule": schedule,
+    }
+
+    # The ask is already one tick through the submitted limit.
+    land_taker(engine, STRATEGY, payload, {"no": _book(0.54, 0.56)})
+
+    assert engine.ledger.cash(STRATEGY) == pytest.approx(cash_before)
+    assert engine.ledger.positions(STRATEGY) == []
+    engine.ledger.close()
+
+
 def test_taker_lands_at_the_landing_book_and_reports_a_partial_fill(tmp_path):
     schedule = FeeSchedule(rate=0.05, exponent=1.0, taker_only=True,
                            rebate_rate=0.0, source="test")
@@ -399,14 +423,14 @@ def test_taker_lands_at_the_landing_book_and_reports_a_partial_fill(tmp_path):
     # The landing book has only 25 shares at the bid; the 40-share request
     # fills partially even though the decision snapshot showed 1000.
     _wait_for_landing()
-    landing = {"yes": _book(0.40, 0.42, size=25.0), "no": _book(0.58, 0.60)}
+    landing = {"yes": _book(0.44, 0.46, size=25.0), "no": _book(0.58, 0.60)}
     engine._land(landing, [])
 
     tokens = {lot.token_id: lot.shares for lot in engine.ledger.positions(STRATEGY)}
     assert tokens == {"yes": 275.0}
-    fee = taker_fee(25.0, 0.40, schedule)
+    fee = taker_fee(25.0, 0.44, schedule)
     assert engine.ledger.cash(STRATEGY) == pytest.approx(
-        cash_before + 25.0 * 0.40 - fee
+        cash_before + 25.0 * 0.44 - fee
     )
     engine.ledger.close()
 
@@ -515,15 +539,15 @@ def test_merge_and_synthetic_cross_keep_cash_and_inventory_reconciled(tmp_path):
     engine._deskew(books, _prints())
     assert engine.deskew.last_decision["c1"].pathway is DeSkewPathway.DIRECT_CROSS
     _wait_for_landing()
-    landing = {"yes": _book(0.40, 0.42), "no": _book(0.58, 0.60)}
+    landing = {"yes": _book(0.44, 0.46), "no": _book(0.58, 0.60)}
     engine._land(landing, [])
 
     tokens = {lot.token_id: lot.shares for lot in engine.ledger.positions(STRATEGY)}
     assert tokens == {"yes": 160.0}
-    fee = taker_fee(40.0, 0.40, schedule)
+    fee = taker_fee(40.0, 0.44, schedule)
     gas = engine.deskew.gas_cost_usd
     assert engine.ledger.cash(STRATEGY) == pytest.approx(
-        cash_before - 100.0 * 0.54 + 100.0 - gas + 40.0 * 0.40 - fee
+        cash_before - 100.0 * 0.54 + 100.0 - gas + 40.0 * 0.44 - fee
     )
     # Directional exposure shrank by the merged sets and the crossed shares.
     assert tokens["yes"] == pytest.approx(net_before - 100.0 - 40.0)
