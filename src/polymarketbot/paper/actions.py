@@ -16,11 +16,15 @@ import uuid
 from dataclasses import dataclass
 
 import polymarketbot.strategy.venue.reads as venue
+from polymarketbot.fees import taker_fee
 from polymarketbot.logs import get_logger
 from polymarketbot.risk.queue_position import QueuePositionTracker
 from polymarketbot.strategy.books import ladder
 
 log = get_logger(__name__)
+
+#: ``ActionBook`` kind for a Tier-2 deskew cross (``paper.deskew`` submits it).
+TAKER_KIND = "deskew_taker"
 
 
 def new_order_id(strategy: str, token_id: str) -> str:
@@ -109,10 +113,108 @@ def probe_loop(engine) -> None:
         engine._stop.wait(engine._rtt_refresh_s)
 
 
+def land_taker(engine, strategy: str, payload: dict, books: dict[str, dict]) -> None:
+    """Land a Tier-2 cross against the book that exists now, not the decision.
+
+    The action reached ``ActionBook.due()`` only after the measured CLOB round
+    trip, so ``books`` is the post-flight snapshot. Depth is consumed level by
+    level, so a fill is partial exactly when the landing book is thinner than
+    the requested size, and the venue's taker fee is charged per executed price.
+    A missing book, fee schedule or cash refuses the landing and leaves the
+    ledger untouched.
+    """
+    token_id = str(payload["token_id"])
+    side = str(payload["side"]).upper()
+    requested = float(payload["shares"])
+    pathway = str(payload.get("pathway") or "deskew")
+    condition_id = str(payload.get("condition_id") or "")
+    if side not in ("BUY", "SELL") or requested <= 0.0:
+        return
+    schedule = payload.get("fee_schedule")
+    if schedule is None:
+        log.error(
+            f"taker landing refused for {token_id[:12]}: no measured fee schedule, "
+            "a taker fill cannot be priced as free"
+        )
+        return
+    if side == "SELL":
+        available = sum(
+            lot.shares
+            for lot in engine.ledger.positions(strategy)
+            if lot.token_id == token_id
+        )
+        requested = min(requested, available)
+        if requested <= 0.0:
+            log.warning(
+                f"taker landing refused for {token_id[:12]}: no inventory left to sell"
+            )
+            return
+    levels = ladder(books.get(token_id) or {}, asks=(side == "BUY"))
+    if not levels:
+        log.warning(
+            f"taker landing refused for {token_id[:12]}: no "
+            f"{'ask' if side == 'BUY' else 'bid'} book at landing"
+        )
+        return
+
+    remaining, filled, cost, fee = requested, 0.0, 0.0, 0.0
+    for price, size in levels:
+        take = min(size, remaining)
+        if take <= 0.0:
+            continue
+        cost += take * price
+        fee += taker_fee(take, price, schedule)
+        filled += take
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if filled <= 0.0:
+        log.warning(f"taker landing refused for {token_id[:12]}: empty book side")
+        return
+    price = cost / filled
+
+    if side == "BUY":
+        if cost + fee > engine.ledger.cash(strategy) + 1e-9:
+            log.warning(
+                f"taker landing refused for {token_id[:12]}: BUY "
+                f"{filled:.2f} @ ${price:.4f} + fee ${fee:.5f} exceeds cash "
+                f"${engine.ledger.cash(strategy):.2f}"
+            )
+            return
+        if not engine.ledger.buy(
+            strategy,
+            condition_id=condition_id,
+            token_id=token_id,
+            shares=filled,
+            price=price,
+            fee=fee,
+            tag=f"deskew_{pathway}",
+        ):
+            log.warning(f"taker landing refused for {token_id[:12]}: ledger refused")
+            return
+    else:
+        engine.ledger.sell(
+            strategy,
+            condition_id=condition_id,
+            token_id=token_id,
+            shares=filled,
+            price=price,
+            fee=fee,
+            tag=f"deskew_{pathway}",
+        )
+    log.warning(
+        f"paper de-skew landing ({pathway}): {side} {filled:.2f}/{requested:.2f} "
+        f"{token_id[:12]} VWAP ${price:.4f} fee ${fee:.5f} "
+        f"[{'partial' if filled + 1e-9 < requested else 'full'} fill]"
+    )
+
+
 def land(engine, books: dict[str, dict], prints: list[venue.Print]) -> None:
     for action in engine.actions.due():
         payload = action.payload
-        if action.kind == "reward_cancel":
+        if action.kind == TAKER_KIND:
+            land_taker(engine, action.strategy, payload, books)
+        elif action.kind == "reward_cancel":
             resting = engine.reward_quotes.pop(payload["token_id"], None)
             if resting is not None and resting.order_id:
                 queue_tracker(engine).drop(resting.token_id, resting.order_id)

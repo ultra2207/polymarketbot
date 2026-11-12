@@ -25,6 +25,7 @@ import polymarketbot.strategy.reward.decision as reward
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
 from polymarketbot.paper.actions import Resting, new_order_id, queue_tracker
+from polymarketbot.paper.deskew import skew_target
 from polymarketbot.strategy.books import ladder
 from polymarketbot.strategy.reward.accrual import (
     REWARD_ELIGIBILITY_SECONDS,
@@ -390,6 +391,10 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
     engine._shadow_yield = shadow_state.get("shadow_yield")
     for token_id, quote in wanted.items():
         current = engine.reward_quotes.get(token_id)
+        # A passive fade re-prices this leg; the pair is no longer the symmetric
+        # bid pair the planner priced, so the deskew price is what rests.
+        skew = skew_target(engine, token_id)
+        price = float(quote.price) if skew is None else float(skew.price)
         # An order is gone once it has fully filled (``shares == 0``) or has
         # been cancelled. The fill path leaves a fully-filled quote in place
         # with ``cancel_at is None``, so treating merely "present at the same
@@ -405,7 +410,7 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
         if (
             current is not None
             and not gone
-            and abs(current.price - quote.price) < 1e-9
+            and abs(current.price - price) < 1e-9
         ):
             current.daily_payout = quote.daily_payout
             continue
@@ -415,12 +420,18 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                                   {"token_id": token_id})
         landing = now + engine._rtt()
         resting = Resting("RewardHarvester", quote.condition_id, token_id,
-                          quote.price, quote.shares, quote.min_size, landing,
+                          price, quote.shares, quote.min_size, landing,
                           tick=engine.by_condition[quote.condition_id].tick,
                           daily_payout=quote.daily_payout, seen_ts=landing,
                           initial_shares=quote.shares)
         engine.actions.submit("reward_quote", "RewardHarvester",
                               {"token_id": token_id, "resting": resting})
+        if skew is not None and abs(price - float(quote.price)) > 1e-9:
+            log.info(
+                f"reward quote {token_id[:12]} placed at de-skew "
+                f"{skew.pathway} ${price:.3f} (planner ${quote.price:.3f}): "
+                f"{skew.reason}"
+            )
     if not wanted and engine._reserved(engine.reward_quotes) > 0.0:
         # Cash is already committed to resting bids: hold them rather than
         # cancelling and re-quoting the same liquidity every tick.

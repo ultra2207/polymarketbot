@@ -21,6 +21,7 @@ from typing import Any
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import actions as venue_actions
+from polymarketbot.paper import deskew as paper_deskew
 from polymarketbot.paper.actions import Resting
 from polymarketbot.paper.pillars import reward_runner
 from polymarketbot.risk.queue_position import QueuePositionTracker
@@ -47,6 +48,7 @@ class PaperEngine:
         duration: float | None = None,
         resume: bool = False,
         rtt_refresh_s: float = 60.0,
+        deskew: paper_deskew.DeskewState | None = None,
     ) -> None:
         self.interval = max(1.0, float(interval))
         self.duration = duration
@@ -79,6 +81,11 @@ class PaperEngine:
         #: None until solved; the CTF gate refuses rather than assumes 0.
         self._shadow_yield: float | None = None
         self.reward_quotes: dict[str, Resting] = {}
+        #: Complete-set merge and de-skew state, built once from the measured
+        #: artifacts (calibration, gas, remaining-life reference). A refusal is
+        #: carried as a reason on the state: quoting continues, the merge and
+        #: the cross do not run.
+        self.deskew = deskew if deskew is not None else paper_deskew.build_state()
         #: FIFO position of every resting reward quote, reconstructed from the
         #: L2 book and the public prints (``risk/queue_position.py``). Fills are
         #: booked from this position, not from a pro-rata share of the level.
@@ -161,6 +168,15 @@ class PaperEngine:
                 notional[quote.condition_id] = notional.get(quote.condition_id, 0.0) + (
                     quote.shares * quote.price
                 )
+        # Held inventory needs its tape too: the de-skew optimizer sizes its
+        # holding horizon from this condition's measured print rate, and a
+        # one-legged position whose other quote is gone would otherwise be
+        # unmeasured and silently un-deskewed.
+        for strategy in STRATEGIES:
+            for lot in self.ledger.positions(strategy):
+                notional[lot.condition_id] = notional.get(lot.condition_id, 0.0) + (
+                    lot.shares * lot.mark()
+                )
         if notional:
             # Spend the bounded tape budget on the conditions holding the most
             # capital first; a $0.30 long-shot leg does not outrank a $400 bid.
@@ -173,8 +189,18 @@ class PaperEngine:
         self._land(books, prints)
         self._stage("land", stage0)
         stage0 = time.monotonic()
+        # The deskew decision is made on settled inventory, before the planner
+        # re-solves, so a passive fade is what this tick's plan rests.
+        self._deskew(books, prints)
+        self._stage("deskew", stage0)
+        stage0 = time.monotonic()
         self._reward(books, prints)
         self._stage("reward", stage0)
+        stage0 = time.monotonic()
+        # Merge after the fill pass: a pair completed this tick is merged on the
+        # same tick, at the measured gas price.
+        self._merge(books)
+        self._stage("merge", stage0)
         stage0 = time.monotonic()
         self._mark(books)
         self._stage("mark", stage0)
@@ -274,12 +300,19 @@ class PaperEngine:
                  # The pillar owns its own cash, so the reserve is shown against
                  # the balance it is actually drawn on.
                  f" reserved=reward {self._reserved(self.reward_quotes):.2f}"
-                 f"/{self.ledger.cash('RewardHarvester'):.2f})")
+                 f"/{self.ledger.cash('RewardHarvester'):.2f})"
+                 f" | de-skew merges={self.deskew.merges} "
+                 f"takers={self.deskew.takers}"
+                 f"{' refused: ' + self.deskew.merge_refusal if self.deskew.merge_refusal else ''}")
 
     # -- delegates: the moved implementations, original names ------------
     def _refresh_venue_state(self) -> None: return venue_actions.refresh_venue_state(self)
     def _probe_loop(self) -> None: return venue_actions.probe_loop(self)
     def _land(self, books, prints) -> None: return venue_actions.land(self, books, prints)
+    def _deskew(self, books, prints) -> None:
+        return paper_deskew.run_deskew(self, books, prints, STRATEGIES)
+    def _merge(self, books) -> None:
+        return paper_deskew.run_merges(self, books, STRATEGIES)
     def _reward(self, books, prints) -> None: return reward_runner.run_reward(self, books, prints)
     def _apply_resting_fills(self, resting, strategy, books, prints, now) -> None:
         return reward_runner.apply_resting_fills(

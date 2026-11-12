@@ -18,6 +18,7 @@ import sys
 from polymarketbot.gamma import GammaClient
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import BookFeed, PaperEngine, RttProbe, session
+from polymarketbot.paper.deskew import build_state as build_deskew_state
 from polymarketbot.paper.engine import STRATEGIES
 
 log = get_logger(__name__)
@@ -56,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     log.info(f"Measured CLOB round trip p50={measured * 1000.0:.1f}ms")
 
+    # Measure merge gas (and the de-skew calibration) before the first tick: a
+    # missing measurement disables merging/de-skewing with a stated reason
+    # rather than merging on an assumed zero.
+    deskew_state = build_deskew_state(measure_gas=True)
+
     engine = PaperEngine(
         cash,
         http=http,
@@ -66,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         interval=args.interval,
         duration=args.duration,
         resume=not args.fresh,
+        deskew=deskew_state,
     )
 
     def _stop(signum: int, _frame: object) -> None:
