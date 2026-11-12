@@ -90,7 +90,7 @@ def test_measured_inputs_are_all_provenanced(monkeypatch):
 
 def test_competing_score_is_measured_from_the_book_when_absent(monkeypatch):
     _install_tables(monkeypatch)
-    monkeypatch.setattr(sizing_mod, "_compute_competing_score", lambda session, token, band: 250.0)
+    monkeypatch.setattr(sizing_mod, "_compute_competing_score", lambda session, token_yes, band, token_no: 250.0)
 
     measured = _measure(competing_score=None, http_session=SimpleNamespace(close=lambda: None))
 
@@ -105,7 +105,7 @@ def test_refuses_without_a_measured_mid(monkeypatch):
 
 def test_refuses_without_a_measured_competing_score(monkeypatch):
     _install_tables(monkeypatch)
-    monkeypatch.setattr(sizing_mod, "_compute_competing_score", lambda session, token, band: None)
+    monkeypatch.setattr(sizing_mod, "_compute_competing_score", lambda session, token_yes, band, token_no: None)
 
     assert _measure(competing_score=None) is None
 
