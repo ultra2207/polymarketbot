@@ -207,9 +207,9 @@ def test_tick_feeds_measured_mids_and_marked_equity_to_the_risk_manager(
     assert rm.portfolio_state.current_cash_usd == pytest.approx(
         engine.ledger.cash(STRATEGY)
     )
-    # 100 shares bought at $0.40, marked at a $0.55 bid.
-    assert rm.portfolio_state.daily_unrealized_pnl == pytest.approx(15.0)
-    assert rm.portfolio_state.current_equity_usd == pytest.approx(1015.0)
+    # 100 shares bought at $0.40, marked at the $0.555 mid.
+    assert rm.portfolio_state.daily_unrealized_pnl == pytest.approx(15.5)
+    assert rm.portfolio_state.current_equity_usd == pytest.approx(1015.5)
     assert rm.portfolio_state.last_heartbeat_timestamp >= heartbeat_before
     # Both outcome mids of the market were observed; the 2 c breaker sees them.
     assert rm.volatility_monitor.last_mid["yes"] == pytest.approx(0.50)
@@ -315,14 +315,14 @@ def test_max_drawdown_breaker_halts_after_a_peak(tmp_path, monkeypatch):
     )
     _plan(monkeypatch, [])
 
-    # Peak: $500 cash + 1000 x $0.65 = $1,150.
+    # Peak: $500 cash + 1000 x $0.655 mid = $1,155.
     books["yes"] = _book(0.65, 0.66)
     engine._tick()
-    assert engine.risk_manager.portfolio_state.peak_equity_usd == pytest.approx(1150.0)
+    assert engine.risk_manager.portfolio_state.peak_equity_usd == pytest.approx(1155.0)
     assert engine.risk_manager.portfolio_state.is_halted is False
 
-    # Trough: $500 + 1000 x $0.52 = $1,020. The day is still +$20 over its
-    # $1,000 opening equity, so only the cumulative drawdown can trip:
+    # Trough: $500 + 1000 x $0.525 mid = $1,025. The day is still +$25 over
+    # its $1,000 opening equity, so only the cumulative drawdown can trip:
     # $130 = 11.3 % of the peak, over the shared 10 % limit.
     books["yes"] = _book(0.52, 0.53)
     engine._tick()

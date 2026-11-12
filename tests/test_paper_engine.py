@@ -193,6 +193,23 @@ def test_rtt_probe_is_refreshed_on_its_cadence_not_only_at_startup(
     engine.ledger.close()
 
 
+def test_mark_infers_a_missing_leg_from_the_binary_complement(tmp_path, fake_venue):
+    """A missing NO book is valued at 1 - YES mid, not left unmarked."""
+    market, _books = fake_venue
+    engine = _engine(tmp_path, {})
+    engine.by_condition = {"c1": market}
+    assert engine.ledger.buy(
+        "RewardHarvester", condition_id="c1", token_id="no",
+        shares=100.0, price=0.10,
+    )
+    engine._mark({"yes": _book(0.60, 0.62)})
+    lot = engine.ledger.positions("RewardHarvester")[0]
+    assert lot.mark_live is True
+    assert lot.last_mark == pytest.approx(0.39)
+    assert engine.ledger.unmarked("RewardHarvester") == []
+    engine.ledger.close()
+
+
 def test_mark_stage_flags_a_vanished_book_once_then_clears(tmp_path):
     """No book: flag the lot, keep the last measurement, log one transition."""
     from loguru import logger
@@ -211,7 +228,7 @@ def test_mark_stage_flags_a_vanished_book_once_then_clears(tmp_path):
         engine._mark({"tok9": _book(0.55, 0.56)})
         assert lot.mark_live is True
         assert engine.ledger.equity()["RewardHarvester"] == pytest.approx(
-            100.0 - 40.0 + 100.0 * 0.55
+            100.0 - 40.0 + 100.0 * 0.555
         )
 
         engine._mark({})
@@ -224,7 +241,7 @@ def test_mark_stage_flags_a_vanished_book_once_then_clears(tmp_path):
 
         engine._mark({"tok9": _book(0.60, 0.61)})
         assert lot.mark_live is True
-        assert lot.last_mark == pytest.approx(0.60)
+        assert lot.last_mark == pytest.approx(0.605)
         assert engine.ledger.unmarked("RewardHarvester") == []
     finally:
         logger.remove(sink_id)

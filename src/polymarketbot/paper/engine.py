@@ -27,7 +27,7 @@ from polymarketbot.paper.actions import Resting
 from polymarketbot.paper.pillars import reward_runner
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.queue_position import QueuePositionTracker
-from polymarketbot.strategy.books import best_bid
+from polymarketbot.strategy.books import best_bid, mid
 from polymarketbot.strategy.latency import ActionBook, RttProbe
 from polymarketbot.strategy.ledger import Ledger
 
@@ -271,8 +271,17 @@ class PaperEngine:
                 # value is the mark.
                 if lot.par_value is not None:
                     continue
-                bid = best_bid(books.get(lot.token_id) or {})
-                if bid is None:
+                # Live marks inventory at the fresh mid, not the bid, and
+                # cross-infers the missing leg from the binary complement
+                # (``live/engine/accounting.py::_mark_prices``). Paper must use
+                # the same convention or its equity and risk breakers read a
+                # different account than the live engine's.
+                price = mid(books.get(lot.token_id) or {})
+                source = "mid"
+                if price is None:
+                    price = self._complement_mid(books, lot.token_id)
+                    source = "complement mid"
+                if price is None:
                     # Never invent a price to fill the gap. Keep the last real
                     # measurement as the value, clear `mark_live`, and say so
                     # once per measured -> unmeasured transition.
@@ -280,13 +289,33 @@ class PaperEngine:
                         log.warning(
                             f"mark unmeasured: {strategy} {lot.token_id[:10]} "
                             f"{lot.shares:.2f} shares held at ${lot.mark():.4f} "
-                            f"(last live ${lot.last_mark:.4f}); no bid this tick"
+                            f"(last live ${lot.last_mark:.4f}); no two-sided book "
+                            "and no complementary mid this tick"
                         )
-                elif self.ledger.mark(lot.token_id, bid, strategy):
+                elif self.ledger.mark(lot.token_id, price, strategy):
                     log.info(
                         f"mark live: {strategy} {lot.token_id[:10]} "
-                        f"{lot.shares:.2f} shares at bid ${bid:.4f}"
+                        f"{lot.shares:.2f} shares at {source} ${price:.4f}"
                     )
+
+    def _complement_mid(self, books: dict[str, dict], token_id: str) -> float | None:
+        """The missing leg's fair value from its binary complement, or None.
+
+        Only a two-token condition has complements; a neg-risk or multi-leg
+        market must not be priced from an unrelated sibling.
+        """
+        for market in self.by_condition.values():
+            ids = tuple(market.token_ids)
+            if len(ids) != 2 or token_id not in ids:
+                continue
+            other = ids[1] if token_id == ids[0] else ids[0]
+            other_mid = mid(books.get(other) or {})
+            if other_mid is None:
+                continue
+            price = 1.0 - other_mid
+            if 0.0 < price < 1.0:
+                return price
+        return None
 
     def _rtt(self) -> float:
         """Measured CLOB round trip, or refuse to schedule at zero latency.
