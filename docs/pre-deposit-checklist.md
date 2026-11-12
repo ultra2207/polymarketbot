@@ -14,28 +14,41 @@ Run in order. Nothing here places an order until step 4.
 uv run python -m polymarketbot.live.runner --live --yes \
   --condition-id <non-neg-risk-condition-id> \
   --token-yes <yes-token-id> --token-no <no-token-id> \
-  --min-size 5 --quote-size 5 --daily-reward 0 \
-  --max-budget 20 --duration 3600 --record-live-data
+  --min-size 20 --quote-size 20 --daily-reward 0 \
+  --max-budget 40 --duration 3600 --record-live-data
 ```
 
-## The order-size rule (why 5 shares is not a size)
+## The order-size rule (equal shares, not equal dollars)
 
-The market's `orderMinSize` is a **$5 USDC notional**, not a share count, so a
-5-share quote is sub-minimum on any leg priced below $1.00. The runner therefore
-sizes both legs at one share count — the count that clears the minimum on the
-cheap leg:
+There are **two separate minimums**:
+
+- **Venue:** `orderMinSize` is a **$5 USDC notional per order** (each leg is its own
+  order). A 5-share quote is sub-minimum on any leg priced below $1.00.
+- **Rewards campaign:** `rewards_min_size` is a **share count per side** (20 shares on
+  ~72% of markets, 50/200 on others). `--min-size` is this campaign count, not the $5
+  notional. The old `--min-size 5` command was below the campaign minimum and earned
+  `$0` rewards.
+
+The runner sizes both legs at one share count — the count that clears the campaign
+minimum and the notional on the cheap leg:
 
 ```
-q = max(configured, ceil(orderMinSize / (cheap_leg_price - one tick)))
+q = max(rewards_min_size, ceil(orderMinSize / (cheap_leg_price - one tick)))
 pair cost = q * (p_yes + p_no)          # <= q, since a binary pair is <= $1
 ```
 
-Both legs quote at `q`; the legs are never sized by equal dollars, because that
-leaves an unhedged residual in the cheap leg. If one matched pair costs more
-than the sizing cap (`--max-budget`, or `--budget-pct` of the wallet), startup
-**aborts** with the exact dollar amount needed instead of quoting one leg
-against a different share count. At `q=11` on a 0.50/0.50 market the pair is
-about $10.9, so `--max-budget 20` leaves headroom for a reprice.
+Both legs quote at `q`. **Never size by equal dollars.** At 0.80/0.20, $5 on each
+side is 6.25 YES + 25 NO: an 18.75-share directional residual, and the YES side is
+below the 20-share campaign minimum. Equal shares at `q=25` is 25 YES ($20) + 25 NO
+($5) = a $25 matched pair; the expensive leg carries more dollars because it owns the
+same number of shares, and the pair redeems at $25. The venue's $5 floor is already
+met on the cheap leg by construction.
+
+If one matched pair costs more than the sizing cap (`--max-budget`, or
+`--budget-pct` of the wallet), startup **aborts** with the exact dollar amount needed
+instead of quoting one leg against a different share count. At `q=20` on a
+0.50/0.50 market the pair is about $20, so `--max-budget 40` leaves headroom for a
+reprice and the 5% cash reserve.
 
 ## What step 2 checks
 
