@@ -236,7 +236,20 @@ class PaperEngine:
                     )
 
     def _rtt(self) -> float:
-        return self.rtt.p50() or 0.0
+        """Measured CLOB round trip, or refuse to schedule at zero latency.
+
+        ``paper.main`` refuses to start without a measurement, but a probe can
+        degrade mid-run. Falling back to ``0.0`` here would make the same
+        engine that refuses an unmeasured action schedule its next cancel for
+        "now", so the transition is a hard stop instead.
+        """
+        measured = self.rtt.p50()
+        if measured is None or float(measured) <= 0.0:
+            raise RuntimeError(
+                "measured CLOB RTT is unavailable; refusing to schedule a venue "
+                "action at zero latency (paper) - stop and re-measure"
+            )
+        return float(measured)
 
     def _snapshot(self) -> None:
         equity = self.ledger.snapshot()

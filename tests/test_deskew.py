@@ -590,3 +590,45 @@ class TestFittedEstimators:
         )
         if calibration.skew_aggressiveness == 0.0:
             assert payload.get("corner") is True
+
+
+# ---------------------------------------------------------------- tier-2 risk
+def _taker_engine(*, cash: float, halted: bool = False, kill: bool = False):
+    from types import SimpleNamespace
+
+    from polymarketbot.live.engine.deskew import DeskewMixin
+
+    engine = SimpleNamespace(
+        risk_manager=SimpleNamespace(
+            config=SimpleNamespace(
+                max_position_cost_per_market=100.0,
+                max_portfolio_inventory_usd=100.0,
+            ),
+            kill_switch_active=kill,
+            portfolio_state=SimpleNamespace(is_halted=halted),
+        ),
+        shares_yes=0.0,
+        avg_cost_yes=0.0,
+        get_cash=lambda: cash,
+        _inventory_value=lambda: 0.0,
+    )
+    return DeskewMixin, engine
+
+
+def test_tier2_taker_buy_cannot_spend_cash_that_does_not_exist():
+    mixin, engine = _taker_engine(cash=5.0)
+    assert mixin._taker_risk_refusal(engine, "YES", "BUY", 12.0, 0.50) is not None
+    # Exactly the free cash is allowed; the refusal is strictly above it.
+    assert mixin._taker_risk_refusal(engine, "YES", "BUY", 10.0, 0.50) is None
+
+
+def test_tier2_taker_sell_is_not_blocked_by_cash_or_token_cost():
+    mixin, engine = _taker_engine(cash=0.0)
+    assert mixin._taker_risk_refusal(engine, "YES", "SELL", 10.0, 0.50) is None
+
+
+def test_tier2_taker_refuses_while_risk_is_halted():
+    mixin, engine = _taker_engine(cash=10.0, halted=True)
+    assert "halted" in mixin._taker_risk_refusal(engine, "YES", "SELL", 1.0, 0.50)
+    mixin, engine = _taker_engine(cash=10.0, kill=True)
+    assert "kill-switched" in mixin._taker_risk_refusal(engine, "YES", "SELL", 1.0, 0.50)

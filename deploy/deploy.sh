@@ -172,7 +172,24 @@ if [ "$SCRIPT_SOURCE_DIR" != "$APP_DIR" ]; then
         --exclude='data/logs' \
         --exclude='*.pyc' \
         --exclude='__pycache__' \
+        --exclude='.env' \
+        --exclude='.env.*' \
+        --exclude='deploy/.env' \
+        --exclude='deploy/*.env' \
+        --exclude='key.txt' \
+        --exclude='secrets/' \
+        --exclude='*.pem' \
+        --exclude='*.key' \
         "$SCRIPT_SOURCE_DIR/" "$APP_DIR/"
+fi
+
+# Secrets live in /etc/polymarketbot (0600, root-owned), never in the app tree.
+leaked_secret=$(find "$APP_DIR" -maxdepth 3 -type f \
+    \( -name '.env' -o -name '.env.*' -o -name 'key.txt' \
+       -o -name '*.pem' -o -name '*.key' \) -print -quit 2>/dev/null || true)
+if [ -n "$leaked_secret" ]; then
+    log_error "Refusing deployment: secret material found in the app tree: $leaked_secret"
+    exit 1
 fi
 
 mkdir -p "$APP_DIR/data/logs"

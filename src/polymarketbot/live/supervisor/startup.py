@@ -198,6 +198,21 @@ def build_engine(ctx: RunContext) -> None:
 
 async def run_startup_check(ctx: RunContext) -> int | None:
     """Reconcile against venue truth and refuse to trade on an unready preflight."""
+    # A missing fitted calibration leaves the microstructure gate unwired; the
+    # hard breakers still run, but live quoting would skip the toxic-flow /
+    # queue / adverse-fill veto entirely. That is a fail-open state, so a live
+    # run refuses instead of trading with a guard the operator believes is on.
+    # BaseMarketMakingEngine always exposes the flag; engines that do not are
+    # test doubles, not a second live implementation.
+    if not ctx.dry_run and not bool(getattr(ctx.engine, "micro_gate_active", True)):
+        log.critical(
+            "Microstructure risk gate is disabled (no fitted risk calibration); "
+            "refusing to trade live. Fit data/derived/risk_calibration.json or "
+            "run dry-run explicitly."
+        )
+        await _close_engine_quietly(ctx.engine)
+        return 1
+
     # -- Startup reconciliation (venue truth) -------------------------------
     try:
         await asyncio.to_thread(ctx.engine.reconcile_startup)

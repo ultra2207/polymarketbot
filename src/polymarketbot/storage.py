@@ -4,8 +4,10 @@ What is on the live path and what is an operator call:
 
 * :func:`open_journal_connection` / :func:`run_with_busy_retry` - the contract a
   journal caller should use (WAL + busy timeout + bounded lock retry). The paper
-  ledger and the live engine still open their own raw connections, so this is
-  wired nowhere yet; the exact call-site patch is in ``docs/sweep-infra.md``.
+  ledger opens through :func:`open_journal_connection`; the live engine's
+  ``_init_sqlite`` applies the same pragmas (WAL + ``synchronous=NORMAL`` +
+  ``busy_timeout``) on its own connection, and its commits are serialised by
+  the engine lock.
 * :func:`prune_directory` - called by ``live/recorder.py`` after every session
   to bound the live tape.
 * :func:`get_disk_status` / :func:`clean_ephemeral_caches` / :func:`prune_sqlite_table`

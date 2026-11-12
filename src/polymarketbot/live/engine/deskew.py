@@ -175,6 +175,49 @@ class DeskewMixin:
             target_size = min(target_size, max(0.0, owned))
         return target_size
 
+    def _taker_risk_refusal(
+        self, target_token: str, target_side: str, target_size: float, target_price: float
+    ) -> str | None:
+        """Capital/position approval for the Tier-2 taker leg.
+
+        The maker path runs ``RiskManager.validate_quote``; the deskew cross
+        does not place a resting quote, so the micro/queue gate does not apply,
+        but the hard capital and position limits still do. A BUY can only spend
+        cash that exists, and it cannot push the token or portfolio past the
+        configured cost caps (the caps are already a refusal, not a resize, so
+        the emergency exit size is never silently changed).
+        """
+        state = getattr(self.risk_manager, "portfolio_state", None)
+        if bool(getattr(self.risk_manager, "kill_switch_active", False)) or bool(
+            getattr(state, "is_halted", False)
+        ):
+            return "risk manager is halted or kill-switched"
+        if target_side != "BUY":
+            return None
+        notional = float(target_size) * float(target_price)
+        free_cash = float(self.get_cash())
+        if notional > free_cash + 1e-9:
+            return f"taker BUY ${notional:.4f} exceeds free cash ${free_cash:.4f}"
+        cfg = self.risk_manager.config
+        owned = float(self.shares_yes if target_token == "YES" else self.shares_no)
+        avg = float(self.avg_cost_yes if target_token == "YES" else self.avg_cost_no)
+        token_cost = (max(0.0, owned) * avg) + notional
+        token_cap = getattr(cfg, "max_position_cost_per_market", None)
+        if token_cap is not None and token_cost > float(token_cap) + 1e-9:
+            return (
+                f"taker BUY would take {target_token} cost to ${token_cost:.2f} "
+                f"(cap ${float(token_cap):.2f})"
+            )
+        portfolio_cap = getattr(cfg, "max_portfolio_inventory_usd", None)
+        if portfolio_cap is not None:
+            after = float(self._inventory_value()) + notional
+            if after > float(portfolio_cap) + 1e-9:
+                return (
+                    f"taker BUY would take inventory to ${after:.2f} "
+                    f"(cap ${float(portfolio_cap):.2f})"
+                )
+        return None
+
     def _execute_tier2_taker_deskew(self, decision: DeSkewDecision, ts: float) -> None:
         """Execute Tier 2 emergency cross-spread taker execution on CLOB.
 
@@ -259,6 +302,13 @@ class DeskewMixin:
             logger.warning(
                 f"Tier 2 de-skew skipped: size after caps is {target_size:.4f} for {target_token}"
             )
+            return
+
+        refusal = self._taker_risk_refusal(
+            target_token, target_side, target_size, target_price
+        )
+        if refusal is not None:
+            logger.warning(f"Tier 2 de-skew refused: {refusal}")
             return
 
         self._record_deskew_event(decision, landing_ts)

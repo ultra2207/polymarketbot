@@ -261,6 +261,20 @@ def test_action_lands_only_after_measured_rtt():
     assert [a.kind for a in actions.due()] == ["buy"]
 
 
+def test_paper_engine_refuses_to_schedule_at_zero_latency():
+    from types import SimpleNamespace
+
+    from polymarketbot.paper.engine import PaperEngine
+
+    class _Probe:
+        @staticmethod
+        def p50():
+            return None
+
+    with pytest.raises(RuntimeError, match="measured CLOB RTT"):
+        PaperEngine._rtt(SimpleNamespace(rtt=_Probe()))
+
+
 def test_action_is_refused_without_measured_rtt():
     actions = ActionBook(lambda: None)
     assert actions.submit("buy", "S", {}) is None

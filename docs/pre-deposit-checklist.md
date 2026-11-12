@@ -64,6 +64,11 @@ rows[rows.kind == "micro_risk_decision"].sort_values("recv_ts_ns")
 
 ## Limits to carry into the run
 
+- **Startup refuses live without a fitted microstructure calibration.** If
+  `data/derived/risk_calibration.json` is absent the engine reports
+  `micro_gate_active=False` and the runner aborts (exit 1) rather than trading with
+  the toxic-flow/queue veto silently off. See `docs/real-money-blockers-2026-11-12.md` (B2).
+
 - **Below 20 shares earns $0 rewards.** The campaign minimum is 20 shares; the canary
   buys mechanics (place, rest, cancel, fill, detect), not income. For income the
   measured floor is $358 of capital (`docs/minimum-live-capital.md`).

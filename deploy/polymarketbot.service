@@ -22,25 +22,28 @@ Environment=DUCKDB_MEMORY_LIMIT=1GB
 Environment=DUCKDB_THREADS=2
 
 # Execution Command
-# Default (Leading to Dec 1): 24/7 Zero-Capital Live Paper Trading Soak across the 3 active production strategies
-#   Allocates $1,000 each to Domain2ARR, CtfSplitter, and SettlementHarvester ($3,000 Total).
-#   (LatencySniper is archived due to taker fee drag and cross-region latency decay).
-ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000
+# Default: 24/7 zero-capital paper soak of the single live pillar (RewardHarvester).
+# Requires the canonical >=2 GB host profile from AGENTS.md; the 1 GB t3.micro was
+# measured to restart under the full-universe walk.
+ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10
 
 # Alternate modes (override via systemctl edit polymarketbot):
 #   Real Money Quoting (Blocked until Dec 1st - Requires --live, --yes, and populated credentials):
 #     ExecStart=/opt/polymarketbot/.venv/bin/python -m polymarketbot.live.runner --live --yes --budget-pct 0.20
 
 # Reliability & Crash Recovery
-Restart=always
-RestartSec=5s
+# on-failure (not always): a clean --duration exit must not re-enter trading, and
+# a crash restart still runs reconcile_startup, which cancels/verifies venue orders.
+Restart=on-failure
+RestartSec=10s
 TimeoutStopSec=30s
 KillMode=mixed
 FinalKillSignal=SIGKILL
 
-# Low-RAM VPS Resource Protection (Guards 1GB - 4GB instances against OOM thrashing)
-MemoryHigh=1.2G
-MemoryMax=1.5G
+# Host memory guard. The measured soak peaks at 441-558 MB plus the agent harness;
+# run this unit only on the >=2 GB host profile (AGENTS.md).
+MemoryHigh=1.5G
+MemoryMax=2.0G
 MemorySwapMax=0
 CPUQuota=95%
 

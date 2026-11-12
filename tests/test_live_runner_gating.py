@@ -459,6 +459,23 @@ def _live_args(tmp_path, *extra: str) -> argparse.Namespace:
     )
 
 
+class DisabledMicroEngine(NotReadyEngine):
+    """Live engine built without a fitted risk calibration."""
+
+    micro_gate_active = False
+
+
+def test_live_refuses_a_disabled_microstructure_gate(monkeypatch, tmp_path):
+    NotReadyEngine.created.clear()
+    _install_live_fakes(monkeypatch, _market_info, engine_cls=DisabledMicroEngine)
+
+    exit_code = asyncio.run(runner.run_live_runner_async(_live_args(tmp_path)))
+
+    assert exit_code == 1
+    assert len(NotReadyEngine.created) == 1
+    assert NotReadyEngine.created[0].closed is True
+
+
 def test_live_with_unready_preflight_aborts_without_downgrade(monkeypatch, tmp_path):
     NotReadyEngine.created.clear()
     FakeLiveFeed.instances.clear()

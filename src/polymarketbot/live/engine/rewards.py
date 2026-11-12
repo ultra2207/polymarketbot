@@ -25,7 +25,20 @@ class RewardMixin:
             rew_data = self.clob_client.get_total_rewards()
             if rew_data:
                 self.actual_rewards_usd = float(rew_data.get("reward_income_usd", 0.0) or 0.0)
-                self.actual_rebates_usd = float(rew_data.get("maker_rebates_usd", 0.0) or 0.0)
+                venue_rebates = float(rew_data.get("maker_rebates_usd", 0.0) or 0.0)
+                modelled_rebates = float(self.actual_rebates_usd)
+                if abs(venue_rebates - modelled_rebates) > 1e-9:
+                    # Cash already carries the per-fill modelled credits. This
+                    # line is the evidence needed to calibrate that model
+                    # against the venue's own total; it must not silently
+                    # overwrite the two figures as if they were the same.
+                    logger.info(
+                        f"Rebate reconciliation: venue ${venue_rebates:.4f} vs "
+                        f"modelled ${modelled_rebates:.4f} "
+                        f"(delta ${venue_rebates - modelled_rebates:+.4f}); "
+                        "cash carries the modelled credit"
+                    )
+                self.actual_rebates_usd = venue_rebates
                 self.reward_source = str(rew_data.get("source", self.reward_source))
 
             daily_data = self.clob_client.get_daily_rewards()
