@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 import polymarketbot.strategy.reward.decision as reward
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
+from polymarketbot.paper import micro as paper_micro
 from polymarketbot.paper import risk as paper_risk
 from polymarketbot.paper import sizing as paper_sizing
 from polymarketbot.paper.actions import Resting, new_order_id, queue_tracker
@@ -581,6 +582,7 @@ def apply_resting_fills(
         for token_id, quote in list(resting.items()):
             if quote.order_id:
                 tracker.drop(token_id, quote.order_id)
+                paper_micro.cancel(engine, token_id, quote.order_id)
             resting.pop(token_id, None)
         return
     ordered_prints = sorted(prints, key=lambda p: (p.ts, getattr(p, "seq", 0)))
@@ -593,11 +595,13 @@ def apply_resting_fills(
             # probability.
             if quote.order_id:
                 tracker.drop(token_id, quote.order_id)
+                paper_micro.cancel(engine, token_id, quote.order_id)
             resting.pop(token_id, None)
             continue
         if quote.cancel_at is not None and now >= quote.cancel_at + engine._rtt():
             if quote.order_id:
                 tracker.drop(token_id, quote.order_id)
+                paper_micro.cancel(engine, token_id, quote.order_id)
             resting.pop(token_id, None)
             continue
         book = books.get(token_id) or {}
@@ -641,6 +645,8 @@ def apply_resting_fills(
         # count the same shares on the next pass. Measured prints are 1-5
         # shares, so the sub-lot carry is what lets a 20-200 share minimum
         # ever clear.
+        if raw > 0.0:
+            paper_micro.fill(engine, token_id, quote.price, raw, now)
         quote.booked_fill += raw
         quote.accumulated += raw
         fill = min(quote.accumulated, quote.shares)

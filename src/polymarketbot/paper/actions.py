@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.fees import taker_fee
 from polymarketbot.logs import get_logger
+from polymarketbot.paper import micro as paper_micro
 from polymarketbot.paper import risk as paper_risk
 from polymarketbot.risk.queue_position import QueuePositionTracker
 from polymarketbot.strategy.books import ladder
@@ -236,6 +237,7 @@ def land(engine, books: dict[str, dict], prints: list[venue.Print]) -> None:
             resting = engine.reward_quotes.pop(payload["token_id"], None)
             if resting is not None and resting.order_id:
                 queue_tracker(engine).drop(resting.token_id, resting.order_id)
+                paper_micro.cancel(engine, resting.token_id, resting.order_id)
         elif action.kind == "reward_quote":
             resting = payload["resting"]
             # A placement that was in flight when a breaker tripped must not
@@ -270,4 +272,5 @@ def land(engine, books: dict[str, dict], prints: list[venue.Print]) -> None:
                 ladder(book, asks=False),
                 ladder(book, asks=True),
             )
+            paper_micro.entry(engine, resting, book, now=resting.placed)
             engine.reward_quotes[resting.token_id] = resting

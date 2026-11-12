@@ -514,6 +514,56 @@ def feed(
     )
 
 
+def entry(engine: Any, resting: Any, book: Mapping[str, Any] | None,
+          now: float) -> None:
+    """Register a landed maker quote with the gate's queue model.
+
+    ``UnifiedRiskEngine`` needs our own entry to price queue position and the
+    adverse-fill streak. The paper queue tracker is a separate FIFO model; this
+    mirror keeps the gate's view of that same order. A token with no measured
+    tick, or a gate that is not attached, is a no-op.
+    """
+    adapter = get(engine)
+    if adapter is None:
+        return
+    gate = adapter.gate_for_token(str(getattr(resting, "token_id", "")))
+    order_id = str(getattr(resting, "order_id", "") or "")
+    if gate is None or not order_id or not isinstance(book, Mapping):
+        return
+    bids = ladder(book, asks=False)
+    asks = ladder(book, asks=True)
+    gate.on_entry(
+        order_id,
+        str(resting.token_id),
+        "BUY",
+        float(resting.price),
+        float(resting.shares),
+        float(now),
+        bids,
+        asks,
+    )
+
+
+def cancel(engine: Any, token_id: str, order_id: str) -> None:
+    """Drop a cancelled maker order from the gate's queue model."""
+    adapter = get(engine)
+    if adapter is None or not order_id:
+        return
+    gate = adapter.gate_for_token(str(token_id))
+    if gate is not None:
+        gate.on_cancel(str(token_id), str(order_id))
+
+
+def fill(engine: Any, token_id: str, price: float, size: float, now: float) -> None:
+    """Book a maker fill against the gate's queue entry."""
+    adapter = get(engine)
+    if adapter is None or size <= 0.0:
+        return
+    gate = adapter.gate_for_token(str(token_id))
+    if gate is not None:
+        gate.on_fill(str(token_id), "BUY", float(price), float(size), float(now))
+
+
 def get(engine: Any) -> PaperMicroRisk | None:
     """The engine's attached paper gate, if any (for the recorder/tests)."""
     adapter = getattr(engine, "_paper_micro", None)

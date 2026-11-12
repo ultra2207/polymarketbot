@@ -220,6 +220,31 @@ def test_two_sided_book_and_dated_print_reach_the_shared_gate() -> None:
     assert progress.traded_at_level == 10.0
 
 
+def test_order_lifecycle_is_mirrored_into_the_gate_queue() -> None:
+    """A landed paper quote, its fill, and its cancel update the shared queue."""
+    engine, adapter = _built_engine()
+    gate = adapter.gate_for_token(YES)
+    quote = types.SimpleNamespace(
+        order_id="order-1", token_id=YES, price=0.49, shares=20.0
+    )
+    micro.entry(
+        engine,
+        quote,
+        {"bids": [{"price": "0.49", "size": "100"}],
+         "asks": [{"price": "0.51", "size": "80"}]},
+        now=1.0,
+    )
+    progress = gate._queue.progress("order-1")
+    assert progress is not None
+    assert progress.ahead == 100.0
+
+    micro.fill(engine, YES, 0.49, 5.0, now=2.0)
+    assert gate._queue.progress("order-1") is not None
+
+    micro.cancel(engine, YES, "order-1")
+    assert gate._queue.progress("order-1") is None
+
+
 def test_one_sided_and_untimestamped_inputs_are_skipped() -> None:
     engine, adapter = _built_engine()
     gate = adapter.gate_for_token(YES)
