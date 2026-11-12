@@ -26,7 +26,13 @@ log = get_logger("rewards_allocator")
 
 
 def activation_lot_capital(cand: dict[str, Any]) -> float | None:
-    """USD for one matched pair at the venue's binding minimum order.
+    """USD capital for the venue's binding minimum order, one or two legs.
+
+    ``capital_per_share`` is the capital one share of the plan commits: the
+    matched pair's cost on the two-sided live path, the single leg's quote
+    price on the one-sided paper path. A caller that does not state it gets
+    $1.00, the definitional upper bound for a binary pair, so legacy callers
+    keep the conservative pair semantics.
 
     The venue publishes ``orderMinSize`` as a USDC notional per order; the
     rewards campaign publishes ``min_size`` as a share count. The binding
@@ -44,9 +50,15 @@ def activation_lot_capital(cand: dict[str, Any]) -> float | None:
         mid = float(cand.get("real_mid", cand.get("mid_yes", 0.0)))
         lot_price = float(cand.get("lot_price", mid))
         order_min = float(cand.get("order_min_usd") or 0.0)
+        capital_per_share = float(cand.get("capital_per_share") or 1.0)
     except (TypeError, ValueError):
         return None
-    if min_sz <= 0.0 or not 0.0 < mid < 1.0 or not 0.0 < lot_price < 1.0:
+    if (
+        min_sz <= 0.0
+        or not 0.0 < mid < 1.0
+        or not 0.0 < lot_price < 1.0
+        or not 0.0 < capital_per_share <= 1.0
+    ):
         return None
     shares = min_sz
     if order_min > 0.0:
@@ -54,7 +66,7 @@ def activation_lot_capital(cand: dict[str, Any]) -> float | None:
         if cheap <= 0.0:
             return None
         shares = max(shares, float(math.ceil(order_min / cheap)))
-    return round(shares, 2)
+    return round(shares * capital_per_share, 2)
 
 
 def parse_candidates(
@@ -123,8 +135,29 @@ def parse_candidates(
         lot_price = float(cand.get("lot_price", mid))
         if not 0.0 < lot_price < 1.0:
             continue
+        # One share of the plan commits either the matched pair's cost
+        # (two-sided live) or the single leg's quote price (one-sided paper).
+        # Sources publish it explicitly; the fallbacks keep legacy callers on
+        # the definitional $1.00 pair bound rather than the leg mid.
+        try:
+            capital_per_share = float(
+                cand.get("capital_per_share")
+                or cand.get("pair_cost")
+                or cand.get("quote_price")
+                or 1.0
+            )
+        except (TypeError, ValueError):
+            continue
+        if not 0.0 < capital_per_share <= 1.0:
+            continue
         lot_capital = activation_lot_capital(
-            {**cand, "min_size": min_sz, "real_mid": mid, "lot_price": lot_price}
+            {
+                **cand,
+                "min_size": min_sz,
+                "real_mid": mid,
+                "lot_price": lot_price,
+                "capital_per_share": capital_per_share,
+            }
         )
         if lot_capital is None:
             continue
@@ -141,6 +174,7 @@ def parse_candidates(
             "c_floor": c_floor,
             "min_size": min_sz,
             "mid": mid,
+            "capital_per_share": capital_per_share,
             "fill_side": fill_side(cand),
         })
     unpriced = sum(1 for m in parsed_candidates if m["fill_side"] is None)

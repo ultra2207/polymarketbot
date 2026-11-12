@@ -186,3 +186,44 @@ uv run python tmp_python/min_live_capital.py --top 60 --refresh   # 13–50 s, ~
 ## 7. One line for the desk
 
 Gas is not the reason to stay small and dilution is not the reason to stay big: **the $1-per-pool payout floor is the only constraint that sets a floor on capital, and at `$358` you can hold one position that survives its competing book doubling.** Everything under `$200` is a single-position bet on a quiet tail pool.
+
+
+---
+
+## Addendum 2026-11-12: is `$40` enough for the `$1/day` floor?
+
+**On the current live universe: yes for one cheap tail market, no as a robust income bankroll.**
+
+Measured live scan at 2026-11-12 13:20 IST (`find_optimal_lp_markets(40)`, 250 pools, 21 screened,
+21 priced, one selected; the same market was selected in the 13:03 scan with D=99.6):
+
+| Item | Value |
+|---|---|
+| Selected market | `0x8bc913d0…` "Google third-best Code Arena / WebDev AI lab" — **non-neg-risk** |
+| Expiry / days left | 2026-12-01 / 18.9 days |
+| Tick / campaign min | 0.001 / 20 shares |
+| Mid / pair cost | 0.4615 / $1.00 |
+| Capital | $40 bankroll, $2 (5%) reserve, **$38 allocated** = 38 shares per leg |
+| Measured pool / competing score | $107/day / D = 89.9 (single snapshot) |
+| Model payout | **$31.45/day** (clears the $1.00 floor) |
+| Fill side | −$0.01/day (p_fill 0.00023; adverse markout roughly cancels capture) |
+| D stress: x2 / x5 / x10 | $18.43 / $8.22 / **$4.28/day** — still above the floor |
+
+So `$38` usable clears the `$1` floor on this specific market even if the measured competing
+denominator increases 10x. The activation lot is affordable (20 shares; the venue's $5 per-order
+notional is also met at ~$9.2 on the cheap leg).
+
+**Why this is not a blanket "yes":**
+- The measured 12 head pools require **50–200 share lots** = **$50–$200** pair capital, so none is
+  affordable at $38. The live scan selected a **$107/day tail pool**, not a head pool.
+- `D` here is a **single snapshot** (`competing_samples` absent); the model is an upper bound.
+  The robust median head-pool requirement remains the `$304 + $53.51 = $358` derived above.
+- The `$1` floor is a cliff: below it the market pays `$0.00`. A new rival or a book change can
+  move `D`; the x10 stress is evidence of margin, not a guarantee.
+- Live accrual (`/rewards/user`) has not validated any of this. The first confirmation is the
+  canary's own epoch accrual, not the model.
+
+**Canary sizing note:** the mechanical canary in `docs/pre-deposit-checklist.md` uses
+`--min-size 5 --quote-size 5`, which is **below the 20-share campaign minimum and earns $0
+rewards** by design. For the `$1/day` income plan at `$40`, quote **at least 20 shares per leg**
+(38 on the selected market). Never quote a neg-risk market live.

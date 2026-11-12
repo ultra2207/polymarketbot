@@ -30,7 +30,7 @@ The Docker daemon (`dockerd`, `containerd`, shim processes, bridge networking, a
 - **Fast Builds & Upgrades**: `uv sync --upgrade --no-dev` installs and updates dependencies directly.
 - **Universal Architecture Support**: Native precompiled binaries for both **ARM64** (`aarch64` Ampere A1) and **x86_64** (Intel/AMD).
 - **Resource Hardening**: Process isolation managed directly by Linux `systemd`:
-  - `MemoryHigh=1.2G`, `MemoryMax=1.5G`, `MemorySwapMax=0`
+  - `MemoryHigh=1.5G`, `MemoryMax=2.0G`, `MemorySwapMax=0`
   - `CPUQuota=95%`
   - Low-memory DuckDB guard: `DUCKDB_MEMORY_LIMIT=1GB`, `DUCKDB_THREADS=2`
   - C memory allocator tuning: `MALLOC_ARENA_MAX=2`
@@ -43,7 +43,7 @@ The Docker daemon (`dockerd`, `containerd`, shim processes, bridge networking, a
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Oracle Cloud (OCI)** | `VM.Standard.A1.Flex` | **ARM64** (Ampere) | Up to 4 OCPUs / 24 GB RAM | **$0.00 (Always Free)** | **`eu-amsterdam-1` (Primary)** |
 | **Oracle Cloud (OCI)** | `VM.Standard.E2.1.Micro` | **x86_64** (AMD) | 1 OCPU (shared) / 1 GB RAM | **$0.00 (Always Free)** | **`eu-amsterdam-1`** |
-| **AWS Free Tier** | `t2.micro` or `t3.micro` | **x86_64** (Intel/AMD) | 1–2 vCPU / 1 GB RAM | **$0.00 (12 Months)** | `eu-central-1` (Frankfurt) |
+| **AWS** | `t3.small` (min) | **x86_64** (Intel/AMD) | 2 vCPU / 2 GB RAM | paid after free tier | `eu-central-1` (Frankfurt) |
 | **Hetzner Cloud** | `CX22` / `CPX11` | **x86_64** (Intel/AMD) | 2 vCPU / 2–4 GB RAM | **~€3.79 – €4.50/mo** | Falkenstein / Helsinki |
 
 ---
@@ -93,16 +93,16 @@ sudo netfilter-persistent save 2>/dev/null || true
 
 ---
 
-## 4. Deployment Walkthrough: AWS Free Tier in `eu-west-2` (London)
+## 4. Deployment Walkthrough: AWS `eu-central-1` (Frankfurt), >= 2 GB instance
 
 ### Step 4.1: Launch EC2 Instance
 1. Log in to [AWS Management Console](https://console.aws.amazon.com/ec2).
-2. Set region selector (top-right) to **Europe (London) `eu-west-2`**.
+2. Set region selector (top-right) to **Europe (Frankfurt) `eu-central-1`**. The London/UK region is geoblocked by Polymarket.
 3. Navigate to **EC2 Dashboard** -> **Launch Instance**.
 4. **Name**: `polymarketbot-aws`
 5. **Application and OS Images (AMI)**: Choose **Ubuntu Server 24.04 LTS (HVM), SSD Volume Type** (64-bit x86).
 6. **Instance Type**:
-   - Choose **`t2.micro`** or **`t3.micro`** (Free tier eligible, 1 vCPU, 1 GiB RAM).
+   - Choose **`t3.small`** (2 vCPU, 2 GiB RAM). The 1 GiB free-tier `t2/t3.micro` is **not sufficient** for the full-universe soak (AGENTS.md host-memory rule); do not use it for the live canary.
 7. **Key Pair**:
    - Select an existing key pair or click **Create new key pair** (Type: `ED25519` or `RSA`, Name: `polymarket-aws-key`). Save the downloaded `.pem` file to `~/.ssh/polymarket-aws-key.pem`.
 8. **Network Settings**:

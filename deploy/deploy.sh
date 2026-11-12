@@ -184,9 +184,12 @@ if [ "$SCRIPT_SOURCE_DIR" != "$APP_DIR" ]; then
 fi
 
 # Secrets live in /etc/polymarketbot (0600, root-owned), never in the app tree.
-leaked_secret=$(find "$APP_DIR" -maxdepth 3 -type f \
-    \( -name '.env' -o -name '.env.*' -o -name 'key.txt' \
-       -o -name '*.pem' -o -name '*.key' \) -print -quit 2>/dev/null || true)
+leaked_secret=$(find "$APP_DIR" \
+    \( -path "$APP_DIR/.venv" -o -path "$APP_DIR/.git" -o -path "$APP_DIR/data" \) -prune -o \
+    -type f \( -name '.env' -o -name '.env.*' -o -name 'key.txt' \
+       -o -name '*.pem' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' \
+       -o -name 'id_rsa*' -o -name '.netrc' -o -name 'credentials*.json' \) \
+    -print -quit 2>/dev/null || true)
 if [ -n "$leaked_secret" ]; then
     log_error "Refusing deployment: secret material found in the app tree: $leaked_secret"
     exit 1
@@ -226,6 +229,10 @@ if [ ! -f "$ENV_TARGET" ]; then
 else
     log_info "Existing environment file found at $ENV_TARGET (preserving existing config)."
 fi
+
+# The 0600 contract holds on every run, not only when the file is created.
+chmod 600 "$ENV_TARGET"
+chown "$APP_USER:$APP_GROUP" "$ENV_TARGET"
 
 # Ensure correct permissions
 chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"

@@ -244,6 +244,8 @@ def _screen_lp_candidate(
         "mid_yes": mid_yes,
         "days_left": days_left,
         "quote_size": quote_size,
+        "pair_cost": pair_cost,
+        "capital_per_share": pair_cost,
         "capital_required": capital_required,
         # USD -> shares per side: the optimizer's score per USD is
         # alpha * (quote_size / capital_required) = alpha / pair_cost. The

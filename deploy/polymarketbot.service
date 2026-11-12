@@ -10,9 +10,9 @@ User=polymarketbot
 Group=polymarketbot
 WorkingDirectory=/opt/polymarketbot
 
-# Environment configuration: checks /etc/polymarketbot first, then local repo fallback
+# Environment configuration: one authoritative secret file. The app tree is
+# not a secret location; deploy.sh aborts if one appears there.
 EnvironmentFile=-/etc/polymarketbot/polymarketbot.env
-EnvironmentFile=-/opt/polymarketbot/.env
 
 # Python and Low-RAM VPS Memory Optimization
 Environment=PYTHONUNBUFFERED=1

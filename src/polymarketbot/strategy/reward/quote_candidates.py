@@ -221,6 +221,8 @@ def reward_candidates(
                     for outcome, token in zip(market.outcomes, market.token_ids)
                 ],
                 "quote_price": quote_price,
+                # One-sided pillar: one share commits its own quote price.
+                "capital_per_share": quote_price,
                 "quote_token": token_id,
                 "quote_side": "bid",
                 "tick": market.tick,

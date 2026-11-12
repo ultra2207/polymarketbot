@@ -357,3 +357,31 @@ def test_water_filling_never_spends_more_than_the_budget():
     assert [allocation.condition_id for allocation in result.allocations] == ["0x_tight"]
     for allocation in result.allocations:
         assert allocation.allocated_capital >= allocation.min_floor_capital
+
+
+def test_allocation_quote_size_uses_pair_cost_not_the_leg_mid():
+    """Dollar capital -> shares per leg must divide by the pair cost.
+
+    ``alpha`` is score per dollar of *pair* capital, so a $38 allocation at a
+    $0.95 pair is 40 shares per leg. Dividing by the 0.475 leg mid would tell
+    the governor 80 shares, i.e. $76 of pair capital.
+    """
+    from polymarketbot.strategy.reward.marginal import allocation_for_capital
+
+    m = {
+        "P": 500.0,
+        "D": 100.0,
+        "alpha": 1.0,
+        "c_floor": 10.0,
+        "mid": 0.475,
+        "capital_per_share": 0.95,
+        "cand": {"condition_id": "0xabc", "question": "q"},
+        "fill_side": (1.0, 0.0),
+    }
+    allocation, _ = allocation_for_capital(m, 38.0)
+    assert allocation.quote_size == pytest.approx(40.0)
+
+    m.pop("capital_per_share")
+    allocation, _ = allocation_for_capital(m, 38.0)
+    # No stated pair cost: the definitional $1.00 upper bound, never the mid.
+    assert allocation.quote_size == pytest.approx(38.0)

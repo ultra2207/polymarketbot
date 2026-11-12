@@ -4,7 +4,7 @@ Run in order. Nothing here places an order until step 4.
 
 | # | Action | How you know it passed |
 |---|---|---|
-| 1 | Create Polymarket API creds + signing key; set `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY` | — |
+| 1 | Create Polymarket API creds + signing key; set `POLY_API_KEY`, `POLY_SECRET`, `POLY_PASSPHRASE`, `PRIVATE_KEY` (aliases: `POLYMARKET_SECRET`, `POLY_PRIVATE_KEY`). The signer address is `POLY_ADDRESS` or `PROXY_WALLET_ADDRESS` | — |
 | 2 | **Fund nothing yet.** Run `--live --yes` on the unfunded wallet | It must abort at preflight with a summary naming missing credentials / $0 collateral / POL / UNAPPROVED allowances. It refuses **before** quoting and does not downgrade to dry-run. Do this *before* depositing — once funded the same command trades. |
 | 3 | Fund **$40 USDC.e** to the Polymarket proxy wallet + **1–2 POL** for merge gas; approve CTF exchange allowances | Re-run step 2; `PreflightReport.summary()` all green |
 | 3b | Run the 30-minute paper soak on the same tree | `uv run python -m polymarketbot.paper.main --capital 3000 --duration 1800 --interval 10 --fresh --db data/paper_soak_telemetry.db` returns; the dashboard quoted both legs and the fill tape recorded activity |
@@ -70,8 +70,11 @@ rows[rows.kind == "micro_risk_decision"].sort_values("recv_ts_ns")
   the toxic-flow/queue veto silently off. See `docs/real-money-blockers-2026-11-12.md` (B2).
 
 - **Below 20 shares earns $0 rewards.** The campaign minimum is 20 shares; the canary
-  buys mechanics (place, rest, cancel, fill, detect), not income. For income the
-  measured floor is $358 of capital (`docs/minimum-live-capital.md`).
+  buys mechanics (place, rest, cancel, fill, detect), not income. A `$40` income attempt
+  must quote **at least 20 shares per leg** (the 2026-11-12 scan found one non-neg-risk
+  market affordable at 38 shares/leg with a modelled payout clearing `$1/day`; see the
+  addendum in `docs/minimum-live-capital.md`). The robust measured bankroll for the
+  median head pool is still `$358`.
 - **Neg-risk markets are refused live.** `mergePositions` has no NegRiskAdapter path,
   so auto-select now skips a stated neg-risk candidate in live mode and startup still
   refuses one outright. Pass `--condition-id` + tokens for the market you chose.

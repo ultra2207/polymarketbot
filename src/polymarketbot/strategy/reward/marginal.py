@@ -232,7 +232,11 @@ def allocation_for_capital(
         condition_id=cand_dict.get("condition_id", ""),
         question=cand_dict.get("question", ""),
         allocated_capital=round(cap, 2),
-        quote_size=round(cap / m["mid"], 1),
+        # Shares per leg. Dividing dollar capital by the *capital one share
+        # commits* is the only conversion consistent with ``alpha`` being score
+        # per dollar of that capital; dividing by the leg mid overstated the
+        # order by 2-4x and the governor resized the engine to it.
+        quote_size=round(cap / float(m.get("capital_per_share") or 1.0), 1),
         daily_reward_payout=round(payout, 2),
         daily_roi_pct=round(roi_pct, 2),
         min_floor_capital=round(m["c_floor"], 2),
