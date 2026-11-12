@@ -52,6 +52,7 @@ from typing import Any
 
 from polymarketbot.fees import FeeSchedule
 from polymarketbot.logs import get_logger
+from polymarketbot.paper import risk as paper_risk
 from polymarketbot.paper.actions import TAKER_KIND as TAKER_ACTION
 from polymarketbot.strategy.books import best_ask, best_bid, shares_at
 from polymarketbot.strategy.onchain.ctf.gas import (
@@ -648,11 +649,29 @@ def _submit_taker(
 
     token_id = market.token_ids[0] if target_token == "YES" else market.token_ids[1]
     size = min(float(decision.target_size), float(quote_size) * 2.0)
+    # The live Tier-2 path caps the cross at the shared per-order share cap;
+    # the paper cross must not book a size the live gate would have clamped.
+    share_cap = paper_risk.max_quote_shares(engine)
+    if share_cap > 0.0:
+        size = min(size, share_cap)
     if side == "SELL":
         size = min(size, float(held.get(token_id, 0.0)))
     if size <= 0.0:
         log.debug(
             f"de-skew cross skipped for {condition_id[:12]}: size after caps is 0"
+        )
+        return
+    refusal = paper_risk.taker_refusal(
+        engine,
+        strategy=strategy,
+        token_id=token_id,
+        side=side,
+        shares=size,
+        price=float(decision.target_price),
+    )
+    if refusal is not None:
+        log.warning(
+            f"de-skew cross refused for {condition_id[:12]}: {refusal}"
         )
         return
     if side == "BUY" and size * float(decision.target_price) > cash + 1e-9:
@@ -700,6 +719,12 @@ def run_deskew(engine, books: dict[str, dict], prints: list[Any], strategies: tu
     """
     state = get_state(engine)
     if state is None or not state.deskew_enabled:
+        return
+    if paper_risk.blocks_actions(engine):
+        # Live refuses the Tier-2 cross on a halt too (its gate checks the
+        # risk manager before sizing). Stale fades must not survive into a
+        # later tick after an operator resumes.
+        state.skews.clear()
         return
     assert state.calibration is not None
     assert state.gas_cost_usd is not None

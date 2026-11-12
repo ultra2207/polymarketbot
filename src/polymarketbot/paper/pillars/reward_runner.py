@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 import polymarketbot.strategy.reward.decision as reward
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
+from polymarketbot.paper import risk as paper_risk
 from polymarketbot.paper.actions import Resting, new_order_id, queue_tracker
 from polymarketbot.paper.deskew import skew_target
 from polymarketbot.strategy.books import ladder
@@ -351,6 +352,17 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                 "since": now, "accrued": 0.0, "notional_seconds": 0.0,
                 "equity0": equity_now,
             }
+    if paper_risk.blocks_fills(engine):
+        # A permanent breaker cancels the resting maker quotes; replaying the
+        # tape into them after the halt would book fills the live venue would
+        # not have. The cancellation still travels the measured round trip, so
+        # the fill pass drains the retired orders here and no replacement is
+        # planned until an operator resumes.
+        paper_risk.cancel_quotes(engine, None, "risk breaker active")
+        apply_resting_fills(
+            engine, engine.reward_quotes, "RewardHarvester", books, prints, now
+        )
+        return
     apply_resting_fills(engine, engine.reward_quotes, "RewardHarvester", books, prints, now)
     rewarded = [m for m in engine.markets if m.daily_reward > 0]
     # The horizon the pillar claims its yield over is one engine interval:
@@ -407,10 +419,52 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
             or current.shares <= 0.0
             or current.cancel_at is not None
         )
+        # The shared risk gate runs before the "still resting" short-circuit:
+        # breakers, the per-asset cooldown, the order/position/notional caps and
+        # the cash headroom all apply to a quote that is already resting too.
+        allowed, reason, approved_size, approved_price = paper_risk.quote_denial(
+            engine,
+            condition_id=quote.condition_id,
+            token_id=token_id,
+            price=price,
+            shares=float(quote.shares),
+            books=books,
+            tick_size=float(engine.by_condition[quote.condition_id].tick),
+            now=now,
+        )
+        if not allowed:
+            log.warning(f"reward quote refused for {token_id[:12]}: {reason}")
+            if current is not None and not gone:
+                current.cancel_at = now
+                engine.actions.submit(
+                    "reward_cancel", "RewardHarvester", {"token_id": token_id}
+                )
+            continue
+        price = float(approved_price)
+        shares = float(approved_size)
+        if shares + 1e-9 < float(quote.min_size):
+            # A risk-clamped order below the venue minimum can never fill or
+            # score. Refuse it rather than rest a quote that only looks active.
+            log.warning(
+                f"reward quote suppressed for {token_id[:12]}: risk-approved size "
+                f"{shares:.2f} is below the venue minimum {quote.min_size:.2f}"
+            )
+            if current is not None and not gone:
+                current.cancel_at = now
+                engine.actions.submit(
+                    "reward_cancel", "RewardHarvester", {"token_id": token_id}
+                )
+            continue
+        if shares + 1e-9 < float(quote.shares):
+            log.info(
+                f"reward quote {token_id[:12]} clamped by risk: "
+                f"{quote.shares:.2f} -> {shares:.2f} shares"
+            )
         if (
             current is not None
             and not gone
             and abs(current.price - price) < 1e-9
+            and abs(current.shares - shares) < 1e-9
         ):
             current.daily_payout = quote.daily_payout
             continue
@@ -420,10 +474,10 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
                                   {"token_id": token_id})
         landing = now + engine._rtt()
         resting = Resting("RewardHarvester", quote.condition_id, token_id,
-                          price, quote.shares, quote.min_size, landing,
+                          price, shares, quote.min_size, landing,
                           tick=engine.by_condition[quote.condition_id].tick,
                           daily_payout=quote.daily_payout, seen_ts=landing,
-                          initial_shares=quote.shares)
+                          initial_shares=shares)
         engine.actions.submit("reward_quote", "RewardHarvester",
                               {"token_id": token_id, "resting": resting})
         if skew is not None and abs(price - float(quote.price)) > 1e-9:
@@ -512,6 +566,16 @@ def apply_resting_fills(
     now: float,
 ) -> None:
     tracker = queue_tracker(engine)
+    if paper_risk.blocks_fills(engine):
+        # No maker fill may book after a permanent breaker: the live venue is
+        # cancelling these orders. Drop the retired records so a later resume
+        # cannot replay tape that arrived during the halt into them; a taker
+        # exit already in flight is a separate, explicit landing.
+        for token_id, quote in list(resting.items()):
+            if quote.order_id:
+                tracker.drop(token_id, quote.order_id)
+            resting.pop(token_id, None)
+        return
     ordered_prints = sorted(prints, key=lambda p: (p.ts, getattr(p, "seq", 0)))
     for token_id, quote in list(resting.items()):
         if now < quote.placed:

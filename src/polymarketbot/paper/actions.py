@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.fees import taker_fee
 from polymarketbot.logs import get_logger
+from polymarketbot.paper import risk as paper_risk
 from polymarketbot.risk.queue_position import QueuePositionTracker
 from polymarketbot.strategy.books import ladder
 
@@ -237,6 +238,17 @@ def land(engine, books: dict[str, dict], prints: list[venue.Print]) -> None:
                 queue_tracker(engine).drop(resting.token_id, resting.order_id)
         elif action.kind == "reward_quote":
             resting = payload["resting"]
+            # A placement that was in flight when a breaker tripped must not
+            # come to rest: the venue would hold it after the engine cancelled
+            # everything. Same for a market that entered a volatility cooldown
+            # between the decision and its landing.
+            blocked = paper_risk.quote_block_reason(engine, resting.token_id)
+            if blocked is not None:
+                log.warning(
+                    f"reward quote landing discarded for {resting.token_id[:12]}: "
+                    f"{blocked}"
+                )
+                continue
             previous = engine.reward_quotes.get(resting.token_id)
             if previous is not None and previous.order_id:
                 queue_tracker(engine).drop(resting.token_id, previous.order_id)

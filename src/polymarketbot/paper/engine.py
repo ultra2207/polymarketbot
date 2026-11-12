@@ -22,8 +22,10 @@ import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import actions as venue_actions
 from polymarketbot.paper import deskew as paper_deskew
+from polymarketbot.paper import risk as paper_risk
 from polymarketbot.paper.actions import Resting
 from polymarketbot.paper.pillars import reward_runner
+from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.queue_position import QueuePositionTracker
 from polymarketbot.strategy.books import best_bid
 from polymarketbot.strategy.latency import ActionBook, RttProbe
@@ -49,6 +51,7 @@ class PaperEngine:
         resume: bool = False,
         rtt_refresh_s: float = 60.0,
         deskew: paper_deskew.DeskewState | None = None,
+        risk_manager: RiskManager | None = None,
     ) -> None:
         self.interval = max(1.0, float(interval))
         self.duration = duration
@@ -56,6 +59,9 @@ class PaperEngine:
         self.gamma = gamma
         self.feed = feed
         self.rtt = rtt
+        #: Seed capital per strategy. The risk layer is built from its total;
+        #: the ledger's marked equity is the day's opening equity from then on.
+        self.capital = {name: float(value) for name, value in capital.items()}
         # The landing model pays whatever p50 the probe currently holds, so a
         # probe sampled once at startup prices every action for the whole run.
         # Measured drift between windows is 1.7x (344 ms at 04:14, 570 ms at
@@ -95,6 +101,11 @@ class PaperEngine:
         self._book_cursor = 0
         self._stop = threading.Event()
         self._fills = {name: 0 for name in STRATEGIES}
+        #: The shared live risk authority, configured from the ledger's capital
+        #: and fed measured paper state every tick (``paper.risk``). It is not
+        #: optional: a paper run without hard breakers would not be a model of
+        #: the live engine. A caller may inject one (tests, operator override).
+        self.risk_manager = paper_risk.attach(self, risk_manager)
 
     # -- lifecycle -------------------------------------------------------
     def stop(self) -> None:
@@ -186,6 +197,19 @@ class PaperEngine:
             )
         self._stage("tape", stage0)
         stage0 = time.monotonic()
+        # Marks and equity come before risk: the daily-loss and drawdown
+        # breakers must evaluate this tick's measurements, not last tick's.
+        self._mark(books)
+        self._stage("mark", stage0)
+        stage0 = time.monotonic()
+        # The shared risk layer observes every measured mid (heartbeat and
+        # per-asset price-jump cooldown) and this tick's marked equity, and
+        # cancels quotes through its callback before anything may rest one.
+        # It runs before the planner so a tripped breaker cannot be followed
+        # by a new quote in the same tick.
+        self._risk(books, now)
+        self._stage("risk", stage0)
+        stage0 = time.monotonic()
         self._land(books, prints)
         self._stage("land", stage0)
         stage0 = time.monotonic()
@@ -202,6 +226,9 @@ class PaperEngine:
         self._merge(books)
         self._stage("merge", stage0)
         stage0 = time.monotonic()
+        # Mark again after landing, the fill pass and the merge: lots created
+        # by this tick are valued at the book they landed against, so the
+        # snapshot never lags a fill by a whole interval.
         self._mark(books)
         self._stage("mark", stage0)
         self._last_tick_dt = time.monotonic() - tick_started
@@ -308,6 +335,7 @@ class PaperEngine:
     # -- delegates: the moved implementations, original names ------------
     def _refresh_venue_state(self) -> None: return venue_actions.refresh_venue_state(self)
     def _probe_loop(self) -> None: return venue_actions.probe_loop(self)
+    def _risk(self, books, now) -> None: return paper_risk.tick(self, books, now)
     def _land(self, books, prints) -> None: return venue_actions.land(self, books, prints)
     def _deskew(self, books, prints) -> None:
         return paper_deskew.run_deskew(self, books, prints, STRATEGIES)
