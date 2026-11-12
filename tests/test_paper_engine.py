@@ -210,6 +210,22 @@ def test_mark_infers_a_missing_leg_from_the_binary_complement(tmp_path, fake_ven
     engine.ledger.close()
 
 
+def test_mark_normalises_an_inconsistent_complementary_pair(tmp_path, fake_venue):
+    """YES/NO mids more than 2 c from par: NO is marked at 1 - YES, as live does."""
+    market, _books = fake_venue
+    engine = _engine(tmp_path, {})
+    engine.by_condition = {"c1": market}
+    assert engine.ledger.buy(
+        "RewardHarvester", condition_id="c1", token_id="no",
+        shares=100.0, price=0.10,
+    )
+    engine._mark({"yes": _book(0.60, 0.62), "no": _book(0.50, 0.52)})
+    lot = engine.ledger.positions("RewardHarvester")[0]
+    assert lot.mark_live is True
+    assert lot.last_mark == pytest.approx(0.39)   # 1 - yes mid 0.61; NO mid 0.51 rejected
+    engine.ledger.close()
+
+
 def test_mark_stage_flags_a_vanished_book_once_then_clears(tmp_path):
     """No book: flag the lot, keep the last measurement, log one transition."""
     from loguru import logger

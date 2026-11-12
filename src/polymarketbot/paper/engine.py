@@ -276,11 +276,7 @@ class PaperEngine:
                 # (``live/engine/accounting.py::_mark_prices``). Paper must use
                 # the same convention or its equity and risk breakers read a
                 # different account than the live engine's.
-                price = mid(books.get(lot.token_id) or {})
-                source = "mid"
-                if price is None:
-                    price = self._complement_mid(books, lot.token_id)
-                    source = "complement mid"
+                price, source = self._mark_price(books, lot.token_id)
                 if price is None:
                     # Never invent a price to fill the gap. Keep the last real
                     # measurement as the value, clear `mark_live`, and say so
@@ -298,24 +294,44 @@ class PaperEngine:
                         f"{lot.shares:.2f} shares at {source} ${price:.4f}"
                     )
 
-    def _complement_mid(self, books: dict[str, dict], token_id: str) -> float | None:
-        """The missing leg's fair value from its binary complement, or None.
+    def _mark_price(
+        self, books: dict[str, dict], token_id: str
+    ) -> tuple[float | None, str]:
+        """The token's mark and its source, with live's complementary rules.
 
-        Only a two-token condition has complements; a neg-risk or multi-leg
-        market must not be priced from an unrelated sibling.
+        A binary condition's two books are one price: if both mids exist and
+        their sum is more than two cents from par, live normalises the NO leg
+        to ``1 - YES`` so an inconsistent snapshot cannot inflate equity. A
+        missing leg is inferred from its complement. A neg-risk or multi-leg
+        market has no binary complement and is never priced from a sibling.
         """
         for market in self.by_condition.values():
             ids = tuple(market.token_ids)
             if len(ids) != 2 or token_id not in ids:
                 continue
-            other = ids[1] if token_id == ids[0] else ids[0]
-            other_mid = mid(books.get(other) or {})
-            if other_mid is None:
-                continue
-            price = 1.0 - other_mid
-            if 0.0 < price < 1.0:
-                return price
-        return None
+            yes_id, no_id = ids
+            yes_mid = mid(books.get(yes_id) or {})
+            no_mid = mid(books.get(no_id) or {})
+            if yes_mid is not None and no_mid is not None:
+                if abs(yes_mid + no_mid - 1.0) > 0.02:
+                    no_mid = 1.0 - yes_mid
+            if token_id == no_id:
+                if no_mid is not None and 0.0 < no_mid < 1.0:
+                    return no_mid, "mid"
+                if yes_mid is not None:
+                    price = 1.0 - yes_mid
+                    if 0.0 < price < 1.0:
+                        return price, "complement mid"
+            else:
+                if yes_mid is not None and 0.0 < yes_mid < 1.0:
+                    return yes_mid, "mid"
+                if no_mid is not None:
+                    price = 1.0 - no_mid
+                    if 0.0 < price < 1.0:
+                        return price, "complement mid"
+            return None, "unmeasured"
+        price = mid(books.get(token_id) or {})
+        return (price, "mid") if price is not None else (None, "unmeasured")
 
     def _rtt(self) -> float:
         """Measured CLOB round trip, or refuse to schedule at zero latency.
