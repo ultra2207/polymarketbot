@@ -25,6 +25,7 @@ import polymarketbot.strategy.reward.decision as reward
 import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import risk as paper_risk
+from polymarketbot.paper import sizing as paper_sizing
 from polymarketbot.paper.actions import Resting, new_order_id, queue_tracker
 from polymarketbot.paper.deskew import skew_target
 from polymarketbot.strategy.books import ladder
@@ -401,6 +402,12 @@ def run_reward(engine, books: dict[str, dict], prints: list[venue.Print]) -> Non
     # must clear before it spends the same dollar. None = not solved, which
     # the CTF gate treats as missing data and refuses on.
     engine._shadow_yield = shadow_state.get("shadow_yield")
+    # The shared per-order cap must price the plan about to be validated: live
+    # derives it from its measured sizer size, and paper's measurement is the
+    # planner's own leg size. Observed from the plan (never from resting state
+    # and never from a quote the gate refuses) before the placement loop, so
+    # every leg below goes through ``validate_quote`` under this tick's size.
+    paper_sizing.record(engine, wanted.values(), now=now)
     for token_id, quote in wanted.items():
         current = engine.reward_quotes.get(token_id)
         # A passive fade re-prices this leg; the pair is no longer the symmetric

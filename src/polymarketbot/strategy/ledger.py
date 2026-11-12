@@ -2,8 +2,9 @@
 
 One invariant: every cash movement is a trade row in SQLite. Equity is
 ``cash + sum(shares * value)`` where ``value`` is the lot's protocol value
-(par ``1.0`` once an oracle verdict exists, otherwise the last measured mark).
-No lot is ever valued at its own purchase price when a market mark exists.
+(par ``1.0`` once an oracle verdict exists, otherwise the last measured mark,
+or its average cost when the book is gone - live's own fallback). No lot is
+ever valued at its own purchase price when a market mark exists.
 """
 
 from __future__ import annotations
@@ -78,8 +79,9 @@ class Lot:
     tag: str = ""
     # True while ``last_mark`` is a live book measurement. ``False`` means the
     # lot has never been measured (``last_mark`` is its purchase price) *or*
-    # its book disappeared after the last measurement; the flag is surfaced so
-    # equity can never silently pretend a frozen price is current.
+    # its book disappeared, in which case ``mark_at_cost`` replaces the frozen
+    # mid with the average cost exactly as live's ``_mark_prices`` does; the flag
+    # is surfaced so equity can never silently pretend a stale price is current.
     mark_live: bool = False
 
     def mark(self) -> float:
@@ -446,6 +448,32 @@ class Ledger:
                         transitioned = True
             return transitioned
 
+    def mark_at_cost(self, token_id: str,
+                     strategy: str | None = None) -> bool:
+        """Value lots of ``token_id`` at their average cost because no book exists.
+
+        This is live's fallback (``live/engine/accounting.py::_mark_prices``):
+        when neither the token nor its binary complement has a fresh mid, the
+        position is carried at what it cost, never at a frozen last mid that
+        the venue no longer quotes. ``mark_live`` is cleared, so the lot stays
+        visible as unmeasured. Returns True on a transition (a live mark was
+        cleared, or the stored value was not already the average cost), which
+        is the once-per-transition log trigger.
+        """
+        with self._lock:
+            books = (self._books[strategy],) if strategy is not None else self._books.values()
+            transitioned = False
+            for book in books:
+                for lot in book.lots:
+                    if lot.token_id != token_id or lot.shares <= 1e-9:
+                        continue
+                    average_cost = lot.cost_usd / lot.shares
+                    if lot.mark_live or abs(lot.last_mark - average_cost) > 1e-12:
+                        transitioned = True
+                    lot.last_mark = average_cost
+                    lot.mark_live = False
+            return transitioned
+
     def unmarked(self, strategy: str) -> list[Lot]:
         """Open lots whose value is not backed by a live market measurement."""
         with self._lock:
@@ -470,6 +498,21 @@ class Ledger:
                     lot.par_value = float(par) if lot.token_id == winning_token_id else 0.0
 
     # -- reads -----------------------------------------------------------
+    def strategies(self) -> tuple[str, ...]:
+        """Every strategy with a book in this ledger."""
+        with self._lock:
+            return tuple(self._books)
+
+    def conditions(self) -> set[str]:
+        """Every condition id with an open lot, across all strategy books."""
+        with self._lock:
+            return {
+                lot.condition_id
+                for book in self._books.values()
+                for lot in book.lots
+                if lot.shares > 1e-9 and lot.condition_id
+            }
+
     def cash(self, strategy: str) -> float:
         with self._lock:
             return self._books[strategy].cash

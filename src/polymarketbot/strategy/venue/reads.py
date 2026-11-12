@@ -48,6 +48,10 @@ class Market:
     uma_status: str
     outcome_prices: tuple[float, ...] = ()
     category: str = "other"
+    #: Gamma event grouping, used by the correlated-event risk caps. Empty
+    #: when the payload carries no event; the caller then skips the event cap
+    #: instead of guessing a grouping.
+    event_id: str = ""
 
     @property
     def binary(self) -> bool:
@@ -73,6 +77,24 @@ def _json_list(value: Any) -> list[Any]:
             return []
         return list(parsed) if isinstance(parsed, list) else []
     return []
+
+
+def _event_id(row: dict[str, Any]) -> str:
+    """The Gamma event grouping from whichever shape this payload carries.
+
+    Gamma rows expose ``events[0]["id"]``; metadata and CLOB rows may carry a
+    flat ``event_id``/``eventId``. Nothing is derived: no field means ``""``.
+    """
+    for key in ("event_id", "eventId"):
+        value = row.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    events = _json_list(row.get("events"))
+    if events and isinstance(events[0], dict):
+        value = events[0].get("id") or events[0].get("event_id")
+        if value is not None and str(value) != "":
+            return str(value)
+    return ""
 
 
 def parse_market(row: dict[str, Any]) -> Market | None:
@@ -124,6 +146,7 @@ def parse_market(row: dict[str, Any]) -> Market | None:
         uma_status=str(row.get("umaResolutionStatus") or "").lower(),
         outcome_prices=tuple(prices),
         category=category,
+        event_id=_event_id(row),
     )
 
 
@@ -267,33 +290,44 @@ class BookFeed:
         self._lock = threading.Lock()
         self._book: dict[str, dict[str, Any]] = {}
         self._stamp: dict[str, float] = {}
+        #: Wall-clock time of the last successful ``/books`` call (2xx with a
+        #: parsed body), or ``None`` until one succeeds. This is the paper
+        #: data source's heartbeat: a cached snapshot or a failed fetch does
+        #: not advance it, so the risk layer can tell a live path from a stale
+        #: cache.
+        self.last_ok_ts: float | None = None
 
     def _fetch(self, token_ids: list[str]) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
         chunks = [token_ids[i:i + self._chunk] for i in range(0, len(token_ids), self._chunk)]
 
-        def one(chunk: list[str]) -> dict[str, dict[str, Any]]:
+        def one(chunk: list[str]) -> tuple[bool, dict[str, dict[str, Any]]]:
             try:
                 response = self._http.post(
                     f"{CLOB}/books",
                     json=[{"token_id": token} for token in chunk],
                     timeout=10.0,
                 )
-                if response.status_code != 200:
+                if not 200 <= response.status_code < 300:
                     log.warning(f"/books chunk HTTP {response.status_code}")
-                    return {}
-                return {
+                    return False, {}
+                return True, {
                     str(book.get("asset_id")): book
                     for book in response.json()
                     if book.get("asset_id")
                 }
             except Exception as exc:  # noqa: BLE001 - a failed chunk is missing data
                 log.warning(f"/books chunk failed: {exc}")
-                return {}
+                return False, {}
 
+        ok = False
         with ThreadPoolExecutor(max_workers=self._workers) as pool:
-            for partial in pool.map(one, chunks):
+            for chunk_ok, partial in pool.map(one, chunks):
+                ok = ok or chunk_ok
                 out.update(partial)
+        if ok:
+            with self._lock:
+                self.last_ok_ts = time.time()
         return out
 
     def books(self, token_ids: Iterable[str], force: bool = False) -> dict[str, dict[str, Any]]:

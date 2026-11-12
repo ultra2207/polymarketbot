@@ -22,12 +22,14 @@ import polymarketbot.strategy.venue.reads as venue
 from polymarketbot.logs import get_logger
 from polymarketbot.paper import actions as venue_actions
 from polymarketbot.paper import deskew as paper_deskew
+from polymarketbot.paper import lifecycle as paper_lifecycle
+from polymarketbot.paper import micro as paper_micro
 from polymarketbot.paper import risk as paper_risk
 from polymarketbot.paper.actions import Resting
 from polymarketbot.paper.pillars import reward_runner
 from polymarketbot.risk.manager import RiskManager
 from polymarketbot.risk.queue_position import QueuePositionTracker
-from polymarketbot.strategy.books import best_bid, mid
+from polymarketbot.strategy.books import mid
 from polymarketbot.strategy.latency import ActionBook, RttProbe
 from polymarketbot.strategy.ledger import Ledger
 
@@ -106,6 +108,10 @@ class PaperEngine:
         #: optional: a paper run without hard breakers would not be a model of
         #: the live engine. A caller may inject one (tests, operator override).
         self.risk_manager = paper_risk.attach(self, risk_manager)
+        #: The measured microstructure gate. It cannot build until the universe
+        #: walker publishes a market tick, so `feed` builds/attaches it on the
+        #: first tick that has both books and measured tick sizes.
+        self.paper_micro = paper_micro.attach(self)
 
     # -- lifecycle -------------------------------------------------------
     def stop(self) -> None:
@@ -160,7 +166,14 @@ class PaperEngine:
             log.info(f"universe: {len(self.markets)} known active markets "
                      f"({sum(1 for m in self.markets if m.daily_reward > 0)} rewarded, "
                      f"pass_complete={complete})")
-        tick_start0 = tick_started
+        # Resolution before anything trades: a closed market's quotes are
+        # cancelled and it is removed from the tradable views, and a final
+        # verdict moves its lots to par / redeem / write-off before the marks
+        # and the risk layer read equity.
+        stage0 = time.monotonic()
+        self._lifecycle(now)
+        self._stage("lifecycle", stage0)
+        tick_start0 = time.monotonic()
         tokens = [token for m in self.markets for token in m.token_ids]
         if tokens:
             size = min(len(tokens), 12000)
@@ -195,6 +208,10 @@ class PaperEngine:
             prints += venue.condition_tape(
                 self.http, ordered, window_s=max(120.0, 4 * self.interval)
             )
+        # Feed the shared microstructure gate the same two-sided books and the
+        # full print set (global plus held-condition tape), before any quote is
+        # validated this tick.
+        paper_micro.feed(self, books, prints, now)
         self._stage("tape", stage0)
         stage0 = time.monotonic()
         # Marks and equity come before risk: the daily-loss and drawdown
@@ -278,15 +295,17 @@ class PaperEngine:
                 # different account than the live engine's.
                 price, source = self._mark_price(books, lot.token_id)
                 if price is None:
-                    # Never invent a price to fill the gap. Keep the last real
-                    # measurement as the value, clear `mark_live`, and say so
-                    # once per measured -> unmeasured transition.
-                    if self.ledger.mark_unmeasured(lot.token_id, strategy):
+                    # Neither this token nor its binary complement has a book.
+                    # Live carries that position at its average cost
+                    # (``live/engine/accounting.py::_mark_prices``), never at a
+                    # frozen last mid the venue no longer quotes; paper does the
+                    # same and clears `mark_live`, saying so once per transition.
+                    if self.ledger.mark_at_cost(lot.token_id, strategy):
                         log.warning(
                             f"mark unmeasured: {strategy} {lot.token_id[:10]} "
-                            f"{lot.shares:.2f} shares held at ${lot.mark():.4f} "
-                            f"(last live ${lot.last_mark:.4f}); no two-sided book "
-                            "and no complementary mid this tick"
+                            f"{lot.shares:.2f} shares carried at average cost "
+                            f"${lot.mark():.4f}; no two-sided book and no "
+                            "complementary mid this tick"
                         )
                 elif self.ledger.mark(lot.token_id, price, strategy):
                     log.info(
@@ -312,9 +331,12 @@ class PaperEngine:
             yes_id, no_id = ids
             yes_mid = mid(books.get(yes_id) or {})
             no_mid = mid(books.get(no_id) or {})
-            if yes_mid is not None and no_mid is not None:
-                if abs(yes_mid + no_mid - 1.0) > 0.02:
-                    no_mid = 1.0 - yes_mid
+            if (
+                yes_mid is not None
+                and no_mid is not None
+                and abs(yes_mid + no_mid - 1.0) > 0.02
+            ):
+                no_mid = 1.0 - yes_mid
             if token_id == no_id:
                 if no_mid is not None and 0.0 < no_mid < 1.0:
                     return no_mid, "mid"
@@ -380,6 +402,7 @@ class PaperEngine:
     # -- delegates: the moved implementations, original names ------------
     def _refresh_venue_state(self) -> None: return venue_actions.refresh_venue_state(self)
     def _probe_loop(self) -> None: return venue_actions.probe_loop(self)
+    def _lifecycle(self, now) -> None: return paper_lifecycle.refresh(self, now)
     def _risk(self, books, now) -> None: return paper_risk.tick(self, books, now)
     def _land(self, books, prints) -> None: return venue_actions.land(self, books, prints)
     def _deskew(self, books, prints) -> None:

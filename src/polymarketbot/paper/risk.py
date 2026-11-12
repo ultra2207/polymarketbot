@@ -17,21 +17,26 @@ the bankroll (the paper ledger's capital) and long-only mode (the live
 real-money engine is long-only, and the paper ledger only ever sells inventory
 it owns). The breakers - 5 % daily loss, 10 % peak drawdown, 2 c jump over
 60 s, 300 s cooldown, 15 s heartbeat - are ``RiskConfig``'s own defaults; the
-live engine spells the same derived values out in its constructor. Paper does
-not override ``max_quote_size_shares``: live's aggregate engine sets it from a
-measured sizer quote size, and the paper planner has no equivalent separate
-measurement, so the shared default applies. The correlated ``event_id`` caps
-cannot be enforced because the paper ``Market`` payload carries no event id.
+live engine spells the same derived values out in its constructor. The
+per-order cap starts at the live aggregate fallback (the derived position-cost
+cap) and is then re-published each reward tick from ``paper.sizing``, which
+measures the planner's own per-leg quote size; an empty plan leaves the last
+measured cap in place. The correlated-event caps use the ``event_id`` parsed
+from the venue ``Market``; a market without one skips the event cap instead of
+guessing a grouping.
 
 What this layer deliberately does not do
 ----------------------------------------
-* Heartbeat timeout: the paper feed is a REST snapshot fetched inside the tick,
-  not a long-lived WebSocket. A dead data path shows up as a missing/stale book
-  and is handled per asset below; tripping a *permanent* disconnect halt on one
-  slow snapshot would be less faithful than the stale-book block.
-* Microstructure gating: ``RiskManager.set_micro_risk`` is not wired. Paper
-  has no per-order flow/queue feed into ``UnifiedRiskEngine``; an unfitted or
-  unwired gate is skipped by ``validate_quote`` itself rather than guessed.
+* Heartbeat by cached snapshot: the paper feed is a REST snapshot fetched
+  inside the tick. Its ``last_ok_ts`` advances only on a successful ``/books``
+  call, and ``tick`` feeds that timestamp to the shared heartbeat monitor. A
+  cache read or a failed fetch is not a heartbeat, so a dead data path trips
+  ``DISCONNECT_TIMEOUT`` and cancels quotes exactly as live does.
+* Microstructure gating: ``paper.micro`` wires the shared measured
+  ``UnifiedRiskEngine`` per market tick and feeds it this tick's books and
+  prints. If the fit is absent or no market tick is measured yet, the gate is
+  disabled with a stated reason rather than guessed; ``validate_quote`` then
+  skips only that gate.
 * Reward accrual credits and locked collateral keep their existing paper
   accounting. Only the risk state reads them through marked equity.
 """
@@ -179,6 +184,44 @@ def token_position(engine, token_id: str) -> tuple[float, float]:
     return shares, cost
 
 
+def event_id_for_condition(engine, condition_id: str) -> str:
+    """The Gamma event a condition belongs to, or ``""`` when it is unknown.
+
+    The event id is metadata parsed from the venue payload, never inferred
+    from a question, a slug or a sibling condition.
+    """
+    market = engine.by_condition.get(condition_id)
+    return str(getattr(market, "event_id", "") or "")
+
+
+def event_position(engine, event_id: str) -> tuple[float, float]:
+    """``(marked value, cost basis)`` held across one event's markets.
+
+    A lot's event is the event of its own condition. A condition the engine
+    does not know cannot be attributed to an event, so it is skipped rather
+    than guessed into one; an empty event id measures nothing.
+    """
+    if not event_id:
+        return 0.0, 0.0
+    value = 0.0
+    cost = 0.0
+    for name in engine.ledger.equity():
+        for lot in engine.ledger.positions(name):
+            market = engine.by_condition.get(lot.condition_id)
+            if market is None or str(getattr(market, "event_id", "") or "") != event_id:
+                continue
+            value += lot.shares * lot.mark()
+            cost += lot.cost_usd
+    return value, cost
+
+
+def _condition_for_token(engine, token_id: str) -> str:
+    for condition_id, market in engine.by_condition.items():
+        if token_id in market.token_ids:
+            return condition_id
+    return ""
+
+
 def reserved_cash(engine, *, exclude_token: str | None = None) -> float:
     """Cash the resting bids already committed, optionally excluding one order.
 
@@ -320,6 +363,18 @@ def tick(engine, books: dict[str, dict], now: float) -> None:
     if rm is None:
         return
 
+    # The data-source heartbeat is the last *successful* fetch, not this
+    # tick's clock: a cached snapshot and a failed call are both "no new
+    # data". ``None`` means no successful call has happened yet, so there is
+    # no heartbeat to record and none to fabricate.
+    feed = getattr(engine, "feed", None)
+    last_ok = getattr(feed, "last_ok_ts", None)
+    if last_ok is not None:
+        rm.record_heartbeat(float(last_ok))
+        if not rm.check_heartbeat(now):
+            cancel_quotes(engine, None, "data source heartbeat lost")
+            return
+
     for condition_id, market in engine.by_condition.items():
         for token_id in market.token_ids:
             price = mid(books.get(token_id) or {})
@@ -396,6 +451,14 @@ def quote_denial(
     pos_shares, pos_cost = token_position(engine, token_id)
     acc = account(engine)
     free_cash = acc.cash - reserved_cash(engine, exclude_token=token_id)
+    # Correlated-event caps: the marked value and cost of every lot whose
+    # condition maps to this market's event. An unknown event id is missing
+    # metadata, so the shared manager skips the event cap.
+    event_id = event_id_for_condition(engine, condition_id)
+    event_value: float | None = None
+    event_cost: float | None = None
+    if event_id:
+        event_value, event_cost = event_position(engine, event_id)
     return rm.validate_quote(
         asset_id=token_id,
         condition_id=condition_id,
@@ -409,6 +472,9 @@ def quote_denial(
         mid_price=mid_price,
         tick_size=float(tick_size),
         timestamp=now,
+        event_id=event_id or None,
+        current_event_inventory_usd=event_value,
+        current_event_cost=event_cost,
     )
 
 
@@ -424,9 +490,10 @@ def taker_refusal(
     """Capital/position approval for a de-skew taker leg, or a refusal reason.
 
     Mirrors the live Tier-2 gate: a halted/killed engine refuses the cross; a
-    BUY may only spend free cash and may not push the token cost or the
-    portfolio inventory past the shared caps. The cap is a refusal, not a
-    resize, so an emergency exit is never silently changed.
+    BUY may only spend free cash and may not push the token cost, the
+    portfolio inventory or the correlated-event inventory/cost past the shared
+    caps. The cap is a refusal, not a resize, so an emergency exit is never
+    silently changed.
     """
     rm = manager(engine)
     if rm is None:
@@ -455,5 +522,29 @@ def taker_refusal(
             return (
                 f"taker BUY would take inventory to ${after:.2f} "
                 f"(cap ${float(portfolio_cap):.2f})"
+            )
+    # Same correlated-event caps ``validate_quote`` applies to maker quotes:
+    # every market in the event shares one inventory/cost budget. A token whose
+    # market carries no event id has no event budget to check.
+    event_id = event_id_for_condition(engine, _condition_for_token(engine, token_id))
+    if event_id:
+        event_value, event_cost = event_position(engine, event_id)
+        event_inv_cap = getattr(rm.config, "max_event_inventory_usd", None)
+        if (
+            event_inv_cap is not None
+            and event_value + notional > float(event_inv_cap) + 1e-9
+        ):
+            return (
+                f"taker BUY would take event {event_id} inventory to "
+                f"${event_value + notional:.2f} (cap ${float(event_inv_cap):.2f})"
+            )
+        event_cost_cap = getattr(rm.config, "max_event_position_cost_usd", None)
+        if (
+            event_cost_cap is not None
+            and event_cost + notional > float(event_cost_cap) + 1e-9
+        ):
+            return (
+                f"taker BUY would take event {event_id} cost to "
+                f"${event_cost + notional:.2f} (cap ${float(event_cost_cap):.2f})"
             )
     return None

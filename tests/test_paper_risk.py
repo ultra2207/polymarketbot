@@ -45,8 +45,11 @@ class _Gamma:
 
 
 class _Feed:
-    def __init__(self, books):
+    def __init__(self, books, last_ok_ts=None):
         self._books = books
+        #: Absent by default, like a feed that has never fetched successfully:
+        #: the risk tick then has no heartbeat to record (and fabricates none).
+        self.last_ok_ts = last_ok_ts
 
     def books(self, token_ids, force=False):
         return {token: book for token, book in self._books.items() if token in token_ids}
@@ -93,6 +96,7 @@ def _market(
     reward: float = 0.0,
     min_order: float = 5.0,
     min_size: float = 20.0,
+    event_id: str = "",
 ) -> Market:
     return Market(
         condition_id=condition_id,
@@ -109,6 +113,7 @@ def _market(
         closed=False,
         uma_status="",
         outcome_prices=(0.5, 0.5),
+        event_id=event_id,
     )
 
 
@@ -120,12 +125,13 @@ def _engine(
     capital: float = 1000.0,
     risk_manager: RiskManager | None = None,
     db: str = "risk.db",
+    last_ok_ts: float | None = None,
 ):
     engine = engine_mod.PaperEngine(
         {STRATEGY: capital},
         http=_Http(),
         gamma=_Gamma(),
-        feed=_Feed(books),
+        feed=_Feed(books, last_ok_ts=last_ok_ts),
         rtt=_Rtt(0.001),
         db_path=str(tmp_path / db),
         interval=1.0,
@@ -531,4 +537,181 @@ def test_position_cost_cap_refuses_a_quote_below_the_venue_minimum(
         lot.token_id: (lot.shares, lot.cost_usd)
         for lot in engine.ledger.positions(STRATEGY)
     } == lots_before
+    engine.ledger.close()
+
+
+# --------------------------------------------------------------- event caps
+def _event_engine(tmp_path, markets, *, capital=1000.0):
+    engine = _engine(tmp_path, {}, markets, capital=capital)
+    engine.by_condition = {market.condition_id: market for market in markets}
+    return engine
+
+
+def _quote(engine, condition_id, token_id, books, *, shares=20.0, price=0.48):
+    return paper_risk.quote_denial(
+        engine,
+        condition_id=condition_id,
+        token_id=token_id,
+        price=price,
+        shares=shares,
+        books=books,
+        tick_size=0.01,
+        now=time.time(),
+    )
+
+
+def test_event_inventory_cap_denies_a_sibling_market(tmp_path):
+    """A marked lot in one market consumes the whole event's inventory budget."""
+    c1 = _market("c1", "y1", "n1", event_id="ev1")
+    c2 = _market("c2", "y2", "n2", event_id="ev1")
+    c3 = _market("c3", "y3", "n3", event_id="ev2")
+    engine = _event_engine(tmp_path, [c1, c2, c3])
+    # $1,000 bankroll -> $500 shared event cap (RiskConfig derivation). The
+    # $297 cost is marked to $544.50, so inventory alone is exhausted.
+    assert engine.ledger.buy(
+        STRATEGY, condition_id="c1", token_id="y1", shares=990.0, price=0.30
+    )
+    assert engine.ledger.mark("y1", 0.55)
+    assert engine.risk_manager.config.max_event_inventory_usd == pytest.approx(500.0)
+    books = {"y2": _book(0.48, 0.52), "y3": _book(0.48, 0.52)}
+
+    allowed, _, size, _ = _quote(engine, "c2", "y2", books)
+    assert allowed is False
+    assert size == 0.0
+
+    # A market in a different event shares none of that budget.
+    allowed, _, size, _ = _quote(engine, "c3", "y3", books)
+    assert allowed is True
+    assert size > 0.0
+    engine.ledger.close()
+
+
+def test_event_cost_cap_denies_a_sibling_market(tmp_path):
+    """Cost basis alone can exhaust the event budget even when marks are low."""
+    c1 = _market("c1", "y1", "n1", event_id="ev1")
+    c2 = _market("c2", "y2", "n2", event_id="ev1")
+    c3 = _market("c3", "y3", "n3", event_id="ev2")
+    engine = _event_engine(tmp_path, [c1, c2, c3])
+    assert engine.ledger.buy(
+        STRATEGY, condition_id="c1", token_id="y1", shares=1001.0, price=0.50
+    )
+    assert engine.ledger.mark("y1", 0.05)
+    assert engine.risk_manager.config.max_event_position_cost_usd == pytest.approx(500.0)
+    books = {"y2": _book(0.48, 0.52), "y3": _book(0.48, 0.52)}
+
+    allowed, _, size, _ = _quote(engine, "c2", "y2", books)
+    assert allowed is False
+    assert size == 0.0
+
+    allowed, _, size, _ = _quote(engine, "c3", "y3", books)
+    assert allowed is True
+    assert size > 0.0
+    engine.ledger.close()
+
+
+def test_a_market_without_an_event_id_skips_the_event_cap(tmp_path):
+    """Missing event metadata is no grouping, not an empty common event."""
+    c1 = _market("c1", "y1", "n1")
+    c2 = _market("c2", "y2", "n2")
+    engine = _event_engine(tmp_path, [c1, c2])
+    assert engine.ledger.buy(
+        STRATEGY, condition_id="c1", token_id="y1", shares=1001.0, price=0.50
+    )
+    assert engine.ledger.mark("y1", 0.05)
+    books = {"y2": _book(0.48, 0.52)}
+
+    allowed, _, size, _ = _quote(engine, "c2", "y2", books)
+    assert allowed is True
+    assert size > 0.0
+    engine.ledger.close()
+
+
+def test_taker_refusal_enforces_the_shared_event_caps(tmp_path):
+    c1 = _market("c1", "y1", "n1", event_id="ev1")
+    c2 = _market("c2", "y2", "n2", event_id="ev1")
+    c3 = _market("c3", "y3", "n3", event_id="ev2")
+    engine = _event_engine(tmp_path, [c1, c2, c3])
+    assert engine.ledger.buy(
+        STRATEGY, condition_id="c1", token_id="y1", shares=1001.0, price=0.50
+    )
+    assert engine.ledger.mark("y1", 0.05)
+
+    reason = paper_risk.taker_refusal(
+        engine, strategy=STRATEGY, token_id="y2", side="BUY", shares=20.0, price=0.48
+    )
+    assert reason is not None
+    assert "event ev1" in reason
+    assert "cost" in reason
+
+    # A different event has its own, untouched budget.
+    assert paper_risk.taker_refusal(
+        engine, strategy=STRATEGY, token_id="y3", side="BUY", shares=20.0, price=0.48
+    ) is None
+    engine.ledger.close()
+
+
+# ---------------------------------------------------------------- heartbeat
+def test_stale_feed_heartbeat_trips_the_breaker_and_cancels_quotes(
+    tmp_path, stable_books, monkeypatch,
+):
+    _no_network(monkeypatch)
+    # No successful /books call within the shared 15 s heartbeat timeout.
+    engine = _engine(
+        tmp_path, stable_books, [_market()], last_ok_ts=time.time() - 60.0
+    )
+    engine.reward_quotes["yes"] = Resting(
+        STRATEGY, "c1", "yes", 0.48, 20.0, 5.0, 0.0,
+        order_id="seeded", initial_shares=20.0, seen_ts=0.0,
+    )
+
+    engine._tick()
+
+    rm = engine.risk_manager
+    assert rm.portfolio_state.is_halted is True
+    reasons = [event.reason for event in rm.portfolio_state.circuit_breaker_events]
+    assert CircuitBreakerReason.DISCONNECT_TIMEOUT in reasons
+    # The seeded quote is either marked cancelled (cancel still in flight) or
+    # already drained by the landing pass.
+    quote = engine.reward_quotes.get("yes")
+    assert quote is None or quote.cancel_at is not None
+    engine.ledger.close()
+
+
+def test_fresh_feed_heartbeat_keeps_quoting(tmp_path, stable_books, monkeypatch):
+    _no_network(monkeypatch)
+    engine = _engine(
+        tmp_path, stable_books, [_market()], last_ok_ts=time.time()
+    )
+    _plan(monkeypatch, [_wanted("c1", "yes")])
+
+    engine._tick()
+
+    rm = engine.risk_manager
+    assert rm.portfolio_state.is_halted is False
+    assert rm.portfolio_state.status is not RiskStatus.HALTED
+    assert CircuitBreakerReason.DISCONNECT_TIMEOUT not in [
+        event.reason for event in rm.portfolio_state.circuit_breaker_events
+    ]
+    assert len(_pending(engine, "reward_quote")) == 1
+    engine.ledger.close()
+
+
+def test_a_feed_that_never_fetched_records_no_heartbeat(
+    tmp_path, stable_books, monkeypatch,
+):
+    """``last_ok_ts is None`` is missing data, not a fresh heartbeat."""
+    _no_network(monkeypatch)
+    engine = _engine(tmp_path, stable_books, [_market()])
+    heartbeat_before = engine.risk_manager.portfolio_state.last_heartbeat_timestamp
+
+    engine._tick()
+
+    # The mid observations still record the tick's own heartbeat; what the
+    # feed does not do is fabricate a data-source one.
+    assert engine.feed.last_ok_ts is None
+    assert engine.risk_manager.portfolio_state.is_halted is False
+    assert (
+        engine.risk_manager.portfolio_state.last_heartbeat_timestamp
+        >= heartbeat_before
+    )
     engine.ledger.close()
