@@ -66,7 +66,7 @@ on the LF form of `deploy.sh`.
 3. Confirm secrets live only in `/etc/polymarketbot/polymarketbot.env`, mode 0600; `deploy.sh` now
    aborts if they leak into the app tree.
 4. Run the canary as a foreground command, not under the systemd paper unit:
-   `uv run python -m polymarketbot.live.runner --live --yes --condition-id … --token-yes … --token-no … --min-size 5 --quote-size 5 --daily-reward 0 --max-budget 20 --duration 3600 --record-live-data`.
+   `uv run python -m polymarketbot.live.runner --live --yes --condition-id … --token-yes … --token-no … --min-size 20 --quote-size 20 --daily-reward 0 --max-budget 40 --duration 3600 --record-live-data`.
 5. Watch: `Rebate reconciliation:` (L1), `micro_risk_decision` rows (L6), `reward_epochs.actual` vs
    `modelled` (L2), locked-cash calibration log (L4), and `Tier 2 landing:` lines (L5).
 6. Stop on: exit code 3, repeated `CANCELLING`, reconciliation failures, or any `GasUnmeasured`.

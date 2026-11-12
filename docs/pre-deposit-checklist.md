@@ -109,7 +109,9 @@ rows[rows.kind == "micro_risk_decision"].sort_values("recv_ts_ns")
 
 ## Already verified in code (no action needed)
 
-- Full suite **926 tests green**; `ruff check src tests` clean.
+- Targeted paper/reward suite **87 tests passed** after the dual-sided paper
+  change; `ruff check` is clean on the touched files. The full suite has **not**
+  been rerun after this change — run it before depositing.
 - Notional sizing rule covered by `tests/test_notional_quote_sizing.py`; exercised in a
   live-path dry-run: configured 5 shares were raised to the notional-clearing count and
   the previously rejected leg was accepted.
